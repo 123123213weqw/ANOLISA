@@ -6,13 +6,16 @@
 pub mod config;
 mod filesystem;
 pub mod integrity;
+mod ledger;
 pub mod models;
 pub mod scanner;
+pub mod service;
 
 pub use asc_action_types::{DecisionAction, SkillIdentity};
 pub use config::{ManagedSkillDir, SkillSecConfig};
 pub use integrity::{FileHashes, HashDiff, KeyStore, SigningIdentity, hash_tree};
 pub use models::{Finding, Manifest, ScanEntry, ScanStatus, UserDecision};
+pub use service::{ScanOptions, SkillRoot, SkillSecService};
 
 /// Domain failures, kept separate from daemon transport errors and risk findings.
 #[derive(Debug, thiserror::Error)]
