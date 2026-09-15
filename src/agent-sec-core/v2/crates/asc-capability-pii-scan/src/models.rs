@@ -168,6 +168,12 @@ pub struct PiiSummary {
     pub scanner_version: String,
     /// Identifies this detector revision and active rule content.
     pub ruleset_id: String,
+    /// Input-independent execution failure message, absent on completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Stable execution error code, absent on completion.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_type: Option<String>,
 }
 
 /// Stable public scan response, compatible with v1 Hook consumers.
@@ -209,6 +215,12 @@ pub enum ScanError {
     /// The inherited execution deadline expired between matching steps.
     #[error("PII scan deadline exceeded")]
     DeadlineExceeded,
+    /// The caller had already cancelled before execution started.
+    #[error("PII scan cancelled")]
+    Cancelled,
+    /// Both process-owned PII execution slots are occupied.
+    #[error("PII scanner is busy")]
+    Busy,
 }
 
 impl ScanError {
@@ -219,6 +231,8 @@ impl ScanError {
             Self::InvalidBuiltin => "invalid_builtin",
             Self::Matching => "matching_failed",
             Self::DeadlineExceeded => "scan_deadline_exceeded",
+            Self::Cancelled => "scan_cancelled",
+            Self::Busy => "scan_busy",
         }
     }
 }

@@ -44,3 +44,14 @@ pub struct PiiScanOptions {
     /// Client prefix length retained for the legacy `bytes_scanned` counter.
     pub input_bytes_scanned: Option<usize>,
 }
+
+/// One scan invocation; raw text deliberately has no diagnostic `Debug` projection.
+#[derive(Clone)]
+pub struct PiiScanRequest {
+    /// Exact UTF-8 text received from the caller.
+    pub text: String,
+    /// Explicit input coverage and response options.
+    pub options: PiiScanOptions,
+    /// Optional business metadata, never a trusted identity.
+    pub agent_name: Option<String>,
+}

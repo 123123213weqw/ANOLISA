@@ -134,6 +134,8 @@ impl PiiScanner {
                 scanned_bytes: text.len(),
                 scanner_version: crate::SCANNER_VERSION.to_owned(),
                 ruleset_id: self.rules.id.clone(),
+                error: None,
+                error_type: None,
             },
             findings: findings.items,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
