@@ -163,8 +163,10 @@ name = "asc-capability-skill-sec"
 version = "0.13.2"
 dependencies = [
  "asc-action-types",
+ "asc-capability-code-scan",
  "base64",
  "chrono",
+ "fancy-regex",
  "ring",
  "rustix",
  "serde",
@@ -172,6 +174,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror",
+ "yaml-rust2",
 ]
 
 [[package]]

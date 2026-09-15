@@ -7,6 +7,7 @@ pub mod config;
 mod filesystem;
 pub mod integrity;
 pub mod models;
+pub mod scanner;
 
 pub use asc_action_types::{DecisionAction, SkillIdentity};
 pub use config::{ManagedSkillDir, SkillSecConfig};
@@ -37,6 +38,20 @@ pub enum SkillSecError {
     /// Cryptographic key generation or decoding failed without exposing secrets.
     #[error("SkillSec signing key operation failed")]
     Key,
+    /// A request exhausted its execution deadline before completing.
+    #[error("SkillSec execution deadline exceeded")]
+    Timeout,
+    /// A scanner could not initialize or finish its requested operation.
+    #[error("SkillSec scanner failed: {0}")]
+    Scanner(String),
+}
+
+pub(crate) fn check_deadline(deadline: std::time::Instant) -> Result<(), SkillSecError> {
+    if std::time::Instant::now() >= deadline {
+        Err(SkillSecError::Timeout)
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn io_error(
