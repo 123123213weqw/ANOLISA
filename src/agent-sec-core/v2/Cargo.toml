@@ -9,6 +9,7 @@ members = [
     "crates/asc-action-types",
     "crates/asc-capability-code-scan",
     "crates/asc-capability-pii-scan",
+    "crates/asc-capability-skill-sec",
     "crates/asc-daemon-client",
     "crates/asc-daemon-core",
     "crates/asc-daemon-handler",
@@ -49,6 +50,7 @@ asc-action-runtime = { path = "crates/asc-action-runtime" }
 asc-action-types = { path = "crates/asc-action-types" }
 asc-agentsight-client = { path = "crates/asc-agentsight-client" }
 asc-capability-code-scan = { path = "crates/asc-capability-code-scan" }
+asc-capability-skill-sec = { path = "crates/asc-capability-skill-sec" }
 opentelemetry = { version = "0.32", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace"] }
 tracing = "0.1"
@@ -85,6 +87,7 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 clap = { version = "4.6", features = ["derive"] }
 fancy-regex = "0.16"
 nix = { version = "0.31", default-features = false, features = ["user"] }
+ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde = { version = "1", features = ["derive"] }

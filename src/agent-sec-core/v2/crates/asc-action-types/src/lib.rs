@@ -151,3 +151,6 @@ pub struct CodeScanRequest {
     /// Optional engine mode.
     pub mode: Option<String>,
 }
+
+mod skill_sec;
+pub use skill_sec::{DecisionAction, SkillIdentity, SkillSecInputError};

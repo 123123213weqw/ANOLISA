@@ -106,6 +106,7 @@ version = "0.13.2"
 dependencies = [
  "serde",
  "serde_json",
+ "thiserror",
 ]
 
 [[package]]
@@ -155,6 +156,22 @@ dependencies = [
  "tempfile",
  "thiserror",
  "yaml-rust2",
+]
+
+[[package]]
+name = "asc-capability-skill-sec"
+version = "0.13.2"
+dependencies = [
+ "asc-action-types",
+ "base64",
+ "chrono",
+ "ring",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]
