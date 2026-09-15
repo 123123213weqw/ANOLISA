@@ -43,11 +43,6 @@ fn frozen_v1_builtin_responses_match() {
         for finding in expected["findings"].as_array_mut().unwrap() {
             finding["metadata"]["engine"] = serde_json::json!("regex_v2");
         }
-        // Custom rules are introduced by the next migration commit.
-        expected["summary"]
-            .as_object_mut()
-            .unwrap()
-            .remove("custom_rules");
         assert_eq!(actual, expected, "v1 fixture {index}: {:?}", case["text"]);
     }
 }

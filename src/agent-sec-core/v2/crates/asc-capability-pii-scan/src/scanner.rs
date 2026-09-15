@@ -1,19 +1,20 @@
 //! Aggregate v1 findings while retaining explicit input coverage.
 
-use crate::builtin::{BuiltinDetector, PATTERNS, TYPES};
+use crate::custom;
 use crate::models::{
     Coverage, CoverageStatus, PiiScanOptions, PiiScanReport, PiiSummary, ScanError, ScanStatus,
     check_deadline,
 };
 use crate::redact;
 use crate::report::{Findings, bound_report};
+use crate::rules::PiiRuleSet;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Reusable in-process scanner; construct once and share across requests.
 pub struct PiiScanner {
-    builtin: BuiltinDetector,
-    ruleset_id: String,
+    rules: Arc<PiiRuleSet>,
 }
 
 impl PiiScanner {
@@ -22,14 +23,12 @@ impl PiiScanner {
     /// # Errors
     /// Returns an input-independent error if the shipped patterns are invalid.
     pub fn new() -> Result<Self, ScanError> {
-        Ok(Self {
-            builtin: BuiltinDetector::new()?,
-            ruleset_id: digest(format!(
-                "pii-scanner:{}:{PATTERNS}:{}",
-                crate::SCANNER_VERSION,
-                TYPES.join(",")
-            )),
-        })
+        Ok(Self::with_rules(Arc::new(PiiRuleSet::builtin()?)))
+    }
+
+    /// Uses one previously loaded, immutable collection for every request.
+    pub fn with_rules(rules: Arc<PiiRuleSet>) -> Self {
+        Self { rules }
     }
 
     /// Scans text and returns the v1 response plus completeness metadata.
@@ -58,13 +57,26 @@ impl PiiScanner {
         }
         let text = &input[..boundary];
         let truncated = boundary < input.len() || options.input_truncated;
-        let mut builtin = self.builtin.detect(text, deadline);
+        let custom = custom::detect(text, &self.rules, deadline)?;
+        let mut builtin = self.rules.builtin.detect(text, deadline).peekable();
+        let mut candidates = custom.candidates.into_iter().peekable();
         let mut findings = Findings::default();
         let mut redactor = options.redact_output.then(|| redact::Text::new(text));
         let mut previous = None;
         loop {
             check_deadline(deadline)?;
-            let Some(candidate) = builtin.next().transpose()? else {
+            let take_builtin = match (builtin.peek(), candidates.peek()) {
+                (Some(Err(_)), _) | (Some(_), None) => true,
+                (Some(Ok(a)), Some(b)) => a.compare(b).is_le(),
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            let candidate = if take_builtin {
+                builtin.next().transpose()?
+            } else {
+                candidates.next()
+            };
+            let Some(candidate) = candidate else {
                 break;
             };
             let key = (candidate.span, candidate.kind);
@@ -84,6 +96,7 @@ impl PiiScanner {
         if truncated {
             reasons.push("input_truncated".to_owned());
         }
+        reasons.extend(custom.reasons.into_iter().map(str::to_owned));
         let (redacted_text, redacted_text_omitted) = redactor.map_or((None, false), |r| {
             let (text, omitted) = r.finish();
             (Some(text), omitted)
@@ -106,6 +119,7 @@ impl PiiScanner {
                     bytes_scanned
                 },
                 truncated,
+                custom_rules: custom.summary,
                 execution_status: ScanStatus::Completed,
                 coverage: Coverage {
                     status: if reasons.is_empty() {
@@ -119,7 +133,7 @@ impl PiiScanner {
                 scanned_input_sha256: digest(text),
                 scanned_bytes: text.len(),
                 scanner_version: crate::SCANNER_VERSION.to_owned(),
-                ruleset_id: self.ruleset_id.clone(),
+                ruleset_id: self.rules.id.clone(),
             },
             findings: findings.items,
             elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
