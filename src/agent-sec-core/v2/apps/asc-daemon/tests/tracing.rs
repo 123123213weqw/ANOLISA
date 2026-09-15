@@ -1,4 +1,6 @@
-use asc_daemon::{BootstrapConfig, serve};
+use asc_action_runtime::testing::discarding_finalizer;
+use asc_capability_pii_scan::PiiRuleSet;
+use asc_daemon::{BootstrapConfig, scan_application, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_pap::PapService;
@@ -46,10 +48,11 @@ async fn tracing_span_remains_open_after_dispatch_timeout_until_work_finishes() 
         Arc::new(ProcessLocalPapRepository::default()),
         Arc::new(PolicyTemplateCompiler),
     );
+    let rules = Arc::new(PiiRuleSet::builtin().unwrap());
     let dispatcher = Arc::new(DaemonDispatcher::new(
         pap,
         Arc::new(PausedPolicy(Mutex::new(release_rx))),
-        asc_daemon::scan_application(asc_action_runtime::testing::discarding_finalizer()),
+        scan_application(discarding_finalizer(), rules),
     ));
     let directory =
         std::env::temp_dir().join(format!("asc-otel-lifetime-{}", uuid::Uuid::new_v4()));

@@ -162,6 +162,7 @@ name = "asc-cli"
 version = "0.13.2"
 dependencies = [
  "asc-action-runtime",
+ "asc-capability-pii-scan",
  "asc-daemon",
  "asc-daemon-client",
  "asc-daemon-core",
@@ -192,6 +193,7 @@ dependencies = [
  "asc-action-types",
  "asc-agentsight-client",
  "asc-capability-code-scan",
+ "asc-capability-pii-scan",
  "asc-daemon-core",
  "asc-daemon-handler",
  "asc-daemon-protocol",
@@ -248,6 +250,7 @@ dependencies = [
  "asc-foundation-types",
  "asc-pap",
  "asc-policy-types",
+ "serde_json",
  "thiserror",
 ]
 
@@ -258,6 +261,7 @@ dependencies = [
  "asc-action-runtime",
  "asc-action-types",
  "asc-capability-code-scan",
+ "asc-capability-pii-scan",
  "asc-daemon-core",
  "asc-daemon-protocol",
  "asc-daemon-service",
