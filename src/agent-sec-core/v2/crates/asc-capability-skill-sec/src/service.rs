@@ -132,7 +132,9 @@ impl SkillSecService {
         deadline: Instant,
     ) -> Result<Value, SkillSecError> {
         let requested = requested_names(options.scanners.as_deref())?;
-        self.with_skill(root, deadline, |directory, key| {
+        self.with_locked_root(root, deadline, |directory, key| {
+            self.recover_rollback(root, directory, key, deadline)?;
+            validate_skill(directory)?;
             let ledger = required_ledger(directory)?;
             let content = Content::capture(directory, false, deadline)?;
             let original = ScanTree::open(&root.io_dir, deadline)?;
@@ -149,7 +151,9 @@ impl SkillSecService {
                 .collect();
             if to_run.is_empty() {
                 content.unchanged(directory, &original, deadline)?;
-                return self.noop(root, &manifest, &requested);
+                let mut result = self.noop(root, &manifest, &requested)?;
+                result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
+                return Ok(result);
             }
             let (staging_dir, tree) =
                 content.scan_tree(&self.config.state_dir, &original, deadline)?;
@@ -161,7 +165,9 @@ impl SkillSecService {
                     ));
                 }
                 content.unchanged(directory, &original, deadline)?;
-                return self.noop(root, &manifest, &to_run);
+                let mut result = self.noop(root, &manifest, &to_run)?;
+                result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
+                return Ok(result);
             }
             canonicalize_entries(&mut entries, staging_dir.path(), root)?;
             let scanners_run: Vec<_> = entries.iter().map(|s| s.scanner.clone()).collect();
@@ -179,6 +185,7 @@ impl SkillSecService {
             let mut result = scan_payload(&manifest, new_version, &scanners_run, "scanned");
             result["skippedScanners"] = json!(skipped);
             recovery_event(&mut result, state, "scan", &manifest, &scanners_run);
+            result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
             Ok(result)
         })
     }
@@ -196,7 +203,9 @@ impl SkillSecService {
         deadline: Instant,
     ) -> Result<Value, SkillSecError> {
         let parsed = self.registry.parse_external(scanner, findings)?;
-        self.with_skill(root, deadline, |directory, key| {
+        self.with_locked_root(root, deadline, |directory, key| {
+            self.recover_rollback(root, directory, key, deadline)?;
+            validate_skill(directory)?;
             let ledger = required_ledger(directory)?;
             let content = Content::capture(directory, false, deadline)?;
             let original = ScanTree::open(&root.io_dir, deadline)?;
@@ -220,6 +229,7 @@ impl SkillSecService {
                 result["warnings"] = json!(parsed.warnings);
             }
             recovery_event(&mut result, state, "certify", &manifest, &scanners_run);
+            result["activation"] = refresh_locked(&ledger, directory, key, root, deadline);
             Ok(result)
         })
     }
@@ -307,6 +317,13 @@ impl SkillSecService {
         }
         self.with_skill(root, deadline, |directory, key| {
             let ledger = Ledger::open(directory, false)?.ok_or_else(|| SkillSecError::Integrity("Skill has no versions".into()))?;
+            let selected;
+            let selector = if selector == "active" {
+                let status = check_locked(directory, key, root, deadline)?;
+                let summary = crate::activation::summary(Some(&ledger), key, root, &status, deadline)?;
+                selected = summary["activeVersionId"].as_str().ok_or_else(|| SkillSecError::Integrity("Skill has no active version".into()))?.to_owned();
+                selected.as_str()
+            } else { selector };
             let manifest = if selector == "latest" {
                 ledger.latest(key, &root.identity, true, deadline)?.ok_or_else(|| SkillSecError::Integrity("Skill has no latest version".into()))?
             } else { ledger.version(selector, key, &root.identity, deadline)? };
@@ -332,8 +349,19 @@ impl SkillSecService {
         deadline: Instant,
         operation: impl FnOnce(&Directory, &SigningIdentity) -> Result<T, SkillSecError>,
     ) -> Result<T, SkillSecError> {
-        self.with_locked_directory(root, deadline, |directory| {
+        self.with_locked_root(root, deadline, |directory, key| {
             validate_skill(directory)?;
+            operation(directory, key)
+        })
+    }
+
+    fn with_locked_root<T>(
+        &self,
+        root: &SkillRoot,
+        deadline: Instant,
+        operation: impl FnOnce(&Directory, &SigningIdentity) -> Result<T, SkillSecError>,
+    ) -> Result<T, SkillSecError> {
+        self.with_locked_directory(root, deadline, |directory| {
             let key = KeyStore::open(&self.config.state_dir)?.load()?;
             operation(directory, &key)
         })
@@ -523,7 +551,7 @@ pub(crate) fn findings(manifest: &Manifest) -> Value {
 pub(crate) fn manifest_metadata(manifest: &Manifest) -> Value {
     json!({"canonicalSkillDir":manifest.canonical_skill_dir,"skillName":manifest.skill_name,
         "versionId":manifest.version_id,"createdAt":manifest.created_at,"updatedAt":manifest.updated_at,
-        "fileCount":manifest.file_hashes.len(),"manifestHash":manifest.manifest_hash,"userDecision":manifest.user_decision})
+        "fileCount":manifest.file_hashes.len(),"manifestHash":manifest.manifest_hash,"userDecision":crate::activation::decision_value(manifest.user_decision.as_ref())})
 }
 
 fn safe_metadata(root: &SkillRoot) -> Value {
@@ -595,6 +623,9 @@ fn canonicalize(value: &mut Value, physical: &str, canonical: &str) {
     }
 }
 
+#[cfg(test)]
+pub(crate) mod tests;
+
 fn check_locked(
     directory: &Directory,
     key: &SigningIdentity,
@@ -639,5 +670,7 @@ fn check_locked(
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests;
+mod activation;
+mod display;
+mod rollback;
+use activation::refresh_locked;
