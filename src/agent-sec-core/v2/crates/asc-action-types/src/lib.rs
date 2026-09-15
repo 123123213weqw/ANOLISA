@@ -5,6 +5,10 @@
 
 #![forbid(unsafe_code)]
 
+mod pii;
+
+pub use pii::{PiiScanOptions, Source};
+
 use serde_json::Map;
 use serde_json::Value;
 
