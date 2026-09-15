@@ -10,23 +10,6 @@ import subprocess
 import pytest
 
 
-@pytest.fixture
-def pii_environment(tmp_path, monkeypatch):
-    data = tmp_path / "audit"
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("AGENT_SEC_DATA_DIR", str(data))
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.delenv("AGENT_SEC_DAEMON_SOCKET", raising=False)
-    return data, home
-
-
-@pytest.fixture
-def pii_daemon(pii_environment, start_daemon):
-    # No policy-administrator grant is needed for PII scanning.
-    return start_daemon(admin_uids=[])
-
-
 def _events(environment):
     path = environment[0] / "security-events.jsonl"
     if not path.exists():
@@ -93,6 +76,8 @@ def test_input_modes_unicode_redaction_and_one_event_per_scan(
         assert report["summary"]["source"] == "tool_input"
         assert report["summary"]["scanner_version"] == "2.0.0"
         assert report["summary"]["coverage"] == {"status": "complete", "reasons": []}
+        assert not report["summary"].get("findings_truncated", False)
+        assert not report["summary"].get("redacted_text_omitted", False)
         assert (
             report["summary"]["input_sha256"]
             == hashlib.sha256(text.encode()).hexdigest()
@@ -138,6 +123,78 @@ def test_empty_warning_low_confidence_and_text_output(pii_daemon):
     )
     assert text.returncode == 0 and "Verdict: warn" in text.stdout
     assert "Redacted text:" in text.stdout and "alice@company.cn" not in text.stdout
+
+
+def test_dense_report_retains_complete_verdict_and_one_terminal_event(
+    pii_daemon, pii_environment
+):
+    text = "a@b.co " * 20_000 + "\npassword=abcdefghijklmnop"
+    result = pii_daemon.cli(
+        "scan-pii", "--stdin", "--raw-evidence", "--redact-output", input_text=text
+    )
+    assert result.returncode == 0, result.stderr
+    # The pretty CLI report stays within the response budget, below UDS limits.
+    assert len(result.stdout.rstrip("\n").encode()) <= 512 * 1024
+    report = json.loads(result.stdout)
+    summary = report["summary"]
+    assert report["ok"] and report["verdict"] == "deny"
+    assert summary["total"] == 20_001
+    assert summary["by_severity"] == {"deny": 1, "warn": 20_000}
+    assert summary["by_type"] == {"email": 20_000, "generic_secret_field": 1}
+    assert summary["coverage"] == {"status": "complete", "reasons": []}
+    assert not summary["truncated"]
+    assert summary["scanned_bytes"] == len(text.encode())
+    assert summary["input_sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert summary["findings_truncated"] is True
+    assert not summary.get("redacted_text_omitted", False)
+    assert [finding["type"] for finding in report["findings"]] == [
+        "email",
+        "generic_secret_field",
+    ]
+    assert report["findings"][0]["span"] == {"start": 0, "end": 6}
+    assert report["findings"][-1]["severity"] == "deny"
+    assert report["findings"][-1]["span"]["end"] == len(text)
+    for finding in report["findings"]:
+        assert "raw_evidence" not in finding
+        assert finding["metadata"]["evidence_omitted"] is True
+    assert report["redacted_text"].count("a***@b.co") == 20_000
+    assert "abcdefghijklmnop" not in result.stdout
+    [event] = _events(pii_environment)
+    audited = event["details"]["result"]
+    assert event["result"] == "succeeded" and audited["verdict"] == "deny"
+    assert audited["summary"] == summary
+    assert event["details"]["request"]["text_sha256"] == summary["input_sha256"]
+    assert "redacted_text" not in audited
+    assert "raw_evidence" not in json.dumps(event)
+    assert "abcdefghijklmnop" not in json.dumps(event)
+
+
+def test_oversized_redacted_text_returns_a_marked_safe_replacement(
+    pii_daemon, pii_environment
+):
+    text = "x" * (600 * 1024) + "\npassword=abcdefghijklmnop"
+    result = pii_daemon.cli("scan-pii", "--stdin", "--redact-output", input_text=text)
+    assert result.returncode == 0, result.stderr
+    assert len(result.stdout.rstrip("\n").encode()) <= 512 * 1024
+    report = json.loads(result.stdout)
+    summary = report["summary"]
+    assert report["ok"] and report["verdict"] == "deny"
+    assert summary["total"] == 1 and summary["by_severity"] == {"deny": 1}
+    assert summary["coverage"] == {"status": "complete", "reasons": []}
+    assert not summary["truncated"]
+    assert summary["scanned_bytes"] == len(text.encode())
+    assert summary["input_sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert summary["redacted_text_omitted"] is True
+    assert report["redacted_text"] == "[REDACTED: output size limit]"
+    assert report["findings"][0]["severity"] == "deny"
+    assert "abcdefghijklmnop" not in result.stdout
+    [event] = _events(pii_environment)
+    audited = event["details"]["result"]
+    assert event["result"] == "succeeded" and audited["verdict"] == "deny"
+    assert audited["summary"] == summary
+    assert "redacted_text" not in audited
+    assert "raw_evidence" not in json.dumps(event)
+    assert "abcdefghijklmnop" not in json.dumps(event)
 
 
 def test_explicit_utf8_limit_attests_only_received_prefix(pii_daemon):
