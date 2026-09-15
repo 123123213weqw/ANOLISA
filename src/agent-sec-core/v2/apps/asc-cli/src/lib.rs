@@ -49,8 +49,8 @@ struct Arguments {
     #[arg(long, global = true)]
     socket: Option<PathBuf>,
     /// Total connect/write/read deadline in milliseconds; requests are never retried.
-    #[arg(long, global = true, default_value_t = 5000, value_parser = clap::value_parser!(u32).range(1..))]
-    timeout_ms: u32,
+    #[arg(long, global = true, value_parser = clap::value_parser!(u32).range(1..))]
+    timeout_ms: Option<u32>,
     /// Version 1 W3C traceparent/tracestate/baggage JSON carrier.
     #[arg(long, global = true)]
     otel_context: Option<String>,
@@ -115,7 +115,13 @@ impl Cli {
         };
         Ok(Self {
             socket,
-            timeout_ms: arguments.timeout_ms,
+            timeout_ms: arguments
+                .timeout_ms
+                .unwrap_or(if arguments.command.is_skill_sec() {
+                    60_000
+                } else {
+                    5000
+                }),
             context: context::parse(
                 arguments.otel_context.as_deref(),
                 trace_context_input.as_deref(),
@@ -155,7 +161,22 @@ impl Cli {
     /// # Errors
     /// Returns a file read, template decode, or request encoding error.
     pub fn request(&self) -> Result<DaemonRequest, InputError> {
-        self.command.request()
+        let mut request = self.command.request()?;
+        if self.command.is_skill_sec() {
+            request.params["timeoutMs"] = serde_json::json!(self.timeout_ms.min(120_000));
+        }
+        Ok(request)
+    }
+
+    /// Whether this invocation uses the Skill Ledger business output projection.
+    pub const fn is_skill_sec(&self) -> bool {
+        self.command.is_skill_sec()
+    }
+
+    /// Adds caller-owned cleanup results to an already validated successful business result.
+    /// Changed findings are retained; local failures do not undo the committed certification.
+    pub fn after_success(&self, request: &DaemonRequest, output: &mut serde_json::Value) {
+        self.command.after_success(request, output);
     }
 
     /// Whether this invocation uses the V1-compatible scan-code projection.
@@ -207,6 +228,17 @@ pub enum InputError {
     /// Untruncated input cannot fit the daemon transport.
     #[error("PII input exceeds the 4 MiB business frame limit")]
     PiiTooLarge,
+    /// Invalid `SkillSec` business input.
+    #[error("SkillSec input: {0}")]
+    SkillSec(String),
+    /// Analyze retains its structured bad-input result.
+    #[error("{message}")]
+    AnalyzeInput {
+        /// Stable consumer error code.
+        code: &'static str,
+        /// Bounded public explanation.
+        message: &'static str,
+    },
     /// The V1-compatible scan-code command received no non-whitespace source.
     #[error("Error: --code is required (use --code '<source>')")]
     EmptyCode,

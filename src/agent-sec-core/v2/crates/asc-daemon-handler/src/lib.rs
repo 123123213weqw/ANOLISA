@@ -13,6 +13,7 @@ mod dispatcher;
 mod pap;
 mod pii;
 mod rejection;
+mod skill_sec;
 
 pub use dispatcher::DaemonDispatcher;
 pub use rejection::JsonRejectionEncoder;

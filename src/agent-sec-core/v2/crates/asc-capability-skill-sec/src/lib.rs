@@ -5,6 +5,8 @@
 
 pub mod activation;
 pub mod config;
+mod discovery;
+pub mod executor;
 mod filesystem;
 pub mod integrity;
 mod ledger;
@@ -16,7 +18,7 @@ pub use asc_action_types::{DecisionAction, SkillIdentity};
 pub use config::{ManagedSkillDir, SkillSecConfig};
 pub use integrity::{FileHashes, HashDiff, KeyStore, SigningIdentity, hash_tree};
 pub use models::{Finding, Manifest, ScanEntry, ScanStatus, UserDecision};
-pub use service::{ScanOptions, SkillRoot, SkillSecService};
+pub use service::{InitOptions, ScanOptions, SkillRoot, SkillSecService};
 
 /// Domain failures, kept separate from daemon transport errors and risk findings.
 #[derive(Debug, thiserror::Error)]
@@ -42,6 +44,18 @@ pub enum SkillSecError {
     /// Cryptographic key generation or decoding failed without exposing secrets.
     #[error("SkillSec signing key operation failed")]
     Key,
+    /// The operation requires the kernel-authenticated root administrator.
+    #[error("SkillSec operation requires root administrator")]
+    PermissionDenied,
+    /// A requested identity is outside administrator-configured Skill directories or mounts.
+    #[error("SkillSec path is outside managedSkillDirs and configured SkillFS mounts: {}", .0.path().display())]
+    ScopeDenied(SkillIdentity),
+    /// Bounded shared-daemon admission is exhausted.
+    #[error("SkillSec is busy; retry after an in-flight operation completes")]
+    Busy,
+    /// Rotation must finish before ordinary ledger access resumes.
+    #[error("SkillSec key rotation is pending; administrator must resume rotation")]
+    RotationPending,
     /// A request exhausted its execution deadline before completing.
     #[error("SkillSec execution deadline exceeded")]
     Timeout,

@@ -1,4 +1,4 @@
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -46,6 +46,37 @@ fn create_runtime_directory() -> PathBuf {
         .create(&directory)
         .unwrap();
     directory
+}
+
+fn configured_command(directory: &Path) -> Command {
+    // Process tests never open the machine's production SkillSec key store or configuration.
+    let config = directory.join("skillsec.json");
+    std::fs::write(
+        &config,
+        serde_json::to_vec(&serde_json::json!({
+            "stateDir": directory.join("state")
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-sec-daemon"));
+    command.arg("--skillsec-config").arg(config);
+    command
+}
+
+async fn rejected_without_root(running: &mut RunningBinary) -> bool {
+    if rustix::process::geteuid().as_raw() == 0 {
+        return false;
+    }
+    assert!(!wait_for_exit(running).await.success());
+    let stderr = read_stderr(&running.directory);
+    assert!(
+        stderr.contains("SkillSec system daemon must run as root"),
+        "{stderr}"
+    );
+    assert!(!running.socket_path.exists());
+    true
 }
 
 fn stderr_log(directory: &Path) -> Stdio {
@@ -157,7 +188,7 @@ async fn daemon_refuses_to_bind_when_sqlite_event_storage_is_unusable() {
     let data_dir = directory.join("data");
     std::fs::create_dir(&data_dir).unwrap();
     std::fs::create_dir(data_dir.join("security-events.db")).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agent-sec-daemon"))
+    let child = configured_command(&directory)
         .env("AGENT_SEC_DATA_DIR", &data_dir)
         .args(["serve", "--socket"])
         .arg(&socket_path)
@@ -172,6 +203,9 @@ async fn daemon_refuses_to_bind_when_sqlite_event_storage_is_unusable() {
         directory,
         socket_path,
     };
+    if rejected_without_root(&mut running).await {
+        return;
+    }
     assert!(!wait_for_exit(&mut running).await.success());
     let stderr = read_stderr(&running.directory);
     assert!(
@@ -188,7 +222,7 @@ async fn daemon_binds_when_jsonl_event_storage_is_unusable() {
     let data_dir = directory.join("data");
     std::fs::create_dir(&data_dir).unwrap();
     std::fs::create_dir(data_dir.join("security-events.jsonl")).unwrap();
-    let child = Command::new(env!("CARGO_BIN_EXE_agent-sec-daemon"))
+    let child = configured_command(&directory)
         .env("AGENT_SEC_DATA_DIR", &data_dir)
         .args(["serve", "--socket"])
         .arg(&socket_path)
@@ -203,6 +237,9 @@ async fn daemon_binds_when_jsonl_event_storage_is_unusable() {
         socket_path,
     };
 
+    if rejected_without_root(&mut running).await {
+        return;
+    }
     wait_for_socket(&mut running).await;
     assert!(data_dir.join("security-events.db").exists());
     let stderr = read_stderr(&running.directory);
@@ -224,7 +261,7 @@ async fn run_binary_scenario(configure_admin: bool) {
     let directory = create_runtime_directory();
     let socket_path = directory.join("daemon.sock");
     let data_dir = directory.join("data");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_agent-sec-daemon"));
+    let mut command = configured_command(&directory);
     command.env("AGENT_SEC_DATA_DIR", &data_dir);
     if configure_admin {
         let uid = std::fs::metadata(&directory).unwrap().uid();
@@ -244,6 +281,9 @@ async fn run_binary_scenario(configure_admin: bool) {
         socket_path,
     };
 
+    if rejected_without_root(&mut running).await {
+        return;
+    }
     wait_for_socket(&mut running).await;
     // DPROC-UDS-001: local users can reach the service; PAP still requires an administrator.
     assert_eq!(

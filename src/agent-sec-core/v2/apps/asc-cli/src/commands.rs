@@ -7,6 +7,7 @@ mod policy;
 mod scan_code;
 mod scan_pii;
 mod scope;
+mod skill_ledger;
 
 use asc_daemon_protocol::DaemonRequest;
 use clap::Subcommand;
@@ -35,6 +36,9 @@ pub(crate) enum Command {
     ScanCode(ScanCodeCommand),
     /// Detect PII and credentials through the daemon.
     ScanPii(ScanPiiCommand),
+    /// Manage Skill scanning, signatures, history and activation.
+    #[command(subcommand)]
+    SkillLedger(skill_ledger::SkillLedgerCommand),
     /// Show agent-sec hook capabilities from the current CLI environment variables.
     Capabilities(CapabilitiesCommand),
 }
@@ -48,6 +52,17 @@ impl Command {
             Self::ScanCode(command) => command.request(),
             Self::ScanPii(command) => command.request(),
             Self::Capabilities(_) => Err(InputError::LocalCommand),
+            Self::SkillLedger(command) => command.request(),
+        }
+    }
+
+    pub(crate) const fn is_skill_sec(&self) -> bool {
+        matches!(self, Self::SkillLedger(_))
+    }
+
+    pub(crate) fn after_success(&self, request: &DaemonRequest, output: &mut serde_json::Value) {
+        if let Self::SkillLedger(command) = self {
+            command.after_success(request, output);
         }
     }
 

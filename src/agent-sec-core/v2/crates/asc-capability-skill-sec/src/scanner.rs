@@ -137,14 +137,16 @@ impl ScannerRegistry {
         names: Option<&[String]>,
         deadline: Instant,
     ) -> Result<Vec<ScanEntry>, SkillSecError> {
+        let requested = requested_names(names)?;
         let tree = ScanTree::open(root, deadline)?;
-        self.scan_tree(&tree, names, deadline)
+        self.scan_tree(&tree, &requested, deadline)
     }
 
+    // Callers pass validated selections or built-in constants; raw input enters through scan().
     pub(crate) fn scan_tree(
         &self,
         tree: &ScanTree,
-        names: Option<&[String]>,
+        requested: &[String],
         deadline: Instant,
     ) -> Result<Vec<ScanEntry>, SkillSecError> {
         if !tree.errors.is_empty() {
@@ -152,7 +154,6 @@ impl ScannerRegistry {
                 "Skill exceeds directory scan limits".into(),
             ));
         }
-        let requested = requested_names(names)?;
         let mut results = Vec::new();
         for scanner in &self.scanners {
             check_deadline(deadline)?;

@@ -13,6 +13,7 @@ Runs the AgentSecCore V2 UDS service with PAP administration methods.\n\
 Without --socket, uses nonempty $AGENT_SEC_DAEMON_SOCKET or /run/agent-sec-core/daemon.sock.\n\
 Root is always authorized. --policy-admin-uid adds an administrator at startup.\n\
 Repeat this option for multiple UIDs; omitted means root only.\n\
+--skillsec-config selects a root-owned JSON configuration file.\n\
 PAP state is process-local until durable Repository integration lands.\n\
 PII rules: --pii-rules <ABSOLUTE_PATH>, default /etc/agent-sec/pii-checker/rules.yaml.\n\
 Rules are compiled at startup; restart to apply updates.\n";
@@ -26,13 +27,15 @@ pub struct Cli {
     pub policy_admin_uids: BTreeSet<u32>,
     /// Administrator-owned PII rules file; absence selects the centralized default.
     pub pii_rules: Option<PathBuf>,
+    /// Optional root-owned `SkillSec` settings file.
+    pub skillsec_config: Option<PathBuf>,
 }
 
 /// Successful command-line parse outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseOutcome {
     /// Run the foreground daemon service.
-    Serve(Cli),
+    Serve(Box<Cli>),
     /// Print help without starting the service.
     Help(&'static str),
 }
@@ -70,6 +73,7 @@ impl Cli {
         let mut command_seen = false;
         let mut policy_admin_uids = BTreeSet::new();
         let mut pii_rules = None;
+        let mut skillsec_config = None;
 
         while let Some(argument) = arguments.next() {
             if argument == OsStr::new("--help") || argument == OsStr::new("-h") {
@@ -112,6 +116,17 @@ impl Cli {
                 pii_rules = Some(path);
                 continue;
             }
+            if argument == OsStr::new("--skillsec-config") {
+                let path = arguments
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or(CliError::InvalidSkillSecConfig)?;
+                if skillsec_config.is_some() || !path.is_absolute() {
+                    return Err(CliError::InvalidSkillSecConfig);
+                }
+                skillsec_config = Some(path);
+                continue;
+            }
             let inline_uid = argument
                 .to_str()
                 .and_then(|value| value.strip_prefix("--policy-admin-uid="));
@@ -121,15 +136,7 @@ impl Cli {
                 } else {
                     arguments.next().ok_or(CliError::MissingAdminUid)?
                 };
-                let value = value.to_str().ok_or(CliError::InvalidAdminUid)?;
-                if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
-                    return Err(CliError::InvalidAdminUid);
-                }
-                policy_admin_uids.insert(
-                    value
-                        .parse::<u32>()
-                        .map_err(|_| CliError::InvalidAdminUid)?,
-                );
+                policy_admin_uids.insert(parse_admin_uid(&value)?);
                 continue;
             }
 
@@ -155,12 +162,21 @@ impl Cli {
         let mut bootstrap = BootstrapConfig::new(socket_path);
         // The host service accepts local users; embedders retain a private default.
         bootstrap.socket_mode = 0o666;
-        Ok(ParseOutcome::Serve(Self {
+        Ok(ParseOutcome::Serve(Box::new(Self {
             bootstrap,
             policy_admin_uids,
             pii_rules,
-        }))
+            skillsec_config,
+        })))
     }
+}
+
+fn parse_admin_uid(value: &OsStr) -> Result<u32, CliError> {
+    let value = value.to_str().ok_or(CliError::InvalidAdminUid)?;
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(CliError::InvalidAdminUid);
+    }
+    value.parse::<u32>().map_err(|_| CliError::InvalidAdminUid)
 }
 
 /// Invalid daemon command-line input.
@@ -175,6 +191,9 @@ pub enum CliError {
     /// A daemon uses exactly one custom rule collection.
     #[error("--pii-rules may be specified only once")]
     RepeatedPiiRules,
+    /// Settings must be an explicit absolute path and supplied at most once.
+    #[error("--skillsec-config requires one absolute path")]
+    InvalidSkillSecConfig,
     /// A startup administrator option was not followed by a UID.
     #[error("--policy-admin-uid requires a UID")]
     MissingAdminUid,

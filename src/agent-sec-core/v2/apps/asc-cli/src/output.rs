@@ -157,3 +157,96 @@ mod tests {
         }
     }
 }
+
+/// Prints Skill Ledger business JSON and preserves its explicit exit code.
+/// Protocol errors remain stderr diagnostics; completed risk results remain stdout JSON.
+/// Caller cleanup runs only after envelope validation, before the single business JSON is written.
+///
+/// # Errors
+/// Rejects malformed action envelopes and reports output write failures.
+pub fn render_skill_sec(
+    response: &DaemonResponse,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+    after_success: impl FnOnce(&mut serde_json::Value),
+) -> io::Result<u8> {
+    match response {
+        DaemonResponse::Error(error) => {
+            writeln!(stderr, "{}", error.error.message())?;
+            Ok(1)
+        }
+        DaemonResponse::Success(success) => {
+            let value = &success.result;
+            let code = value["exitCode"]
+                .as_u64()
+                .filter(|n| *n <= 2)
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid SkillSec exit code")
+                })?;
+            if !value["success"].is_boolean()
+                || !value["errorType"].is_string()
+                || !value["data"].is_object()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "invalid SkillSec result",
+                ));
+            }
+            let mut data = value["data"].clone();
+            if code == 0 && value["success"] == true {
+                after_success(&mut data);
+            }
+            serde_json::to_writer_pretty(&mut *stdout, &data)?;
+            writeln!(stdout)?;
+            if let Some(warnings) = data["warnings"].as_array() {
+                for warning in warnings {
+                    if let Some(warning) = warning.as_str() {
+                        writeln!(stderr, "{warning}")?;
+                    }
+                }
+            }
+            if let Some(error) = value["error"].as_str() {
+                writeln!(stderr, "{error}")?;
+            }
+            Ok(u8::try_from(code).map_err(io::Error::other)?)
+        }
+    }
+}
+
+#[cfg(test)]
+mod skill_sec_contract_tests {
+    use super::*;
+
+    #[test]
+    fn frozen_consumer_samples_keep_business_json_exit_codes_and_failure_layers() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../fixtures/skillsec/consumer.json")).unwrap();
+        for case in fixture["cases"].as_array().unwrap() {
+            let response: DaemonResponse =
+                serde_json::from_value(case["response"].clone()).unwrap();
+            let (mut stdout, mut stderr) = (Vec::new(), Vec::new());
+            let code = render_skill_sec(&response, &mut stdout, &mut stderr, |_| {}).unwrap();
+            assert_eq!(
+                u64::from(code),
+                case["exitCode"].as_u64().unwrap(),
+                "{}",
+                case["name"]
+            );
+            let error = String::from_utf8(stderr).unwrap();
+            let expected = case["stderrContains"].as_str().unwrap();
+            if expected.is_empty() {
+                assert!(error.is_empty(), "{}", case["name"]);
+            } else {
+                assert!(error.contains(expected));
+            }
+            if case["response"].get("result").is_some() {
+                assert_eq!(
+                    serde_json::from_slice::<serde_json::Value>(&stdout).unwrap(),
+                    case["response"]["result"]["data"]
+                );
+            } else {
+                assert!(stdout.is_empty());
+            }
+        }
+    }
+}

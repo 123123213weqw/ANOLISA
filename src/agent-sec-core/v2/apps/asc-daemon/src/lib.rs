@@ -8,7 +8,7 @@
 
 mod actions;
 mod bootstrap;
-pub use actions::scan_application;
+pub use actions::{scan_application, skill_application, skill_task_scope};
 mod cli;
 mod reconciliation;
 mod runtime;

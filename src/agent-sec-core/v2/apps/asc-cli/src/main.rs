@@ -4,7 +4,9 @@ use std::process::ExitCode;
 use asc_cli::{
     Cli, InputError, Plan,
     capabilities::process_environment,
-    output::{render_binding_mutation, render_pii_scan, render_policy, render_scan_code},
+    output::{
+        render_binding_mutation, render_pii_scan, render_policy, render_scan_code, render_skill_sec,
+    },
 };
 
 fn main() -> ExitCode {
@@ -69,6 +71,11 @@ fn main() -> ExitCode {
     runtime.shutdown(std::time::Duration::from_millis(50));
     match result {
         Ok(code) => ExitCode::from(code),
+        Err(RunError::Input(InputError::AnalyzeInput { code, message })) => {
+            let result = serde_json::json!({"schema_version":"1","engine_version":env!("CARGO_PKG_VERSION"),"status":"error","coverage_complete":false,"scanners":[],"errors":[{"code":code,"message":message}]});
+            println!("{result}");
+            ExitCode::from(2)
+        }
         Err(error @ RunError::Input(InputError::EmptyCode)) => {
             eprintln!("{error}");
             ExitCode::FAILURE
@@ -104,6 +111,14 @@ fn run(cli: &Cli) -> Result<u8, RunError> {
             format,
             &mut io::stdout().lock(),
             &mut io::stderr(),
+        )
+        .map_err(RunError::Output)
+    } else if cli.is_skill_sec() {
+        render_skill_sec(
+            &response,
+            &mut io::stdout().lock(),
+            &mut io::stderr(),
+            |output| cli.after_success(&request, output),
         )
         .map_err(RunError::Output)
     } else if cli.is_scan_code() {

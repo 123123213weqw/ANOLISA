@@ -697,3 +697,24 @@ V2 使用 fancy-regex，回溯上限 1,000,000、循环预算 200 ms；不承诺
 差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 142 个
 V1 合成用例及单测验证。完整差异、未来 Evidence 边界和回滚见
 [PII 两阶段设计](PII_V2_MIGRATION_zh.md)。保留 V1 实现独立回滚。
+
+## 14. [TARGET V2] SkillSec Action Runtime 合同
+
+`asc-capability-skill-sec` 的 SkillSecExecutor 通过共享 SkillSecService 执行业务，
+SkillSecAuditProjector 单独生成公共审计投影，ActionRuntime/Finalizer/Sink 统一收尾。
+ActionId::SkillSec 的 event_type/category 均保持 `skill_ledger`。调用者 UID/PID 来自内核，
+请求 JSON 无法覆盖；启动 reconcile 记录实际 daemon 进程身份。
+
+[PRESERVE V1] scan/certify 完成风险扫描仍退出 0；check deny/tampered/error 退出 1；
+audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1、非法输入 2。业务失败与执行错误
+分别记录：风险拒绝可有 success=false 且 errorType 为空。公共审计包括 command、数量、受控
+status/version/exitCode 和错误类别；不复制源码、findings、路径、人工理由、导入证据或密钥。
+
+[批准替代] key/status 使用系统密钥身份，不包含用户公钥路径、口令或历史 keyring；init-keys 和
+--passphrase 不保留。init --no-baseline 只建密钥，force-keys 与 rotate-keys 为 root-only。
+完整输出仍通过 Rust CLI 提供，CLI 不执行任何本地能力回退。每次最多两个 SkillSec 执行，
+满载返回 Busy 并经过相同 finalizer；同 Skill 的写操作继续由 Service 锁串行化。
+
+SAR-001/002/003/005/006/007/010 的本模块证据位于 capability 的 executor、administration 测试、
+`v2/apps/asc-cli/tests/skill_sec.rs` 和 `v2/fixtures/skillsec/consumer.json`；前四批冻结的
+V1 Scanner/Ledger/Activation fixtures 继续约束完整业务语义。未声明真实 Agent Hook 接入成功。

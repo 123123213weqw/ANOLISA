@@ -18,6 +18,7 @@ use crate::{
 use crate::{FileHashes, UserDecision};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -64,7 +65,11 @@ impl SkillSecService {
             let snapshot_tree = ScanTree::open(&snapshot_path, deadline)?;
             let (staging_dir, tree) =
                 content.scan_tree(&self.config.state_dir, &snapshot_tree, deadline)?;
-            let mut entries = self.registry.scan_tree(&tree, None, deadline)?;
+            let mut entries = self.registry.scan_tree(
+                &tree,
+                &crate::scanner::DEFAULT_SCANNERS.map(String::from),
+                deadline,
+            )?;
             if entries.is_empty() {
                 return Err(SkillSecError::Scanner(
                     "rollback requires built-in scan results".into(),
@@ -276,7 +281,13 @@ fn replace_root(
             directory.remove_child(&name, deadline)?;
         }
     }
-    content.write(directory, deadline)
+    // A root daemon must not turn a user's editable source into root-owned restored files.
+    let owner = directory
+        .file
+        .metadata()
+        .map_err(|e| io_error(&directory.path, e))?
+        .uid();
+    content.write_owned(directory, deadline, Some(owner))
 }
 
 fn rollback_target(

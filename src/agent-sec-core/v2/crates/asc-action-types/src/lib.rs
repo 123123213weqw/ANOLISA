@@ -19,6 +19,8 @@ pub enum ActionId {
     CodeScan,
     /// Detects personal information and credentials in supplied text.
     PiiScan,
+    /// Scans, authenticates and manages Skill versions and activation.
+    SkillSec,
 }
 
 impl ActionId {
@@ -28,6 +30,7 @@ impl ActionId {
         match self {
             Self::CodeScan => "code_scan",
             Self::PiiScan => "pii_scan",
+            Self::SkillSec => "skill_ledger",
         }
     }
 
@@ -37,6 +40,7 @@ impl ActionId {
         match self {
             Self::CodeScan => "code_scan",
             Self::PiiScan => "pii_scan",
+            Self::SkillSec => "skill_ledger",
         }
     }
 }
@@ -152,5 +156,7 @@ pub struct CodeScanRequest {
     pub mode: Option<String>,
 }
 
-mod skill_sec;
-pub use skill_sec::{DecisionAction, SkillIdentity, SkillSecInputError};
+pub mod skill_sec;
+pub use skill_sec::{
+    DecisionAction, SkillIdentity, SkillSecCommand, SkillSecInputError, SkillSecRequest,
+};

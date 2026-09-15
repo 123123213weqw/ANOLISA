@@ -78,7 +78,7 @@ pub fn analyze(root: &Path, deadline: Instant) -> Result<AnalyzeResult, SkillSec
     let mut results = Vec::new();
     for name in super::DEFAULT_SCANNERS {
         let names = [name.to_owned()];
-        let scan = registry.scan_tree(&tree, Some(&names), deadline);
+        let scan = registry.scan_tree(&tree, &names, deadline);
         let (version, findings) = match scan {
             Ok(mut scans) => {
                 let entry = scans
