@@ -110,7 +110,14 @@ def _daemon_settings(socket_path: Path) -> tuple[Path, dict[str, str]]:
             "V2 daemon E2E requires container root; clients may drop to an ordinary UID"
         )
     config = socket_path.with_suffix(".skillsec.json")
-    config.write_text(json.dumps({"stateDir": str(socket_path.with_suffix(".state"))}))
+    config.write_text(
+        json.dumps(
+            {
+                "stateDir": str(socket_path.with_suffix(".state")),
+                "managedSkillDirs": [str(socket_path.parent / "*")],
+            }
+        )
+    )
     config.chmod(0o600)
     environment = os.environ.copy()
     environment.setdefault("AGENT_SEC_DATA_DIR", str(socket_path.with_suffix(".audit")))

@@ -3,9 +3,9 @@
 [中文版](SKILL_SEC_PHASE_ONE_zh.md)
 
 SkillSec separates Skill scanning, content authentication, version storage and activation inside
-one `asc-capability-skill-sec` crate. `SkillSecService` will coordinate these modules in the
-system daemon. This document tracks the migration contract and implementation batches; a planned
-row is not evidence that the capability is already available.
+one `asc-capability-skill-sec` crate. `SkillSecService` coordinates these modules in the
+system daemon. This document records the migration contract, implementation batches and Linux
+acceptance boundaries.
 
 ## Delivery and acceptance
 
@@ -14,20 +14,222 @@ public Action Runtime audit lifecycle, daemon, CLI, SkillFS and Linux deployment
 implementations, capability views, Hook defaults and real Agent acceptance belong to the next PR.
 Consumer request/response fixtures establish an interface contract, not successful Agent integration.
 Phase-two policy integration is outside this PR.
+The table records implemented batches and their earlier checks; it does not establish complete
+V1 parity. The four reviewed migration corrections and their current validation are recorded below.
 
 | Batch | Responsibility | Implementation | Acceptance required before the next batch |
 | --- | --- | --- | --- |
-| 1 | Types, canonical identity, system keys, Integrity | Implemented; Linux gates passed | Signature/tamper/replay checks, key permissions, source/snapshot path rules |
-| 2 | Scanner and analyze | Implemented; Linux gates passed | V1 result comparison, selection/aliases, incomplete coverage, errors, no Ledger writes |
-| 3 | Ledger and Service | Implemented; Linux gates passed | Versions, fill-in/force, snapshots, export, serialization, changes during scan |
-| 4 | Activation | Implemented; Linux gates passed | Decisions, active/pending/hidden, rollback, publish failure and startup reconcile |
-| 5 | daemon, CLI and audit | Linux acceptance passed | Real CLI requests, outputs/exit codes, peer identity, audit, deadlines, admin rotation, consumer fixtures |
-| 6 | SkillFS | Linux acceptance passed | One socket, authenticated notify/resolver, no downgrade, real FUSE effects, ordinary IPC regression |
-| 7 | Deployment | Planned | Source/RPM installation, root systemd service, local non-root callers, complete core workflow |
+| 1 | Types, canonical identity, system keys, Integrity | Linux capability tests passed | Signature/tamper/replay checks, key permissions, source/snapshot path rules |
+| 2 | Scanner and analyze | Linux capability tests passed | V1 result comparison, selection/aliases, incomplete coverage, errors, no Ledger writes |
+| 3 | Ledger and Service | Linux capability tests passed | Versions, fill-in/force, snapshots, export, serialization, changes during scan |
+| 4 | Activation | Linux capability tests passed | Decisions, active/pending/hidden, rollback, publish failure and startup reconcile |
+| 5 | daemon, CLI and audit | Runtime and source-installed validation passed | Real CLI requests, outputs/exit codes, peer identity, audit, deadlines, admin rotation, consumer fixtures |
+| 6 | SkillFS | Real Linux IPC and FUSE validation passed | One socket, authenticated notify/resolver, no downgrade, real FUSE effects, ordinary IPC regression |
+| 7 | Deployment | Source/RPM/systemd validation passed | Source/RPM installation, root systemd service, local non-root callers, complete core workflow |
 
 Each batch is one independently compiling logical commit with its tests and documentation.
 Failures introduced by a batch are fixed in that commit. Linux tests are required; macOS formatting
 or manifest inspection does not establish build or runtime acceptance.
+
+## Shared execution and OTel alignment
+
+The current fixed main baseline is `e60de761e9acb01a14990cb09272cbe75c08d1bd`, including
+PII integration and offline RPM build support. Library crates use `v2/crates/asc-*/`, and the
+seven business commits are retained. The process composes Code Scan, PII and SkillSec into
+one ActionService and shared Finalizer; central PII rules and SkillSec configuration are loaded
+independently. Earlier Linux/RPM results below remain bound to their recorded revisions.
+
+```text
+CLI / RPC -> Handler -> ActionService -> ActionRuntime -> SkillSecExecutor -> SkillSecService
+SkillFS notify -> authenticated queue / worker -> ActionService
+Configured ordinary Skills -> startup discovery / same worker -> ActionService
+Startup recovery ---------------------------> ActionService
+```
+
+`asc-action-types` owns the shared command, canonical identity and decision types. Invocation input
+contains only a command and a server-injected caller UID. Physical roots, handles and keys remain
+inside the capability. Handler decodes and projects responses; Executor selects and resolves roots
+through a narrow `SkillEnvironment` port before Service performs the existing domain transitions.
+An unavailable authenticated mapping never falls back to the visible FUSE tree. The existing
+unavailable-root representation preserves per-Skill errors in aggregate operations.
+
+The daemon composition root owns one Service, the executors, projectors, runtimes and shared
+Finalizer. SkillFS lives in `asc-daemon::skillfs`, using the existing dispatcher/session ports.
+Startup prepares resolver and queue resources, registers ActionService, runs recovery, starts the
+daemon-owned worker, then opens the socket. The worker performs bounded discovery and scanning in
+its background thread even without SkillFS. The Executor retains resolver/health resources, not the worker.
+Configuration, private-state or bridge initialization and worker-start failures prevent admission.
+Unfinished rotation recovery retains its fence and permits status/admin retry; individual reconcile
+failures are diagnosed while other items continue.
+
+Ordinary requests use main's top-level OTel carrier, compatibility labels and request scope.
+UID/GID/PID come from kernel credentials; Agent baggage is correlation metadata, never authority.
+Each dequeued notification or startup recovery item starts a fresh daemon Context. Scan, activation
+and Busy retries remain separate invocations. Runtime finalizes an unexpected execution failure once
+before returning `InvokeError`; entries do not emit a second terminal record. Analyze remains
+Ledger-read-only while producing invocation audit. Audit, telemetry and diagnostics share the public
+Finalizer, with the existing telemetry field allowlist and independent output-failure handling.
+
+SkillFS keeps its HMAC/notify wire contract. Authentication is selected before ordinary dispatch and
+retains its bounded five-second exchange; the SkillSec execution override remains 60 seconds by
+default, capped at 120 seconds. Other methods retain their configured limits. Shutdown stops UDS
+admission and drains requests, joins the SkillSec worker (65 seconds) and PAP (30 seconds) in parallel, then closes
+the outer runtime, durable sinks and OTel. Waiting notifications are recovered from registered Skills
+on restart; this is not a durable queue or an exactly-once guarantee.
+
+Backing mounts are cloned while detached, made private through `/proc/self/fd`, then published with
+`move_mount`. This protects copies received by an already running daemon from later in-place FUSE
+over-mounts. The daemon gains no mount capability. Unsupported/denied operations fail closed.
+The backing-propagation regression and real FUSE verification passed on the Linux test machine.
+
+## Current migration corrections
+
+Run `skillsec-four-fixes-20260929` validates the four independently confirmed findings on original
+PR head `0d252302a3de428508998ae3acc13422a2afcc22` and the fixed main baseline above. The Linux
+environment is Alibaba Cloud Linux 4.0.4, Python 3.11.6 and Rust 1.93.1. Candidate 3 archive SHA-256
+is `46f165bcac690850ee33966eba18d11eea10d487e568b3b4822bd2acefad5669`.
+Subsequent overlays only fix test syntax and simplify a worker test fixture; their hashes and
+focused reruns are retained with the run. No production behavior changes after this candidate.
+
+| Finding | Correction and validation |
+| --- | --- |
+| P1: Unicode I matching | Fixed static rules explicitly retain Python's I/i/İ/ı equivalence, including ranges and negative assertions, without changing input bytes. All 91 V1 scanner/analyze fixtures pass, including 41 new cases. Service and real CLI tests confirm deny, preserved snapshots and no unsafe new activation. |
+| P2: findings cleanup | CLI adds `findingsDeleted`/`findingsDeleteError` before its single JSON output. Real UID1001 tests preserve committed certification and exit 0 on cleanup failure; success, retained input and rejected requests are covered. |
+| P2: read-only system batches | Batch/init share an FD-relative daemon write-access preflight limited to authorized host-backed direct children of the two system defaults. Real EROFS mount tests verify skip, no metadata, writable-root controls and strict explicit/out-of-scope/non-default failures. |
+| P2: ordinary startup scanning | The daemon owns the existing worker independently of SkillFS. Shared discovery feeds configured and registered authorized Skills into its existing ActionService scan/activate loop. Real no-SkillFS restart tests cover changed, new, risky and unchanged Skills; a blocked-scan unit test verifies nonblocking startup and tracked shutdown. |
+
+- Final V2 formatting, strict workspace/all-targets Clippy, rustdoc and three architecture checks
+  pass. The complete `cargo test --workspace --locked --no-fail-fast` run reports **951 passed,
+  1 failed, 3 ignored**. The sole failure remains main's unchanged event-log root-DAC fixture;
+  a reduced-DAC rerun executes that one test and passes. The original failed command is retained.
+- The new ignored EROFS Rust regression separately executes **1/1** on native Linux in a private
+  mount namespace. Other ignored tests are not counted as executed. Final test-only overlays pass
+  the CLI cleanup regression and all three worker tests without changing production code.
+- Release build, isolated source installation and layout checks pass. The installed core/public
+  suite reports **898 passed, 38 skipped, 0 failed**, covering SkillSec, Code Scan, PII, PAP and IPC.
+  The initial debug/concurrent E2E attempt reports 93 passed/3 failed; the corrected release setup
+  supplies its shared daemon and all three pass in the full rerun. No product deadline is changed.
+- Real root in-place and UID65534 FUSE topologies pass authentication, activation and daemon-only
+  restart with an unchanged SkillFS PID. Root cases also verify notify-to-scan, block/rollback
+  exposed bytes, invalid UID/key/plaintext rejection and resolver-unavailable refusal.
+
+The four reported findings are corrected; these targeted cases do not claim all possible Python/Rust
+regex equivalence or real Agent execution. Native RPM installation and the unchanged full SkillFS
+workspace are not repeated in this run. Hook and phase-two scope remain deferred.
+If an earlier PR candidate produced unsafe pass/warn records, updating the daemon does not rewrite
+that history. Force-rescan affected current content with `--force --scanners static-scanner` and
+inspect older activation candidates; use existing block/version decisions where isolation is needed.
+
+## Historical scope validation
+
+
+Run `skillsec-scope-20260929` validates the managed-directory correction on the current fixed
+baseline, using Alibaba Cloud Linux 4.0.4, Python 3.11.6 and Rust 1.93.1. Tested candidate 5 has
+archive SHA-256 `225304fa34af7a9c7b8d02cdfc11da1621644d4bb6d2cc7a1afc60889b4862c5`.
+Reorganizing its corrections into the seven original commits produced code head `2b101a9b`
+with an identical tree; subsequent acceptance-record and CI fixture edits do not change product code.
+
+- V2 formatting, strict workspace/all-targets Clippy and rustdoc passed. The complete root
+  workspace test command reported **949 passed, 1 failed, 2 ignored**. The unchanged main
+  event-log DAC fixture is the sole failure; its reduced-DAC rerun executed one test and passed.
+  The original full command remains recorded as failed.
+- Seven scope regressions and real CLI requests from root and UID 1001 passed: exact, `/*`,
+  `/**`, dynamic children, hidden/symlink exclusion, all-or-nothing batch rejection before side
+  effects, restart with stale registration, and interrupted-rotation authorization boundaries.
+- Fresh release source installation, the packaging check and installed core/public-capability
+  suite passed: **898 passed, 38 skipped**. Coverage includes SkillSec CLI, PII, Code Scan, PAP
+  and ordinary IPC. Skips cover 36 Python rule-source cases, one existing Code Scan telemetry
+  case and one unconfigured LLM case; no Agent Hook deployment is included.
+- All seven commits independently passed `cargo check --workspace --all-targets --locked`;
+  commits six and seven also passed the SkillFS equivalent, for nine successful build gates.
+- Real FUSE verified root in-place and UID 65534 mounts, public socket mode, authenticated
+  resolution, activation, and daemon-only restart with the SkillFS PID unchanged. Root cases
+  additionally verified mutation-to-notify-to-scan, block/rollback exposed bytes, rejection of
+  wrong UID/key/plaintext, and refusal to fall back when the resolver is unavailable.
+
+Independent review accepted the directory-scope correction and found the four discrepancies
+corrected in the current run above. The original Unicode evidence established signed pass and
+activation publication, not observed Agent execution. The RPM CI fixture authorizes only its
+isolated pytest base directory. This scope run did not repeat native RPM installation or the
+unchanged full SkillFS workspace suite; its results are historical evidence for that revision.
+
+## Historical Linux acceptance (after PII integration)
+
+Run `skillsec-ready-20260928` validates code head `72d50d82b5d4cde2d9d5fd5ef36620e291e3c8c6`
+on baseline `08e6be80c86ab3d41e9081967f37afcbdd59b197`. The environment is Alibaba Cloud Linux 4.0.4, Python 3.11.6,
+V2 Rust 1.93.1 and SkillFS Rust 1.86.0. Evidence binds source trees, patch equivalence, installed
+binaries and CI artifact hashes; prior revisions are not substituted for this acceptance.
+
+- V2 formatting, strict workspace/all-targets Clippy and rustdoc passed. The full root workspace
+  rerun reported **942 passed, 1 failed and 2 ignored**. The sole failure is the unchanged main
+  event-log DAC permission fixture; it passes without DAC override. The root command remains
+  recorded as failed. All seven commits independently compiled, with SkillFS also checked at
+  commits six and seven (nine successful gates).
+- Source release installation and independent fresh CI RPM installation each passed the complete
+  installed-only suite: **1,204 passed, 45 skipped**. The same daemon handles PII with a custom
+  central rule, Code Scan and SkillSec, with separate audit records and read-only analyze behavior.
+  Existing PII Hook subprocess fixtures are covered; this does not enable or validate real Agents.
+- SkillFS formatting, strict Clippy, rustdoc and workspace tests passed: **1,620 reported passes,
+  8 ignored**. Native FUSE smoke separately verified managed worker/supervisor recovery and cleanup.
+  Root and ordinary-user integration passed HMAC/resolver, notify-to-activation and daemon-only
+  restart with the SkillFS PID unchanged; root cases also covered block/rollback and rejection of
+  invalid identity, key and plaintext. Guarded workspace counts are not all real FUSE executions.
+- Native systemd lifecycle and UID1001 operations on synthetic HOME, temporary and shared Skill
+  roots passed, including private export ownership, non-admin rotation rejection, retained trust
+  and audit after restart. Source installation retained operator configuration and isolated V1 units.
+- The exact RPM comes from CI run `36421070474`, artifact `10970226616`; package integrity checks
+  passed. Its CI installed suite also passed **1,204 tests, 45 skipped**, and the complete V2 job
+  succeeded. CLI RPM SHA-256:
+  `857bb0420111553061e0c2ce9c875a5117ca268eef2837a7f5e82ab7348fcbec`.
+- PR CI `Test agent-sec-core` passed at this code head, including the two previously failing CLI
+  Clippy checks and subsequent V2 Rust tests. Boxing the internal startup configuration and
+  extracting unchanged UID parsing resolved those checks without changing the CLI contract.
+
+Failed setup attempts remain in the run evidence: an overly private run-owned build directory and
+missing container tools were corrected before complete reruns. Agent Hook migration, real Agent/model
+acceptance and phase-two policy remain separate work; historical rollback evidence is retained below.
+
+## Historical Linux acceptance (before PII integration)
+
+Run `skillsec-d-20260928` uses Alibaba Cloud Linux 4.0.4, Python 3.11.6, Rust 1.93.1 for V2
+and Rust 1.86.0 for SkillFS. Source starts at `8e3f1a0b`, with acceptance fixes attributed to their
+original commits. The verified code head is `87113892a7729ec1403c69face98f25d43b29081`;
+subsequent changes update only these paired acceptance documents. The run records retain exact
+patches, source trees, binaries, commands and logs.
+
+- V2 formatting, strict Clippy and rustdoc passed. The root workspace run reported 892 passed,
+  one failed and two ignored. The sole failure is the existing event-log chmod fixture: root's
+  DAC capability defeats its expected rename error. It fails identically on fixed main; the same
+  head test passes without DAC override. This is not a fully green root workspace command.
+- Source release installation and the installed CLI/daemon suite passed: 953 passed, 45 skipped.
+  Ordinary-user export, key-rotation denial, audit and core Skill operations passed separately.
+  A migrated CLI path acquired stderr's lock before producing successful output and could stall
+  behind the diagnostic worker. Removing that eager lock restores main's output pattern; the
+  existing blocked-pipe test now also covers SkillSec, with its original timeout unchanged.
+- SkillFS workspace checks passed: 1,619 reported passes and eight ignored tests. Guarded tests
+  were then run with real FUSE: 28 targets returned success, reporting 507 passes and one ignored.
+  Three environment guards and the ignored in-place backing-root test were verified separately.
+  Counts include overlapping coverage and must not be added as unique tests. The backing-propagation
+  regression passed explicitly.
+- Root in-place and ordinary-user FUSE mounts passed notification, scan/activation, block/rollback,
+  invalid HMAC/peer/plaintext rejection and resolver failure without fallback. Both recovered
+  edits made while only the daemon was stopped; SkillFS kept the same PID. A historical rollback
+  decision remains eligible after clearing only the latest decision, matching V1 behavior.
+- Native systemd lifecycle passed, including restart, drain, the 75-second forced-stop deadline
+  and start limiting. Ordinary users operated synthetic HOME, temporary and system Skill roots
+  under the shipped capability restrictions; mounted-volume behavior was exercised in FUSE tests.
+- Exact CI RPMs from `8e3f1a0b` passed installation and 952 installed tests (46 skipped), plus an
+  isolated V1 to V2 to matching-V1 package/configuration/state restore. These RPM results precede
+  the CLI lock fix. The replacement RPM from code head `87113892` and CI run `36387153042`
+  passed both CI (953 passed, 45 skipped) and independent fresh-install test-machine acceptance
+  (953 passed, 45 skipped), including the blocked-stderr and cross-UID regressions. The CLI RPM
+  SHA-256 is `69797d1a9dbba14f3ff6d3a5f29f01d4f7b86ce20a083b81a6a1b402e64308b4`.
+
+All seven commits passed independent V2 workspace/all-targets compilation; SkillFS also passed at
+commits six and seven (nine checks). Agent Hooks, real Agent/model acceptance and phase-two policy
+integration remain excluded. The earlier unrelated setup-uv post-cache failure was not changed;
+the replacement V2 RPM job completed successfully. Failed attempts and their source identities
+remain in the run evidence.
 
 ## Preserved business capabilities
 
@@ -202,7 +404,7 @@ require authentication.
 
 Registration follows the signed commit and precedes activation. If the first registration fails,
 the request fails without publishing activation, although its version may already be committed.
-Startup recovery only enumerates registered roots. After correcting the reported failure, retrying
+Startup recovery only enumerates registered roots and rejects those outside the current configured scope. After correcting the reported failure, retrying
 `scan` on unchanged content reuses the authenticated version and completes registration. No durable
 discovery queue is promised for an unacknowledged first request.
 
@@ -279,15 +481,29 @@ is removable. The runnable process uses mode 0666 while embedded service default
 These focused lifecycle changes align with the open system-service proposal #3217 at `5d2ff1f`;
 they do not imply that proposal has merged or that its service identity is adopted.
 
-Root-owned `/etc/agent-sec/skillsec.json` (or `--skillsec-config`) configures `stateDir`, exact
+Root-owned `/etc/agent-sec/skillsec.json` (or `--skillsec-config`) configures `stateDir`,
 `managedSkillDirs`, scanner overrides and parsers. The default state is
 `/var/lib/agent-sec/skillsec`, owned by root with mode 0700; the current key remains 0600.
-No user config, history or keyring is imported. For `init` baseline and `check/scan --all`, the CLI
-contributes exact roots discovered in the current user's default Skill locations and the two system
-Skill directories; the daemon combines these with its registered roots. Empty `check/scan --all` returns an execution failure without creating keys. Caller discovery is
-bounded to 1024 roots; persisted registration remains available for status and key rotation.
-No sibling registration is
-inferred from a single explicit path. Status reports the system registry, not the invoking HOME.
+No user config, history or keyring is imported. `managedSkillDirs` retains exact, terminal `/*`
+and terminal `/**` forms. It is parsed separately from exact request identities; no additional
+`allowedSkillRoots` configuration is introduced. Recursive discovery includes its root if that
+root has `SKILL.md`, skips hidden descendants, refuses symlink traversal and expands on each
+aggregate request so new children do not require a restart. Paths are absolute; no HOME expansion.
+
+The Executor rejects caller paths outside configured patterns or authenticated SkillFS mounts
+before physical resolution and business side effects. All commands share this boundary, including
+analyze, export, background work and ordinary startup reconcile. Aggregate discovery combines
+configured patterns and still-authorized registration; caller discovery does not expand authority.
+One out-of-range caller path rejects the whole batch before processing any Skill. Empty
+`check/scan --all` remains an execution failure without creating keys. Caller discovery is bounded
+to 1024 roots. Registration is operational history, never an authorization source. Status uses the
+current configuration and authorized history independently of caller HOME. Configured mount trees
+are not walked through FUSE; authenticated notifications and the existing registry supply their roots.
+
+Root must restore a removed scope before a new rotation can withdraw its historical exposure.
+An already authorized private rotation intent can still finish withdrawal after reconfiguration;
+this exception only permits root rotation recovery, not a new baseline scan outside current scope.
+
 The shared CLI discovery includes direct Skill children of `$XDG_DATA_HOME/anolisa/skills`.
 It follows the installer's syntax rules: unset/empty/relative overrides or raw `.`/`..` segments
 fall back to `$HOME/.local/share/anolisa/skills`; a valid but absent directory is simply skipped.
@@ -299,7 +515,11 @@ Rotation takes the service generation write lock, records a private intent, and 
 registered exposure before replacing the key. A pending rollback must first reconcile. A failed
 withdrawal retains the old key and fences ordinary Ledger operations until administrator retry or
 startup recovery succeeds. A changed fingerprint during recovery proves replacement already
-committed and prevents a second rotation. Startup recovery uses the public Action Runtime; failed
+committed and permits intent cleanup without resolving mappings or rotating again. The intent stores
+only the previous fingerprint and canonical Skill identities. Startup, `rotate-keys`, and
+`init --force-keys` resolve current physical mappings and inodes again before withdrawal; the service
+requires exactly the recorded Skill set. Resolver failure retains the intent and old key for retry.
+Startup recovery uses the public Action Runtime; failed
 Skill recovery is visible without disabling unrelated daemon methods.
 
 The public Finalizer/Sink receives controlled command, counts, verdict/status, version and execution
@@ -315,7 +535,7 @@ no committed mutation is undone. Findings import is bounded to 2 MiB.
 `v2/fixtures/skillsec/consumer.json` records normal, risk, uninitialized, timeout, execution-error
 and incomplete-activation examples. CLI rendering tests consume these examples; runtime and real
 CLI tests independently exercise execution, caller identity, rotation and safe audit. They do not
-establish Agent Hook integration or SkillFS effects. Linux batch-five acceptance passed strict
+establish Agent Hook integration or SkillFS effects. Historical batch-five acceptance (before the current alignment) passed strict
 workspace Clippy, all workspace tests and rustdoc. The cross-UID CLI workflow runs with normal
 root DAC permissions; other permission-sensitive cases retain reduced DAC. A separate daemon
 binary and CLI completed 25 operations, including restart, rotation, ordinary-user export, PAP,
@@ -327,7 +547,7 @@ stripped. The cross-UID CLI workflow verifies rollback followed by a real user w
 
 ## Batch six: SkillFS boundary
 
-`asc-daemon-handler::skillfs` owns the compatibility adapter. The generic socket service only adds
+`asc-daemon::skillfs` owns the compatibility adapter. The generic socket service only adds
 an optional connection-local session port and retains buffered bytes between frames. The normal
 V2 envelope remains closed to unknown fields. Authenticated sessions accept only
 `skill_ledger.skillfs_notify_change`; they cannot dispatch PAP or arbitrary V1 methods.
@@ -388,9 +608,11 @@ within the execution deadline; unknown post-commit failures are not replayed. Ea
 30-second budget. Failures remain visible in the audit, stderr and `status`'s `skillfs` counters.
 Shutdown stops queue admission and waits for the current pair of bounded operations.
 
-After synchronous rollback/latest/activation recovery, daemon startup schedules all explicitly
-registered mount Skills for a fresh scan and activation. This does not require SkillFS to restart.
-The startup list comes from the bounded private registry; live notifications allow up to 256
+After synchronous rollback/latest/activation recovery, the daemon-owned worker discovers ordinary
+Skills from current exact/`/*`/`/**` configuration and authorized history, including unregistered Skills.
+It also schedules registered mount Skills without requiring SkillFS to restart. Discovery uses the
+same bounded no-symlink traversal as RPC and skips mount subtrees. The deduplicated startup list
+feeds the same scan/activation loop; slow scans do not delay socket admission. Live notifications allow up to 256
 pending distinct Skills, and queue overflow returns a signed rejection. This is an explicit Rust
 resource bound beyond the unbounded Python pending map; it is not durable acceptance. Mount
 startup notifications cover newly discovered Skills. There is no persistent event queue or replay
@@ -399,10 +621,61 @@ of original notification order.
 Batch-six tests cover frozen SkillFS HMAC vectors, coalesced wire frames, wrong keys and payload
 MACs, plaintext rejection, source/live identity, false resolver mappings, replaced backing
 inodes, daemon startup rescan, activation after scan errors and normal V2 calls. The synthetic
-resolver tests establish the IPC contract. Linux acceptance additionally passed V2 workspace gates,
+resolver tests establish the IPC contract. Historical acceptance (before the current alignment) additionally passed V2 workspace gates,
 SkillFS workspace tests with targeted retries under the existing tests' environment assumptions,
 and the repository's real FUSE smoke. The root in-place mount and UID-1001 ordinary mount each
 completed 25 real daemon/SkillFS operations, including authenticated notify/resolver, publication,
 invalid identity/key/plaintext rejection and daemon-only restart recovery. SkillFS Clippy used the
 repository's pinned Rust 1.86; V2 used Rust 1.93.1. These are core/FUSE results, not Agent Hook or
 installed-systemd acceptance.
+
+## Batch seven: deployment boundary
+
+V2 `install-core-v2` installs the Rust binaries, root system unit and initial private configuration.
+The V2 RPM shares the binary and system-unit installation targets and uses systemd system-service
+scriptlets. V1 retains its original user unit. Neither source installation nor the unit enables
+Agent Hooks or imports V1 state. Existing operator settings survive source reinstallation and RPM
+upgrade (`%config(noreplace)`). The signing key is created by a business operation, not installation.
+
+The system unit owns `/run/agent-sec-core` (0755), `/var/lib/agent-sec/skillsec` (0700) and
+`/var/log/agent-sec` (0700), with umask 0077. It runs as root with only DAC override, CHOWN and
+FOWNER capabilities, `NoNewPrivileges`, `SystemCallFilter=@system-service`, native syscall
+architecture, `MemoryDenyWriteExecute` and kernel protections. HOME, `/tmp`, system Skill roots
+and shared mounts remain accessible because these are supported content locations. The daemon
+does not receive SYS_ADMIN. A systemd test container's separate namespace-management capability
+is a test-runtime requirement, not part of the product service's capability set.
+
+The V2 CLI RPM no longer depends on Python, GPG or loongshield; unchanged Hook packages retain
+their own dependencies. The full repository RPM recipe still builds those plugin packages and
+the sandbox. Its OpenClaw build dependency requires Node.js 22.14 or later; V2 CI uses Node 22.
+`V2_CARGO_TARGET_DIR` allows a task-owned cache while preserving the real release-build path.
+
+`tests/packaging/test-skillsec-install.sh` checks real built binaries in a temporary DESTDIR,
+configuration preservation, absence of automatic activation/key creation and V1 unit isolation.
+The installed Python V2 E2E fixtures isolate daemon state/audit and exercise ordinary-UID PAP
+denial against a root process. These checks remain distinct from actual systemd lifecycle and
+real FUSE evidence. The
+[core guide](../../../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md) gives
+source/RPM commands, shared-volume requirements and state-matched upgrade/rollback instructions.
+
+Historical delivery acceptance (before the current alignment) passed on Alibaba Cloud Linux 4, x86_64. After alignment with the upstream system daemon, the
+source-installed suite passed 914 tests, with 38 skips including the unavailable system manager.
+The RPM suite passed 914 tests with 37 skips; its corrected systemd lifecycle case passed separately,
+for 915 unique installed cases. Both exclude two real-model cases. The other skips concern
+source-only rule inventory/metadata and telemetry;
+SkillSec, PAP and daemon lifecycle cases ran. Python Ledger was unavailable to these suites.
+The repository recipe produced the RPMs, and DNF installed the core and Skill resources with
+normal dependency checks. This is repository-built artifact evidence, not a GitHub CI result.
+
+The unchanged product unit completed 45 operations under actual PID 1 systemd 255. Its effective
+and bounding capabilities were exactly CHOWN, DAC_OVERRIDE and FOWNER, with `NoNewPrivileges`.
+UID 1001 managed private HOME, `/tmp`, system and shared-volume Skills; rollback remained editable,
+rotation stayed root-only, restart retained trust, and public audit omitted sensitive details.
+Twelve package lifecycle checks passed: reinstallation retained configuration, removal saved
+modified configuration and retained the private key, and restoration preserved trust and package
+verification. This verifies V2 package recovery, not a V1 downgrade or Agent Hook integration.
+
+The system-manager fixture also verifies the shipped 75-second forced-stop deadline and startup
+rate limit. It uses the selected executable in place because `/run` may be noexec, injects a
+non-terminating stop signal only in the isolated test unit, and checks actual admission rejection
+instead of a distribution-specific `Result` string. Earlier failed fixture attempts remain recorded.
