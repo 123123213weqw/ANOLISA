@@ -13,6 +13,10 @@ name = "agent-sec-daemon"
 path = "src/main.rs"
 
 [dependencies]
+base64.workspace = true
+ring.workspace = true
+socket2.workspace = true
+uuid.workspace = true
 asc-action-types.workspace = true
 asc-capability-code-scan.workspace = true
 asc-capability-skill-sec.workspace = true
@@ -50,7 +54,6 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
-uuid.workspace = true
 
 [lints]
 workspace = true

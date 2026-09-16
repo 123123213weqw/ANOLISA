@@ -46,7 +46,7 @@ impl SkillSecService {
         };
         let (results, failed) = if options.baseline {
             batch(roots, deadline, |root| {
-                self.scan_selected(root, &requested, false, deadline)
+                self.scan_batch_root(root, &requested, false, deadline)
             })?
         } else {
             (Vec::new(), false)
@@ -71,12 +71,68 @@ impl SkillSecService {
         let requested = requested_names(options.scanners.as_deref())?;
         let key = self.initialize_with_deadline(deadline)?;
         let (results, failed) = batch(roots, deadline, |root| {
-            self.scan_selected(root, &requested, options.force, deadline)
+            self.scan_batch_root(root, &requested, options.force, deadline)
         })?;
         Ok((
             json!({"command":"scan","keyCreated":key["keyCreated"],"key":key,"results":results}),
             i64::from(failed),
         ))
+    }
+
+    fn scan_batch_root(
+        &self,
+        root: &SkillRoot,
+        requested: &[String],
+        force: bool,
+        deadline: Instant,
+    ) -> Result<Value, SkillSecError> {
+        if let Some(skipped) = readonly_system_skip(root, deadline)? {
+            return Ok(skipped);
+        }
+        self.scan_selected(root, requested, force, deadline)
+    }
+}
+
+// V1 batch/init skip unmanageable host system defaults; explicit writes remain strict.
+fn readonly_system_skip(
+    root: &SkillRoot,
+    deadline: Instant,
+) -> Result<Option<Value>, SkillSecError> {
+    use crate::ledger::storage::missing;
+    use rustix::fs::{Access, AtFlags, accessat};
+    use std::path::Path;
+
+    if !root.host_backed
+        || !root.identity.path().parent().is_some_and(|parent| {
+            [
+                "/usr/share/anolisa/skills",
+                "/usr/local/share/anolisa/skills",
+            ]
+            .iter()
+            .any(|path| parent == Path::new(path))
+        })
+    {
+        return Ok(None);
+    }
+    check_deadline(deadline)?;
+    let directory = root.open_verified()?;
+    super::validate_skill(&directory)?;
+    let target = match directory.child(".skill-meta", false) {
+        Ok(meta) => meta,
+        Err(error) if missing(&error) => directory,
+        Err(error) => return Err(error),
+    };
+    // The kernel checks effective daemon credentials and read-only mounts on the pinned directory.
+    match accessat(&target.file, ".", Access::WRITE_OK, AtFlags::EACCESS) {
+        Ok(()) => Ok(None),
+        Err(rustix::io::Errno::ACCESS | rustix::io::Errno::ROFS) => Ok(Some(json!({
+            "canonicalSkillDir": root.identity,
+            "skillName": root.identity.name(),
+            "status": "skipped",
+            "reasonCode": "readonly_system_skill",
+            "persisted": false,
+        }))),
+        Err(error) => Err(crate::io_error(&target.path, error)),
     }
 }
 

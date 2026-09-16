@@ -26,7 +26,7 @@ impl ActionService {
         }
     }
 
-    /// Adds the process-owned SkillSec invocation without a capability dependency.
+    /// Adds the process-owned `SkillSec` invocation without a capability dependency.
     #[must_use]
     pub fn with_skill_sec(
         mut self,

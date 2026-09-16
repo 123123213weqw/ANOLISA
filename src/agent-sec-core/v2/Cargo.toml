@@ -90,7 +90,7 @@ fancy-regex = "0.16"
 nix = { version = "0.31", default-features = false, features = ["user"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled"] }
-rustix = { version = "1.1", features = ["fs", "process"] }
+rustix = { version = "1.1", features = ["fs", "process", "net"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 serial_test = "3"

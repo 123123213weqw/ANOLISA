@@ -167,6 +167,9 @@ impl SkillSecService {
                     "reconcile pending rollback before rotating keys".into(),
                 ));
             }
+            for root in roots {
+                root.verify_mapping()?;
+            }
             if !recovering {
                 let bytes = serde_json::to_vec(&intent)?;
                 if bytes.len() as u64 > MAX_RECORD_BYTES {
@@ -178,7 +181,7 @@ impl SkillSecService {
             }
             for root in roots {
                 check_deadline(deadline)?;
-                let directory = Directory::open(&root.io_dir)?;
+                let directory = root.open_verified()?;
                 let ledger = required_ledger(&directory)?;
                 let withdrawn = publish(
                     &ledger,

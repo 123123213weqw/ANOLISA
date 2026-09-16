@@ -21,3 +21,8 @@ pub use reconciliation::{
 };
 pub use runtime::{RuntimeError, run_with_shutdown_timeout};
 pub use signals::{ProcessSignals, SignalError};
+
+mod skill_worker;
+/// Authenticated `SkillFS` integration owned by the daemon process.
+pub mod skillfs;
+pub use skill_worker::SkillWorker;

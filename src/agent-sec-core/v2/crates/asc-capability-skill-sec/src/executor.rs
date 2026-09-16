@@ -437,7 +437,9 @@ fn event_verdict(command: &SkillSecCommand, output: &Value) -> Option<&'static s
 }
 
 fn analyze(root: &SkillRoot, deadline: Instant) -> Result<(Value, i64), SkillSecError> {
+    root.verify_mapping()?;
     let result = crate::scanner::analyze(&root.io_dir, deadline)?;
+    root.verify_mapping()?;
     Ok((result.data, i64::from(result.exit_code)))
 }
 

@@ -9,6 +9,7 @@ use asc_capability_skill_sec::scanner::{ScannerConfig, ScannerRegistry};
 use asc_capability_skill_sec::{
     ManagedSkillDir, SkillIdentity, SkillSecConfig, SkillSecError, SkillSecService,
 };
+use asc_daemon::skillfs::SkillFsConfig;
 use asc_daemon_core::{ActionService, PeerCredentials};
 use rustix::fs::{Mode, OFlags, mkdirat, open, openat};
 use serde::Deserialize;
@@ -31,13 +32,17 @@ struct Settings {
     scanners: Vec<ScannerConfig>,
     #[serde(default)]
     parsers: BTreeMap<String, String>,
+    #[serde(default)]
+    skillfs: Option<SkillFsConfig>,
 }
 
 fn default_state() -> PathBuf {
     PathBuf::from("/var/lib/agent-sec/skillsec")
 }
 
-pub(super) fn start(config: Option<&Path>) -> Result<Arc<SkillSecService>, StartupError> {
+pub(super) fn start(
+    config: Option<&Path>,
+) -> Result<(Arc<SkillSecService>, Option<SkillFsConfig>), StartupError> {
     if rustix::process::geteuid().as_raw() != 0 {
         return Err(StartupError::RootRequired);
     }
@@ -52,10 +57,18 @@ pub(super) fn start(config: Option<&Path>) -> Result<Arc<SkillSecService>, Start
                 managed_skill_dirs: Vec::new(),
                 scanners: Vec::new(),
                 parsers: BTreeMap::new(),
+                skillfs: None,
             },
             Err(error) => return Err(error),
         }
     };
+    if settings
+        .skillfs
+        .as_ref()
+        .is_some_and(|s| s.auth_key_file == settings.state_dir.join("signing-key.pk8"))
+    {
+        return Err(StartupError::UnsafePath);
+    }
     private_state(&settings.state_dir)?;
     let service = Arc::new(SkillSecService::new(
         SkillSecConfig {
@@ -64,7 +77,7 @@ pub(super) fn start(config: Option<&Path>) -> Result<Arc<SkillSecService>, Start
         },
         ScannerRegistry::new(settings.scanners, settings.parsers)?,
     )?);
-    Ok(service)
+    Ok((service, settings.skillfs))
 }
 
 fn read_settings(path: &Path) -> Result<Settings, StartupError> {

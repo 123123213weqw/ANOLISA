@@ -42,7 +42,10 @@ def test_capabilities_cannot_write_events_or_telemetry_directly():
 
 
 def test_skillsec_entries_reuse_process_application_composition():
-    sources = [V2 / "apps/asc-daemon/src/skill_sec.rs"]
+    sources = [
+        V2 / "apps/asc-daemon/src/skill_sec.rs",
+        V2 / "apps/asc-daemon/src/skill_worker.rs",
+    ]
     sources.extend((V2 / "apps/asc-daemon/src/skillfs").rglob("*.rs"))
     for source in sources:
         if source.name == "tests.rs":
