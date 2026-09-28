@@ -70,6 +70,8 @@ def _run_hook(input_data, *, env_override=None):
 
 _MOCK_CLI_SCRIPT = f"#!{sys.executable}\n" + textwrap.dedent("""\
     import os, sys
+    if "init" in sys.argv:
+        sys.exit(0)
     output = os.environ.get("_MOCK_CLI_OUTPUT", "")
     rc = int(os.environ.get("_MOCK_CLI_RC", "0"))
     if output:
@@ -602,40 +604,6 @@ class TestSkillCatalog:
 # ---------------------------------------------------------------------------
 
 
-class TestKeyManagement:
-    """Test _keys_exist and _ensure_keys."""
-
-    def test_keys_exist_true(self, tmp_path, monkeypatch):
-        data_dir = tmp_path / "agent-sec" / "skill-ledger"
-        data_dir.mkdir(parents=True)
-        (data_dir / "key.pub").write_text("pub")
-        (data_dir / "key.enc").write_text("enc")
-        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-
-        assert skill_ledger_hook._keys_exist() is True
-
-    def test_keys_exist_false(self, tmp_path, monkeypatch):
-        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-        assert skill_ledger_hook._keys_exist() is False
-
-    def test_ensure_keys_skips_when_exist(self, tmp_path, monkeypatch):
-        data_dir = tmp_path / "agent-sec" / "skill-ledger"
-        data_dir.mkdir(parents=True)
-        (data_dir / "key.pub").write_text("pub")
-        (data_dir / "key.enc").write_text("enc")
-        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
-
-        captured = {}
-
-        def fake_run(args, **kwargs):
-            captured["called"] = True
-            return subprocess.CompletedProcess(args, 0, "", "")
-
-        monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        skill_ledger_hook._ensure_keys({})
-        assert "called" not in captured  # should not have called subprocess
-
-
 # ---------------------------------------------------------------------------
 # Mode-based tests with real skill dir
 # ---------------------------------------------------------------------------
@@ -830,7 +798,7 @@ class TestMainMonkeypatch:
             raise OSError("not found")
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fail_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
 
         output = self._run_main(
             monkeypatch,
@@ -861,7 +829,7 @@ class TestMainMonkeypatch:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
 
         self._run_main(
             monkeypatch,
@@ -895,7 +863,7 @@ class TestMainMonkeypatch:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
 
         self._run_main(
             monkeypatch,
@@ -927,7 +895,7 @@ class TestMainMonkeypatch:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
 
         output = self._run_main(
             monkeypatch,
@@ -973,7 +941,7 @@ class TestBlockStatuses:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
         monkeypatch.setattr(skill_ledger_hook, "MODE", "deny")
         monkeypatch.setattr(
             skill_ledger_hook.sys,
@@ -1006,7 +974,7 @@ class TestBlockStatuses:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
         monkeypatch.setattr(skill_ledger_hook, "MODE", "deny")
         monkeypatch.setattr(
             skill_ledger_hook.sys,
@@ -1037,7 +1005,7 @@ class TestBlockStatuses:
             )
 
         monkeypatch.setattr(skill_ledger_hook.subprocess, "run", fake_run)
-        monkeypatch.setattr(skill_ledger_hook, "_keys_exist", lambda: True)
+        monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
         monkeypatch.setattr(skill_ledger_hook, "MODE", "deny")
         monkeypatch.setattr(
             skill_ledger_hook.sys,

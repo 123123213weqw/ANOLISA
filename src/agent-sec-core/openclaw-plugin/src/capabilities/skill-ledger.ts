@@ -1,4 +1,3 @@
-import { existsSync } from "node:fs";
 import { resolve, dirname, basename } from "node:path";
 import { homedir } from "node:os";
 import type { SecurityCapability } from "../types.js";
@@ -50,25 +49,6 @@ const CONFIRMATION_SEVERITY: Record<string, "warning" | "critical"> = {
   deny: "critical",
   tampered: "critical",
 };
-
-// ---------------------------------------------------------------------------
-// Key path resolution (mirrors Python's XDG_DATA_HOME / agent-sec/skill-ledger)
-// ---------------------------------------------------------------------------
-
-function getKeyPubPath(): string {
-  const xdgData = process.env.XDG_DATA_HOME || resolve(homedir(), ".local", "share");
-  return resolve(xdgData, "agent-sec", "skill-ledger", "key.pub");
-}
-
-function getKeyEncPath(): string {
-  const xdgData = process.env.XDG_DATA_HOME || resolve(homedir(), ".local", "share");
-  return resolve(xdgData, "agent-sec", "skill-ledger", "key.enc");
-}
-
-/** Return true only if both key.pub and key.enc exist (mirrors Python key_manager.keys_exist). */
-function keysExist(): boolean {
-  return existsSync(getKeyPubPath()) && existsSync(getKeyEncPath());
-}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -166,14 +146,6 @@ function logDiagnostic(api: any, cfg: SkillLedgerConfig, message: string): void 
   }
 }
 
-function logLifecycle(api: any, cfg: SkillLedgerConfig, message: string): void {
-  if (cfg.policy === "observe") {
-    logDebug(api, message);
-  } else {
-    api.logger.info(`[skill-ledger] ${message}`);
-  }
-}
-
 // ---------------------------------------------------------------------------
 // Capability
 // ---------------------------------------------------------------------------
@@ -188,45 +160,20 @@ export const skillLedger: SecurityCapability = {
     }
     const cfg = readConfig((api.pluginConfig as Record<string, any>) ?? {}, api);
 
-    /** Ensure signing keys exist; auto-init if missing. */
-    let ensureKeysPromise: Promise<void> | null = null;
-
-    function ensureKeys(traceContext?: TraceContext): Promise<void> {
-      if (ensureKeysPromise) return ensureKeysPromise;
-
-      ensureKeysPromise = (async () => {
-        if (keysExist()) return;
-
-        logLifecycle(
-          api,
-          cfg,
-          "signing keys not found — running init --no-baseline",
-        );
+    async function ensureKeys(traceContext?: TraceContext): Promise<boolean> {
+      // The daemon owns readiness and serializes concurrent initialization.
+      try {
         const result = await callAgentSecCli(
           ["skill-ledger", "init", "--no-baseline"],
           { timeout: DEFAULT_TIMEOUT_MS, traceContext },
         );
-
-        if (result.exitCode === 0) {
-          logLifecycle(api, cfg, "signing keys initialized successfully");
-        } else if (!keysExist()) {
-          logDiagnostic(
-            api,
-            cfg,
-            `init --no-baseline failed: ${result.stderr}`,
-          );
-          ensureKeysPromise = null; // allow retry on next call
-        }
-      })().catch((err) => {
-        logDiagnostic(api, cfg, `init --no-baseline error: ${err}`);
-        ensureKeysPromise = null; // unexpected error — allow retry
-      });
-
-      return ensureKeysPromise;
+        if (result.exitCode === 0) return true;
+        logDiagnostic(api, cfg, `init --no-baseline failed: exit ${result.exitCode}`);
+      } catch {
+        logDiagnostic(api, cfg, "init --no-baseline failed");
+      }
+      return false;
     }
-
-    // Eager key initialization (fire-and-forget from register)
-    ensureKeys().catch(() => {});
 
     // ── Hook handlers ───────────────────────────────────────────────
     api.on(
@@ -241,7 +188,7 @@ export const skillLedger: SecurityCapability = {
           const traceContext = buildTraceContext(event, ctx);
 
           // Ensure keys are ready
-          await ensureKeys(traceContext);
+          if (!(await ensureKeys(traceContext))) return undefined;
 
           // Invoke CLI
           const result = await callAgentSecCli(

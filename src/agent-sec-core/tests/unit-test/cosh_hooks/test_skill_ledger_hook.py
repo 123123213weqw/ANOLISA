@@ -178,7 +178,7 @@ def test_injects_trace_context_into_skill_ledger_show_command(
             stderr="",
         )
 
-    monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda _input_data: None)
+    monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda _input_data: True)
     monkeypatch.setattr(
         skill_ledger_hook,
         "_resolve_skill_dir",
@@ -709,7 +709,7 @@ class TestSkillDirResolution:
 _MOCK_CLI_SCRIPT = f"#!{sys.executable}\n" + textwrap.dedent("""\
     import os, sys
     # init --no-baseline → silent success
-    if len(sys.argv) >= 4 and sys.argv[2] == "init" and sys.argv[3] == "--no-baseline":
+    if "init" in sys.argv:
         sys.exit(0)
     # show → return canned output from env
     output = os.environ.get("_MOCK_CHECK_OUTPUT", "")
@@ -740,7 +740,7 @@ def mock_cli_env(tmp_path):
     project.mkdir()
     _create_skill_dir(str(project), "test-skill")
 
-    # Create fake key files so _ensure_keys() is a no-op
+    # Legacy user keys must not suppress daemon initialization
     data_dir = tmp_path / "xdg-data" / "agent-sec" / "skill-ledger"
     data_dir.mkdir(parents=True)
     (data_dir / "key.pub").write_text("fake-pub")
