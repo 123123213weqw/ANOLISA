@@ -2,13 +2,18 @@ use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 
 static DIRECTORY_ID: AtomicU64 = AtomicU64::new(0);
+
+// Readiness includes real SQLite initialization on shared CI storage.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+// Match the deployment stop budget, including drain, persistence, and runtime cleanup.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(45);
 
 struct RunningBinary {
     child: Child,
@@ -54,7 +59,8 @@ fn read_stderr(directory: &Path) -> String {
 }
 
 async fn wait_for_socket(running: &mut RunningBinary) {
-    let result = tokio::time::timeout(Duration::from_secs(2), async {
+    let started = Instant::now();
+    let result = tokio::time::timeout(STARTUP_TIMEOUT, async {
         loop {
             if let Some(status) = running.child.try_wait().unwrap() {
                 panic!(
@@ -86,27 +92,40 @@ async fn wait_for_socket(running: &mut RunningBinary) {
     })
     .await;
     if result.is_err() {
+        let elapsed = started.elapsed();
         let _ = running.child.kill();
         let status = running.child.wait().unwrap();
         panic!(
-            "daemon bootstrap timed out; socket: {}; status after cleanup: {status}; stderr: {}",
+            "daemon bootstrap timed out after {elapsed:?}; pid: {}; socket: {}; status after cleanup: {status}; stderr: {}",
+            running.child.id(),
             running.socket_path.display(),
             read_stderr(&running.directory)
         );
     }
 }
 
-async fn wait_for_exit(child: &mut Child) -> std::process::ExitStatus {
-    tokio::time::timeout(Duration::from_secs(2), async {
+async fn wait_for_exit(running: &mut RunningBinary) -> std::process::ExitStatus {
+    let started = Instant::now();
+    tokio::time::timeout(EXIT_TIMEOUT, async {
         loop {
-            if let Some(status) = child.try_wait().unwrap() {
+            if let Some(status) = running.child.try_wait().unwrap() {
                 return status;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .expect("the foreground daemon should exit within the deadline")
+    .unwrap_or_else(|_| {
+        let elapsed = started.elapsed();
+        let _ = running.child.kill();
+        let status = running.child.wait().unwrap();
+        panic!(
+            "daemon exit timed out after {elapsed:?}; pid: {}; socket: {}; status after cleanup: {status}; stderr: {}",
+            running.child.id(),
+            running.socket_path.display(),
+            read_stderr(&running.directory)
+        );
+    })
 }
 
 async fn request(path: &Path, payload: &[u8]) -> Value {
@@ -153,7 +172,7 @@ async fn daemon_refuses_to_bind_when_sqlite_event_storage_is_unusable() {
         directory,
         socket_path,
     };
-    assert!(!wait_for_exit(&mut running.child).await.success());
+    assert!(!wait_for_exit(&mut running).await.success());
     let stderr = read_stderr(&running.directory);
     assert!(
         stderr.contains("security event storage unavailable"),
@@ -198,7 +217,7 @@ async fn daemon_binds_when_jsonl_event_storage_is_unusable() {
         .status()
         .unwrap();
     assert!(signal.success());
-    assert!(wait_for_exit(&mut running.child).await.success());
+    assert!(wait_for_exit(&mut running).await.success());
 }
 
 async fn run_binary_scenario(configure_admin: bool) {
@@ -264,7 +283,7 @@ async fn run_binary_scenario(configure_admin: bool) {
         .status()
         .unwrap();
     assert!(signal.success());
-    let status = wait_for_exit(&mut running.child).await;
+    let status = wait_for_exit(&mut running).await;
 
     assert!(status.success());
     assert!(!running.socket_path.exists());
