@@ -498,3 +498,13 @@ def test_malformed_private_key_stress_does_not_backtrack_slowly():
     result = _scan(text)
 
     assert "private_key" not in _types(result)
+
+
+def test_model_input_source_preserves_detection_and_masks_evidence() -> None:
+    secret = "sk-test9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA"
+    result = _scan(secret, source="model_input")
+    assert result["summary"]["source"] == "model_input"
+    assert result["verdict"] == "deny"
+    assert "api_key" in _types(result)
+    assert secret not in str(result)
+    assert "redacted_text" not in result

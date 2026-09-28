@@ -39,8 +39,9 @@ def _scan(daemon, *args, input_text=None):
     return json.loads(result.stdout)
 
 
+@pytest.mark.parametrize("source", ["tool_input", "model_input"])
 def test_input_modes_unicode_redaction_and_one_event_per_scan(
-    pii_daemon, pii_environment, tmp_path
+    source, pii_daemon, pii_environment, tmp_path
 ):
     text = "备注🙂e\u0301 alice@company.cn password=SecretToken987"
     input_file = tmp_path / "input.txt"
@@ -57,7 +58,7 @@ def test_input_modes_unicode_redaction_and_one_event_per_scan(
                 pii_daemon,
                 *args,
                 "--source",
-                "tool_input",
+                source,
                 "--raw-evidence",
                 "--redact-output",
                 input_text=stdin,
@@ -73,7 +74,7 @@ def test_input_modes_unicode_redaction_and_one_event_per_scan(
             "redacted_text",
         }
         assert report["ok"] and report["verdict"] == "deny"
-        assert report["summary"]["source"] == "tool_input"
+        assert report["summary"]["source"] == source
         assert report["summary"]["scanner_version"] == "2.0.0"
         assert report["summary"]["coverage"] == {"status": "complete", "reasons": []}
         assert not report["summary"].get("findings_truncated", False)
@@ -95,6 +96,7 @@ def test_input_modes_unicode_redaction_and_one_event_per_scan(
         assert event["result"] == "succeeded"
         assert event["details"]["request"]["text_length"] == len(text)
         assert event["details"]["result"]["summary"]["scanner_version"] == "2.0.0"
+        assert event["details"]["result"]["summary"]["source"] == source
     audit = json.dumps(events)
     for forbidden in [
         text,

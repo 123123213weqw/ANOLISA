@@ -348,6 +348,9 @@ V1 保留 `~/.config/agent-sec/pii-checker/rules.yaml`。V2 报告 coverage、�
 覆盖不完整时的 `pass` 不代表检测完整。本阶段保持 Hook 契约，不切换真实宿主，也不新增 PDP 执行控制。
 公共 CLI `--trace-context` 适配通过顶层 OTel 信封传播关联信息，不支持 `params.traceContext`。
 
+正式版 OpenClaw `>=2026.5.12` 在模型运行入口扫描，记录为 `source=model_input`；
+较旧的受支持版本保留入站扫描。输入是否阻断取决于策略，工具输出 hook 仍只用于观测。
+
 详见 [PII Checker 用户使用指南](../../docs/user-guide/zh/agent-security/agent-sec-core/pii-checker.md)。
 
 ## Skill Ledger

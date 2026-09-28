@@ -204,12 +204,13 @@ def _hermes(hook, event):
     )
 
 
-def _openclaw(hook, event):
+def _openclaw(hook, event, version="2026.4.14"):
     return _run(
         ["node", str(FIXTURES / "openclaw_pii_hook.mjs")],
         {
             "hook": hook,
             "event": event,
+            "version": version,
             "context": {
                 "sessionId": "pii-session",
                 "runId": "pii-run",
@@ -291,6 +292,7 @@ def test_hermes_native_pii_contract(
     "hook,fields,source",
     [
         ("before_dispatch", {"content": TEXT}, "user_input"),
+        ("before_agent_run", {"prompt": TEXT}, "model_input"),
         (
             "before_tool_call",
             {"toolName": "read", "params": {"content": TEXT}},
@@ -304,10 +306,13 @@ def test_openclaw_native_pii_contract(
     policy, hook, fields, source, hook_environment, monkeypatch
 ):
     monkeypatch.setenv("PII_CHECKER_MODE", policy)
-    output = _openclaw(hook, fields)
+    version = "2026.5.12" if hook == "before_agent_run" else "2026.4.14"
+    output = _openclaw(hook, fields, version)
     decision = output["result"]
     if hook == "before_dispatch" and policy == "block":
         assert decision["handled"] is True and decision["text"]
+    elif hook == "before_agent_run" and policy == "block":
+        assert decision["outcome"] == "block" and decision["message"]
     elif hook == "before_tool_call" and policy == "block":
         assert decision["block"] is True and decision["blockReason"]
     elif hook == "before_tool_call" and policy == "ask":

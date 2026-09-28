@@ -35,7 +35,7 @@ pub(crate) struct ScanPiiCommand {
     #[arg(long, value_enum, default_value = "json")]
     pub(crate) format: PiiOutputFormat,
     /// Caller-declared input origin; does not grant authorization.
-    #[arg(long, default_value = "unknown", value_parser = ["user_input", "tool_input", "tool_output", "model_output", "observability", "manual", "unknown"])]
+    #[arg(long, default_value = "unknown", value_parser = ["user_input", "model_input", "tool_input", "tool_output", "model_output", "observability", "manual", "unknown"])]
     source: String,
     /// Optional positive byte prefix; omitted means no implicit truncation.
     #[arg(long, value_parser = positive_limit)]

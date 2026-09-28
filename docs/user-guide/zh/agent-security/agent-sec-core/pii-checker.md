@@ -129,7 +129,7 @@ agent-sec-cli scan-pii --input ./agent-output.txt --format text
 | `--max-bytes N` | 最多扫描 `N` 个 UTF-8 字节，并标记结果已截断 |
 | `--source SOURCE` | 标记审计上下文，例如 `user_input` 或 `tool_output` |
 
-支持的 source 包括 `user_input`、`tool_input`、`tool_output`、`model_output`、
+支持的 source 包括 `user_input`、`model_input`、`tool_input`、`tool_output`、`model_output`、
 `observability`、`manual` 和 `unknown`。
 
 ## 内置检测
@@ -194,6 +194,30 @@ cosh、Hermes 和 OpenClaw 不读取这两个环境变量。Hermes 可通过 cap
 hook 和 agent-sec-core 并不是需要单独重启的 policy 服务。
 
 scanner verdict `deny` 描述扫描风险，hook policy `block` 决定 adapter 是否执行阻断。
+
+### OpenClaw 输入保护
+
+在正式版 OpenClaw `>=2026.5.12` 上，PII Checker 使用 `before_agent_run` 扫描
+`prompt`、`systemPrompt` 和 hook 提供的会话消息文本，包括工具参数和结果，
+记录为 `source=model_input`；不扫描媒体载荷或消息元数据。检查对象是运行入口可见的文本，
+不覆盖运行中的每一次模型请求或宿主独立的辅助模型调用（例如会话标题生成），也不保证能读取用户原始输入。
+
+较旧的受支持版本（`>=2026.4.14`）、预发布版以及无法识别的版本，使用
+`before_dispatch` 和 `source=user_input`，只扫描 OpenClaw 提供的入站文本。
+启动日志会注明选择的输入 hook，使用旧路径时会给出兼容提示。PII 输入 hook 只注册一个。
+
+`before_agent_run` 需要
+`plugins.entries.agent-sec.hooks.allowConversationAccess=true`；部署脚本已在支持该配置的宿主上设置它。
+`block` 模式下，`deny` 结果会阻断此处的模型提交；`observe` 记录扫描，`warn` 记录告警，
+`ask` 因此 gate 不支持确认而降级为告警。扫描器失败时告警后放行。插件不会用脱敏文本替换模型输入。
+
+`pass` 只描述实际扫描的文本。如果 OpenClaw 已将凭据打码，实际模型请求也只包含打码后的内容，
+没有重新识别出原始凭据并不意味着发生泄露。应结合扫描输入和实际模型请求验证保护效果，
+而非要求每条原始用户消息都产生凭据 finding。
+
+`before_tool_call` 保留工具参数检查及确认/阻断行为。`after_tool_call` 只能记录或告警，
+即使配置为 `block`，也不能脱敏或扣留工具结果；结果仍可能进入后续模型上下文，这是已有的执行控制缺口。
+`llm_output` 同样只观测或告警，不脱敏或阻断交付。这些 hook 不构成覆盖所有模型请求的完整防泄露保证。
 
 ## 自定义正则规则
 

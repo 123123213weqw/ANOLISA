@@ -387,6 +387,10 @@ agent-sec-cli events --summary
 
 Run the command from the same shell/container/service environment that starts the target Agent when you want the closest approximation. The command does not read OpenClaw, Hermes, or other Agent configuration files, and it does not resolve Agent home directories; Agent config values such as enabled flags, policies, and timeouts can still make runtime behavior differ from this view.
 
+OpenClaw PII metadata lists both version-dependent input hooks. The runtime selects
+`before_agent_run` on stable `>=2026.5.12`, otherwise `before_dispatch`; the CLI
+does not inspect the host version. Check the plugin startup log for its selection.
+
 ```bash
 # All agents and all capabilities
 agent-sec-cli capabilities

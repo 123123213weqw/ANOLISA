@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 pub enum Source {
     /// User's current input.
     UserInput,
+    /// Text exposed by the host before model execution.
+    ModelInput,
     /// Tool arguments.
     ToolInput,
     /// Tool result.

@@ -11,6 +11,7 @@ export async function runHookProbe({
   env,
   logsDir,
   openclawBin,
+  openclawVersion,
   pluginRoot,
   repoRoot,
   workdir,
@@ -44,6 +45,7 @@ export async function runHookProbe({
       },
     },
     pluginRoot: importRoot.root,
+    openclawVersion,
   });
   probe.registeredHooks = capture.hooks.map((hook) => ({
     hookName: hook.hookName,
@@ -58,6 +60,8 @@ export async function runHookProbe({
     "# Pilot Skill\n\nThis fixture is used by the OpenClaw pilot e2e hook probe.\n",
   );
 
+  const piiInputHook = capture.hooks.some((hook) => hook.hookName === "before_agent_run")
+    ? "before_agent_run" : "before_dispatch";
   const normalCases = [
     // These cases cover every registered capability at least once. They are not
     // policy acceptance by themselves; Gateway matrix cases above own that.
@@ -74,9 +78,11 @@ export async function runHookProbe({
       ctx: beforeDispatchCtx(),
     },
     {
-      name: "pii-scan-before-dispatch",
-      hookName: "before_dispatch",
+      name: `pii-scan-${piiInputHook}`,
+      hookName: piiInputHook,
       event: {
+        prompt: "Contact me at alice@example.com for the pilot.",
+        messages: [],
         content: "Contact me at alice@example.com for the pilot.",
         body: "Contact me at alice@example.com for the pilot.",
         senderId: "pilot-user",
@@ -359,7 +365,7 @@ export function assertHookProbe(probe) {
   }
 }
 
-async function capturePluginHooks({ pluginConfig, pluginRoot }) {
+async function capturePluginHooks({ pluginConfig, pluginRoot, openclawVersion }) {
   // Import dist with a cache-busting query so repeated pilot runs in the same
   // Node process cannot reuse stale plugin registration state.
   const distEntry = path.join(pluginRoot, "dist", "index.js");
@@ -373,6 +379,7 @@ async function capturePluginHooks({ pluginConfig, pluginRoot }) {
   const logs = [];
   const api = {
     pluginConfig,
+    runtime: { version: openclawVersion },
     logger: {
       info: (message) => logs.push(`[INFO] ${message}`),
       warn: (message) => logs.push(`[WARN] ${message}`),

@@ -431,7 +431,7 @@ Prompt Scanner 当前由 Rust native engine 实现；Python backend 只是 adapt
 | `input_truncated` | boolean | false，上游已截断标记 |
 | `input_bytes_scanned` | non-negative integer/null | 上游实际扫描 byte 数 |
 
-source 合法值：`user_input/tool_input/tool_output/model_output/observability/manual/unknown`；
+source 合法值：`user_input/model_input/tool_input/tool_output/model_output/observability/manual/unknown`；
 其它值归一为 `unknown`。`max_bytes` 按 UTF-8 bytes 截取，不能截断在半个 UTF-8 codepoint。
 注意 scanner module 的常量 1 MiB 不会自动用于 middleware；middleware 缺省是 unlimited。
 

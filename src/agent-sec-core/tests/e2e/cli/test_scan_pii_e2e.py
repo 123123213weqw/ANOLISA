@@ -471,3 +471,24 @@ def test_scan_pii_invalid_custom_rules_fail_open(mode: str, tmp_path: Path) -> N
     assert sensitive_pattern not in details_text
     assert "alice@company.cn" not in details_text
     assert ".config" not in details_text
+
+
+@pytest.mark.parametrize("mode", _MODES)
+def test_scan_pii_model_input_source(mode: str, tmp_path: Path) -> None:
+    secret = "sk-test9876543210ZYXWVUTSRQPONMLKJIHGFEDCBA"
+    result = _run_cli(
+        mode,
+        "scan-pii",
+        "--stdin",
+        "--source",
+        "model_input",
+        "--format",
+        "json",
+        data_dir=tmp_path / mode / "model-input",
+        input_text=secret,
+    )
+    data = _load_json(result)
+    assert data["summary"]["source"] == "model_input"
+    assert data["verdict"] == "deny"
+    assert "redacted_text" not in data
+    assert secret not in result.stdout

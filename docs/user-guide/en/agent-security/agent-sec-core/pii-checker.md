@@ -149,7 +149,7 @@ Useful options:
 | `--max-bytes N` | Scan at most `N` UTF-8 bytes and mark the result as truncated |
 | `--source SOURCE` | Label the audit context, such as `user_input` or `tool_output` |
 
-Supported source labels are `user_input`, `tool_input`, `tool_output`, `model_output`,
+Supported source labels are `user_input`, `model_input`, `tool_input`, `tool_output`, `model_output`,
 `observability`, `manual`, and `unknown`.
 
 ## Built-in detection
@@ -222,6 +222,40 @@ hosts the hook after changing them; the hook and agent-sec-core are not separate
 
 Scanner verdict `deny` describes finding severity. Hook policy `block` controls whether the
 current adapter attempts enforcement.
+
+### OpenClaw input protection
+
+On stable OpenClaw `>=2026.5.12`, PII Checker uses `before_agent_run` to scan
+`prompt`, `systemPrompt`, and text in the supplied session messages, including tool
+arguments and results. It records `source=model_input`. Media payloads and message
+metadata are excluded. This checks text available at run entry. It does not cover every
+model request inside the run or auxiliary model calls such as session title generation,
+and does not promise access to the original user input.
+
+Older supported versions (`>=2026.4.14`), prereleases, and unrecognized versions use
+`before_dispatch` with `source=user_input`. This legacy path only scans the inbound
+text supplied by OpenClaw. Startup logs name the selected input hook and warn when
+using the legacy path. Only one PII input hook is registered.
+
+`before_agent_run` requires
+`plugins.entries.agent-sec.hooks.allowConversationAccess=true`; the deployment script
+already sets it on supported hosts. In `block` mode, a `deny` result blocks submission
+at this gate. `observe` records the scan, `warn` logs a warning, and `ask` falls back
+to a warning because this gate has no confirmation mechanism. Scanner failures warn
+and fail open. The integration does not replace model input with redacted text.
+
+A `pass` describes the text actually scanned. If OpenClaw has already masked a
+credential and the model request also contains only its masked form, failure to
+rediscover the original credential is not evidence of disclosure. Validate protection
+using the scan input and actual model request, rather than requiring a credential
+finding for every original user message.
+
+`before_tool_call` retains its parameter checks and approval/block behavior.
+`after_tool_call` only records or warns: it cannot redact or withhold a tool result,
+even in `block` mode. Tool results can therefore enter subsequent model context;
+this is an existing enforcement gap. `llm_output` likewise observes or warns without
+redacting or blocking delivery. These hooks do not provide complete prevention across
+all model requests.
 
 ## Custom regex rules
 

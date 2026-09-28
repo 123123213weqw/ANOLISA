@@ -898,7 +898,7 @@ V2 顶层 OTel 信封及第 13 节独立预算（请求业务 4 MiB + 传播 32 
 | `params` 字段 | 类型与默认值 |
 |---------------|----------------|
 | `text` | 必填 string，允许空文本 |
-| `source` | string，默认 `unknown`；允许 user_input/tool_input/tool_output/model_output/observability/manual/unknown |
+| `source` | string，默认 `unknown`；允许 user_input/model_input/tool_input/tool_output/model_output/observability/manual/unknown |
 | `includeLowConfidence`、`rawEvidence`、`redactOutput` | bool，默认 false |
 | `maxBytes` | 可选正整数或 null |
 | `inputTruncated` | bool，默认 false |

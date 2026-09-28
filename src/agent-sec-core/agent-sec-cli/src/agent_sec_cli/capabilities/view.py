@@ -249,6 +249,7 @@ _OPENCLAW_HOOKS = {
     "code-scan": ("before_tool_call",),
     "prompt-scan": ("before_dispatch",),
     "pii-check": (
+        "before_agent_run",
         "before_dispatch",
         "before_tool_call",
         "after_tool_call",

@@ -369,6 +369,10 @@ Hook contracts without switching live hosts or adding PDP enforcement.
 The shared CLI `--trace-context` adapter propagates attribution through the top-level OTel
 envelope; `params.traceContext` is not supported.
 
+OpenClaw records model-entry scans as `source=model_input` on stable `>=2026.5.12`;
+older supported hosts retain inbound scanning. Input blocking depends on policy,
+and tool-output hooks remain observation-only.
+
 Details: [PII Checker User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/pii-checker.md).
 
 ## Skill Ledger

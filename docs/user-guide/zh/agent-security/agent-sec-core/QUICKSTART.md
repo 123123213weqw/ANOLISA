@@ -372,6 +372,10 @@ agent-sec-cli events --summary
 
 若希望结果尽量接近目标 Agent，请在启动目标 Agent 的同一 shell/container/service 环境中运行该命令。命令不读取 OpenClaw、Hermes 或其他 Agent 的配置文件，也不解析 Agent home 目录；Agent 配置中的 enabled、policy、timeout 等值仍可能让真实运行行为与该视图不同。
 
+OpenClaw PII 元数据列出两种按版本选择的输入 hook。运行时在正式版 `>=2026.5.12`
+选择 `before_agent_run`，其他版本选择 `before_dispatch`；CLI 不探测宿主版本，
+具体选择请查看插件启动日志。
+
 ```bash
 # 展示所有 agent 的所有 capability
 agent-sec-cli capabilities

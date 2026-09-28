@@ -9,6 +9,7 @@ const { observability } = await import(pathToFileURL(`${directory}/capabilities/
 const hooks = new Map();
 const logs = [];
 const api = {
+  runtime: { version: request.version },
   pluginConfig: {},
   on: (name, callback) => hooks.set(name, callback),
   logger: {
