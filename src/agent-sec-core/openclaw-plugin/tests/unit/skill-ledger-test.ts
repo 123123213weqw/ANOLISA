@@ -368,7 +368,7 @@ describe("skill-ledger", () => {
 
   for (const status of ["none", "drifted", "deny", "tampered"]) {
     it(`${status} asks for approval by default`, async () => {
-      mockSkillLedgerStatus(status, status === "none" ? 0 : 1);
+      mockSkillLedgerStatus(status);
       const { beforeToolCall } = registerHandlers();
 
       const result = await beforeToolCall.handler(
@@ -414,7 +414,7 @@ describe("skill-ledger", () => {
 
   for (const status of ["none", "drifted", "deny", "tampered"]) {
     it(`${status} logs debug and allows with debug policy`, async () => {
-      mockSkillLedgerStatus(status, status === "none" ? 0 : 1);
+      mockSkillLedgerStatus(status);
       const { beforeToolCall, logs } = registerHandlers(policyConfig("debug"));
 
       const result = await beforeToolCall.handler(
@@ -429,7 +429,7 @@ describe("skill-ledger", () => {
   }
 
   it("invalid explicit policy falls back to default ask policy", async () => {
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall, logs } = registerHandlers({
       capabilities: {
         "skill-ledger": { policy: "blcok" },
@@ -451,7 +451,7 @@ describe("skill-ledger", () => {
 
   it("lets the environment policy override capability configuration", async () => {
     process.env.SKILL_LEDGER_MODE = "observe";
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall, logs } = registerHandlers(policyConfig("block"));
 
     const result = await beforeToolCall.handler(readSkillEvent("/skills/deny/SKILL.md"), {});
@@ -462,7 +462,7 @@ describe("skill-ledger", () => {
 
   it("invalid environment mode falls back to default ask policy", async () => {
     process.env.SKILL_LEDGER_MODE = "blcok";
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall, logs } = registerHandlers(policyConfig("observe"));
 
     const result = await beforeToolCall.handler(readSkillEvent("/skills/deny/SKILL.md"), {});
@@ -477,7 +477,7 @@ describe("skill-ledger", () => {
 
   it("maps deny in the environment mode to block", async () => {
     process.env.SKILL_LEDGER_MODE = "deny";
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall } = registerHandlers(policyConfig("observe"));
 
     const result = await beforeToolCall.handler(readSkillEvent("/skills/deny/SKILL.md"), {});
@@ -487,7 +487,7 @@ describe("skill-ledger", () => {
   });
 
   it("block policy hard-blocks with the summary message", async () => {
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall } = registerHandlers(policyConfig("block"));
 
     const result = await beforeToolCall.handler(
@@ -532,7 +532,7 @@ describe("skill-ledger", () => {
   }
 
   it("maps legacy enableBlock=true to block policy", async () => {
-    mockSkillLedgerStatus("deny", 1);
+    mockSkillLedgerStatus("deny");
     const { beforeToolCall } = registerHandlers(legacyEnableBlockConfig(true));
 
     const result = await beforeToolCall.handler(readSkillEvent("/skills/deny/SKILL.md"), {});
@@ -540,4 +540,29 @@ describe("skill-ledger", () => {
     assert.equal(result?.block, true);
     assert.match(result?.blockReason, /summary message for deny/);
   });
+  for (const [value, exitCode] of [
+    [{ status: "error", error: "private failure" }, 1],
+    [{ status: "error", error: "private failure" }, 0],
+    [{ latestStatus: "pass", message: null }, 1],
+    [{ latestStatus: "deny" }, 0],
+    [{ latestStatus: "mystery", message: "private failure" }, 0],
+    [{ latestStatus: "pass", message: 7 }, 0],
+    [null, 0], [[], 0],
+  ] as const) {
+    it(`diagnoses invalid show result ${JSON.stringify(value)} / ${exitCode}`, async () => {
+      mockSkillLedgerCheck({ exitCode, stdout: JSON.stringify(value), stderr: "private failure" });
+      const { beforeToolCall, logs } = registerHandlers(policyConfig("block"));
+      assert.equal(await beforeToolCall.handler(readSkillEvent(), {}), undefined);
+      assert.ok(logs.some((log) => log.includes("[WARN] [skill-ledger]")));
+      assert.ok(logs.every((log) => !log.includes("private failure")));
+    });
+  }
+
+  it("retains unmanaged show results without treating them as malformed", async () => {
+    mockSkillLedgerCheck({ exitCode: 0, stdout: JSON.stringify({ managed: false, latestStatus: "unmanaged", message: null }), stderr: "" });
+    const { beforeToolCall, logs } = registerHandlers(policyConfig("block"));
+    assert.equal(await beforeToolCall.handler(readSkillEvent(), {}), undefined);
+    assert.deepEqual(logs, []);
+  });
+
 });

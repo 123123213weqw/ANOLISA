@@ -422,15 +422,30 @@ def main() -> None:
                 text=True,
                 timeout=TIMEOUT,
             )
-        except Exception:
-            continue  # fail-open on subprocess error
+        except Exception as exc:
+            print(f"[skill-ledger] check failed: {type(exc).__name__}", file=sys.stderr)
+            continue
 
         try:
             check_result = json.loads(proc.stdout)
         except (json.JSONDecodeError, ValueError):
-            continue  # fail-open on parse error
+            print("[skill-ledger] invalid check JSON", file=sys.stderr)
+            continue
 
-        status = check_result.get("status", "unknown")
+        if not isinstance(check_result, dict):
+            print("[skill-ledger] invalid check response", file=sys.stderr)
+            continue
+        status = check_result.get("status")
+        if (
+            not isinstance(status, str)
+            or status not in _BLOCK_STATUSES | {"pass"}
+            or proc.returncode not in (0, 1)
+            or (proc.returncode != 0 and status == "pass")
+        ):
+            print(
+                "[skill-ledger] check did not produce a valid verdict", file=sys.stderr
+            )
+            continue
         if status in _BLOCK_STATUSES:
             failed.append((skill_name, status))
 

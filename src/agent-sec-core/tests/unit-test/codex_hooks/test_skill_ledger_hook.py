@@ -1023,3 +1023,54 @@ class TestBlockStatuses:
         skill_ledger_hook.main()
         out = capsys.readouterr().out
         assert out.strip() == ""
+
+
+@pytest.mark.parametrize(
+    "payload,exit_code,blocked",
+    [
+        ({"status": "deny"}, 1, True),
+        ({"status": "tampered"}, 1, True),
+        ({"status": "pass"}, 1, False),
+        ({"status": "error", "error": "private failure"}, 1, False),
+        ({"status": "deny"}, 2, False),
+        ({"status": []}, 0, False),
+        (None, 0, False),
+        ([], 0, False),
+    ],
+)
+def test_check_risk_exit_differs_from_execution_failure(
+    tmp_path, monkeypatch, capsys, payload, exit_code, blocked
+):
+    codex_home = tmp_path / ".codex"
+    _make_skill_dir(codex_home / "skills", "example")
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(skill_ledger_hook, "_ensure_keys", lambda *_args: True)
+    monkeypatch.setattr(skill_ledger_hook, "MODE", "block")
+    monkeypatch.setattr(
+        skill_ledger_hook.sys,
+        "stdin",
+        io.StringIO(
+            json.dumps(
+                {
+                    "hook_event_name": "UserPromptSubmit",
+                    "prompt": "$example",
+                    "cwd": str(tmp_path),
+                }
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        skill_ledger_hook.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args, exit_code, json.dumps(payload), "private failure"
+        ),
+    )
+    skill_ledger_hook.main()
+    output = capsys.readouterr()
+    if blocked:
+        assert json.loads(output.out)["decision"] == "block"
+    else:
+        assert not output.out.strip()
+        assert "skill-ledger" in output.err
+    assert "private failure" not in output.err

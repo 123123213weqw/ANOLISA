@@ -941,3 +941,14 @@ def test_show_process_exception_is_fail_open(monkeypatch):
     )
 
     assert skill_ledger_hook._show_skill(Path("/skill"), _event(), "test-skill") is None
+
+
+def test_error_payload_cannot_hide_behind_unmanaged(monkeypatch, capsys):
+    summary = {"managed": False, "status": "error", "error": "private failure"}
+    assert (
+        skill_ledger_hook._format_qwen(summary, "example", "block", _event())
+        == skill_ledger_hook._noop()
+    )
+    diagnostic = capsys.readouterr().err
+    assert '"code":"show_failed"' in diagnostic
+    assert "private failure" not in diagnostic

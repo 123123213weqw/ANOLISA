@@ -350,7 +350,23 @@ def _ensure_keys(input_data: dict[str, Any]) -> bool:
 
 def _format_cosh(summary: dict, skill_name: str, policy: str) -> str:
     """Convert an exposure summary into a cosh HookOutput JSON string."""
-    message = summary.get("message")
+    if not isinstance(summary, dict) or summary.get("status") == "error":
+        _debug("invalid show response")
+        return _allow()
+    if summary.get("managed") is False:
+        return _allow()
+    status = summary.get("latestStatus")
+    if (
+        summary.get("managed") is not None
+        and summary["managed"] is not True
+        or not isinstance(status, str)
+        or status not in {"pass", "none", "drifted", "warn", "deny", "tampered"}
+        or "message" not in summary
+        or (summary["message"] is not None and not isinstance(summary["message"], str))
+    ):
+        _debug("invalid show summary")
+        return _allow()
+    message = summary["message"]
     if not isinstance(message, str) or not message.strip():
         return _allow()
 
@@ -462,13 +478,18 @@ def main() -> None:
         print(_allow())
         return
 
+    if proc.returncode != 0:
+        _debug(f"show failed: exit {proc.returncode}")
+        print(_allow())
+        return
+
     # 6. Parse exposure summary and format output
     try:
         exposure_summary = json.loads(proc.stdout)
     except (json.JSONDecodeError, ValueError):
         _debug(
-            "skill='{}' invalid CLI JSON, exit_code={}, stderr={!r}".format(
-                skill_name, proc.returncode, proc.stderr
+            "skill='{}' invalid CLI JSON, exit_code={}".format(
+                skill_name, proc.returncode
             )
         )
         print(_allow())

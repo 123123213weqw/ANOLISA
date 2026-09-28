@@ -196,25 +196,29 @@ export const skillLedger: SecurityCapability = {
             { timeout: DEFAULT_TIMEOUT_MS, traceContext },
           );
 
-          // Parse JSON output. CLI may return exit code 1 for errors, but show
-          // normally returns a JSON summary with message/null semantics.
+          if (result.exitCode !== 0) {
+            logDiagnostic(api, cfg, `show failed: exit ${result.exitCode}`);
+            return undefined;
+          }
           let summary: ExposureSummary;
           try {
             summary = JSON.parse(result.stdout) as ExposureSummary;
           } catch {
-            if (result.exitCode !== 0) {
-              logDiagnostic(
-                api,
-                cfg,
-                `CLI error (exit ${result.exitCode}): ${result.stderr}`,
-              );
-            } else {
-              logDiagnostic(
-                api,
-                cfg,
-                `failed to parse CLI output: ${result.stdout}`,
-              );
-            }
+            logDiagnostic(api, cfg, "invalid show JSON");
+            return undefined;
+          }
+          if (!summary || typeof summary !== "object" || Array.isArray(summary) || summary.status === "error") {
+            logDiagnostic(api, cfg, "invalid show response");
+            return undefined;
+          }
+          if (summary.managed === false) return undefined;
+          if (
+            (summary.managed !== undefined && summary.managed !== true) ||
+            !["pass", "none", "drifted", "warn", "deny", "tampered"].includes(summary.latestStatus) ||
+            !("message" in summary) ||
+            (summary.message !== null && typeof summary.message !== "string")
+          ) {
+            logDiagnostic(api, cfg, "invalid show summary");
             return undefined;
           }
 
@@ -248,9 +252,9 @@ export const skillLedger: SecurityCapability = {
           // For warn/error/unknown states, log and allow. Fail-open behavior for
           // CLI/runtime failures remains handled by the catch/parse branches.
           return undefined;
-        } catch (err) {
+        } catch {
           // Fail-open: uncaught errors must never block tool calls
-          logDiagnostic(api, cfg, `error: ${err}`);
+          logDiagnostic(api, cfg, "Skill check failed before a valid response");
           return undefined;
         }
       },

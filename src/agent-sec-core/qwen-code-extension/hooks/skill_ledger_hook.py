@@ -630,6 +630,9 @@ def _format_qwen(
     # ``skill-ledger show`` marks only unmanaged results explicitly. Managed
     # results omit the field, while accepting ``True`` keeps the hook compatible
     # with callers that already provide an explicit marker.
+    if summary.get("status") == "error":
+        _diagnostic("show_failed", input_data, skill_name=skill_name)
+        return _noop()
     managed = summary.get("managed")
     if managed is False:
         _diagnostic("unmanaged", input_data, skill_name=skill_name)

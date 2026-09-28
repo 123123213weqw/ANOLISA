@@ -927,7 +927,9 @@ def test_invalid_mode_reports_ask_fallback(monkeypatch, capsys):
 def test_raw_user_skill_reaches_block_policy(
     mock_cli_env, tmp_path, data_home, with_context
 ):
-    env = mock_cli_env["make_env"](json.dumps({"message": "raw skill denied"}))
+    env = mock_cli_env["make_env"](
+        json.dumps({"latestStatus": "deny", "message": "raw skill denied"})
+    )
     home = tmp_path / "home"
     root = tmp_path / "XDG Data" if data_home == "absolute" else home / ".local/share"
     skill = root / "anolisa/skills/raw-probe"
@@ -948,3 +950,29 @@ def test_raw_user_skill_reaches_block_policy(
     )
     assert output["decision"] == "block"
     assert "raw skill denied" in output["reason"]
+
+
+@pytest.mark.parametrize(
+    "payload,exit_code",
+    [
+        ({"status": "error", "error": "private failure"}, 1),
+        ({"status": "error", "error": "private failure"}, 0),
+        ({"latestStatus": "pass", "message": None}, 1),
+        ({"latestStatus": "deny"}, 0),
+        ({"latestStatus": "mystery", "message": "private failure"}, 0),
+        ({"latestStatus": "pass", "message": 7}, 0),
+        (None, 0),
+        ([], 0),
+    ],
+)
+def test_failed_show_is_diagnostic_not_a_clean_result(mock_cli_env, payload, exit_code):
+    env = mock_cli_env["make_env"](json.dumps(payload), rc=exit_code)
+    env["SKILL_LEDGER_MODE"] = "block"
+    output, diagnostic = _run_hook(
+        _make_skill_event("test-skill", mock_cli_env["cwd"]),
+        env_override=env,
+        return_stderr=True,
+    )
+    assert output == {"decision": "allow"}
+    assert "skill-ledger" in diagnostic
+    assert "private failure" not in diagnostic
