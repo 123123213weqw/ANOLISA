@@ -337,10 +337,16 @@ fn classify_event(source: &Path, path: &Path, kind: notify::EventKind) -> Option
             EventKind::Remove(_) => Some(SkillEvent::Deleted(path.to_path_buf())),
             _ => None,
         }
-    } else if is_immediate_child && path.is_dir() {
+    } else if is_immediate_child {
         match kind {
-            EventKind::Create(_) => Some(SkillEvent::DirCreated(path.to_path_buf())),
-            EventKind::Remove(_) => Some(SkillEvent::DirDeleted(path.to_path_buf())),
+            EventKind::Create(_) if path.is_dir() => {
+                Some(SkillEvent::DirCreated(path.to_path_buf()))
+            }
+            // Removed paths no longer exist. Use the event's original object
+            // kind instead of inspecting the filesystem after deletion.
+            EventKind::Remove(notify::event::RemoveKind::Folder) => {
+                Some(SkillEvent::DirDeleted(path.to_path_buf()))
+            }
             _ => None,
         }
     } else {
@@ -351,6 +357,60 @@ fn classify_event(source: &Path, path: &Path, kind: notify::EventKind) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn removed_immediate_directory_is_classified_without_restat() {
+        let source = tempfile::tempdir().expect("source directory");
+        let child = source.path().join("alpha");
+        std::fs::create_dir(&child).expect("skill directory");
+        std::fs::remove_dir(&child).expect("remove skill directory");
+
+        let event = classify_event(
+            source.path(),
+            &child,
+            notify::EventKind::Remove(notify::event::RemoveKind::Folder),
+        );
+        assert!(matches!(event, Some(SkillEvent::DirDeleted(path)) if path == child));
+    }
+
+    #[test]
+    fn removed_files_and_unknown_objects_are_not_directory_events() {
+        let source = tempfile::tempdir().expect("source directory");
+        let file = source.path().join("README.md");
+        std::fs::write(&file, "readme").expect("top-level file");
+        std::fs::remove_file(&file).expect("remove top-level file");
+
+        for kind in [
+            notify::event::RemoveKind::File,
+            notify::event::RemoveKind::Any,
+            notify::event::RemoveKind::Other,
+        ] {
+            assert!(
+                classify_event(source.path(), &file, notify::EventKind::Remove(kind)).is_none(),
+                "{kind:?} must not be attributed as a removed directory"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_removal_outside_immediate_children_is_ignored() {
+        let source = tempfile::tempdir().expect("source directory");
+        let nested = source.path().join("alpha/scripts");
+        std::fs::create_dir_all(&nested).expect("nested directory");
+        std::fs::remove_dir(&nested).expect("remove nested directory");
+
+        for path in [nested.as_path(), source.path(), Path::new("/outside/alpha")] {
+            assert!(
+                classify_event(
+                    source.path(),
+                    path,
+                    notify::EventKind::Remove(notify::event::RemoveKind::Folder),
+                )
+                .is_none(),
+                "directory deletion must stay within the immediate-child scope"
+            );
+        }
+    }
 
     /// Missing source paths must surface as `PathNotFound` synchronously,
     /// before any background watcher task is spawned. Predates W1 but pinned

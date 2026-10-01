@@ -7,7 +7,28 @@ use std::time::Duration;
 
 use tempfile::tempdir;
 
-use skillfs_core::watcher::{SkillEvent, watch_source};
+use skillfs_core::watcher::{SkillEvent, watch_source, watch_source_with_handle};
+
+#[tokio::test]
+#[ignore = "flaky in CI - filesystem events may not fire reliably"]
+async fn test_watcher_detects_directory_deletion() {
+    let source_dir = tempdir().expect("source directory");
+    let source = source_dir.path().to_path_buf();
+    let skill_dir = source.join("to-delete");
+    std::fs::create_dir(&skill_dir).expect("skill directory");
+
+    let (mut rx, handle) = watch_source_with_handle(source, 50)
+        .await
+        .expect("watcher must be attached before deleting the directory");
+    std::fs::remove_dir(&skill_dir).expect("remove skill directory");
+
+    let event = tokio::time::timeout(Duration::from_secs(3), rx.recv()).await;
+    handle.shutdown().await;
+    assert!(
+        matches!(event, Ok(Some(SkillEvent::DirDeleted(path))) if path == skill_dir),
+        "directory deletion must emit a directory-level event"
+    );
+}
 
 #[tokio::test]
 #[ignore = "flaky in CI - filesystem events may not fire reliably"]
