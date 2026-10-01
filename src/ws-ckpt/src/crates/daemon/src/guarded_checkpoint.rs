@@ -4,6 +4,7 @@ use std::path::{Component, Path};
 use std::sync::Arc;
 
 use sha2::{Digest, Sha256};
+use ws_ckpt_common::backend::DiffError;
 use ws_ckpt_common::{
     validate_checkpoint_id_v2, validate_workspace_id_v2, ErrorCode, GuardedCheckpointEvidenceV2,
     GuardedCheckpointOutcomeV2, GuardedCheckpointRejectionCodeV2, GuardedRollbackEvidenceV2,
@@ -382,10 +383,7 @@ pub(crate) async fn rollback_preview(
     let changes = match state.backend.diff(ws_id, target_snapshot_id, None).await {
         Ok(changes) => changes,
         Err(error) => {
-            return rollback_rejected(
-                GuardedRollbackRejectionCodeV2::DaemonNotReady,
-                format!("failed to compute guarded rollback preview: {error:#}"),
-            )
+            return rollback_diff_rejected(error, "failed to compute guarded rollback preview")
         }
     };
     let diff_digest = rollback_diff_digest(&changes);
@@ -577,10 +575,8 @@ pub(crate) async fn rollback(
     let changes = match state.backend.diff(ws_id, target_snapshot_id, None).await {
         Ok(changes) => changes,
         Err(error) => {
-            let response = rollback_rejected(
-                GuardedRollbackRejectionCodeV2::DaemonNotReady,
-                format!("failed to recompute guarded rollback diff: {error:#}"),
-            );
+            let response =
+                rollback_diff_rejected(error, "failed to recompute guarded rollback diff");
             return abort_reserved_rollback(state, &mut workspace, operation_id, response).await;
         }
     };
@@ -937,6 +933,16 @@ fn rollback_workspace_not_found(workspace: &str) -> Response {
         GuardedRollbackRejectionCodeV2::WorkspaceNotFound,
         format!("workspace is not registered: {workspace}"),
     )
+}
+
+fn rollback_diff_rejected(error: anyhow::Error, context: &str) -> Response {
+    let code = match error.downcast_ref::<DiffError>() {
+        Some(DiffError::UnsupportedWorkspacePath { .. }) => {
+            GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath
+        }
+        None => GuardedRollbackRejectionCodeV2::DaemonNotReady,
+    };
+    rollback_rejected(code, format!("{context}: {error:#}"))
 }
 
 fn rollback_rejected(code: GuardedRollbackRejectionCodeV2, message: impl Into<String>) -> Response {

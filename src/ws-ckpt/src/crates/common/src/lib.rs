@@ -424,6 +424,8 @@ pub enum ErrorCode {
     DiskSpaceInsufficient,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; fix the filename before retrying.
+    UnsupportedWorkspacePath,
 }
 
 /// Opaque identity for one live writable-subvolume generation of a workspace.
@@ -560,6 +562,8 @@ pub enum GuardedRollbackRejectionCodeV2 {
     EvidenceCapacityReached,
     CwdOccupied,
     CwdScanFailed,
+    /// A diff path cannot be represented as UTF-8; unchanged input must not be retried.
+    UnsupportedWorkspacePath,
 }
 
 /// Validates the canonical `ws-xxxxxx` identifier and optional `-N` collision suffix.
@@ -1928,6 +1932,7 @@ mod tests {
             ErrorCode::DiskSpaceInsufficient,
             ErrorCode::CwdOccupied,
             ErrorCode::CwdScanFailed,
+            ErrorCode::UnsupportedWorkspacePath,
         ];
         for code in codes {
             let resp = Response::Error {
@@ -3639,6 +3644,10 @@ mod tests {
             bincode::serialize(&ErrorCode::CwdScanFailed).unwrap(),
             12_u32.to_le_bytes()
         );
+        assert_eq!(
+            bincode::serialize(&ErrorCode::UnsupportedWorkspacePath).unwrap(),
+            13_u32.to_le_bytes()
+        );
     }
 
     #[test]
@@ -3700,11 +3709,19 @@ mod tests {
             GuardedRollbackRejectionCodeV2::EvidenceCapacityReached,
             GuardedRollbackRejectionCodeV2::CwdOccupied,
             GuardedRollbackRejectionCodeV2::CwdScanFailed,
+            GuardedRollbackRejectionCodeV2::UnsupportedWorkspacePath,
         ];
-        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=15) {
+        for (code, expected_discriminant) in rollback_rejections.iter().zip(0_u32..=16) {
             assert_eq!(
                 bincode::serialize(code).unwrap(),
                 expected_discriminant.to_le_bytes()
+            );
+            assert_eq!(
+                bincode::deserialize::<GuardedRollbackRejectionCodeV2>(
+                    &expected_discriminant.to_le_bytes()
+                )
+                .unwrap(),
+                *code
             );
         }
     }

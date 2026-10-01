@@ -380,6 +380,26 @@ class TestHandlers:
         result = json.loads(handle_ws_ckpt_diff({"from": "a", "to": "b"}))
         assert result["success"] is True
 
+    @pytest.mark.parametrize("handler,args", [
+        (handle_ws_ckpt_diff, {"from": "snap1"}),
+        (handle_ws_ckpt_rollback, {"target": "snap1", "preview": True}),
+    ])
+    def test_diff_path_encoding_error_reaches_agent(self, handler, args):
+        diagnostic = (
+            r'Error [UnsupportedWorkspacePath]: mkfile path cannot be represented as UTF-8: '
+            r'"./snap/bad\\377"'
+        )
+        with (
+            patch("hermes.tools._require_workspace", return_value=("/ws", None)),
+            patch("hermes.tools._resolve_workspace", return_value=("/ws", None)),
+            patch("hermes.tools.subprocess.run") as mock_run,
+        ):
+            mock_run.return_value = MagicMock(returncode=1, stdout="", stderr=diagnostic)
+            result = json.loads(handler(args))
+        assert result["success"] is False
+        assert "NOT retryable until the filename is fixed" in result["error"]
+        assert diagnostic in result["error"]
+
     @patch("hermes.tools._run_ws_ckpt_cmd", return_value=(True, "deleted"))
     @patch("hermes.tools._resolve_workspace", return_value=("/ws", None))
     def test_delete_success(self, _ws, _cmd):

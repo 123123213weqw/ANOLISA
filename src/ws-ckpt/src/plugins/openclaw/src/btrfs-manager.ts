@@ -22,6 +22,14 @@ import type {
  * These messages are designed to be understood by AI agents.
  */
 export function mapErrorToLLMMessage(stderr: string, context?: { id?: string }): string {
+  // A filename may itself contain words such as "active write" or "not found".
+  if (stderr.includes('cannot be represented as UTF-8')) {
+    const diagnostic = stderr.replace(/\x1b\[[0-9;]*m/g, '').trim();
+    return 'A workspace path cannot be represented as UTF-8. ' +
+      'This is NOT retryable until the filename is fixed. ' +
+      'Use a valid UTF-8 name for the affected file or directory. ' +
+      'The operation and escaped path token are shown in this diagnostic:\n' + diagnostic;
+  }
   if (stderr.includes('already exists')) {
     return `Snapshot ID '${context?.id ?? 'unknown'}' already exists in this workspace. Use a different ID.`;
   }

@@ -45,6 +45,21 @@ pub enum SnapshotDeleteOutcome {
     Failed(String),
 }
 
+/// Deterministic diff failures that callers must distinguish from backend unavailability.
+#[derive(Debug, thiserror::Error)]
+pub enum DiffError {
+    /// A path cannot be represented without losing filename bytes.
+    #[error("{operation} {field} cannot be represented as UTF-8: {token:?}")]
+    UnsupportedWorkspacePath {
+        /// Dump operation containing the path.
+        operation: &'static str,
+        /// Path slot within the operation, such as source or destination.
+        field: &'static str,
+        /// Original escaped token, preserved for diagnosis without lossy decoding.
+        token: String,
+    },
+}
+
 /// GC result (generation cleanup)
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct GcResult {
@@ -123,6 +138,8 @@ pub trait StorageBackend: Send + Sync {
     ) -> anyhow::Result<Vec<String>>;
 
     /// Compute diff between two snapshots, or between a snapshot and the live workspace.
+    /// Returns [`DiffError::UnsupportedWorkspacePath`] when a diff path cannot be
+    /// represented as UTF-8; retrying without correcting the path cannot succeed.
     async fn diff(
         &self,
         ws_id: &str,

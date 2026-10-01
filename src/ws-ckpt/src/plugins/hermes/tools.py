@@ -25,6 +25,7 @@ from .checkpoint_manager import (
     cwd_inside_workspace,
     cwd_inside_workspace_reason,
     get_manager,
+    map_error_to_message,
 )
 
 
@@ -712,7 +713,7 @@ def handle_ws_ckpt_rollback(args: Dict[str, Any], **_kwargs) -> str:
     success, output = _run_ws_ckpt_cmd(cmd)
     if success and not preview:
         get_manager().skip_next_auto_checkpoint = True
-    return _ok(output) if success else _err(output)
+    return _ok(output) if success else _err(map_error_to_message(output))
 
 
 def handle_ws_ckpt_list(args: Dict[str, Any], **_kwargs) -> str:
@@ -739,7 +740,7 @@ def handle_ws_ckpt_diff(args: Dict[str, Any], **_kwargs) -> str:
     if to_id:
         cmd.extend(["--to", to_id])
     success, output = _run_ws_ckpt_cmd(cmd)
-    return _ok(output) if success else _err(output)
+    return _ok(output) if success else _err(map_error_to_message(output))
 
 
 def handle_ws_ckpt_delete(args: Dict[str, Any], **_kwargs) -> str:
