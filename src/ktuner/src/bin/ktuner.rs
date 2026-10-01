@@ -218,7 +218,26 @@ fn cmd_fix(param: &str) -> Result<i32> {
 
 fn cmd_why(param: &str) -> Result<i32> {
     let (_, eval) = gather()?;
-    let normalized = param.replace('/', ".").to_lowercase();
+    let (output, code) = why_with(param, &eval, |path| {
+        std::path::Path::new(path)
+            .exists()
+            .then(|| std::fs::read_to_string(path).unwrap_or_default())
+    })?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(code)
+}
+
+fn why_with(
+    param: &str,
+    eval: &rules::EvalResult,
+    read_current: impl FnOnce(&str) -> Option<String>,
+) -> Result<(serde_json::Value, i32)> {
+    // sysfs names are filesystem identities, while sysctl names accept aliases.
+    let normalized = if param.starts_with("block/") || param.starts_with("transparent_hugepage/") {
+        param.to_string()
+    } else {
+        param.replace('/', ".").to_lowercase()
+    };
     if let Some(rec) = eval
         .recommendations
         .iter()
@@ -234,15 +253,12 @@ fn cmd_why(param: &str) -> Result<i32> {
             "subcategory": category::param_subcategory(&rec.param),
             "writable": rec.writable,
         });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(1);
+        return Ok((output, 1));
     }
     let path = tuner::param_to_path(&normalized);
-    if std::path::Path::new(&path).exists() {
-        let val = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(val) = read_current(&path) {
         let output = json!({ "param": normalized, "current": val.trim(), "status": "optimal" });
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(0);
+        return Ok((output, 0));
     }
     anyhow::bail!("parameter not found: {param}")
 }
