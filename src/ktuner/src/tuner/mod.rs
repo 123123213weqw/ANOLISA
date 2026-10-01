@@ -499,16 +499,35 @@ fn save_rollback(recommendations: &[Recommendation]) -> Result<()> {
 }
 
 /// Merge `(param, previous, applied)` entries into a cumulative rollback record.
-/// For a param already recorded, keep the ORIGINAL `previous` (the true
+/// For a kernel path already recorded, keep the ORIGINAL `previous` (the true
 /// pre-ktuner value) so rollback always restores pristine state even across
 /// multiple tune/fix/import runs; only refresh `applied`. New params are added.
 /// Pure (no I/O) so the keep-original-previous invariant is unit-testable.
+///
+/// Known limitation: alias matching only prevents NEW duplicates. A ledger
+/// written before this fix may already hold two spellings of one kernel path
+/// (e.g. `vm.swappiness` from tune and `vm/swappiness` from import); both are
+/// kept, a new alias updates whichever is found first, and rollback restores
+/// both to the same path in key order, so the slashed entry (`'/'` sorts after
+/// `'.'`) writes last and may restore an intermediate value. Healing such
+/// ledgers at merge time is left to a follow-up.
 fn merge_entries<I>(mut data: RollbackData, entries: I) -> RollbackData
 where
     I: IntoIterator<Item = (String, String, String)>,
 {
     for (param, previous, applied) in entries {
         let path = param_to_path(&param);
+        let identity = canonicalize_path(&path);
+        // Equivalent spellings must share the first rollback record, or a
+        // later alias would restore an intermediate value over the original.
+        if let Some(entry) = data
+            .entries
+            .values_mut()
+            .find(|entry| canonicalize_path(&entry.path) == identity)
+        {
+            entry.applied = applied;
+            continue;
+        }
         data.entries
             .entry(param)
             .and_modify(|e| e.applied = applied.clone())
@@ -765,14 +784,7 @@ pub fn rollback_quiet() -> Result<RollbackOutcome> {
     rollback_inner(true)
 }
 
-fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
-    if !Path::new(ROLLBACK_PATH).exists() {
-        anyhow::bail!("没有找到 rollback 文件 ({ROLLBACK_PATH})，可能尚未执行过 tune");
-    }
-
-    let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
-    let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
-
+fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
     let mut restored = 0;
     let mut failed = 0;
     let mut skipped = 0;
@@ -806,6 +818,26 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
             skipped += 1;
         }
     }
+
+    RollbackOutcome {
+        restored,
+        failed,
+        skipped,
+    }
+}
+
+fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
+    if !Path::new(ROLLBACK_PATH).exists() {
+        anyhow::bail!("没有找到 rollback 文件 ({ROLLBACK_PATH})，可能尚未执行过 tune");
+    }
+
+    let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
+    let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
+    let RollbackOutcome {
+        restored,
+        failed,
+        skipped,
+    } = restore_entries(&data, quiet);
 
     if rollback_should_finalize(failed, skipped) {
         if Path::new(SYSCTL_PERSIST_PATH).exists() {
@@ -1216,6 +1248,185 @@ mod tests {
         assert!(!rollback_should_finalize(1, 0)); // a write failed
         assert!(!rollback_should_finalize(0, 1)); // a path was absent — the missed case
         assert!(!rollback_should_finalize(2, 3));
+    }
+
+    #[test]
+    fn test_merge_aliases_keep_one_pristine_rollback_entry() {
+        for (first, second) in [
+            ("vm.swappiness", "vm/swappiness"),
+            ("vm/swappiness", "vm.swappiness"),
+            ("net.ipv4.tcp_fastopen", "net/ipv4/tcp_fastopen"),
+        ] {
+            for param in [first, second] {
+                assert!(is_safe_param(param));
+                assert!(!is_forbidden_param(param));
+            }
+            let data = RollbackData {
+                version: 1,
+                entries: BTreeMap::new(),
+            };
+            let data = merge_entries(
+                data,
+                [(first.to_string(), "10".to_string(), "20".to_string())],
+            );
+            let data = merge_entries(
+                data,
+                [(second.to_string(), "20".to_string(), "30".to_string())],
+            );
+            assert_eq!(data.entries.len(), 1, "aliases {first} / {second}");
+            let entry = &data.entries[first];
+            assert_eq!(entry.previous, "10", "pristine value for {first}");
+            assert_eq!(entry.applied, "30", "latest value for {second}");
+            assert_eq!(canonicalize_path(&entry.path), param_to_path(first));
+        }
+    }
+
+    #[test]
+    fn test_merge_alias_preserves_single_existing_ledger_entry() {
+        let data: RollbackData = serde_json::from_str(
+            r#"{"version":1,"entries":{"vm/swappiness":{
+                "previous":"10","applied":"20","path":"/proc/sys/vm/swappiness"
+            }}}"#,
+        )
+        .unwrap();
+        let data = merge_entries(
+            data,
+            [(
+                "vm.swappiness".to_string(),
+                "20".to_string(),
+                "30".to_string(),
+            )],
+        );
+        assert_eq!(data.entries.len(), 1);
+        let entry = &data.entries["vm/swappiness"];
+        assert_eq!(entry.previous, "10");
+        assert_eq!(entry.applied, "30");
+        assert_eq!(entry.path, "/proc/sys/vm/swappiness");
+    }
+
+    #[test]
+    fn test_merge_keeps_distinct_kernel_paths_separate() {
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [
+                (
+                    "vm.swappiness".to_string(),
+                    "10".to_string(),
+                    "20".to_string(),
+                ),
+                (
+                    "vm.swappiness_extra".to_string(),
+                    "40".to_string(),
+                    "50".to_string(),
+                ),
+            ],
+        );
+        assert_eq!(data.entries.len(), 2);
+        assert_eq!(data.entries["vm.swappiness"].previous, "10");
+        assert_eq!(data.entries["vm.swappiness_extra"].previous, "40");
+    }
+
+    #[test]
+    fn test_merge_sysfs_aliases_share_a_rollback_entry() {
+        for (first, second) in [
+            ("block/sda/scheduler", "block/sda//scheduler"),
+            (
+                "transparent_hugepage/enabled",
+                "transparent_hugepage//enabled",
+            ),
+        ] {
+            let data = RollbackData {
+                version: 1,
+                entries: BTreeMap::new(),
+            };
+            let data = merge_entries(
+                data,
+                [(
+                    first.to_string(),
+                    "before".to_string(),
+                    "middle".to_string(),
+                )],
+            );
+            let data = merge_entries(
+                data,
+                [(
+                    second.to_string(),
+                    "middle".to_string(),
+                    "after".to_string(),
+                )],
+            );
+            assert_eq!(data.entries.len(), 1, "aliases {first} / {second}");
+            assert_eq!(data.entries[first].previous, "before");
+            assert_eq!(data.entries[first].applied, "after");
+        }
+    }
+
+    #[test]
+    fn test_rollback_aliases_restore_pristine_value_once() {
+        let dir = AtomicTestDir::new("rollback_alias");
+        let path = dir.0.join("swappiness");
+        fs::write(&path, "10").unwrap();
+        let mut data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        for (param, applied) in [("vm.swappiness", "20"), ("vm/swappiness", "30")] {
+            let previous = fs::read_to_string(&path).unwrap();
+            fs::write(&path, applied).unwrap();
+            data = merge_entries(data, [(param.to_string(), previous, applied.to_string())]);
+        }
+        assert_eq!(fs::read_to_string(&path).unwrap(), "30");
+        // Run the production restore loop against a temporary parameter file;
+        // no /proc/sys writes or system-wide rollback cleanup are needed.
+        for entry in data.entries.values_mut() {
+            entry.path = path.to_str().unwrap().to_string();
+        }
+        let outcome = restore_entries(&data, true);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "10");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 0);
+    }
+
+    #[test]
+    fn test_restore_entries_preserves_guards_and_outcome_counts() {
+        let dir = AtomicTestDir::new("rollback_outcome");
+        let allowed = dir.0.join("allowed");
+        let forbidden = dir.0.join("forbidden");
+        fs::write(&allowed, "20").unwrap();
+        fs::write(&forbidden, "unchanged").unwrap();
+        let mut entries = BTreeMap::new();
+        for (param, path) in [
+            ("vm.swappiness", allowed.clone()),
+            ("kernel.core_pattern", forbidden.clone()),
+            ("vm.dirty_ratio", dir.0.clone()),
+            ("vm.dirty_background_ratio", dir.0.join("missing")),
+        ] {
+            entries.insert(
+                param.to_string(),
+                RollbackEntry {
+                    previous: "10".to_string(),
+                    applied: "20".to_string(),
+                    path: path.to_str().unwrap().to_string(),
+                },
+            );
+        }
+        let outcome = restore_entries(
+            &RollbackData {
+                version: 1,
+                entries,
+            },
+            true,
+        );
+        assert_eq!(fs::read_to_string(allowed).unwrap(), "10");
+        assert_eq!(fs::read_to_string(forbidden).unwrap(), "unchanged");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.failed, 2);
+        assert_eq!(outcome.skipped, 1);
     }
 
     #[test]
