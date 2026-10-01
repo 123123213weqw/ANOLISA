@@ -296,3 +296,170 @@ fn rec_json(r: &Recommendation) -> serde_json::Value {
         "category": format!("{:?}", r.category).to_lowercase(),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    struct CurrentFile(PathBuf);
+
+    impl CurrentFile {
+        fn new(value: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner-why-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(value.as_bytes()).unwrap();
+            Self(path)
+        }
+
+        fn read_for(&self, actual_path: &str, expected_path: &str) -> Option<String> {
+            (actual_path == expected_path).then(|| std::fs::read_to_string(&self.0).unwrap())
+        }
+    }
+
+    impl Drop for CurrentFile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    fn evaluation(recommendations: Vec<Recommendation>) -> rules::EvalResult {
+        rules::EvalResult {
+            recommendations,
+            total_checked: 1,
+        }
+    }
+
+    #[test]
+    fn why_reads_sysfs_fallback_without_rewriting_identity() {
+        let eval = evaluation(Vec::new());
+        for (param, path, value) in [
+            (
+                "transparent_hugepage/enabled",
+                "/sys/kernel/mm/transparent_hugepage/enabled",
+                "always [madvise] never\n",
+            ),
+            (
+                "transparent_hugepage/defrag",
+                "/sys/kernel/mm/transparent_hugepage/defrag",
+                "always defer defer+madvise [madvise] never\n",
+            ),
+            (
+                "block/Disk.0/scheduler",
+                "/sys/block/Disk.0/queue/scheduler",
+                "[none] mq-deadline\n",
+            ),
+        ] {
+            let current = CurrentFile::new(value);
+            let (output, code) = why_with(param, &eval, |actual| current.read_for(actual, path))
+                .expect("existing sysfs parameter must be readable without a recommendation");
+            assert_eq!(code, 0);
+            assert_eq!(
+                output,
+                json!({ "param": param, "current": value.trim(), "status": "optimal" })
+            );
+        }
+    }
+
+    #[test]
+    fn why_keeps_sysctl_aliases_in_current_value_fallback() {
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("Linux\n");
+        for param in [
+            "kernel.ostype",
+            "kernel/ostype",
+            "KERNEL.OSTYPE",
+            "KERNEL/OSTYPE",
+        ] {
+            let (output, code) = why_with(param, &eval, |path| {
+                current.read_for(path, "/proc/sys/kernel/ostype")
+            })
+            .expect("sysctl spellings must resolve to the same parameter");
+            assert_eq!(code, 0);
+            assert_eq!(
+                output,
+                json!({ "param": "kernel.ostype", "current": "Linux", "status": "optimal" })
+            );
+        }
+    }
+
+    #[test]
+    fn why_keeps_recommendation_matching_and_output() {
+        for (query, param, subcategory) in [
+            (
+                "transparent_hugepage/enabled",
+                "transparent_hugepage/enabled",
+                "io",
+            ),
+            ("block/Disk.0/scheduler", "block/Disk.0/scheduler", "io"),
+            ("vm.swappiness", "vm.swappiness", "memory"),
+            ("VM/SWAPPINESS", "vm.swappiness", "memory"),
+        ] {
+            let eval = evaluation(vec![Recommendation {
+                param: param.to_string(),
+                current_value: "before".to_string(),
+                recommended_value: "after".to_string(),
+                reason: "existing reason".to_string(),
+                writable: true,
+                ..Default::default()
+            }]);
+            let (output, code) = why_with(query, &eval, |_| {
+                panic!("a recommendation must not fall through to a filesystem read")
+            })
+            .unwrap();
+            assert_eq!(code, 1);
+            assert_eq!(
+                output,
+                json!({
+                    "param": param,
+                    "current": "before",
+                    "recommended": "after",
+                    "reason": "existing reason",
+                    "confidence": "high",
+                    "category": "performance",
+                    "subcategory": subcategory,
+                    "writable": true,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn why_does_not_invent_sysfs_aliases_or_missing_parameters() {
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("[none] mq-deadline\n");
+        let thp_current = CurrentFile::new("always [madvise] never\n");
+        for param in [
+            "block/disk.0/scheduler",
+            "BLOCK/Disk.0/scheduler",
+            "block.Disk.0.scheduler",
+            "transparent_hugepage.ENABLED",
+            "transparent_hugepage/ENABLED",
+            "TRANSPARENT_HUGEPAGE/enabled",
+            "no_such_ktuner_parameter",
+        ] {
+            let error = why_with(param, &eval, |path| {
+                current
+                    .read_for(path, "/sys/block/Disk.0/queue/scheduler")
+                    .or_else(|| {
+                        thp_current.read_for(path, "/sys/kernel/mm/transparent_hugepage/enabled")
+                    })
+            })
+            .expect_err("only the exact existing sysfs spelling may be accepted");
+            assert_eq!(error.to_string(), format!("parameter not found: {param}"));
+        }
+    }
+}
