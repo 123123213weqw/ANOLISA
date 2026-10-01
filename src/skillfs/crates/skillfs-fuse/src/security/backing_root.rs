@@ -1049,8 +1049,20 @@ mod tests {
 
         let result = LedgerBackingRoot::setup(&source_canon, &backing_path, &mount_canon, false);
 
-        // Without root, bind mount fails, and the separate directory
-        // has different dev/ino -> IdentityMismatch.
+        // With mount privileges, `setup` bind-mounts the source onto the
+        // backing path itself, so the directory is no longer separate and the
+        // premise does not hold. Decide on the actual outcome, not the uid:
+        // root without CAP_SYS_ADMIN (as in many containers) still takes the
+        // identity-check fallback asserted below. Dropping `result` unmounts.
+        if let Ok(root) = &result {
+            if root.created_bind_mount() {
+                eprintln!("SKIP p1_1_identity_mismatch_rejected: setup created a bind mount");
+                return;
+            }
+        }
+
+        // Without mount privileges, bind mount fails, and the separate
+        // directory has different dev/ino -> IdentityMismatch.
         assert!(
             matches!(result, Err(BackingRootError::IdentityMismatch { .. })),
             "separate non-bind-mount directory should be rejected (identity mismatch): {result:?}"
