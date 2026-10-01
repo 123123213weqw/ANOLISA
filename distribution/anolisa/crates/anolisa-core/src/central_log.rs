@@ -22,6 +22,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
+use chrono::{DateTime, FixedOffset};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
@@ -132,8 +133,8 @@ pub struct LogFilter {
     /// compatibility with records that only carry `component` — if
     /// `component == Some(value)`.
     pub object: Option<String>,
-    /// Lexicographic lower bound on `started_at` (ISO8601 sorts
-    /// correctly for UTC).
+    /// Inclusive RFC3339 lower bound on `started_at`, compared as an instant.
+    /// Records with invalid timestamps do not match this filter.
     pub since: Option<String>,
     /// Cap the returned record count to the most recent N matches
     /// (append-only file order). Results stay chronological: oldest of
@@ -242,8 +243,8 @@ impl QueryScanHold {
 /// Errors raised by [`CentralLog`].
 #[derive(Debug, thiserror::Error)]
 pub enum CentralLogError {
-    /// Filesystem access failed while opening, locking, reading, or
-    /// writing the JSONL file.
+    /// Filesystem access failed, or the query's `since` filter is invalid.
+    /// Invalid RFC3339 filter values use [`io::ErrorKind::InvalidInput`].
     #[error("io error while accessing {path}: {source}")]
     Io {
         /// Path involved in the failed filesystem operation.
@@ -326,6 +327,9 @@ impl CentralLog {
     /// and keeps the most recent `N` matches in append-only file order
     /// (oldest of that window first). `None` returns every match;
     /// `Some(0)` is empty.
+    /// A `since` bound compares RFC3339 timestamps as instants, including
+    /// fractional seconds and offsets. Invalid record timestamps do not
+    /// match a time filter; queries without that filter still return them.
     ///
     /// A shared `flock` is held only long enough to snapshot a stable
     /// byte length so a concurrent `append` cannot publish a partial
@@ -333,6 +337,12 @@ impl CentralLog {
     /// reads only those bytes, so a tail query does not block writers
     /// for an O(file-size) deserialize. Later appends extend the file
     /// past the snapshot and are not included.
+    ///
+    /// # Errors
+    ///
+    /// An invalid `since` bound returns [`CentralLogError::Io`] with
+    /// [`io::ErrorKind::InvalidInput`], even for an empty query. Filesystem
+    /// failures return `Io`; malformed JSON records return `Serialize`.
     ///
     /// # Examples
     ///
@@ -378,6 +388,19 @@ impl CentralLog {
     /// assert_eq!(hits[1].operation_id.as_deref(), Some("op-c"));
     /// ```
     pub fn query(&self, filter: &LogFilter) -> Result<Vec<LogRecord>, CentralLogError> {
+        let since = filter
+            .since
+            .as_deref()
+            .map(|raw| {
+                DateTime::parse_from_rfc3339(raw).map_err(|error| CentralLogError::Io {
+                    path: self.path.clone(),
+                    source: io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid RFC3339 since filter '{raw}': {error}"),
+                    ),
+                })
+            })
+            .transpose()?;
         if filter.limit == Some(0) {
             return Ok(Vec::new());
         }
@@ -411,13 +434,14 @@ impl CentralLog {
                 path: self.path.clone(),
                 source,
             })?;
-        self.scan_reader(file.take(len), filter)
+        self.scan_reader(file.take(len), filter, since.as_ref())
     }
 
     fn scan_reader<R: Read>(
         &self,
         reader: R,
         filter: &LogFilter,
+        since: Option<&DateTime<FixedOffset>>,
     ) -> Result<Vec<LogRecord>, CentralLogError> {
         let reader = BufReader::new(reader);
         // Keep a sliding window so `--limit` is a tail cap. Stopping at the
@@ -433,7 +457,7 @@ impl CentralLog {
                 continue;
             }
             let record: LogRecord = serde_json::from_str(&line)?;
-            if record_matches(&record, filter) {
+            if record_matches(&record, filter, since) {
                 matches.push_back(record);
                 if let Some(limit) = filter.limit
                     && matches.len() > limit
@@ -446,7 +470,11 @@ impl CentralLog {
     }
 }
 
-fn record_matches(record: &LogRecord, filter: &LogFilter) -> bool {
+fn record_matches(
+    record: &LogRecord,
+    filter: &LogFilter,
+    since: Option<&DateTime<FixedOffset>>,
+) -> bool {
     if let Some(kind) = filter.kind
         && record.kind != kind
     {
@@ -481,8 +509,9 @@ fn record_matches(record: &LogRecord, filter: &LogFilter) -> bool {
             return false;
         }
     }
-    if let Some(since) = &filter.since
-        && record.started_at.as_str() < since.as_str()
+    if let Some(since) = since
+        && !DateTime::parse_from_rfc3339(&record.started_at)
+            .is_ok_and(|started_at| started_at >= *since)
     {
         return false;
     }
@@ -887,7 +916,7 @@ mod tests {
     }
 
     #[test]
-    fn query_since_uses_lexicographic_lower_bound() {
+    fn query_since_uses_inclusive_lower_bound() {
         let dir = tempfile::tempdir().expect("tempdir");
         let log = CentralLog::open(dir.path().join("audit.jsonl"));
         log.append(&operation_record(
@@ -913,6 +942,156 @@ mod tests {
             .expect("query");
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].operation_id.as_deref(), Some("op-new"));
+    }
+
+    #[test]
+    fn query_since_compares_fractional_instants_and_offsets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = CentralLog::open(dir.path().join("audit.jsonl"));
+        for (id, timestamp) in [
+            ("before", "2026-10-01T00:29:59Z"),
+            ("at", "2026-10-01T00:30:00Z"),
+            ("at-positive", "2026-10-01T08:30:00+08:00"),
+            ("at-negative", "2026-09-30T19:30:00-05:00"),
+            ("fraction", "2026-10-01T00:30:00.100Z"),
+            ("later-fraction", "2026-10-01T00:30:00.250Z"),
+            ("after", "2026-10-01T00:30:01Z"),
+        ] {
+            log.append(&operation_record(timestamp, id, &[], Severity::Info))
+                .expect("append");
+        }
+        for since in [
+            "2026-10-01T00:30:00Z",
+            "2026-10-01T00:30:00.000Z",
+            "2026-10-01T08:30:00+08:00",
+            "2026-09-30T19:30:00-05:00",
+        ] {
+            let hits = log
+                .query(&LogFilter {
+                    since: Some(since.to_string()),
+                    ..Default::default()
+                })
+                .expect("query");
+            let ids: Vec<_> = hits
+                .iter()
+                .filter_map(|r| r.operation_id.as_deref())
+                .collect();
+            assert_eq!(
+                ids,
+                [
+                    "at",
+                    "at-positive",
+                    "at-negative",
+                    "fraction",
+                    "later-fraction",
+                    "after"
+                ],
+                "since {since}",
+            );
+        }
+        for (since, limit, expected) in [
+            (
+                "2026-10-01T00:30:00.100Z",
+                None,
+                vec!["fraction", "later-fraction", "after"],
+            ),
+            (
+                "2026-10-01T00:30:00.1+00:00",
+                Some(2),
+                vec!["later-fraction", "after"],
+            ),
+            (
+                "2026-10-01T00:30:00.100000001Z",
+                None,
+                vec!["later-fraction", "after"],
+            ),
+        ] {
+            let hits = log
+                .query(&LogFilter {
+                    since: Some(since.to_string()),
+                    limit,
+                    ..Default::default()
+                })
+                .expect("fractional query");
+            let ids: Vec<_> = hits
+                .iter()
+                .filter_map(|r| r.operation_id.as_deref())
+                .collect();
+            assert_eq!(ids, expected, "since {since}, limit {limit:?}");
+        }
+    }
+
+    #[test]
+    fn query_since_ignores_invalid_timestamps_but_keeps_json_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = CentralLog::open(dir.path().join("audit.jsonl"));
+        log.append(&operation_record(
+            "not-a-time",
+            "invalid",
+            &[],
+            Severity::Info,
+        ))
+        .expect("append invalid timestamp");
+        log.append(&operation_record(
+            "2026-10-01T00:30:00Z",
+            "valid",
+            &[],
+            Severity::Info,
+        ))
+        .expect("append valid timestamp");
+        let original = fs::read(log.path()).expect("read log");
+        let all = log.query(&LogFilter::default()).expect("unfiltered query");
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].started_at, "not-a-time");
+        let filter = LogFilter {
+            since: Some("2026-10-01T00:30:00Z".to_string()),
+            ..Default::default()
+        };
+        let filtered = log.query(&filter).expect("time-filtered query");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].operation_id.as_deref(), Some("valid"));
+        assert_eq!(fs::read(log.path()).expect("reread log"), original);
+
+        fs::write(log.path(), "not json\n").expect("write malformed JSON");
+        for filter in [LogFilter::default(), filter] {
+            assert!(matches!(
+                log.query(&filter),
+                Err(CentralLogError::Serialize(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn query_rejects_invalid_since_before_empty_shortcuts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for exists in [false, true] {
+            let path = dir.path().join(if exists {
+                "empty.jsonl"
+            } else {
+                "missing.jsonl"
+            });
+            if exists {
+                fs::write(&path, "").expect("create empty log");
+            }
+            let log = CentralLog::open(path);
+            for limit in [None, Some(0)] {
+                let error = log
+                    .query(&LogFilter {
+                        since: Some("not-a-time".to_string()),
+                        limit,
+                        ..Default::default()
+                    })
+                    .expect_err("invalid bound must fail");
+                match error {
+                    CentralLogError::Io { source, .. } => {
+                        assert_eq!(source.kind(), io::ErrorKind::InvalidInput);
+                        assert!(source.to_string().contains("since filter 'not-a-time'"));
+                    }
+                    other => panic!("expected invalid filter error, got {other}"),
+                }
+            }
+            assert_eq!(log.path().exists(), exists);
+        }
     }
 
     #[test]

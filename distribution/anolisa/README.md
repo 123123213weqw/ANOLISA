@@ -42,6 +42,10 @@ anolisa update all
 `status` and `doctor` allow content edits to raw-installed `type = "config"`
 files while continuing to check their presence, permissions, and path safety.
 
+`logs --since <RFC3339>` applies an inclusive timestamp filter, accounting for
+offsets and fractional seconds. Records with unparseable timestamps are excluded
+only when `--since` is set.
+
 ### Tier 2 — Management
 
 | Command | Description |
