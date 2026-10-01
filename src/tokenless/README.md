@@ -385,14 +385,23 @@ tokenless compress-response -f response.json
 curl -s https://api.example.com/data | tokenless compress-response
 ```
 
-Long arrays are truncated to a head+tail window: the first
+Long arrays are handled two ways. An array of 33 or more JSON objects is
+reduced as records instead of being windowed: the CLI keeps the first and
+last four records plus every record with an error signal, a deviating field
+shape, or an outlying number, samples the remaining ordinary records evenly
+up to 32 kept in total, and appends an "N of M records omitted" marker.
+`--truncate-arrays-at` and `--array-tail-preserve` do not apply to record
+arrays. Every other long array is truncated to a head+tail window: the first
 `--truncate-arrays-at` items (default 32) plus the last
 `--array-tail-preserve` items (default 8), with a truncation marker in
 between; pass `--array-tail-preserve 0` for head-only truncation. By default
-`compress-response` stashes the dropped middle segment so it can be retrieved
-later (see [Reversible compression](docs/stash-reversible-compression.md)).
-Pass `--no-stash` for lossy truncation, or `--stash-db <path>` to override the
-stash database (default `~/.tokenless/stash.db`).
+`compress-response` stashes what was dropped so it can be retrieved later
+(see [Reversible compression](docs/stash-reversible-compression.md)): record
+reduction stashes the complete array, while head+tail truncation stashes only
+the dropped middle segment, so `retrieve` restores exactly what each path
+removed. Pass `--no-stash` for lossy head+tail truncation — record arrays are
+then left unreduced rather than positionally truncated — or `--stash-db
+<path>` to override the stash database (default `~/.tokenless/stash.db`).
 
 ### retrieve
 
@@ -420,7 +429,7 @@ echo '{"name":"Alice","age":30}' | tokenless compress-toon --min-toon-chars 0
 # age: 30
 
 # Decode TOON back to JSON
-echo 'name: Alice\nage: 30' | tokenless decompress-toon
+printf 'name: Alice\nage: 30\n' | tokenless decompress-toon
 # {"name":"Alice","age":30}
 ```
 
