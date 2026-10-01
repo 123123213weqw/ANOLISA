@@ -48,14 +48,14 @@ pub enum WatchError {
 ///
 /// Long-lived embedders that repeatedly mount and unmount SkillFS need a
 /// way to stop the underlying `notify` watcher and await its task
-/// completion deterministically, instead of relying on the next outbound
-/// send-failure or runtime teardown to tear it down. [`WatcherHandle`] is
+/// completion deterministically, instead of dropping the receiver without
+/// awaiting task completion. [`WatcherHandle`] is
 /// that surface.
 ///
 /// Acquired through [`watch_source_with_handle`]. The companion
 /// [`watch_source`] entry point is unchanged for callers that do not need
 /// explicit shutdown — the watcher event loop still exits when its
-/// outbound receiver is dropped, exactly as it did before.
+/// outbound receiver is dropped, without waiting for a filesystem event.
 ///
 /// Calling [`WatcherHandle::shutdown`] signals the watcher event loop to
 /// exit and waits until the spawned task has finished. After
@@ -127,10 +127,9 @@ impl Drop for WatcherHandle {
 /// tokio task until the receiver is dropped.
 ///
 /// **Implicit cleanup.** This entry point exposes only the receiver, so
-/// callers cannot signal shutdown explicitly. The watcher exits on the
-/// next debounce tick after the receiver is dropped (the existing
-/// `tx.send(...).is_err()` exit path). Long-lived embedders that need to
-/// signal shutdown deterministically should use
+/// callers cannot signal shutdown explicitly. Receiver closure wakes the
+/// watcher even when the source is quiet or debounce is long. Long-lived
+/// embedders that need to await shutdown deterministically should use
 /// [`watch_source_with_handle`] instead.
 pub async fn watch_source(
     source: PathBuf,
@@ -146,7 +145,7 @@ pub async fn watch_source(
 /// The receiver behaves identically to [`watch_source`]'s output; the
 /// readiness contract is unchanged. The additional [`WatcherHandle`]
 /// lets callers signal shutdown and await task completion deterministically
-/// instead of relying on receiver-drop + send-failure to tear the watcher
+/// instead of relying on receiver-drop to tear the watcher
 /// down. This is the entry point the W1 drift runtime adapter consumes
 /// so [`crate::watcher::WatcherHandle::shutdown`] can be threaded through
 /// to long-lived embedders. The implicit, receiver-drop-driven cleanup
@@ -256,9 +255,8 @@ async fn run_watcher(
     // exits as soon as the corresponding `WatcherHandle::shutdown` (or
     // its Drop fallback) sends on the channel. When it is `None`
     // (callers that went through the original `watch_source` API) the
-    // future is `pending` forever, so the only way out is the
-    // existing `tx.send(...).is_err()` receiver-drop path. This keeps
-    // `watch_source`'s implicit cleanup behavior unchanged.
+    // future is `pending` forever; receiver closure still independently
+    // exits the loop without waiting for a filesystem event.
     let shutdown_fut = async move {
         match shutdown_rx {
             Some(rx) => {
@@ -271,6 +269,7 @@ async fn run_watcher(
 
     loop {
         tokio::select! {
+            _ = tx.closed() => return,
             _ = &mut shutdown_fut => {
                 // Explicit shutdown requested. Drop the notify watcher
                 // by returning so any in-flight events stop being
