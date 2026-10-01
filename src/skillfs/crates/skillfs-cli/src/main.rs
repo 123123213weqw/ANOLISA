@@ -3074,7 +3074,7 @@ async fn cmd_validate(
                             "name": name,
                             "description": entry.metadata.description,
                             "enabled": entry.metadata.enabled,
-                            "status": format!("{:?}", entry.parse_status).to_lowercase()
+                            "status": entry.parse_status.status_str()
                         })
                     } else {
                         serde_json::json!({})
