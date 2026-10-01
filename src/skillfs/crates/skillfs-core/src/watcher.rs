@@ -525,4 +525,34 @@ mod tests {
             handle.shutdown().await;
         }
     }
+
+    #[tokio::test]
+    async fn dropped_receivers_stop_quiet_watchers_without_waiting_for_debounce() {
+        let dir = tempfile::tempdir().expect("temp source dir");
+        for explicit_handle in [false, true] {
+            for _ in 0..3 {
+                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                let shutdown_rx = explicit_handle.then_some(shutdown_rx);
+                let (rx, mut join) = start_watcher(dir.path().to_path_buf(), 60_000, shutdown_rx)
+                    .await
+                    .expect("watcher must attach");
+                drop(rx);
+
+                // Keep the explicit shutdown sender live: receiver closure alone
+                // must release the task and its native watcher on a quiet source.
+                let completed =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), &mut join).await;
+                if completed.is_err() {
+                    join.abort();
+                    let _ = join.await;
+                }
+                drop(shutdown_tx);
+                assert!(
+                    completed.is_ok(),
+                    "dropped receiver left its watcher running"
+                );
+                assert!(completed.unwrap().is_ok(), "watcher task must exit cleanly");
+            }
+        }
+    }
 }
