@@ -1157,6 +1157,10 @@ jobs:
           grep -Fx 'base_url = "https://mirror.example.com/raw/v1/"' \
             "$REPO_CONFIG"
 
+      - name: Validate install promotion permissions
+        run: |
+          bash distribution/anolisa/tests/test-install-chmod-scope.sh
+
       - name: Check formatting
         run: |
           cd distribution/anolisa
