@@ -353,6 +353,8 @@ make build-all
 ActPlane `target/release/agentsight-enforcer` 二进制。`make build-mac` 不会构建
 enforcer。
 
+> `cargo build --release` 只编译 Rust，不会重新构建内嵌的 Dashboard UI，因此面向用户的构建请使用 `make build-all`。
+
 ### macOS 构建
 
 macOS 构建 `agentsight trace`（轨迹采集器）和 `agentsight serve`（Dashboard 查看器）。不需要 libbpf、clang/llvm、内核头文件、root 权限或 Linux BPF capabilities。
