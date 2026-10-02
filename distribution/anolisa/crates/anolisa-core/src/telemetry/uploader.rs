@@ -542,12 +542,17 @@ impl Uploader {
                     // forever, and continue with the remaining components.
                     eprintln!("[anolisa] telemetry: logstore `{component}` not found, skipping");
                 }
-                Err(UploaderError::Http { code, .. }) if (400..500).contains(&code) => {
+                Err(UploaderError::Http { code, .. })
+                    if (400..500).contains(&code) && code != 408 && code != 429 =>
+                {
                     // Client error: the request itself is invalid (e.g., malformed
                     // body or unsupported content). Retrying the same payload will
                     // never succeed, so advance the offset to avoid blocking the
                     // pipeline indefinitely. The error is still logged above for
-                    // visibility.
+                    // visibility. 408 Request Timeout and 429 Too Many Requests
+                    // are excluded: per RFC 9110 they are retryable (the server
+                    // invites a repeat, possibly later), so they fall through to
+                    // the retryable arm below and the batch is resent next round.
                     eprintln!(
                         "[anolisa] telemetry: logstore `{component}` rejected request with HTTP {code}, skipping"
                     );
@@ -1178,6 +1183,42 @@ mod tests {
                 ])
             );
         }
+    }
+
+    #[test]
+    fn test_run_once_retries_http_408_429_instead_of_dropping() {
+        // 408 Request Timeout and 429 Too Many Requests are retryable per
+        // RFC 9110: the offset must stay put so the buffered batch is resent
+        // next round instead of being silently dropped.
+        for code in [408, 429] {
+            let dir = TempDir::new().unwrap();
+            let up = test_uploader(&dir);
+            write_lines(&up.jsonl_path("cosh"), "{\"a\":1}\n");
+
+            let result = up.run_once_with_post(|_, _| {
+                Err(UploaderError::Http {
+                    code,
+                    url: "https://example.invalid/track".to_string(),
+                })
+            });
+            assert!(matches!(result,
+                Err(UploaderError::Http { code: c, .. }) if c == code));
+            // Retryable: no offset was recorded, so nothing was consumed.
+            assert!(up.load_offsets().is_empty());
+        }
+
+        // Positive control: a genuinely permanent 400 still advances.
+        let dir = TempDir::new().unwrap();
+        let up = test_uploader(&dir);
+        write_lines(&up.jsonl_path("cosh"), "{\"a\":1}\n");
+        up.run_once_with_post(|_, _| {
+            Err(UploaderError::Http {
+                code: 400,
+                url: "https://example.invalid/track".to_string(),
+            })
+        })
+        .unwrap();
+        assert_eq!(up.load_offsets().len(), 1);
     }
 
     #[test]
