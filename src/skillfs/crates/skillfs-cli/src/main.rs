@@ -2234,10 +2234,13 @@ async fn cmd_mount(
         );
         if drift_enabled {
             eprintln!("   • Source drift observation is enabled (Package W1, best-effort):");
-            eprintln!("     out-of-band create/modify/delete of <source>/<skill>/SKILL.md and");
-            eprintln!("     immediate skill directories surface as `source_changed` audit lines.");
-            eprintln!("     Arbitrary files inside skills, '.skill-meta/**', and nested layouts");
-            eprintln!("     are NOT observed; SkillFS does not block in real time.");
+            eprintln!("     out-of-band create/modify/delete of SKILL.md manifests at any");
+            eprintln!("     depth under the source (flat <source>/<skill>/SKILL.md and");
+            eprintln!("     nested/categorized <source>/<category>/<skill>/SKILL.md) and");
+            eprintln!("     immediate skill directories surface as `source_changed` audit");
+            eprintln!("     lines. Arbitrary files inside skills, '.skill-meta/**', and");
+            eprintln!("     nested non-manifest paths are NOT observed; SkillFS does not");
+            eprintln!("     block in real time.");
         } else {
             eprintln!("   • Source drift observation is OFF (no --audit-log): out-of-band");
             eprintln!("     changes to the source path are not observed at all. Re-run with");
