@@ -4,7 +4,7 @@ use std::path::Path;
 use tracing::{info, warn};
 
 use crate::parser;
-use crate::{CategoryMeta, ParseConfig, SkillEntry};
+use crate::{CategoryMeta, ParseConfig, ParseStatus, SkillEntry};
 
 // ---------------------------------------------------------------------------
 // LoadError
@@ -144,7 +144,7 @@ impl SkillStore {
                 match parser::parse_skill_file_with_limit(&skill_md, config.max_skill_size) {
                     Ok(mut entry) => {
                         let dir_name = name.to_string();
-                        entry.metadata.name = dir_name.clone();
+                        adopt_directory_name(&mut entry, &dir_name);
                         info!(name = %dir_name, "loaded skill");
                         if let Some(error) = self.insert_discovered(entry, "") {
                             errors.push(error);
@@ -282,7 +282,7 @@ impl SkillStore {
             match parser::parse_skill_file_with_limit(&skill_md, config.max_skill_size) {
                 Ok(mut entry) => {
                     let dir_name = name.to_string();
-                    entry.metadata.name = dir_name.clone();
+                    adopt_directory_name(&mut entry, &dir_name);
                     info!(name = %dir_name, category = %cat_name, "loaded skill");
                     if let Some(error) = self.insert_discovered(entry, cat_name) {
                         errors.push(error);
@@ -448,6 +448,41 @@ fn is_category_dir(dir: &Path) -> bool {
         }
     }
     false
+}
+
+/// The store exposes every skill under its directory name; that adopted
+/// name must obey the same grammar the parser enforces for the
+/// frontmatter `name` (kebab-case, max 64 chars). When it does not, the
+/// entry is degraded — not skipped — so `skillfs list`/validate surfaces
+/// the problem instead of presenting a non-conforming name as a cleanly
+/// parsed skill.
+fn degrade_on_invalid_dir_name(entry: &mut SkillEntry, dir_name: &str) {
+    let mut issues = Vec::new();
+    parser::validate_name(dir_name, &mut issues);
+    if issues.is_empty() {
+        return;
+    }
+    let issue = format!("skill directory name `{dir_name}`: {}", issues.join("; "));
+    entry.parse_status = match entry.parse_status.clone() {
+        ParseStatus::Ok => ParseStatus::Degraded(issue),
+        ParseStatus::Degraded(existing) => ParseStatus::Degraded(format!("{existing}; {issue}")),
+        error @ ParseStatus::Error(_) => error,
+    };
+}
+
+/// Adopt a skill directory's name as the entry's authoritative identity
+/// and merge the name-grammar validation state into the entry.
+///
+/// The directory name is the store key regardless of what the frontmatter
+/// `name:` field says, so every producer that adopts a directory name —
+/// the store loaders, the FUSE sync worker re-parsing after a write, and
+/// the rename path re-parsing under a new directory — must go through
+/// this single entry point. Applying the adoption anywhere else would let
+/// a runtime re-parse overwrite a `Degraded` entry from the initial scan
+/// with a clean one for the same non-conforming directory.
+pub fn adopt_directory_name(entry: &mut SkillEntry, dir_name: &str) {
+    entry.metadata.name = dir_name.to_string();
+    degrade_on_invalid_dir_name(entry, dir_name);
 }
 
 /// Load `_category.yaml` from `dir` if present; fall back to a default meta
