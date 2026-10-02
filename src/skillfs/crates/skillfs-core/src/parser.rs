@@ -25,6 +25,10 @@ pub enum ParseError {
 /// This function **never** returns `Err` — it always produces a `SkillEntry`
 /// with an appropriate `ParseStatus`.
 pub fn parse_skill_md(content: &str, dir_name: &str) -> SkillEntry {
+    // A UTF-8 BOM (emitted by some editors) must not defeat fence
+    // detection: strip it before any content inspection.
+    let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+
     // Handle empty content
     if content.trim().is_empty() {
         let metadata = SkillMetadata {
@@ -431,6 +435,25 @@ Search the web for current information.
 
         assert_eq!(entry.metadata.name, "web-search"); // from dir_name
         assert!(entry.parse_status.is_degraded());
+    }
+
+    #[test]
+    fn test_parse_bom_prefixed_frontmatter() {
+        let content =
+            "\u{feff}---\nname: web-search\ndescription: Search the web\n---\n\n# Web Search\n";
+
+        let entry = parse_skill_md(content, "fallback-dir");
+
+        assert_eq!(
+            entry.metadata.name, "web-search",
+            "frontmatter after a BOM must be honored, not discarded"
+        );
+        assert_eq!(entry.metadata.description, "Search the web");
+        assert!(
+            entry.parse_status.is_ok(),
+            "BOM-prefixed skill must parse cleanly, got {:?}",
+            entry.parse_status
+        );
     }
 
     #[test]
