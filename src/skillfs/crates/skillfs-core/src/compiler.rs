@@ -455,6 +455,29 @@ fn last_command_segment_tokens(prefix: &str) -> Option<Vec<&str>> {
     Some(tokens)
 }
 
+/// Replace every occurrence of `from` in `line` that is the command being
+/// invoked, leaving matches inside larger words (`pnpm run` contains `npm
+/// run`) and in argument position (`echo npm run`) untouched. Position
+/// checks always run against the full (pre-substitution) line with absolute
+/// offsets, so a later match on the same line — an argument of an earlier
+/// rewritten command — keeps its original context.
+fn rewrite_command_invocations(line: &str, from: &str, to: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut copied = 0; // bytes of `line` already emitted
+    let mut search = 0; // search offset within the original line
+    while let Some(rel) = line[search..].find(from) {
+        let abs = search + rel;
+        if is_command_position(line, abs) {
+            out.push_str(&line[copied..abs]);
+            out.push_str(to);
+            copied = abs + from.len();
+        }
+        search = abs + from.len();
+    }
+    out.push_str(&line[copied..]);
+    out
+}
+
 /// Apply heuristic substitutions to a single line.
 fn normalize_line(line: &str, has_uv: bool, node_pm: &str) -> String {
     let mut result = line.to_string();
@@ -479,46 +502,26 @@ fn normalize_line(line: &str, has_uv: bool, node_pm: &str) -> String {
         // virtualenv <name> → uv venv <name> — only when `virtualenv` is the
         // command being invoked: mkvirtualenv, pyenv virtualenv, and
         // `pip install virtualenv` are different words or argument positions
-        // and must pass through untouched. Position checks always run against
-        // the full (pre-substitution) line with absolute offsets, so a later
-        // match on the same line — an argument of an earlier `virtualenv` —
-        // keeps its original context.
+        // and must pass through untouched.
         if result.contains("virtualenv ") && !result.contains("uv venv") {
-            let mut out = String::with_capacity(result.len());
-            let mut copied = 0; // bytes of `result` already emitted
-            let mut search = 0; // search offset within the original line
-            while let Some(rel) = result[search..].find("virtualenv ") {
-                let abs = search + rel;
-                if is_command_position(&result, abs) {
-                    out.push_str(&result[copied..abs]);
-                    out.push_str("uv venv ");
-                    copied = abs + "virtualenv ".len();
-                }
-                search = abs + "virtualenv ".len();
-            }
-            out.push_str(&result[copied..]);
-            result = out;
+            result = rewrite_command_invocations(&result, "virtualenv ", "uv venv ");
         }
     }
 
-    // Node package manager normalization.
+    // Node package manager normalization. As with `virtualenv` above, only
+    // an invocation is rewritten: `pnpm run build` merely contains `npm run `
+    // at its second byte, and a substring rewrite turned it into
+    // `ppnpm run build` (`pnpm install` → `pyarn install` on a yarn-only
+    // host). The previous line-wide `contains(pm_*)` guards are gone with the
+    // position check: `npm install && pnpm install` now rewrites only the npm
+    // side instead of leaving the whole line alone.
     if !node_pm.is_empty() && node_pm != "npm" {
-        let npm_install = "npm install";
-        let pm_install = format!("{} install", node_pm);
-        if result.contains(npm_install) && !result.contains(&pm_install) {
-            result = result.replace(npm_install, &pm_install);
-        }
-
-        let npm_run = "npm run ";
-        let pm_run = format!("{} run ", node_pm);
-        if result.contains(npm_run) {
-            result = result.replace(npm_run, &pm_run);
-        }
-
-        let npm_test = "npm test";
-        let pm_test = format!("{} test", node_pm);
-        if result.contains(npm_test) && !result.contains(&pm_test) {
-            result = result.replace(npm_test, &pm_test);
+        for (from, to) in [
+            ("npm install", format!("{node_pm} install")),
+            ("npm run ", format!("{node_pm} run ")),
+            ("npm test", format!("{node_pm} test")),
+        ] {
+            result = rewrite_command_invocations(&result, from, &to);
         }
     }
 
@@ -573,6 +576,17 @@ mod tests {
     fn env_node_pnpm() -> EnvironmentProfile {
         let mut cmds = HashSet::new();
         cmds.insert("pnpm".to_string());
+        cmds.insert("node".to_string());
+        EnvironmentProfile {
+            os: OsKind::Linux,
+            available_commands: cmds,
+            env_vars: HashMap::new(),
+        }
+    }
+
+    fn env_node_yarn() -> EnvironmentProfile {
+        let mut cmds = HashSet::new();
+        cmds.insert("yarn".to_string());
         cmds.insert("node".to_string());
         EnvironmentProfile {
             os: OsKind::Linux,
@@ -874,6 +888,49 @@ mod tests {
         assert!(result.contains("pnpm install"));
         assert!(result.contains("pnpm run build"));
         assert!(result.contains("pnpm test"));
+    }
+
+    /// A package-manager name that merely contains `npm` is not the npm
+    /// command being invoked. `pnpm run build` starts with `npm run ` at its
+    /// second byte; rewriting that substring produced `ppnpm run build`, and
+    /// on a yarn-only host `pnpm install` became `pyarn install`. Matches in
+    /// argument position (`echo npm run build`) are not invocations either.
+    #[test]
+    fn test_heuristic_node_pm_rewrites_only_invocations() {
+        let pnpm = env_node_pnpm();
+        let already_pnpm = "pnpm install\npnpm run build\npnpm test\n";
+        assert_eq!(
+            compile(already_pnpm, &pnpm),
+            already_pnpm,
+            "pnpm invocations must pass through untouched"
+        );
+
+        let mixed = "npm install && pnpm install\n";
+        assert_eq!(
+            compile(mixed, &pnpm),
+            "pnpm install && pnpm install\n",
+            "only the npm invocation on the line is rewritten"
+        );
+
+        let argument = "echo npm run build\n";
+        assert_eq!(
+            compile(argument, &pnpm),
+            argument,
+            "an argument of another command is not an invocation"
+        );
+
+        let yarn = env_node_yarn();
+        let already_pnpm_on_yarn = "pnpm install\npnpm test\npnpm run build\n";
+        assert_eq!(
+            compile(already_pnpm_on_yarn, &yarn),
+            already_pnpm_on_yarn,
+            "a yarn-only host must not mangle pnpm invocations"
+        );
+
+        let yarn_rewritten = compile("npm install\nnpm run build\nnpm test\n", &yarn);
+        assert!(yarn_rewritten.contains("yarn install"));
+        assert!(yarn_rewritten.contains("yarn run build"));
+        assert!(yarn_rewritten.contains("yarn test"));
     }
 
     #[test]
