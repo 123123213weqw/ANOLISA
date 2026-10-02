@@ -123,17 +123,40 @@ fn extract_frontmatter(content: &str) -> (String, String) {
         return (String::new(), content.to_string());
     }
 
-    // Find the closing "---" after the opening one
+    // Find the closing "---" after the opening one. The newline following
+    // the opening fence is kept: an immediately-closing fence
+    // ("---\n---\n<body>") must match at offset 0, otherwise both fences
+    // leak into the body.
     let after_open = &content[3..];
-    // Skip the newline after opening ---
-    let after_open = after_open.strip_prefix('\n').unwrap_or(after_open);
 
     if let Some(close_pos) = after_open.find("\n---") {
-        let yaml = after_open[..close_pos].to_string();
+        // close_pos points at the newline preceding the closing fence; the
+        // frontmatter lives between the opening fence's newline and it.
+        // The opening fence's newline (LF or CRLF) is skipped by its byte
+        // length rather than a fixed byte index: a char right after the
+        // opener that is not a newline (e.g. a multi-byte "---é\n…") makes
+        // fixed indices land mid-UTF-8 and panic, and without a newline
+        // after the opener there is no frontmatter to extract, so yaml
+        // stays empty. close_pos can also sit inside the skipped prefix
+        // ("---\r\n---…" matches at 1), which likewise means empty yaml.
+        let open_newline_len = if after_open.starts_with("\r\n") {
+            Some(2)
+        } else if after_open.starts_with('\n') {
+            Some(1)
+        } else {
+            None
+        };
+        let yaml = match (open_newline_len, close_pos) {
+            (Some(len), n) if n >= len => after_open[len..n].to_string(),
+            _ => String::new(),
+        };
         let rest_start = close_pos + 4; // skip "\n---"
         let body = if rest_start < after_open.len() {
             let rest = &after_open[rest_start..];
-            rest.strip_prefix('\n').unwrap_or(rest).to_string()
+            rest.strip_prefix("\r\n")
+                .or_else(|| rest.strip_prefix('\n'))
+                .unwrap_or(rest)
+                .to_string()
         } else {
             String::new()
         };
@@ -470,6 +493,65 @@ Search the web.
 
         assert_eq!(entry.metadata.name, "web-search"); // from dir_name
         assert!(entry.parse_status.is_degraded());
+    }
+
+    #[test]
+    fn test_parse_empty_frontmatter_does_not_leak_fences() {
+        let content = "---\n---\n\n# Web Search\n\nSearch the web.\n";
+
+        let entry = parse_skill_md(content, "web-search");
+
+        assert!(
+            !entry.body.contains("---"),
+            "frontmatter fences must not leak into the body: {:?}",
+            entry.body
+        );
+        assert_eq!(entry.metadata.description, "Search the web.");
+        assert!(entry.parse_status.is_degraded()); // still missing frontmatter
+    }
+
+    #[test]
+    fn test_parse_non_ascii_after_frontmatter_opener() {
+        // The char right after the opening fence is multi-byte; slicing the
+        // remainder from a fixed byte index would land mid-UTF-8 and panic.
+        let content = "---é\n---\nbody";
+
+        let entry = parse_skill_md(content, "demo");
+
+        assert_eq!(entry.metadata.name, "demo");
+        assert!(!entry.body.contains("---"));
+        assert!(entry.parse_status.is_degraded()); // no usable frontmatter
+    }
+
+    #[test]
+    fn test_parse_crlf_frontmatter_metadata_extracted() {
+        // Regression: strip_prefix('\n') after the opening fence returned
+        // None for CRLF files, emptying the whole YAML so a valid skill
+        // degraded to directory-name metadata (worked at merge-base).
+        let content = "---\r\nname: web-search\r\ndescription: Search the web\r\n---\r\nBody\r\n";
+
+        let entry = parse_skill_md(content, "dir-name");
+
+        assert_eq!(entry.metadata.name, "web-search");
+        assert_eq!(entry.metadata.description, "Search the web");
+        assert!(!entry.body.contains("---"));
+        assert!(entry.parse_status.is_ok());
+    }
+
+    #[test]
+    fn test_parse_crlf_empty_frontmatter_does_not_leak_fences() {
+        let content = "---\r\n---\r\nBody";
+
+        let entry = parse_skill_md(content, "web-search");
+
+        assert!(
+            !entry.body.contains("---"),
+            "frontmatter fences must not leak into the body: {:?}",
+            entry.body
+        );
+        assert_eq!(entry.body, "Body");
+        assert_eq!(entry.metadata.name, "web-search"); // from dir_name
+        assert!(entry.parse_status.is_degraded()); // still missing frontmatter
     }
 
     #[test]
