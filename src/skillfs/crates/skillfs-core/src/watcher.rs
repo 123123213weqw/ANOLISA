@@ -307,29 +307,57 @@ async fn run_watcher(
 ///
 /// **Coverage.** This intentionally limits emission to two narrow shapes:
 ///
-/// * `<source>/<skill>/SKILL.md` — file create/modify/remove (used by the
-///   skill manifest tracking pipeline);
+/// * `<source>/…/SKILL.md` — manifest create/modify/remove at **any depth
+///   under the source** (used by the skill manifest tracking pipeline),
+///   except under `.skill-meta` (see below). The store loads both the
+///   flat (`<source>/<skill>/SKILL.md`) and the categorized
+///   (`<source>/<category>/<skill>/SKILL.md`) layout first-class, so
+///   manifest events from either layout must be surfaced; downstream
+///   `DriftEvent::classify` routes deep manifests to
+///   `InsideSourceOutsideSkill`, so consuming them is safe. A `SKILL.md`
+///   directly at the source root is not a manifest in any loaded layout
+///   and stays unclassified.
 /// * `<source>/<skill>` — immediate skill-directory create/remove.
 ///
-/// Arbitrary files inside a skill (`scripts/run.sh`, `notes.txt`,
-/// `.skill-meta/manifest.json`) and nested layouts deeper than depth 2
-/// are **not** surfaced. The W1 drift runtime in `skillfs-fuse` therefore
-/// only observes manifest- and skill-directory-level drift, mirroring this
-/// helper's intentional scope.
+/// Arbitrary non-manifest files inside a skill (`scripts/run.sh`,
+/// `notes.txt`, `.skill-meta/manifest.json`) are **not** surfaced, and
+/// neither is anything under a `.skill-meta` directory: version snapshots
+/// and other store-internal state live there (e.g.
+/// `<source>/<skill>/.skill-meta/versions/<v>.snapshot/SKILL.md`), and
+/// observing the store's own writes would only emit drift noise about
+/// its internals. The W1 drift runtime in `skillfs-fuse` therefore
+/// observes manifest- and skill-directory-level drift, mirroring this
+/// helper's scope.
 fn classify_event(source: &Path, path: &Path, kind: notify::EventKind) -> Option<SkillEvent> {
     use notify::EventKind;
 
     let is_skill_md = path.file_name().and_then(|n| n.to_str()) == Some("SKILL.md");
 
-    let is_in_skill_dir = path
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|pp| pp == source)
+    // `.skill-meta` at any depth of the path relative to the source marks
+    // store-internal snapshot state (both the flat
+    // `<source>/<skill>/.skill-meta/…` and the categorized
+    // `<source>/<category>/<skill>/.skill-meta/…` layout), never a
+    // user-edited manifest.
+    let inside_skill_meta = path
+        .strip_prefix(source)
+        .map(|rel| {
+            rel.components()
+                .any(|c| c.as_os_str().to_str() == Some(".skill-meta"))
+        })
         .unwrap_or(false);
+
+    // Manifest scope: any SKILL.md below the source root (depth >= 2 in
+    // both the flat and the categorized layout) except store-internal
+    // `.skill-meta` snapshots. `starts_with` is a component-wise prefix,
+    // so sibling roots like `<source>-other` do not match.
+    let is_manifest_under_source = is_skill_md
+        && !inside_skill_meta
+        && path.parent().map(|p| p != source).unwrap_or(false)
+        && path.starts_with(source);
 
     let is_immediate_child = path.parent().map(|p| p == source).unwrap_or(false);
 
-    if is_skill_md && is_in_skill_dir {
+    if is_manifest_under_source {
         match kind {
             EventKind::Create(_) => Some(SkillEvent::Created(path.to_path_buf())),
             EventKind::Modify(_) => Some(SkillEvent::Modified(path.to_path_buf())),
@@ -370,6 +398,111 @@ mod tests {
             notify::EventKind::Remove(notify::event::RemoveKind::Folder),
         );
         assert!(matches!(event, Some(SkillEvent::DirDeleted(path)) if path == child));
+    }
+
+    #[test]
+    fn categorized_layout_manifest_events_are_classified() {
+        // The store loads `<source>/<category>/<skill>/SKILL.md` first
+        // class; a manifest event at that depth must be surfaced so the
+        // drift pipeline can observe it. Downstream
+        // `DriftEvent::classify` routes deep manifests to
+        // `InsideSourceOutsideSkill`, so emitting them is safe.
+        let source = tempfile::tempdir().expect("source directory");
+        let skill_md = source.path().join("tools").join("alpha").join("SKILL.md");
+        std::fs::create_dir_all(skill_md.parent().expect("skill dir")).expect("category dirs");
+        std::fs::write(&skill_md, "---\nname: alpha\n---\n").expect("manifest");
+
+        let event = classify_event(
+            source.path(),
+            &skill_md,
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+        );
+        assert!(
+            matches!(event, Some(SkillEvent::Modified(ref path)) if path == &skill_md),
+            "categorized-layout manifest edit must classify, got {event:?}"
+        );
+
+        // Non-manifest files at the same depth stay unsurfaced.
+        let other = source.path().join("tools").join("alpha").join("notes.txt");
+        std::fs::write(&other, "notes").expect("non-manifest file");
+        assert!(
+            classify_event(
+                source.path(),
+                &other,
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            )
+            .is_none(),
+            "non-manifest files must stay outside the manifest scope"
+        );
+    }
+
+    #[test]
+    fn skill_meta_snapshot_manifests_are_not_classified() {
+        // `.skill-meta` directories hold store-internal snapshot state
+        // (e.g. `<source>/<skill>/.skill-meta/versions/<v>.snapshot/
+        // SKILL.md` in the flat layout, one level deeper in the
+        // categorized layout). Surfacing them would emit drift noise
+        // about the store's own writes, so they must classify to None —
+        // the operator-facing `.skill-meta/**` non-observation contract.
+        let source = tempfile::tempdir().expect("source directory");
+        let snapshot_md = source
+            .path()
+            .join("alpha")
+            .join(".skill-meta")
+            .join("versions")
+            .join("v1.snapshot")
+            .join("SKILL.md");
+        std::fs::create_dir_all(snapshot_md.parent().expect("snapshot dir")).expect("meta dirs");
+        std::fs::write(&snapshot_md, "---\nname: alpha\n---\n").expect("snapshot manifest");
+
+        for kind in [
+            notify::EventKind::Create(notify::event::CreateKind::Any),
+            notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            notify::EventKind::Remove(notify::event::RemoveKind::Any),
+        ] {
+            assert!(
+                classify_event(source.path(), &snapshot_md, kind).is_none(),
+                "store-internal .skill-meta snapshot SKILL.md must stay unobserved ({kind:?})"
+            );
+        }
+
+        // Same shape one level deeper (categorized layout) stays excluded.
+        let categorized_snapshot = source
+            .path()
+            .join("tools")
+            .join("alpha")
+            .join(".skill-meta")
+            .join("versions")
+            .join("v1.snapshot")
+            .join("SKILL.md");
+        std::fs::create_dir_all(categorized_snapshot.parent().expect("snapshot dir"))
+            .expect("meta dirs");
+        std::fs::write(&categorized_snapshot, "---\nname: alpha\n---\n").expect("snapshot");
+        assert!(
+            classify_event(
+                source.path(),
+                &categorized_snapshot,
+                notify::EventKind::Modify(notify::event::ModifyKind::Any),
+            )
+            .is_none(),
+            "categorized-layout .skill-meta snapshots must stay unobserved"
+        );
+
+        // A real user manifest at the same depths keeps classifying.
+        let user_md = source.path().join("tools").join("beta").join("SKILL.md");
+        std::fs::create_dir_all(user_md.parent().expect("skill dir")).expect("skill dir");
+        std::fs::write(&user_md, "---\nname: beta\n---\n").expect("manifest");
+        assert!(
+            matches!(
+                classify_event(
+                    source.path(),
+                    &user_md,
+                    notify::EventKind::Modify(notify::event::ModifyKind::Any),
+                ),
+                Some(SkillEvent::Modified(_))
+            ),
+            "user manifests outside .skill-meta must keep classifying"
+        );
     }
 
     #[test]

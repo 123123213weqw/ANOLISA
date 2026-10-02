@@ -238,3 +238,48 @@ async fn test_watcher_debouncing() {
     // Should have received at least one event, but debouncing may reduce the count
     assert!(event_count >= 1, "should receive at least one event");
 }
+
+#[tokio::test]
+#[ignore = "flaky in CI - filesystem events may not fire reliably"]
+async fn test_watcher_ignores_skill_meta_snapshot_manifests() {
+    // Reviewer live probe shape: a metadata change on
+    // `<skill>/.skill-meta/versions/<v>.snapshot/SKILL.md` is
+    // store-internal snapshot state, not a user-edited manifest, and
+    // must not surface as a skill event.
+    use std::os::unix::fs::PermissionsExt;
+
+    let source_dir = tempdir().unwrap();
+    let source = source_dir.path().to_path_buf();
+    let snapshot = source
+        .join("alpha")
+        .join(".skill-meta")
+        .join("versions")
+        .join("v1.snapshot")
+        .join("SKILL.md");
+    std::fs::create_dir_all(snapshot.parent().unwrap()).unwrap();
+    std::fs::write(&snapshot, "---\nname: alpha\n---\n").unwrap();
+
+    let (mut rx, handle) = watch_source_with_handle(source, 50)
+        .await
+        .expect("watcher must be attached before touching the snapshot");
+
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut perms = std::fs::metadata(&snapshot).unwrap().permissions();
+    perms.set_mode(0o600);
+    std::fs::set_permissions(&snapshot, perms).unwrap();
+
+    let result = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await;
+    handle.shutdown().await;
+    if let Ok(Some(event)) = result {
+        let path_str = match &event {
+            SkillEvent::Created(p) | SkillEvent::Modified(p) | SkillEvent::Deleted(p) => {
+                p.to_string_lossy()
+            }
+            SkillEvent::DirCreated(p) | SkillEvent::DirDeleted(p) => p.to_string_lossy(),
+        };
+        assert!(
+            !path_str.contains(".skill-meta"),
+            ".skill-meta snapshot writes must not emit skill events, got {event:?}"
+        );
+    }
+}
