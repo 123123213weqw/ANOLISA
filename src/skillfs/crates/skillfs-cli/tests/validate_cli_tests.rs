@@ -291,3 +291,42 @@ fn json_skill_status_fields_are_clean_names() {
     assert_eq!(statuses["degraded-skill"], "degraded", "degraded status");
     assert_eq!(statuses["bad-yaml"], "error", "bad-yaml status");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. non-UTF-8 source path
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn non_utf8_source_path_is_validated() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    // Linux paths are arbitrary bytes; `source` is a `PathBuf`, so a source
+    // directory whose name is not valid UTF-8 must be accepted like any other.
+    let parent = tempfile::tempdir().expect("parent tempdir");
+    let source = parent.path().join(OsStr::from_bytes(b"skills-\xff"));
+    std::fs::create_dir(&source).expect("create non-UTF-8 source dir");
+    create_skill_dir(&source, "good-skill", VALID_SKILL);
+
+    let out = Command::new(bin_path())
+        .arg("validate")
+        .arg(&source)
+        .output()
+        .expect("invoke skillfs validate");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "skillfs must not panic on a non-UTF-8 argument, stderr={stderr}"
+    );
+    assert!(
+        out.status.success(),
+        "expected success, status={:?} stdout={stdout} stderr={stderr}",
+        out.status
+    );
+    assert!(
+        stdout.contains("All skills loaded successfully"),
+        "stdout={stdout}"
+    );
+}

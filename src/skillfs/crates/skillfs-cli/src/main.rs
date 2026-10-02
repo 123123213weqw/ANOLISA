@@ -1,5 +1,6 @@
 //! SkillFS CLI — AI agent skill management via virtual filesystem.
 
+use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
@@ -471,7 +472,8 @@ async fn main() {
     // Capture the raw arguments (excluding the program name) before clap
     // consumes them. Managed mode reconstructs the foreground worker
     // invocation from these so every mount flag is preserved verbatim.
-    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    // `args_os` because `args` panics on any argument that is not UTF-8.
+    let raw_args: Vec<OsString> = std::env::args_os().skip(1).collect();
     let cli = Cli::parse();
 
     let pid = std::process::id();
@@ -551,7 +553,7 @@ async fn main() {
 
 async fn run(
     cli: Cli,
-    raw_args: Vec<String>,
+    raw_args: Vec<OsString>,
     guard: Option<SlsOpsGuard>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
@@ -594,7 +596,7 @@ async fn run(
                     .flatten();
                 if mount_file.is_some() {
                     let matches = Cli::command().try_get_matches_from(
-                        std::iter::once("skillfs".to_string()).chain(raw_args.iter().cloned()),
+                        std::iter::once(OsString::from("skillfs")).chain(raw_args.iter().cloned()),
                     )?;
                     let (_, args) = matches.subcommand().ok_or("missing mount command")?;
                     mount_file::validate_options(args)?;
@@ -653,7 +655,8 @@ async fn run(
                 // as a foreground worker using the preserved raw arguments.
                 // Log this public mount invocation too — the detached worker's
                 // own mount record is separate.
-                let result = managed::run_client(&raw_args, &source, &mountpoint);
+                let result = utf8_args(&raw_args)
+                    .and_then(|args| managed::run_client(&args, &source, &mountpoint));
                 finish_sls(guard, err_reason(&result));
                 return result;
             }
@@ -732,6 +735,23 @@ async fn run(
         Commands::Stop { mountpoint } => managed::run_stop(&mountpoint),
         Commands::Supervise { instance } => managed::run_supervisor(&instance),
     }
+}
+
+/// Managed mode persists the worker invocation as UTF-8 state, so it needs the
+/// raw arguments as strings; report a non-UTF-8 one instead of mangling it.
+fn utf8_args(raw_args: &[OsString]) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    raw_args
+        .iter()
+        .map(|arg| {
+            arg.clone().into_string().map_err(|arg| {
+                format!(
+                    "managed mount arguments must be valid UTF-8: {}",
+                    arg.to_string_lossy()
+                )
+                .into()
+            })
+        })
+        .collect()
 }
 
 /// Extract a concise error string from a command result for the SLS ops log.
