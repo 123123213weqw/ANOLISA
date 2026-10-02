@@ -335,6 +335,7 @@ fn parse_typed_list(section: &str, issues: &mut Vec<String>) -> Vec<Parameter> {
     let re = &*TYPED_LIST_RE;
 
     let mut result = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for line in section.lines() {
         let trimmed = line.trim();
         if !trimmed.starts_with("- ") {
@@ -349,6 +350,9 @@ fn parse_typed_list(section: &str, issues: &mut Vec<String>) -> Vec<Parameter> {
             match ParamType::from_str_opt(type_str) {
                 Some(param_type) => {
                     let required = required_str == Some("required");
+                    if !seen.insert(name.clone()) {
+                        issues.push(format!("duplicate parameter name: {name}"));
+                    }
                     result.push(Parameter {
                         name,
                         param_type,
@@ -721,6 +725,36 @@ description: Test skill
         assert_eq!(entry.parameters[0].name, "max-results");
         assert_eq!(entry.parameters[1].name, "dry-run");
         assert!(entry.parse_status.is_ok());
+    }
+
+    #[test]
+    fn test_parse_parameters_duplicate_name_is_degraded() {
+        let content = r#"---
+name: test
+description: Test skill
+---
+
+## Parameters
+
+- `query` (string, required): The search query
+- `query` (boolean, optional): A conflicting redefinition
+"#;
+
+        let entry = parse_skill_md(content, "test");
+
+        assert_eq!(entry.parameters.len(), 2); // both entries stay visible
+        assert!(
+            entry.parse_status.is_degraded(),
+            "duplicate parameter name must degrade the entry, got {:?}",
+            entry.parse_status
+        );
+        match &entry.parse_status {
+            ParseStatus::Degraded(msg) => assert!(
+                msg.contains("duplicate parameter name: query"),
+                "issue must name the duplicate, got: {msg}"
+            ),
+            other => panic!("expected degraded status, got {other:?}"),
+        }
     }
 
     #[test]
