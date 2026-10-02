@@ -16,6 +16,15 @@ pub struct LoadError {
     pub error: String,
 }
 
+/// Reported for a Skill or category directory whose name cannot be
+/// represented as UTF-8.
+///
+/// Such a name is never a skill name — the canonical resolver rejects the
+/// path component (`invalid_canonical_path`) — so the loaders report the
+/// directory instead of surfacing it under a fallback name. Directories that
+/// are neither a Skill nor a category stay ignored whatever their name.
+const NON_UTF8_NAME_ERROR: &str = "directory name is not valid UTF-8";
+
 // ---------------------------------------------------------------------------
 // SkillStore
 // ---------------------------------------------------------------------------
@@ -86,12 +95,15 @@ impl SkillStore {
                 continue;
             }
 
-            // Skip hidden directories
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') {
-                    continue;
-                }
+            // Skip hidden directories, whatever the encoding of the name.
+            if is_hidden(&path) {
+                continue;
             }
+            // A name that is not valid UTF-8 is never a skill name: the
+            // canonical resolver rejects such a path component
+            // (`invalid_canonical_path`). It is only reported once the
+            // directory turns out to be a Skill or a category.
+            let name = path.file_name().and_then(|n| n.to_str());
 
             // Check max_skills limit (rough guard)
             if loaded_count >= config.max_skills {
@@ -104,11 +116,11 @@ impl SkillStore {
 
             if is_category_dir(&path) {
                 // ---- Categorized layout ----
-                let cat_name = path
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("unknown")
-                    .to_string();
+                let Some(name) = name else {
+                    errors.push(non_utf8_name_error(&path));
+                    continue;
+                };
+                let cat_name = name.to_string();
 
                 // Try to load _category.yaml
                 let cat_meta = load_category_meta(&path, &cat_name);
@@ -123,15 +135,15 @@ impl SkillStore {
                 if !has_regular_skill_md(&path) {
                     continue;
                 }
+                let Some(name) = name else {
+                    errors.push(non_utf8_name_error(&path));
+                    continue;
+                };
                 let skill_md = path.join("SKILL.md");
 
                 match parser::parse_skill_file_with_limit(&skill_md, config.max_skill_size) {
                     Ok(mut entry) => {
-                        let dir_name = path
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
+                        let dir_name = name.to_string();
                         entry.metadata.name = dir_name.clone();
                         info!(name = %dir_name, "loaded skill");
                         if let Some(error) = self.insert_discovered(entry, "") {
@@ -244,10 +256,8 @@ impl SkillStore {
                 continue;
             }
 
-            if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                if name.starts_with('.') {
-                    continue;
-                }
+            if is_hidden(&path) {
+                continue;
             }
 
             if *loaded_count >= config.max_skills {
@@ -261,15 +271,17 @@ impl SkillStore {
             if !has_regular_skill_md(&path) {
                 continue;
             }
+            // Same rule as the top-level loader: a Skill whose name is not
+            // valid UTF-8 is reported, not loaded under a fallback name.
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                errors.push(non_utf8_name_error(&path));
+                continue;
+            };
             let skill_md = path.join("SKILL.md");
 
             match parser::parse_skill_file_with_limit(&skill_md, config.max_skill_size) {
                 Ok(mut entry) => {
-                    let dir_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("unknown")
-                        .to_string();
+                    let dir_name = name.to_string();
                     entry.metadata.name = dir_name.clone();
                     info!(name = %dir_name, category = %cat_name, "loaded skill");
                     if let Some(error) = self.insert_discovered(entry, cat_name) {
@@ -401,6 +413,20 @@ pub fn has_regular_skill_md(dir: &Path) -> bool {
     match std::fs::symlink_metadata(dir.join("SKILL.md")) {
         Ok(meta) => meta.file_type().is_file(),
         Err(_) => false,
+    }
+}
+
+/// Returns `true` when the last component of `path` starts with `.`, checked
+/// on the raw bytes so a hidden name that is not valid UTF-8 is hidden too.
+fn is_hidden(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|n| n.as_encoded_bytes().starts_with(b"."))
+}
+
+fn non_utf8_name_error(path: &Path) -> LoadError {
+    LoadError {
+        path: path.to_path_buf(),
+        error: NON_UTF8_NAME_ERROR.to_string(),
     }
 }
 
@@ -622,6 +648,168 @@ mod tests {
 
         assert!(errors.is_empty());
         assert!(store.is_empty());
+    }
+
+    /// Build a valid skill directory under `parent` whose directory name is
+    /// not valid UTF-8, e.g. a Latin-1 name coming out of an archive.
+    #[cfg(unix)]
+    fn create_non_utf8_skill_dir(parent: &Path) -> std::path::PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        let dir = parent.join(std::ffi::OsString::from_vec(b"caf\xe9".to_vec()));
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("SKILL.md"), "---\nname: caf\n---\nbody\n").unwrap();
+        dir
+    }
+
+    /// A directory whose name cannot be represented as UTF-8 must not be
+    /// surfaced as a skill: the canonical resolver rejects such a path
+    /// component (`invalid_canonical_path`), so the store must not invent a
+    /// skill named `unknown` for it.
+    #[test]
+    #[cfg(unix)]
+    fn test_load_from_directory_skips_non_utf8_skill_dir() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        create_non_utf8_skill_dir(temp_dir.path());
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(
+            store.is_empty(),
+            "non-UTF-8 directory names must not surface as skills, got {:?}",
+            store.list()
+        );
+        assert!(
+            errors.iter().any(|e| e.error.contains("UTF-8")),
+            "the skipped directory should be reported, got {errors:?}"
+        );
+    }
+
+    /// Two non-UTF-8 skill directories must not collapse into one skill entry
+    /// sharing the fallback name.
+    #[test]
+    #[cfg(unix)]
+    fn test_load_from_directory_does_not_merge_non_utf8_skill_dirs() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        for name in [b"caf\xe9".to_vec(), b"na\xefve".to_vec()] {
+            let dir = temp_dir.path().join(std::ffi::OsString::from_vec(name));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join("SKILL.md"), "---\nname: x\n---\nbody\n").unwrap();
+        }
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        store.load_from_directory(temp_dir.path(), &config);
+
+        assert_eq!(
+            store.len(),
+            0,
+            "neither of the two non-UTF-8 directories is a loadable skill"
+        );
+    }
+
+    /// A non-UTF-8 child directory inside a category layout is skipped the
+    /// same way, and a non-UTF-8 category name must not attribute its skills
+    /// to a fallback category.
+    #[test]
+    #[cfg(unix)]
+    fn test_load_skills_from_category_skips_non_utf8_names() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let category = temp_dir.path().join("tools");
+        std::fs::create_dir(&category).unwrap();
+
+        // A well-formed skill and a non-UTF-8 sibling in the same category.
+        let good = category.join("alpha");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::write(good.join("SKILL.md"), "---\nname: alpha\n---\nbody\n").unwrap();
+        create_non_utf8_skill_dir(&category);
+
+        // A second category whose own name is not UTF-8.
+        let weird_category = temp_dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"cat\xe9".to_vec()));
+        std::fs::create_dir(&weird_category).unwrap();
+        let nested = weird_category.join("beta");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(nested.join("SKILL.md"), "---\nname: beta\n---\nbody\n").unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert_eq!(
+            store.list(),
+            vec!["alpha"],
+            "only the UTF-8 named skill may load"
+        );
+        assert!(
+            errors.iter().any(|e| e.error.contains("UTF-8")),
+            "both skipped directories should be reported, got {errors:?}"
+        );
+    }
+
+    /// Only a Skill or category directory is reported for its name: a
+    /// non-UTF-8 directory without `SKILL.md`, or a hidden one, stays ignored
+    /// like any other unrelated or hidden directory, at the top level and
+    /// inside a category.
+    #[test]
+    #[cfg(unix)]
+    fn test_load_from_directory_ignores_non_utf8_non_skill_dirs() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let raw = |bytes: &[u8]| std::ffi::OsString::from_vec(bytes.to_vec());
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let root = temp_dir.path();
+
+        let good = root.join("good");
+        std::fs::create_dir(&good).unwrap();
+        std::fs::write(good.join("SKILL.md"), "---\nname: good\n---\nbody\n").unwrap();
+        std::fs::create_dir(root.join(raw(b"unrelated-\xff"))).unwrap();
+        let hidden = root.join(raw(b".hidden-\xff"));
+        std::fs::create_dir(&hidden).unwrap();
+        std::fs::write(hidden.join("SKILL.md"), "---\nname: h\n---\nbody\n").unwrap();
+
+        let category = root.join("tools");
+        let alpha = category.join("alpha");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::write(alpha.join("SKILL.md"), "---\nname: alpha\n---\nbody\n").unwrap();
+        std::fs::create_dir(category.join(raw(b"empty-\xff"))).unwrap();
+        let hidden_child = category.join(raw(b".\xff"));
+        std::fs::create_dir(&hidden_child).unwrap();
+        std::fs::write(hidden_child.join("SKILL.md"), "---\nname: h\n---\nbody\n").unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+
+        let errors = store.load_from_directory(root, &config);
+
+        assert!(errors.is_empty(), "nothing to report, got {errors:?}");
+        assert_eq!(store.list(), vec!["alpha", "good"]);
     }
 
     #[test]
