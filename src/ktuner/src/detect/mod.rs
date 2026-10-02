@@ -529,9 +529,17 @@ fn read_processes() -> Result<Vec<ProcessInfo>> {
                 let comm_path = format!("/proc/{fname}/comm");
                 if let Ok(comm) = fs::read_to_string(&comm_path) {
                     let comm = comm.trim().to_string();
-                    // /proc/<pid>/comm is truncated to 15 chars and for a JVM is
-                    // just "java" (likewise "python"/"node"/"beam.smp"), so the
-                    // actual service is invisible. Recover it from cmdline.
+                    // A metrics exporter shares its target's name prefix
+                    // ("postgres_exporter"), so keeping it in the process list
+                    // makes the database rules fire on a host that only scrapes
+                    // metrics. It is not the workload, so drop it here rather
+                    // than teaching every rule about exporters.
+                    if is_monitoring_helper(&fname) {
+                        continue;
+                    }
+                    // For a JVM the name is just "java" (likewise
+                    // "python"/"node"/"beam.smp"), so the actual service is
+                    // invisible. Recover it from cmdline.
                     if is_generic_runtime(&comm) {
                         if let Some(svc) = detect_runtime_service(&fname) {
                             procs.push(ProcessInfo { name: svc });
@@ -544,6 +552,70 @@ fn read_processes() -> Result<Vec<ProcessInfo>> {
     }
 
     Ok(procs)
+}
+
+/// Whether `name` names the process `pattern`, either whole or as the role
+/// prefix a multi-process daemon gives its workers (`nginx: worker process`).
+fn process_name_matches(name: &str, pattern: &str) -> bool {
+    name == pattern
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .next()
+            .is_some_and(|token| token == pattern)
+}
+
+/// Whether the process named `name` is a metrics collector rather than the
+/// workload it monitors. Prometheus-style exporters are named after their target
+/// (`postgres_exporter`, `node-exporter`, `postgres_exporter_v2`), so a service
+/// match reports PostgreSQL, MySQL, Redis or Node as running on a host that only
+/// scrapes metrics, and the database rules then fire.
+pub(crate) fn is_monitoring_helper_name(name: &str) -> bool {
+    let name = name.to_lowercase();
+    name.starts_with("prometheus")
+        || name
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|token| token == "exporter")
+}
+
+/// Whether `pid` is a metrics collector. The kernel truncates
+/// `/proc/<pid>/comm` and the name field of `/proc/<pid>/stat` to 15 bytes,
+/// which hides the distinguishing suffix: `postgres_exporter` becomes
+/// `postgres_export` and is then indistinguishable from a real PostgreSQL
+/// server by name alone. The command line keeps the full name the process was
+/// started with, so it decides when the truncated name does not.
+pub(crate) fn is_monitoring_helper(pid: &str) -> bool {
+    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .map(|comm| comm.trim().to_string())
+        .unwrap_or_default();
+    if is_monitoring_helper_name(&comm) {
+        return true;
+    }
+    fs::read_to_string(format!("/proc/{pid}/cmdline"))
+        .map(|cmdline| cmdline_names_helper(cmdline.split('\0')))
+        .unwrap_or(false)
+}
+
+/// Whether a command line names a metrics collector. Only the program being
+/// run decides — argv[0], or the payload of a `sh -c` wrapper — because a
+/// bare `exporter` token in a later argument (a config path, say) does not
+/// make the process a collector.
+fn cmdline_names_helper<'a>(mut args: impl Iterator<Item = &'a str>) -> bool {
+    let program = args.next().unwrap_or_default();
+    if is_monitoring_helper_name(program) {
+        return true;
+    }
+    // `sh -c "node_exporter --web.listen-address=..."` runs the collector as
+    // the payload, not as argv[0]; the payload's first word is its command.
+    let is_shell = matches!(
+        program.rsplit('/').next().unwrap_or_default(),
+        "sh" | "bash" | "dash" | "zsh" | "ksh"
+    );
+    is_shell
+        && args.next() == Some("-c")
+        && args
+            .next()
+            .and_then(|payload| payload.split_whitespace().next())
+            .is_some_and(is_monitoring_helper_name)
 }
 
 fn is_generic_runtime(comm: &str) -> bool {
@@ -595,8 +667,19 @@ fn detect_runtime_service(pid: &str) -> Option<String> {
 }
 
 impl SystemInfo {
+    /// Whether the sampled process list contains `pattern` as a whole process
+    /// name or as the role prefix of one.
+    ///
+    /// A plain substring test conflates helpers that merely mention a service
+    /// with the service itself: `etcdctl` matched "etcd" and a daemon's private
+    /// helper matched its parent's name. Daemons also name their workers
+    /// `nginx: worker process` or `postgres: writer`, so the name is compared
+    /// both whole and as its first run of name characters — that keeps
+    /// `nginx: worker process` matching while `etcdctl` does not.
     pub fn has_process(&self, pattern: &str) -> bool {
-        self.processes.iter().any(|p| p.name.contains(pattern))
+        self.processes
+            .iter()
+            .any(|p| !is_monitoring_helper_name(&p.name) && process_name_matches(&p.name, pattern))
     }
 
     /// Exact process-name match. Use this for short names that are substrings of
@@ -649,6 +732,33 @@ fn has_listen_socket(content: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn info_with_processes(names: &[&str]) -> SystemInfo {
+        SystemInfo {
+            kernel_version: String::new(),
+            os_distro: String::new(),
+            cpu_model: String::new(),
+            cpu_cores: 1,
+            numa_nodes: 1,
+            memory_total_gb: 1,
+            disks: vec![],
+            network: vec![],
+            sysctl: SysctlValues {
+                swappiness: 60,
+                dirty_ratio: 20,
+                dirty_background_ratio: 10,
+                somaxconn: 128,
+                tcp_fastopen: 0,
+                thp_enabled: "always".to_string(),
+            },
+            processes: names
+                .iter()
+                .map(|name| ProcessInfo {
+                    name: name.to_string(),
+                })
+                .collect(),
+        }
+    }
 
     #[test]
     fn test_gather_system_info() {
@@ -869,5 +979,153 @@ mod tests {
         assert!(info.has_process("postgres"));
         assert!(info.has_process("nginx"));
         assert!(!info.has_process("redis"));
+    }
+
+    #[test]
+    fn test_has_process_respects_name_boundaries() {
+        // A client or dump tool starts with its server's name but is not the
+        // server; a server's own truncated name still is.
+        let info = info_with_processes(&["etcdctl", "mongodump", "postgres", "postgres_export"]);
+
+        assert!(
+            !info.has_process("etcd"),
+            "etcdctl is a client, not the etcd server"
+        );
+        assert!(
+            !info.has_process("mongod"),
+            "mongodump is a tool, not the mongod server"
+        );
+        assert!(info.has_process("postgres"));
+        // The 15-byte comm of a long postgres* process name is still postgres.
+        assert!(info.has_process("postgres_export"));
+    }
+
+    #[test]
+    fn test_has_process_matches_truncated_comm_and_runtime_names() {
+        // "nginx: worker p" is the 15-byte /proc/<pid>/comm of an nginx worker;
+        // "elasticsearch" is the canonical name recovered from a JVM cmdline.
+        let info = info_with_processes(&["nginx: worker p", "elasticsearch", "redis-server"]);
+
+        assert!(info.has_process("nginx"));
+        assert!(info.has_process("elasticsearch"));
+        assert!(info.has_process("redis-server"));
+    }
+
+    #[test]
+    fn test_monitoring_helper_is_detected_from_a_live_process() {
+        // The kernel truncates /proc/<pid>/comm (and the name field of
+        // /proc/<pid>/stat) to 15 bytes, so a collector's distinguishing suffix
+        // only survives in the command line. Drive the real /proc reader
+        // against live processes instead of trusting a name string.
+        let dir = std::env::temp_dir().join(format!("ktuner_exporter_{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let exporter_path = dir.join("postgres_exporter");
+        fs::copy("/bin/sleep", &exporter_path).expect("copy sleep to exporter name");
+
+        let mut exporter = std::process::Command::new(&exporter_path)
+            .arg("30")
+            .spawn()
+            .expect("spawn exporter-named process");
+        let mut service = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+
+        let exporter_pid = exporter.id().to_string();
+        let service_pid = service.id().to_string();
+        let comm = fs::read_to_string(format!("/proc/{exporter_pid}/comm"))
+            .expect("exporter comm")
+            .trim()
+            .to_string();
+
+        let exporter_is_helper = is_monitoring_helper(&exporter_pid);
+        let service_is_helper = is_monitoring_helper(&service_pid);
+        let comm_alone = is_monitoring_helper_name(&comm);
+
+        exporter.kill().ok();
+        service.kill().ok();
+        exporter.wait().ok();
+        service.wait().ok();
+        fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            comm.len(),
+            15,
+            "the kernel truncates the collector name to {comm}"
+        );
+        assert!(
+            !comm_alone,
+            "the truncated name cannot identify the collector"
+        );
+        assert!(
+            exporter_is_helper,
+            "the command line still names the collector"
+        );
+        assert!(!service_is_helper, "a plain sleep is not a collector");
+    }
+
+    #[test]
+    fn test_is_monitoring_helper_name() {
+        for helper in [
+            "postgres_exporter",
+            "mysqld_exporter",
+            "redis_exporter",
+            "blackbox_exporter",
+            "node-exporter",
+            "postgres_exporter_v2",
+            "exporter",
+            "prometheus",
+            "prometheus-node-exporter",
+            "/usr/local/bin/postgres_exporter",
+        ] {
+            assert!(is_monitoring_helper_name(helper), "{helper} is a collector");
+        }
+        for service in [
+            "postgres",
+            "mysqld",
+            "redis-server",
+            "nginx",
+            "node",
+            "etcd",
+            "mongod",
+            "httpd",
+            "/usr/lib/postgresql/16/bin/postgres",
+            "/usr/sbin/nginx",
+        ] {
+            assert!(
+                !is_monitoring_helper_name(service),
+                "{service} is a service, not a collector"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cmdline_names_helper_only_program_names_decide() {
+        // argv[0] names the collector whatever the later arguments say...
+        assert!(cmdline_names_helper(
+            "/usr/local/bin/postgres_exporter\0--config=/etc/agent.conf\0serve".split('\0')
+        ));
+        assert!(cmdline_names_helper(
+            "node-exporter\0--web.listen-address=:9100".split('\0')
+        ));
+        // ...and a bare "exporter" token in a later argument (a config path,
+        // say) does not make the process a collector.
+        assert!(!cmdline_names_helper(
+            "postgres\0--plugin=exporter\0--config=/opt/exporter.conf".split('\0')
+        ));
+        assert!(!cmdline_names_helper("sleep\x0030".split('\0')));
+        // A `sh -c` wrapper runs the collector as its payload.
+        assert!(cmdline_names_helper(
+            "sh\0-c\0node_exporter --web.listen-address=:9100".split('\0')
+        ));
+        assert!(cmdline_names_helper(
+            "/bin/bash\0-c\0postgres_exporter --help".split('\0')
+        ));
+        // The payload's command decides, not its arguments.
+        assert!(!cmdline_names_helper("sh\0-c\0echo exporter".split('\0')));
+        assert!(!cmdline_names_helper(
+            "sh\0-c\0cat /etc/exporter.conf".split('\0')
+        ));
+        assert!(!cmdline_names_helper("".split('\0')));
     }
 }
