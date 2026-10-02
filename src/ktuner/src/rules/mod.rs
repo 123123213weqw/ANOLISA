@@ -1917,19 +1917,30 @@ fn eval_unprivileged_bpf(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current == 0 {
-        recs.push(Recommendation {
-            param: "kernel.unprivileged_bpf_disabled".to_string(),
-            current_value: "0".to_string(),
-            recommended_value: "1".to_string(),
-            reason: "非特权用户可加载 BPF 程序存在提权风险，应禁止".to_string(),
-            confidence: Confidence::High,
-            category: Category::Security,
-            writable: true,
-        });
-    }
+    recommend_unprivileged_bpf(read_sysctl_u64(path), recs);
     1
+}
+
+/// Push the recommendation for a given `kernel.unprivileged_bpf_disabled` value.
+///
+/// Split from the probe so the rule is assertable on every host: 0 is the only
+/// value worth changing, and the target has to be 2 rather than 1.
+fn recommend_unprivileged_bpf(current: u64, recs: &mut Vec<Recommendation>) {
+    if current != 0 {
+        return;
+    }
+    recs.push(Recommendation {
+        param: "kernel.unprivileged_bpf_disabled".to_string(),
+        current_value: "0".to_string(),
+        // 1 and 2 both deny unprivileged bpf(), but the kernel refuses to
+        // clear a 1 for the rest of the boot, so only 2 lets
+        // `ktuner rollback` restore the previous state.
+        recommended_value: "2".to_string(),
+        reason: "非特权用户可加载 BPF 程序存在提权风险，应禁止".to_string(),
+        confidence: Confidence::High,
+        category: Category::Security,
+        writable: true,
+    });
 }
 
 fn eval_core_uses_pid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7970,6 +7981,39 @@ mod tests {
         let checked = eval_bpf_jit_enable(&info, &mut recs);
         if std::path::Path::new("/proc/sys/net/core/bpf_jit_enable").exists() {
             assert!(checked >= 1);
+        }
+    }
+
+    #[test]
+    fn test_unprivileged_bpf_recommends_the_reversible_value() {
+        // 1 and 2 both deny unprivileged bpf(), but the kernel will not clear a
+        // 1 for the rest of the boot ("Once set to 1, this can't be cleared"),
+        // so a 1 recommendation can never be rolled back. The rule is fed the
+        // value directly so the assertion holds on a host that already reports
+        // 1 or 2; the literal is asserted on purpose, so the rule cannot
+        // silently regress to 1.
+        let mut recs = Vec::new();
+        recommend_unprivileged_bpf(0, &mut recs);
+        assert_eq!(recs.len(), 1, "0 must be recommended against");
+        assert_eq!(
+            recs[0].recommended_value, "2",
+            "kernel.unprivileged_bpf_disabled must be recommended as 2: the kernel \
+             cannot clear a 1, which would make the recommendation irreversible"
+        );
+        assert_eq!(recs[0].current_value, "0");
+        assert_eq!(recs[0].category, Category::Security);
+        assert_eq!(recs[0].confidence, Confidence::High);
+        assert!(recs[0].writable);
+
+        // Already denied: nothing to recommend, whichever way it was set.
+        for current in [1u64, 2] {
+            let mut recs = Vec::new();
+            recommend_unprivileged_bpf(current, &mut recs);
+            assert!(
+                recs.is_empty(),
+                "unprivileged bpf is already denied by {current}, so there is \
+                 nothing to change"
+            );
         }
     }
 
