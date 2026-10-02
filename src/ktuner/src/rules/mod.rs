@@ -3484,19 +3484,30 @@ fn eval_panic_on_warn(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current != 0 {
-        recs.push(Recommendation {
-            param: "kernel.panic_on_warn".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "内核 WARN 即 panic 过于激进，正常运行中的 WARN 不应导致系统重启".to_string(),
-            confidence: Confidence::High,
-            category: Category::Performance,
-            writable: true,
-        });
-    }
+    recommend_panic_on_warn(read_sysctl_u64(path), recs);
     1
+}
+
+/// Emit the `kernel.panic_on_warn` recommendation for an already-read value.
+///
+/// Split out from the file probe so the recommendation's shape — its category in
+/// particular — is testable on a host that does not boot with `panic_on_warn=1`.
+fn recommend_panic_on_warn(current: u64, recs: &mut Vec<Recommendation>) {
+    if current == 0 {
+        return;
+    }
+    recs.push(Recommendation {
+        param: "kernel.panic_on_warn".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: "内核 WARN 即 panic 过于激进，正常运行中的 WARN 不应导致系统重启".to_string(),
+        confidence: Confidence::High,
+        // Availability policy about taking the host down, like panic,
+        // panic_on_oops, panic_on_oom and hardlockup_panic: a security
+        // recommendation is what `--category security` selects.
+        category: Category::Security,
+        writable: true,
+    });
 }
 
 fn eval_dirty_background_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -6276,6 +6287,42 @@ mod tests {
         eval_nf_conntrack_max(&info, &mut recs);
         // Just verify it doesn't panic, result depends on system state
         let _ = recs;
+    }
+
+    #[test]
+    fn test_panic_on_warn_is_a_security_recommendation() {
+        // Every sibling panic knob (panic, panic_on_oops, panic_on_oom,
+        // hardlockup_panic) is Category::Security, and `--category security`
+        // selects on that field, so a Performance label hid the "kernel WARN
+        // should not reboot the host" advice from the only filter that looks for
+        // availability policy. Feed the value directly: a host that boots with
+        // panic_on_warn=0 would otherwise make this assertion vacuous.
+        let mut recs = Vec::new();
+        recommend_panic_on_warn(1, &mut recs);
+        let rec = recs
+            .first()
+            .expect("a non-zero panic_on_warn must be recommended");
+        assert_eq!(rec.param, "kernel.panic_on_warn");
+        assert_eq!(rec.recommended_value, "0");
+        assert_eq!(
+            rec.category,
+            Category::Security,
+            "kernel.panic_on_warn must be a security recommendation like its siblings"
+        );
+
+        // The same filter the CLI applies: the label decides visibility, so a
+        // Performance-labelled recommendation would be dropped here.
+        assert_eq!(
+            crate::category::filter_by_category(recs.clone(), "security").len(),
+            1,
+            "the recommendation must survive --category security"
+        );
+        let mut wrong = recs;
+        wrong[0].category = Category::Performance;
+        assert!(
+            crate::category::filter_by_category(wrong, "security").is_empty(),
+            "a Performance-labelled panic_on_warn is invisible to --category security"
+        );
     }
 
     #[test]
