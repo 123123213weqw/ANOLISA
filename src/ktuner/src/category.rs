@@ -28,6 +28,12 @@ pub fn param_subcategory(param: &str) -> &'static str {
         "cpu"
     } else if param.starts_with("kernel.") {
         match param {
+            // SysV shared-memory sizing knobs are a memory resource (the mem
+            // filter has always special-cased kernel.shmmax); they must not
+            // fall through to the generic kernel.* "cpu" bucket.
+            "kernel.shmmax" | "kernel.shmall" | "kernel.shmmni" | "kernel.shm_rmid_forced" => {
+                "memory"
+            }
             "kernel.dmesg_restrict"
             | "kernel.kptr_restrict"
             | "kernel.yama.ptrace_scope"
@@ -251,6 +257,17 @@ mod tests {
         let filtered = filter_by_category(recs, "net");
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0].param, "net.core.somaxconn");
+    }
+
+    #[test]
+    fn shm_params_subcategory_is_memory() {
+        // SysV shared-memory knobs are a memory resource, not cpu: the mem
+        // filter special-cases kernel.shmmax, so the classifier must agree
+        // instead of falling through the kernel.* catch-all to "cpu".
+        assert_eq!(param_subcategory("kernel.shmmax"), "memory");
+        assert_eq!(param_subcategory("kernel.shmall"), "memory");
+        assert_eq!(param_subcategory("kernel.shmmni"), "memory");
+        assert_eq!(param_subcategory("kernel.shm_rmid_forced"), "memory");
     }
 
     #[test]
