@@ -56,7 +56,7 @@ pub fn parse_skill_md(content: &str, dir_name: &str) -> SkillEntry {
     let metadata = parse_frontmatter(&yaml_str, &body, dir_name, &mut issues);
 
     // Phase 3: Section splitting
-    let sections = split_sections(&body);
+    let sections = split_sections(&body, &mut issues);
 
     // Phase 4: Structured extraction
     let parameters = parse_parameters(sections.get("Parameters"), &mut issues);
@@ -263,7 +263,10 @@ fn extract_first_paragraph(body: &str) -> String {
 // Phase 3: Section Splitting
 // ---------------------------------------------------------------------------
 
-fn split_sections(body: &str) -> std::collections::HashMap<String, String> {
+fn split_sections(
+    body: &str,
+    issues: &mut Vec<String>,
+) -> std::collections::HashMap<String, String> {
     let mut sections = std::collections::HashMap::new();
     let mut current_name: Option<String> = None;
     let mut current_content = String::new();
@@ -271,7 +274,7 @@ fn split_sections(body: &str) -> std::collections::HashMap<String, String> {
     for line in body.lines() {
         if let Some(heading) = line.strip_prefix("## ") {
             if let Some(name) = current_name.take() {
-                sections.insert(name, current_content.trim().to_string());
+                record_section(&mut sections, name, current_content, issues);
             }
             current_name = Some(heading.trim().to_string());
             current_content = String::new();
@@ -282,10 +285,42 @@ fn split_sections(body: &str) -> std::collections::HashMap<String, String> {
     }
 
     if let Some(name) = current_name {
-        sections.insert(name, current_content.trim().to_string());
+        record_section(&mut sections, name, current_content, issues);
     }
 
     sections
+}
+
+/// Section names that feed structured extraction. Only these form the
+/// skill's contract; only they are checked for duplication.
+const CONTRACT_SECTIONS: [&str; 2] = ["Parameters", "Returns"];
+
+/// Insert one section, appending in encounter order when the heading
+/// repeats. Only a repeated contract heading (`Parameters` / `Returns`)
+/// is flagged as a parse issue (degrading the entry): structured
+/// extraction consumes just those names, while a same-name H2 under a
+/// different H1 parent is a layout real skills already use, not a
+/// contract violation. The earlier content is always kept, so nothing
+/// the author wrote is silently dropped.
+fn record_section(
+    sections: &mut std::collections::HashMap<String, String>,
+    name: String,
+    content: String,
+    issues: &mut Vec<String>,
+) {
+    let content = content.trim().to_string();
+    match sections.get_mut(&name) {
+        Some(existing) => {
+            if CONTRACT_SECTIONS.contains(&name.as_str()) {
+                issues.push(format!("duplicate section heading: {name}"));
+            }
+            existing.push('\n');
+            existing.push_str(&content);
+        }
+        None => {
+            sections.insert(name, content);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +848,69 @@ No returns section here.
 
         assert!(entry.returns.is_empty());
         assert!(entry.parse_status.is_ok());
+    }
+
+    #[test]
+    fn test_parse_duplicate_parameters_sections_degrade_and_keep_both() {
+        let content = r#"---
+name: test
+description: Test skill
+---
+
+## Parameters
+
+- `first` (string, required): From the first section
+
+## Parameters
+
+- `second` (boolean, optional): From the second section
+"#;
+
+        let entry = parse_skill_md(content, "test");
+
+        assert!(
+            entry.parse_status.is_degraded(),
+            "duplicate ## Parameters heading must degrade the entry, got {:?}",
+            entry.parse_status
+        );
+        let names: Vec<&str> = entry.parameters.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["first", "second"],
+            "the first section's parameters must not be silently lost"
+        );
+    }
+
+    #[test]
+    fn test_same_h2_under_different_h1_parents_is_ok() {
+        // Same-name H2s scoped under different H1 parents are a normal
+        // layout, not a duplicate contract section.
+        let content = r#"---
+name: agentsight
+description: Query the agentsight dashboard
+---
+
+# Token query
+
+## Common commands
+
+- `tokens` (string, required): list tokens
+
+# Audit query
+
+## Common commands
+
+- `events` (string, required): list events
+"#;
+
+        let entry = parse_skill_md(content, "agentsight");
+
+        assert!(
+            entry.parse_status.is_ok(),
+            "same-name H2 under different H1 parents must parse Ok, got {:?}",
+            entry.parse_status
+        );
+        assert!(entry.parameters.is_empty());
     }
 
     // -----------------------------------------------------------------------
