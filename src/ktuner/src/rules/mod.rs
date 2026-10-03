@@ -2087,6 +2087,17 @@ fn eval_threads_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
     1
 }
 
+/// Huge pages covering a quarter of memory. `vm.nr_hugepages` counts pages of
+/// the default huge page size, which is 2 MiB only on common x86 setups (512
+/// MiB on 64K-page aarch64, 1 GiB with `default_hugepagesz=1G`). 0 when the
+/// size is unknown, so no count is guessed.
+fn quarter_memory_hugepages(memory_gb: u64, hugepage_kb: u64) -> u64 {
+    if hugepage_kb == 0 {
+        return 0;
+    }
+    memory_gb * 1024 * 1024 / 4 / hugepage_kb
+}
+
 fn eval_nr_hugepages(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     let path = "/proc/sys/vm/nr_hugepages";
     if !info.param_exists(path) {
@@ -2097,8 +2108,11 @@ fn eval_nr_hugepages(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
         return 1;
     }
     let current = read_sysctl_u64(path);
-    if current == 0 && info.memory_total_gb >= 16 {
-        let recommended = info.memory_total_gb * 1024 / 4 / 2;
+    let recommended = quarter_memory_hugepages(
+        info.memory_total_gb,
+        crate::detect::read_default_hugepage_kb(),
+    );
+    if current == 0 && info.memory_total_gb >= 16 && recommended > 0 {
         recs.push(Recommendation {
             param: "vm.nr_hugepages".to_string(),
             current_value: "0".to_string(),
@@ -6600,6 +6614,22 @@ mod tests {
             recs.is_empty(),
             "THP should not trigger without latency-sensitive processes"
         );
+    }
+
+    #[test]
+    fn test_nr_hugepages_scale_with_default_page_size() {
+        // A quarter of 742 GB: unchanged for 2 MiB pages.
+        assert_eq!(quarter_memory_hugepages(742, 2048), 94976);
+        // 512 MiB (64K-page aarch64) and 1 GiB pages reserve the same quarter
+        // instead of 256x / 512x that much memory.
+        assert_eq!(quarter_memory_hugepages(742, 512 * 1024), 371);
+        assert_eq!(quarter_memory_hugepages(64, 1024 * 1024), 16);
+        for kb in [2048, 512 * 1024, 1024 * 1024] {
+            let reserved_kb = quarter_memory_hugepages(256, kb) * kb;
+            assert!(reserved_kb <= 256 * 1024 * 1024 / 4);
+        }
+        // Unknown size: no recommendation rather than a 2 MiB guess.
+        assert_eq!(quarter_memory_hugepages(742, 0), 0);
     }
 
     #[test]

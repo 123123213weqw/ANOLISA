@@ -259,6 +259,25 @@ fn parse_meminfo_total_kb(content: &str) -> u64 {
     0
 }
 
+/// Default huge page size in kB, which is the unit of `vm.nr_hugepages`; 0
+/// when /proc/meminfo is unreadable or reports no huge page support.
+pub fn read_default_hugepage_kb() -> u64 {
+    fs::read_to_string("/proc/meminfo")
+        .map(|meminfo| parse_meminfo_hugepagesize_kb(&meminfo))
+        .unwrap_or(0)
+}
+
+/// Pure /proc/meminfo parsing: the numeric field of the Hugepagesize line, 0
+/// when absent or unparseable.
+fn parse_meminfo_hugepagesize_kb(content: &str) -> u64 {
+    content
+        .lines()
+        .find_map(|line| line.strip_prefix("Hugepagesize:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse().ok())
+        .unwrap_or(0)
+}
+
 /// Effective memory in whole GB: the cgroup limit only when it is a real
 /// limit that is smaller than the host; floored to GB; never 0 when any RAM
 /// exists (the sub-1GB clamp — a 0 here would mis-scale every memory rule,
@@ -806,6 +825,20 @@ mod tests {
         assert_eq!(parse_meminfo_total_kb("MemFree: 1 kB\n"), 0);
         // Garbage number -> 0, not a panic.
         assert_eq!(parse_meminfo_total_kb("MemTotal: not-a-number kB\n"), 0);
+    }
+
+    #[test]
+    fn parse_meminfo_hugepagesize_kb_reads_the_default_size() {
+        let x86 = "MemTotal: 16384000 kB\nHugePages_Total: 0\nHugepagesize:       2048 kB\n";
+        assert_eq!(parse_meminfo_hugepagesize_kb(x86), 2048);
+        // aarch64 with 64K base pages defaults to 512 MiB huge pages.
+        assert_eq!(
+            parse_meminfo_hugepagesize_kb("Hugepagesize:     524288 kB\n"),
+            524288
+        );
+        // No huge page support, or garbage -> 0, not a panic.
+        assert_eq!(parse_meminfo_hugepagesize_kb("MemTotal: 1 kB\n"), 0);
+        assert_eq!(parse_meminfo_hugepagesize_kb("Hugepagesize: big kB\n"), 0);
     }
 
     #[test]
