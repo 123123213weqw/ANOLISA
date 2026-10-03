@@ -1842,6 +1842,17 @@ fn has_bond() -> bool {
     dir_has_bond(std::path::Path::new("/sys/class/net"))
 }
 
+/// Skip guard shared by the whole ARP-tuning family — the four `conf/all`
+/// rules and the two `conf/default` rules. Hosts qualify only with 2+
+/// interfaces and no bond: a bonded host lists the bond master AND its
+/// slaves, so `network.len() >= 2` holds trivially, yet per `has_bond` the
+/// ARP tweaks must not be recommended there. `bond_present` is `has_bond()`
+/// in production and injected in tests (via `dir_has_bond` on a synthetic
+/// `/sys/class/net`).
+fn arp_tuning_skipped(net_ifaces: usize, bond_present: bool) -> bool {
+    net_ifaces < 2 || bond_present
+}
+
 /// Whether a `/sys/class/net`-style directory lists an actual bond interface.
 ///
 /// The kernel's `bonding_masters` control file appears in this directory
@@ -3228,7 +3239,7 @@ fn eval_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     if !info.param_exists(path) {
         return 1;
     }
-    if info.network.len() < 2 || has_bond() {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3252,7 +3263,7 @@ fn eval_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    if info.network.len() < 2 || has_bond() {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3627,7 +3638,7 @@ fn eval_arp_notify(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if info.network.len() < 2 || has_bond() {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3651,7 +3662,7 @@ fn eval_default_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) 
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if info.network.len() < 2 {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3675,7 +3686,7 @@ fn eval_default_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if info.network.len() < 2 {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3758,7 +3769,7 @@ fn eval_arp_filter(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if info.network.len() <= 1 || has_bond() {
+    if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -5529,6 +5540,32 @@ mod tests {
 
         let dir = NetDir::new(&["eth0/", "lo/"]);
         assert!(!dir_has_bond(&dir.0));
+    }
+
+    #[test]
+    fn arp_tuning_guard_skips_bonded_hosts() {
+        // A bonded host lists the bond master AND its slaves, so
+        // network.len() >= 2 holds trivially — the guard must still skip.
+        assert!(arp_tuning_skipped(2, true));
+        assert!(arp_tuning_skipped(3, true));
+        // Eligible only with 2+ interfaces and no bond.
+        assert!(!arp_tuning_skipped(2, false));
+        assert!(!arp_tuning_skipped(4, false));
+        // Below 2 interfaces never qualifies, bond or not.
+        assert!(arp_tuning_skipped(1, false));
+        assert!(arp_tuning_skipped(0, true));
+    }
+
+    #[test]
+    fn arp_tuning_guard_follows_synthetic_sysfs_bond() {
+        // End-to-end through has_bond()'s injectable leg: a synthetic
+        // /sys/class/net listing a real bond interface must flip the guard.
+        let bonded = NetDir::new(&["bonding_masters", "bond0/", "eth0/", "eth1/"]);
+        assert!(arp_tuning_skipped(3, dir_has_bond(&bonded.0)));
+
+        // Same directory without the bond stays eligible at 2+ interfaces.
+        let plain = NetDir::new(&["bonding_masters", "eth0/", "eth1/"]);
+        assert!(!arp_tuning_skipped(2, dir_has_bond(&plain.0)));
     }
 
     #[test]
