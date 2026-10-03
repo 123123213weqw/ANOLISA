@@ -69,7 +69,18 @@ impl ViewsConfig {
         let path = source_dir.join("skillfs-views.toml");
         let content = std::fs::read_to_string(&path).ok()?;
         match toml::from_str::<ViewsConfig>(&content) {
-            Ok(cfg) => Some(cfg),
+            Ok(cfg) => {
+                let default_views = cfg.views.iter().filter(|view| view.default).count();
+                if default_views > 1 {
+                    warn!(
+                        default_views,
+                        "skillfs-views.toml marks several views as default; only the \
+                         first drives /skills, the others stay discoverable as \
+                         secondary views"
+                    );
+                }
+                Some(cfg)
+            }
             Err(e) => {
                 warn!("failed to parse skillfs-views.toml: {e}");
                 None
@@ -79,12 +90,29 @@ impl ViewsConfig {
 
     /// Return the default view (first one with `default = true`).
     pub fn default_view(&self) -> Option<&ViewConfig> {
-        self.views.iter().find(|v| v.default)
+        self.default_view_index().map(|index| &self.views[index])
     }
 
-    /// Return all non-default views.
+    /// Return every view other than the default view.
+    ///
+    /// `default = true` marks the view shown directly in `/skills`; every
+    /// other view is a secondary view whose skills `skill-discover` lists.
+    /// Filtering on the flag alone dropped views after the first default one
+    /// from both lists, so a skill assigned only to a second
+    /// `default = true` view disappeared from the mounted view entirely.
     pub fn secondary_views(&self) -> Vec<&ViewConfig> {
-        self.views.iter().filter(|v| !v.default).collect()
+        let default = self.default_view_index();
+        self.views
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != default)
+            .map(|(_, view)| view)
+            .collect()
+    }
+
+    /// Index of the default view (first one with `default = true`).
+    fn default_view_index(&self) -> Option<usize> {
+        self.views.iter().position(|view| view.default)
     }
 
     /// Return the skill names in the default view.
@@ -258,5 +286,56 @@ mod tests {
     fn test_load_missing_file() {
         let dir = TempDir::new().unwrap();
         assert!(ViewsConfig::load(dir.path()).is_none());
+    }
+
+    #[test]
+    fn extra_default_views_stay_discoverable() {
+        // The documented contract is one `default = true` view, but a file
+        // that marks several must not hide skills: every view other than the
+        // selected default stays a secondary view, so its skills are listed
+        // by skill-discover instead of disappearing from the mounted view.
+        let mut cfg = make_config();
+        cfg.views[1].default = true; // second default view
+        cfg.views.push(ViewConfig {
+            name: "extra".to_string(),
+            default: false,
+            description: String::new(),
+            skills: vec!["extra-skill".to_string()],
+        });
+        let mut store = crate::store::SkillStore::new();
+        for name in [
+            "github",
+            "notion",
+            "apple-notes",
+            "blogwatcher",
+            "extra-skill",
+        ] {
+            store.upsert(crate::parser::parse_skill_md("# Fixture", name));
+        }
+
+        // The first default view still drives /skills.
+        assert_eq!(cfg.default_view().unwrap().name, "major");
+        assert_eq!(
+            cfg.secondary_views()
+                .iter()
+                .map(|view| view.name.as_str())
+                .collect::<Vec<_>>(),
+            ["other", "extra"],
+            "views after the selected default stay secondary views"
+        );
+
+        // No skill in the store may become unreachable: it is either in the
+        // default view or listed by a secondary view.
+        let mut visible: HashSet<String> =
+            cfg.effective_default_skills(&store).into_iter().collect();
+        for view in cfg.secondary_views() {
+            visible.extend(view.skills.iter().cloned());
+        }
+        for name in store.list() {
+            assert!(
+                visible.contains(name),
+                "skill `{name}` is in no view at all"
+            );
+        }
     }
 }
