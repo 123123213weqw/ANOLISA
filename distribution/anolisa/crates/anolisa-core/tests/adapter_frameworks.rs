@@ -846,6 +846,18 @@ if [ "$1" = "app-server" ]; then
         else
           printf '{"id":1,"result":{"data":[{"hooks":[{"key":"tokenless@anolisa-tokenless:hooks/hooks.json:pre_tool_use:0:0","currentHash":"sha256:trusted","source":"plugin","pluginId":"tokenless@anolisa-tokenless","isManaged":false}],"warnings":[],"errors":[]}]}}\n'
         fi ;;
+      *'"method":"config/read"'*)
+        # The user layer holds the entry enable trusted plus a foreign one.
+        state='"other@m:hooks/hooks.json:stop:0:0":{"trusted_hash":"sha256:other"}'
+        [ -f "$st/trust-request" ] && state="$state"',"tokenless@anolisa-tokenless:hooks/hooks.json:pre_tool_use:0:0":{"trusted_hash":"sha256:trusted"}'
+        printf '{"id":1,"result":{"config":{},"layers":[{"name":{"type":"user","file":"config.toml"},"version":"sha256:v1","config":{"hooks":{"state":{%s}}}}]}}\n' "$state" ;;
+      *'"method":"config/batchWrite"'*'"mergeStrategy":"replace"'*)
+        printf '%s\n' "$line" > "$st/revoke-request"
+        if [ "$FAKE_CODEX_FAIL" = "revoke-conflict" ]; then
+          printf '{"id":1,"error":{"code":-32600,"message":"Configuration was modified since last read."}}\n'
+        else
+          printf '{"id":1,"result":{"status":"ok"}}\n'
+        fi ;;
       *'"method":"config/batchWrite"'*)
         printf '%s\n' "$line" > "$st/trust-request"
         if [ "$FAKE_CODEX_FAIL" = "write-overridden" ]; then
@@ -1011,6 +1023,79 @@ fn codex_enable_trusts_declared_hooks() {
         request["params"]["edits"][0]["value"]["tokenless@anolisa-tokenless:hooks/hooks.json:pre_tool_use:0:0"]
             ["trusted_hash"],
         "sha256:trusted"
+    );
+}
+
+#[test]
+fn codex_disable_revokes_the_hook_trust_enable_wrote() {
+    let guard = EnvGuard::acquire();
+    let world = stage(
+        "codex",
+        "plugin",
+        "{datadir}/adapters/{component}/codex/",
+        stage_codex_hook_bundle,
+    );
+    let fake = write_fake_codex(&world.prefix);
+    apply_codex_env(&guard, &world, &fake);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("codex"), false)
+        .expect("enable");
+
+    let disabled = manager
+        .disable(COMPONENT, Some("codex"), false)
+        .expect("disable");
+    assert!(disabled.claim_removed);
+    let request: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(world.prefix.join("codex-state/revoke-request"))
+            .expect("revoke request"),
+    )
+    .expect("valid request");
+    let edit = &request["params"]["edits"][0];
+    assert_eq!(edit["keyPath"], "hooks.state");
+    assert_eq!(edit["mergeStrategy"], "replace");
+    assert_eq!(request["params"]["expectedVersion"], "sha256:v1");
+    // Only the plugin's own entry goes; the foreign trust is written back.
+    assert_eq!(
+        edit["value"],
+        serde_json::json!({
+            "other@m:hooks/hooks.json:stop:0:0": { "trusted_hash": "sha256:other" }
+        })
+    );
+}
+
+#[test]
+fn codex_disable_keeps_receipt_when_hook_trust_revocation_fails() {
+    let guard = EnvGuard::acquire();
+    let world = stage(
+        "codex",
+        "plugin",
+        "{datadir}/adapters/{component}/codex/",
+        stage_codex_hook_bundle,
+    );
+    let fake = write_fake_codex(&world.prefix);
+    apply_codex_env(&guard, &world, &fake);
+    let manager = world.manager();
+    manager
+        .enable(COMPONENT, Some("codex"), false)
+        .expect("enable");
+    guard.set("FAKE_CODEX_FAIL", Path::new("revoke-conflict"));
+
+    let disabled = manager
+        .disable(COMPONENT, Some("codex"), false)
+        .expect("disable");
+    assert!(
+        !disabled.claim_removed,
+        "a failed revocation must keep the receipt for a retry"
+    );
+    assert!(
+        disabled
+            .report
+            .messages
+            .iter()
+            .any(|m| m.contains("hook trust revocation failed")),
+        "{:?}",
+        disabled.report.messages
     );
 }
 
