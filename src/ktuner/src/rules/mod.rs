@@ -2838,7 +2838,7 @@ fn eval_dirty_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
     }
     let current = read_sysctl_u64(path);
     if current == 0 {
-        let recommended = 256 * 1024 * 1024; // 256MB
+        let recommended = DIRTY_BYTES_TARGET;
         recs.push(Recommendation {
             param: "vm.dirty_bytes".to_string(),
             current_value: "0".to_string(),
@@ -3574,6 +3574,25 @@ fn recommend_panic_on_warn(current: u64, recs: &mut Vec<Recommendation>) {
     });
 }
 
+/// `vm.dirty_bytes` recommended for >=64GB hosts that still use the ratio form.
+const DIRTY_BYTES_TARGET: u64 = 256 * 1024 * 1024;
+/// Preferred `vm.dirty_background_bytes` when the dirty limit leaves room.
+const DIRTY_BACKGROUND_BYTES_TARGET: u64 = 256 * 1024 * 1024;
+
+/// Background threshold that stays below the dirty limit in effect after
+/// tuning: the current `vm.dirty_bytes`, or [`DIRTY_BYTES_TARGET`] when it is
+/// 0 because [`eval_dirty_bytes`] then recommends that value. The kernel
+/// replaces a background threshold at or above the dirty threshold with half
+/// of it (`domain_dirty_limits`), so a larger value would not mean what it says.
+fn dirty_background_bytes_target(dirty_bytes: u64) -> u64 {
+    let limit = if dirty_bytes == 0 {
+        DIRTY_BYTES_TARGET
+    } else {
+        dirty_bytes
+    };
+    DIRTY_BACKGROUND_BYTES_TARGET.min(limit / 2)
+}
+
 fn eval_dirty_background_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     let path = "/proc/sys/vm/dirty_background_bytes";
     if !std::path::Path::new(path).exists() {
@@ -3590,11 +3609,11 @@ fn eval_dirty_background_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>
         0
     };
     if bytes == 0 && ratio > 5 {
-        let recommended_mb = 256;
+        let dirty_bytes = read_sysctl_u64("/proc/sys/vm/dirty_bytes");
         recs.push(Recommendation {
             param: "vm.dirty_background_bytes".to_string(),
             current_value: format!("0 (ratio={ratio}%)"),
-            recommended_value: format!("{}", recommended_mb * 1024 * 1024),
+            recommended_value: dirty_background_bytes_target(dirty_bytes).to_string(),
             reason: format!("{}GB 内存 dirty_background_ratio {}% = {}GB 脏页才开始后台刷盘，用 bytes 可精确控制",
                 info.memory_total_gb, ratio, info.memory_total_gb * ratio / 100),
             confidence: Confidence::Medium,
@@ -6218,6 +6237,21 @@ mod tests {
             "IoLatency workload should recommend swappiness=1 even when current is 10"
         );
         assert_eq!(rec.unwrap().recommended_value, "1");
+    }
+
+    #[test]
+    fn test_dirty_background_bytes_stays_below_dirty_limit() {
+        const MIB: u64 = 1024 * 1024;
+        // dirty_bytes unset: ktuner recommends DIRTY_BYTES_TARGET (256 MiB), so
+        // an equal background value would be halved by the kernel anyway.
+        assert_eq!(dirty_background_bytes_target(0), 128 * MIB);
+        assert!(dirty_background_bytes_target(0) < DIRTY_BYTES_TARGET);
+        // An administrator's dirty_bytes is kept and bounds the background value.
+        assert_eq!(dirty_background_bytes_target(128 * MIB), 64 * MIB);
+        assert_eq!(dirty_background_bytes_target(4096 * MIB), 256 * MIB);
+        for dirty in [2 * 4096, MIB, 300 * MIB, 512 * MIB, u64::MAX] {
+            assert!(dirty_background_bytes_target(dirty) < dirty);
+        }
     }
 
     #[test]
