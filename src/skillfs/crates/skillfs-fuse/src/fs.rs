@@ -511,6 +511,18 @@ impl SkillFs {
             return PathType::Invalid;
         }
         match parsed {
+            // A reserved lifecycle name is never ordinary hub content: the
+            // S3 contract hides it from lookup and readdir and denies
+            // mutation. The flat layout expresses that by classifying the
+            // name as a skill-shaped path, so reuse that classification
+            // here — otherwise a `.staging`/`.certified` entry would be a
+            // category (listed, resolvable) or, as a plain file, an ordinary
+            // passthrough that the lifecycle gate does not cover.
+            PathType::CategoryDir { category } if is_reserved_lifecycle_name(&category) => {
+                PathType::SkillDir {
+                    skill_name: category,
+                }
+            }
             PathType::CategoryDir { category } if self.hermes_is_top_level_skill(&category) => {
                 PathType::SkillDir {
                     skill_name: category,
