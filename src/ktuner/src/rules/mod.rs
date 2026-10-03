@@ -1,4 +1,4 @@
-use crate::detect::{read_sysctl_u64, DiskType, SystemInfo};
+use crate::detect::{read_sysctl_u64, DiskInfo, DiskType, SystemInfo};
 use crate::profile::WorkloadType;
 use anyhow::Result;
 
@@ -371,17 +371,25 @@ fn dedupe_recommendations(recs: Vec<Recommendation>) -> Vec<Recommendation> {
 
 // ─── Performance Rules ────────────────────────────────────────────────────────
 
+/// Scheduler an NVMe disk runs after tuning: the pass-through scheduler
+/// [`eval_io_scheduler`] recommends, or `None` when neither is offered.
+fn nvme_scheduler_target(disk: &DiskInfo) -> Option<&'static str> {
+    if disk.available_schedulers.iter().any(|s| s == "none") {
+        Some("none")
+    } else if disk.available_schedulers.iter().any(|s| s == "noop") {
+        Some("noop")
+    } else {
+        None
+    }
+}
+
 fn eval_io_scheduler(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     let mut count = 0;
     for disk in &info.disks {
         match disk.disk_type {
             DiskType::NVMe => {
                 count += 1;
-                let target = if disk.available_schedulers.contains(&"none".to_string()) {
-                    "none"
-                } else if disk.available_schedulers.contains(&"noop".to_string()) {
-                    "noop"
-                } else {
+                let Some(target) = nvme_scheduler_target(disk) else {
                     continue;
                 };
 
@@ -1485,7 +1493,11 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
 
 fn eval_nr_requests(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     for disk in &info.disks {
-        if disk.disk_type == DiskType::NVMe && disk.nr_requests < 256 {
+        // Without an elevator the kernel caps nr_requests at the hardware tag
+        // depth (larger writes fail with EINVAL), and switching to `none`
+        // resets it to that depth, so under `none` the value cannot be raised.
+        let scheduler = nvme_scheduler_target(disk).unwrap_or(&disk.scheduler);
+        if disk.disk_type == DiskType::NVMe && disk.nr_requests < 256 && scheduler != "none" {
             recs.push(Recommendation {
                 param: format!("block/{}/nr_requests", disk.name),
                 current_value: disk.nr_requests.to_string(),
@@ -5980,6 +5992,8 @@ mod tests {
     fn test_nvme_nr_requests() {
         let mut info = make_test_info();
         info.disks[0].nr_requests = 128;
+        // Only an elevator that stays in place can take a deeper queue.
+        info.disks[0].available_schedulers = vec!["mq-deadline".to_string()];
         let recs = evaluate(&info).unwrap().recommendations;
         let rec = recs.iter().find(|r| r.param.contains("nr_requests"));
         assert!(
@@ -5988,6 +6002,23 @@ mod tests {
         );
         assert_eq!(rec.unwrap().recommended_value, "1024");
         assert_eq!(rec.unwrap().confidence, Confidence::High);
+    }
+
+    #[test]
+    fn test_nvme_nr_requests_skipped_under_none() {
+        // Current `none`, or `none` recommended by the scheduler rule: either
+        // way the queue ends at the hardware depth, so 1024 would hit EINVAL
+        // or be reset by the elevator switch.
+        for scheduler in ["none", "mq-deadline"] {
+            let mut info = make_test_info();
+            info.disks[0].scheduler = scheduler.to_string();
+            info.disks[0].nr_requests = 127;
+            let recs = evaluate(&info).unwrap().recommendations;
+            assert!(
+                !recs.iter().any(|r| r.param.contains("nr_requests")),
+                "nr_requests cannot exceed the hardware depth under none (current {scheduler})"
+            );
+        }
     }
 
     #[test]
