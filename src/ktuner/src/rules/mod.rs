@@ -41,20 +41,50 @@ pub struct EvalResult {
     pub total_checked: usize,
 }
 
+impl Confidence {
+    /// Score penalty of one recommendation: hardware-deterministic advice
+    /// (`High`) costs more than workload-dependent advice (`Medium`), and the
+    /// same weight drives `EvalResult::score` and the score predicted after
+    /// tuning.
+    pub fn weight(&self) -> usize {
+        match self {
+            Confidence::High => 3,
+            Confidence::Medium => 2,
+        }
+    }
+}
+
 impl EvalResult {
+    /// Total penalty the recommendations cost, in `Confidence::weight` units.
+    pub fn penalty(&self) -> usize {
+        self.recommendations
+            .iter()
+            .map(|r| r.confidence.weight())
+            .sum()
+    }
+
+    /// Health score for this result: 100 minus the penalty of every finding,
+    /// floored at 30 so a heavily untuned host stays on a readable scale.
     pub fn score(&self) -> usize {
         if self.recommendations.is_empty() {
             return 100;
         }
-        let penalty: usize = self
+        100usize.saturating_sub(self.penalty()).max(30)
+    }
+
+    /// Score the system would report once every recommendation in `applied` has
+    /// been applied: the penalty of what is *not* applied, floored exactly like
+    /// `score`. `score() + applied weight` is not the same number — `score` is
+    /// already floored at 30, so that sum counts the floor as a gain and
+    /// overstates the result whenever the penalty exceeds 70.
+    pub fn score_after_applying(&self, applied: &[Recommendation]) -> usize {
+        let remaining: usize = self
             .recommendations
             .iter()
-            .map(|r| match r.confidence {
-                Confidence::High => 3,
-                Confidence::Medium => 2,
-            })
+            .filter(|rec| !applied.iter().any(|a| a.param == rec.param))
+            .map(|rec| rec.confidence.weight())
             .sum();
-        100usize.saturating_sub(penalty).max(30)
+        100usize.saturating_sub(remaining).max(30)
     }
 }
 
@@ -6204,6 +6234,35 @@ mod tests {
             total_checked: 40,
         };
         assert_eq!(result.score(), 30); // 100 - 80 capped at 30
+    }
+
+    #[test]
+    fn score_after_applying_keeps_the_floor() {
+        // 20 high-confidence + 20 medium findings = 100 points of penalty, so
+        // `score` sits on its 30-point floor.
+        let recs: Vec<Recommendation> = (0..20)
+            .map(|i| rec(&format!("test.high{i}"), Confidence::High))
+            .chain((0..20).map(|i| rec(&format!("test.medium{i}"), Confidence::Medium)))
+            .collect();
+        let eval = EvalResult {
+            recommendations: recs.clone(),
+            total_checked: 40,
+        };
+        assert_eq!(eval.score(), 30);
+
+        // Applying five findings leaves 85 points of penalty, still inside the
+        // floor, so the score after tuning is 30 — not `score() + 15 = 45`,
+        // which counts the floor as a gain.
+        assert_eq!(eval.score_after_applying(&recs[..5]), 30);
+
+        // On a host that is not floored the prediction moves by the applied
+        // weight as usual: 10 findings cost 30 points, five of them 15.
+        let light = EvalResult {
+            recommendations: recs[..10].to_vec(),
+            total_checked: 10,
+        };
+        assert_eq!(light.score(), 70);
+        assert_eq!(light.score_after_applying(&recs[..5]), 85);
     }
 
     #[test]

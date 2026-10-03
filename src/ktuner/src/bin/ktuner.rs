@@ -84,14 +84,12 @@ fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
 
     let score = eval.score();
     let counts = category::RecCounts::from_recs(&recs);
-    let total_weight: usize = recs
-        .iter()
-        .map(|r| match r.confidence {
-            rules::Confidence::High => 3,
-            rules::Confidence::Medium => 2,
-        })
-        .sum();
-    let predicted_score = (score + total_weight).min(100);
+    // What `score` would report once this view has been applied. Not
+    // `score + shown weight`: `score` is floored at 30, so adding the shown
+    // weight counts that floor as a gain and promises points the untouched
+    // findings still keep off the board (on a 66-finding host,
+    // `--conservative` promised 72 while applying it lands on the floor, 30).
+    let predicted_score = eval.score_after_applying(&recs);
 
     let recs_json: Vec<serde_json::Value> = recs
         .iter()
