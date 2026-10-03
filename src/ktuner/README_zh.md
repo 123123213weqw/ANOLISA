@@ -72,6 +72,14 @@ sudo ktuner rollback
 { "applied": 5, "score_before": 30, "score_after": 35 }
 ```
 
+`tune --dry-run` 输出的是预览；`status` 与短路路径使用同一套取值
+（此处为 `planned`；无可应用项时为 `optimal`/`blocked`），`blocked`
+为本环境过滤掉的建议数（不可写或运行时危险）：
+
+```json
+{ "dry_run": true, "status": "planned", "blocked": 1, "would_apply": [ ... ] }
+```
+
 ### rollback 输出
 
 ```json

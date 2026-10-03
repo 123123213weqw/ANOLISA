@@ -72,6 +72,15 @@ All output goes to **stdout as JSON**. Errors go to **stderr as JSON**. No ANSI 
 { "applied": 5, "score_before": 30, "score_after": 35 }
 ```
 
+`tune --dry-run` previews the plan instead; `status` uses the same
+vocabulary as the short-circuit path (`planned` here; `optimal`/`blocked`
+when there is nothing to apply), and `blocked` counts recommendations this
+environment filtered out (unwritable or runtime-dangerous):
+
+```json
+{ "dry_run": true, "status": "planned", "blocked": 1, "would_apply": [ ... ] }
+```
+
 ### rollback output
 
 ```json

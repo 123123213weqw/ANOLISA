@@ -175,6 +175,26 @@ fn tune_short_circuit(
     ))
 }
 
+/// JSON body of the `tune --dry-run` preview. Pure so the status contract
+/// stays unit-testable without a live host.
+///
+/// The preview carries the same status vocabulary as the short-circuit path:
+/// reaching here means at least one recommendation is applicable, so the
+/// status is `"planned"` — never `"optimal"`, which the short-circuit path
+/// reserves for a host with nothing to recommend. `blocked` counts the
+/// recommendations this environment filtered out (unwritable or
+/// runtime-dangerous), so a script can tell a partial plan from a complete
+/// one without diffing `would_apply`.
+fn dry_run_output(applicable: &[Recommendation], requested: usize) -> serde_json::Value {
+    let recs_json: Vec<serde_json::Value> = applicable.iter().map(rec_json).collect();
+    json!({
+        "dry_run": true,
+        "status": "planned",
+        "blocked": requested - applicable.len(),
+        "would_apply": recs_json,
+    })
+}
+
 fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i32> {
     if !dry_run {
         let is_root = unsafe { libc::geteuid() } == 0;
@@ -205,6 +225,7 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
         .filter(|r| r.writable && !category::is_runtime_dangerous(&r.param))
         .cloned()
         .collect();
+    let requested = recs.len();
     if let Some((output, code)) = tune_short_circuit(&recs, applicable.len()) {
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(code);
@@ -212,8 +233,7 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
     let recs = applicable;
 
     if dry_run {
-        let recs_json: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
-        let output = json!({ "dry_run": true, "would_apply": recs_json });
+        let output = dry_run_output(&recs, requested);
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(0);
     }
@@ -486,6 +506,25 @@ mod tests {
             rec("net.core.somaxconn", true),
         ];
         assert!(tune_short_circuit(&recs, 1).is_none());
+    }
+
+    #[test]
+    fn dry_run_output_reports_planned_and_blocked_count() {
+        // Two applicable recommendations out of three gathered: the preview
+        // must carry the short-circuit status vocabulary ("planned", never
+        // "optimal") and the count this environment filtered out, so a script
+        // can tell a partial plan from a complete one without diffing
+        // would_apply.
+        let recs = vec![rec("vm.swappiness", true), rec("fs.file-max", true)];
+        let output = dry_run_output(&recs, 3);
+        assert_eq!(output["dry_run"], json!(true));
+        assert_eq!(output["status"], json!("planned"));
+        assert_eq!(output["blocked"], json!(1));
+        assert_eq!(output["would_apply"].as_array().map(Vec::len), Some(2));
+        // A fully applicable plan reports zero blocked.
+        let full = dry_run_output(&recs, 2);
+        assert_eq!(full["status"], json!("planned"));
+        assert_eq!(full["blocked"], json!(0));
     }
 
     #[test]
