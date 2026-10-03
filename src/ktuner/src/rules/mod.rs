@@ -3402,19 +3402,30 @@ fn eval_tcp_adv_win_scale(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> 
         .trim()
         .parse::<i64>()
         .unwrap_or(1);
-    if current < 2 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_adv_win_scale".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "2".to_string(),
-            reason: "TCP 接收缓冲区开销因子偏低，增大可让更多缓冲区用于应用数据提升吞吐"
-                .to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = tcp_adv_win_scale_recommendation(current, &info.kernel_version) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `net.ipv4.tcp_adv_win_scale` recommendation for an already-read
+/// value; split from the file probe so the version gate is testable anywhere.
+fn tcp_adv_win_scale_recommendation(current: i64, kernel_version: &str) -> Option<Recommendation> {
+    // Linux 6.6 replaced the sysctl with a per-socket scaling_ratio measured
+    // from real skb overhead; the knob is documented as obsolete and the
+    // receive window ignores it, so raising it there changes nothing.
+    if kernel_at_least(kernel_version, 6, 6) || current >= 2 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_adv_win_scale".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "2".to_string(),
+        reason: "TCP 接收缓冲区开销因子偏低，增大可让更多缓冲区用于应用数据提升吞吐".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_sched_tunable_scaling(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7735,6 +7746,21 @@ mod tests {
             "tcp_fack advice must not be issued for kernel {}: FACK was removed in Linux 4.15",
             info.kernel_version
         );
+    }
+
+    #[test]
+    fn tcp_adv_win_scale_recommendation_gates_on_kernel_version() {
+        // Before 6.6 the receive window is derived from the sysctl.
+        let rec = tcp_adv_win_scale_recommendation(1, "5.10.134-16.an8.x86_64")
+            .expect("pre-6.6 kernels still consume tcp_adv_win_scale");
+        assert_eq!(rec.recommended_value, "2");
+        assert_eq!(rec.current_value, "1");
+        assert!(tcp_adv_win_scale_recommendation(-2, "6.5.0").is_some());
+        // 6.6+ uses the per-socket scaling_ratio; the knob is obsolete.
+        assert!(tcp_adv_win_scale_recommendation(1, "6.6.0").is_none());
+        assert!(tcp_adv_win_scale_recommendation(1, "7.0.0-29-generic").is_none());
+        // Already at or above the target on any version.
+        assert!(tcp_adv_win_scale_recommendation(2, "5.10.0").is_none());
     }
 
     #[test]
