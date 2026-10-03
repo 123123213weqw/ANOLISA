@@ -415,16 +415,39 @@ fn canonicalize_path(path: &str) -> String {
     format!("/{}", out.join("/"))
 }
 
-fn load_rollback() -> RollbackData {
-    if let Ok(json) = fs::read_to_string(ROLLBACK_PATH) {
-        if let Ok(data) = serde_json::from_str::<RollbackData>(&json) {
-            return data;
+fn load_rollback() -> Result<RollbackData> {
+    load_rollback_from(ROLLBACK_PATH)
+}
+
+fn load_rollback_from(path: &str) -> Result<RollbackData> {
+    let json = match fs::read_to_string(path) {
+        Ok(json) => json,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RollbackData {
+                version: 1,
+                entries: BTreeMap::new(),
+            });
         }
-    }
-    RollbackData {
-        version: 1,
-        entries: BTreeMap::new(),
-    }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("read rollback ledger {path}; {}", ledger_remedy(path)))
+        }
+    };
+    // Only an absent ledger is empty: hiding errors would discard originals
+    // when a later merge replaces the existing rollback record.
+    serde_json::from_str(&json)
+        .with_context(|| format!("parse rollback ledger {path}; {}", ledger_remedy(path)))
+}
+
+// tune/fix reach the ledger only after parameters were written, and rollback
+// reads the same file, so the error must name a way out. Moving the ledger
+// aside is only safe while the copy is kept: a fresh ledger would record the
+// already-tuned values as the originals.
+fn ledger_remedy(path: &str) -> String {
+    format!(
+        "parameters may already be applied; inspect and repair {path} (or move it aside \
+         and keep the copy, which holds the original values), then rerun the command"
+    )
 }
 
 // Publish a fresh inode only after its contents and exact final mode are ready.
@@ -503,15 +526,23 @@ fn merge_rollback<I>(entries: I) -> Result<()>
 where
     I: IntoIterator<Item = (String, String, String)>,
 {
-    let dir = Path::new(ROLLBACK_PATH).parent().unwrap();
+    merge_rollback_at(ROLLBACK_PATH, entries)
+}
+
+fn merge_rollback_at<I>(path: &str, entries: I) -> Result<()>
+where
+    I: IntoIterator<Item = (String, String, String)>,
+{
+    let data = merge_entries(load_rollback_from(path)?, entries);
+    let dir = Path::new(path)
+        .parent()
+        .context("rollback path has no parent")?;
     fs::create_dir_all(dir).context("创建 rollback 目录失败")?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .with_context(|| format!("设置 {} 权限 0700 失败", dir.display()))?;
 
-    let data = merge_entries(load_rollback(), entries);
-
     let json = serde_json::to_string_pretty(&data)?;
-    write_atomic(ROLLBACK_PATH, json.as_bytes(), 0o600).context("保存 rollback 文件失败")?;
+    write_atomic(path, json.as_bytes(), 0o600).context("保存 rollback 文件失败")?;
     Ok(())
 }
 
@@ -616,7 +647,7 @@ fn render_persistence(
 /// files with only its own batch, silently dropping earlier params) and never
 /// persists a param that failed to apply (those are not in the record).
 fn persist_from_rollback() -> Result<()> {
-    let data = load_rollback();
+    let data = load_rollback()?;
     let (sysctl_content, nonsysctl_script) = render_persistence(&data.entries);
 
     if let Some(sysctl_content) = sysctl_content {
@@ -1733,6 +1764,107 @@ mod tests {
                 !e.to_string().contains("invalid value"),
                 "normal value wrongly rejected: {e}"
             );
+        }
+    }
+
+    #[test]
+    fn test_absent_rollback_ledger_can_be_created() {
+        let dir = AtomicTestDir::new("ledger-absent");
+        let ledger = dir.0.join("nested/rollback.json");
+        let path = ledger.to_str().unwrap();
+        let data = load_rollback_from(path).unwrap();
+        assert_eq!(data.version, 1);
+        assert!(data.entries.is_empty());
+        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        let data = load_rollback_from(path).unwrap();
+        assert_eq!(data.entries["vm.swappiness"].previous, "60");
+        assert_eq!(data.entries["vm.swappiness"].applied, "10");
+        assert_eq!(
+            fs::metadata(&ledger).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn test_valid_rollback_ledger_keeps_originals_across_merges() {
+        let dir = AtomicTestDir::new("ledger-valid");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        merge_rollback_at(
+            path,
+            [
+                ("vm.swappiness".into(), "10".into(), "20".into()),
+                ("net.core.somaxconn".into(), "128".into(), "256".into()),
+            ],
+        )
+        .unwrap();
+        let data = load_rollback_from(path).unwrap();
+        assert_eq!(data.entries.len(), 2);
+        assert_eq!(data.entries["vm.swappiness"].previous, "60");
+        assert_eq!(data.entries["vm.swappiness"].applied, "20");
+        assert_eq!(data.entries["net.core.somaxconn"].previous, "128");
+    }
+
+    #[test]
+    fn test_invalid_rollback_ledger_is_never_replaced() {
+        let dir = AtomicTestDir::new("ledger-invalid");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        for contents in [
+            b"".as_slice(),
+            br#"{"version":1,"entries":{"vm.swappiness":{"previous":"60""#.as_slice(),
+            br#"{"version":1,"entries":[]}"#.as_slice(),
+            b"\xff\xfe".as_slice(),
+        ] {
+            fs::write(&ledger, contents).unwrap();
+            fs::set_permissions(&ledger, fs::Permissions::from_mode(0o640)).unwrap();
+            fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
+            let error =
+                merge_rollback_at(path, [("vm.swappiness".into(), "10".into(), "20".into())])
+                    .expect_err("invalid ledger must prevent a replacement");
+            assert!(error.to_string().contains(path), "{error:#}");
+            assert_eq!(fs::read(&ledger).unwrap(), contents);
+            assert_eq!(
+                fs::metadata(&ledger).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+            assert_eq!(
+                fs::metadata(&dir.0).unwrap().permissions().mode() & 0o777,
+                0o755
+            );
+            assert!(!Path::new(&format!("{path}.tmp.{}", std::process::id())).exists());
+        }
+    }
+
+    #[test]
+    fn test_rollback_read_errors_do_not_become_empty_ledgers() {
+        let dir = AtomicTestDir::new("ledger-read-error");
+        let path = dir.0.to_str().unwrap();
+        let error = load_rollback_from(path)
+            .err()
+            .expect("a directory is an I/O error, not an absent ledger");
+        assert!(error.to_string().contains(path), "{error:#}");
+        assert!(dir.0.is_dir());
+    }
+
+    #[test]
+    fn test_rollback_ledger_errors_name_a_remedy() {
+        let dir = AtomicTestDir::new("ledger-remedy");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        fs::write(&ledger, b"{").unwrap();
+        for error in [
+            load_rollback_from(path)
+                .err()
+                .expect("truncated ledger must not parse"),
+            load_rollback_from(dir.0.to_str().unwrap())
+                .err()
+                .expect("directory must not read"),
+        ] {
+            let message = error.to_string();
+            assert!(message.contains("inspect and repair"), "{message}");
+            assert!(message.contains("rerun the command"), "{message}");
         }
     }
 }
