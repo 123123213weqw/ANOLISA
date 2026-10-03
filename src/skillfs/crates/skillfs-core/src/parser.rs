@@ -247,16 +247,24 @@ fn extract_first_paragraph(body: &str) -> String {
     } else {
         trimmed
     };
-    // Take first non-empty paragraph
-    content
-        .split("\n\n")
-        .find(|p| !p.trim().is_empty())
-        .unwrap_or("")
-        .lines()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .trim()
-        .to_string()
+    // Take the first non-empty paragraph. A paragraph ends at a blank
+    // line; `lines()` strips the terminator of either convention, so a
+    // CRLF file yields the same paragraph as an LF one.
+    let mut paragraph = String::new();
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            if !paragraph.is_empty() {
+                break;
+            }
+            continue;
+        }
+        if !paragraph.is_empty() {
+            paragraph.push(' ');
+        }
+        paragraph.push_str(line);
+    }
+    paragraph
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +599,41 @@ Search the web.
         assert_eq!(entry.body, "Body");
         assert_eq!(entry.metadata.name, "web-search"); // from dir_name
         assert!(entry.parse_status.is_degraded()); // still missing frontmatter
+    }
+
+    #[test]
+    fn test_parse_crlf_description_stops_at_the_blank_line() {
+        // Regression: the paragraph fallback split on "\n\n", which never
+        // matches CRLF text, so a Windows-authored skill without a
+        // frontmatter description got its whole body back as the
+        // description instead of the first paragraph.
+        let content = "---\r\nname: web-search\r\n---\r\n# Web Search\r\n\r\nSearch the web for dogs.\r\n\r\nMore content here.\r\n";
+
+        let entry = parse_skill_md(content, "web-search");
+
+        assert_eq!(
+            entry.metadata.description, "Search the web for dogs.",
+            "CRLF paragraph must end at the blank line"
+        );
+        assert!(entry.parse_status.is_degraded()); // still missing description
+
+        // The LF twin defines the contract: the same first paragraph.
+        let lf = "---\nname: web-search\n---\n# Web Search\n\nSearch the web for dogs.\n\nMore content here.\n";
+        assert_eq!(
+            parse_skill_md(lf, "web-search").metadata.description,
+            entry.metadata.description
+        );
+    }
+
+    #[test]
+    fn test_parse_crlf_without_frontmatter_uses_the_first_paragraph() {
+        // The no-frontmatter fallback takes the same description path.
+        let content = "# Web Search\r\n\r\nSearch the web for dogs.\r\n\r\nMore content here.\r\n";
+
+        let entry = parse_skill_md(content, "web-search");
+
+        assert_eq!(entry.metadata.description, "Search the web for dogs.");
+        assert!(entry.parse_status.is_degraded()); // missing frontmatter
     }
 
     #[test]
