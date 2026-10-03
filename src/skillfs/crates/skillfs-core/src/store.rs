@@ -48,6 +48,11 @@ impl SkillStore {
     /// A subdirectory is treated as a **category** when it contains no
     /// `SKILL.md` of its own but has sub-subdirectories that contain
     /// `SKILL.md` files.
+    ///
+    /// Skills are keyed by directory leaf name, so two discovered skills
+    /// sharing a leaf name collide: one entry is kept deterministically
+    /// and the collision is returned as a `LoadError` (reported by the
+    /// internal insert_discovered helper used by both loaders).
     pub fn load_from_directory(&mut self, source: &Path, config: &ParseConfig) -> Vec<LoadError> {
         let mut errors = Vec::new();
         let mut loaded_count = 0usize;
@@ -129,8 +134,9 @@ impl SkillStore {
                             .to_string();
                         entry.metadata.name = dir_name.clone();
                         info!(name = %dir_name, "loaded skill");
-                        self.upsert(entry);
-                        self.skill_categories.insert(dir_name, String::new());
+                        if let Some(error) = self.insert_discovered(entry, "") {
+                            errors.push(error);
+                        }
                         loaded_count += 1;
                     }
                     Err(e) => {
@@ -145,6 +151,60 @@ impl SkillStore {
 
         info!(count = loaded_count, "finished loading skills");
         errors
+    }
+
+    /// Insert a discovered skill, reporting a same-key collision.
+    ///
+    /// The store keys skills by their directory leaf name — the key every
+    /// later lookup uses (`get`, `/skills` listings, the sync worker's
+    /// `Reparse` events) — so two valid skills that share a leaf name
+    /// (`alpha/notes` + `beta/notes`, or a flat `demo` plus a categorized
+    /// `catalog/demo`) collide on one entry. Instead of letting the later
+    /// `read_dir` winner silently overwrite the other, keep one entry
+    /// deterministically (the lexicographically smaller `source_path`
+    /// wins, mirroring the earlier-source-wins rule of the multi-source
+    /// loader) and return a `LoadError` describing the loser, so mount
+    /// logs and `sls validate` surface the collision. Re-discovering the
+    /// exact same path is an idempotent refresh and never collides.
+    fn insert_discovered(&mut self, entry: SkillEntry, category: &str) -> Option<LoadError> {
+        let name = entry.metadata.name.clone();
+        match self.skills.get(&name) {
+            Some(existing) if existing.source_path != entry.source_path => {
+                let (keep_new, dropped, kept) = if entry.source_path < existing.source_path {
+                    (
+                        true,
+                        existing.source_path.clone(),
+                        entry.source_path.clone(),
+                    )
+                } else {
+                    (
+                        false,
+                        entry.source_path.clone(),
+                        existing.source_path.clone(),
+                    )
+                };
+                if keep_new {
+                    self.skills.insert(name.clone(), entry);
+                    self.skill_categories
+                        .insert(name.clone(), category.to_string());
+                }
+                Some(LoadError {
+                    path: dropped.clone(),
+                    error: format!(
+                        "duplicate skill name '{name}': {} and {} share the same \
+                         directory name; keeping {}",
+                        dropped.display(),
+                        kept.display(),
+                        kept.display(),
+                    ),
+                })
+            }
+            _ => {
+                self.skills.insert(name.clone(), entry);
+                self.skill_categories.insert(name, category.to_string());
+                None
+            }
+        }
     }
 
     /// Load skills from a single category directory.
@@ -212,8 +272,9 @@ impl SkillStore {
                         .to_string();
                     entry.metadata.name = dir_name.clone();
                     info!(name = %dir_name, category = %cat_name, "loaded skill");
-                    self.upsert(entry);
-                    self.skill_categories.insert(dir_name, cat_name.to_string());
+                    if let Some(error) = self.insert_discovered(entry, cat_name) {
+                        errors.push(error);
+                    }
                     *loaded_count += 1;
                 }
                 Err(e) => {
@@ -777,5 +838,116 @@ mod tests {
             store.get("linknested").is_none(),
             "symlinked nested skill must not load"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Same-leaf-name collision tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn store_load_reports_cross_category_leaf_name_collision() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        for cat in ["alpha", "beta"] {
+            let dir = temp_dir.path().join(cat).join("notes");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: notes\ndescription: {cat}\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        // Exactly one entry survives the shared key, and the collision is
+        // reported instead of silently dropping the loser.
+        assert_eq!(store.len(), 1);
+        assert_eq!(errors.len(), 1, "collision must surface, got {errors:?}");
+        // The deterministic winner is the lexicographically smaller path,
+        // independent of read_dir order.
+        let winner = temp_dir.path().join("alpha").join("notes").join("SKILL.md");
+        let loser = temp_dir.path().join("beta").join("notes").join("SKILL.md");
+        assert_eq!(store.get("notes").unwrap().source_path, winner);
+        assert_eq!(errors[0].path, loser);
+        assert!(errors[0].error.contains("notes"), "{}", errors[0].error);
+
+        // A rescan onto the same store keeps the same deterministic winner
+        // (never flip-flopping with read_dir order): re-discovering the
+        // winner's path is a silent refresh, and the still-existing loser
+        // is reported again on every scan while the collision persists.
+        let errors_again = store.load_from_directory(temp_dir.path(), &config);
+        assert_eq!(errors_again.len(), 1, "reload: {errors_again:?}");
+        assert_eq!(errors_again[0].path, loser);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.get("notes").unwrap().source_path, winner);
+    }
+
+    #[test]
+    fn store_load_reports_flat_and_categorized_leaf_name_collision() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let flat = temp_dir.path().join("demo");
+        std::fs::create_dir(&flat).unwrap();
+        std::fs::write(
+            flat.join("SKILL.md"),
+            "---\nname: demo\ndescription: flat\n---\n",
+        )
+        .unwrap();
+        let nested = temp_dir.path().join("catalog").join("demo");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(
+            nested.join("SKILL.md"),
+            "---\nname: demo\ndescription: categorized\n---\n",
+        )
+        .unwrap();
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert_eq!(store.len(), 1);
+        assert_eq!(errors.len(), 1, "collision must surface, got {errors:?}");
+        // `catalog/demo/SKILL.md` sorts before `demo/SKILL.md`.
+        assert_eq!(
+            store.get("demo").unwrap().source_path,
+            nested.join("SKILL.md")
+        );
+        assert_eq!(errors[0].path, flat.join("SKILL.md"));
+    }
+
+    #[test]
+    fn store_load_distinct_leaf_names_across_categories_both_load() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        for (cat, skill) in [("alpha", "notes"), ("beta", "journal")] {
+            let dir = temp_dir.path().join(cat).join(skill);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(
+                dir.join("SKILL.md"),
+                format!("---\nname: {skill}\ndescription: {cat}\n---\n"),
+            )
+            .unwrap();
+        }
+
+        let mut store = SkillStore::new();
+        let config = ParseConfig {
+            strict: false,
+            max_skill_size: 1_048_576,
+            max_skills: 1000,
+        };
+        let errors = store.load_from_directory(temp_dir.path(), &config);
+
+        assert!(errors.is_empty(), "unexpected load errors: {errors:?}");
+        assert_eq!(store.len(), 2);
+        assert!(store.get("notes").is_some());
+        assert!(store.get("journal").is_some());
     }
 }
