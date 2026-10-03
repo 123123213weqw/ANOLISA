@@ -145,13 +145,19 @@ fn bench_context_switch() -> Result<BenchResult> {
 
     child.join().unwrap();
 
-    let us_per_switch = elapsed.as_micros() as f64 / iterations as f64;
+    Ok(context_switch_result(elapsed, iterations))
+}
 
-    Ok(BenchResult {
+/// Label the unix-socket ping-pong cost. One iteration is a full round-trip
+/// that wakes the peer twice (once for the request, once for the reply), so
+/// the value is per RTT — like `bench_net_latency` — not per single switch.
+fn context_switch_result(elapsed: std::time::Duration, iterations: u64) -> BenchResult {
+    let us_per_rtt = elapsed.as_micros() as f64 / iterations as f64;
+    BenchResult {
         name: "context switch".to_string(),
-        value: us_per_switch,
-        unit: "μs/switch".to_string(),
-    })
+        value: us_per_rtt,
+        unit: "μs/RTT".to_string(),
+    }
 }
 
 fn bench_mem_bandwidth() -> Result<BenchResult> {
@@ -292,13 +298,18 @@ fn bench_io_throughput() -> Result<BenchResult> {
 
     drop(_cleanup);
 
-    let mb_per_sec = total_size as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+    Ok(io_throughput_result(total_size as u64, elapsed))
+}
 
-    Ok(BenchResult {
+/// Label the sequential-write throughput. The math divides bytes by
+/// 1024*1024, so the unit is MiB/s, not MB/s.
+fn io_throughput_result(total_bytes: u64, elapsed: std::time::Duration) -> BenchResult {
+    let mib_per_sec = total_bytes as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0);
+    BenchResult {
         name: "IO throughput (seq)".to_string(),
-        value: mb_per_sec,
-        unit: "MB/s".to_string(),
-    })
+        value: mib_per_sec,
+        unit: "MiB/s".to_string(),
+    }
 }
 
 fn bench_net_latency() -> Result<BenchResult> {
@@ -362,5 +373,26 @@ mod tests {
             assert!(path.exists(), "file must exist while the guard is live");
         }
         assert!(!path.exists(), "guard must remove the file on drop");
+    }
+
+    #[test]
+    fn io_throughput_is_labeled_mib_per_sec() {
+        // 2 MiB written in 2 s is exactly 1.0 MiB/s; the divisor is
+        // 1024*1024, so the label must be MiB/s, not MB/s.
+        let r = io_throughput_result(2 * 1024 * 1024, std::time::Duration::from_secs(2));
+        assert_eq!(r.unit, "MiB/s");
+        assert_eq!(r.name, "IO throughput (seq)");
+        assert!((r.value - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn context_switch_is_labeled_per_round_trip() {
+        // One iteration is a full ping-pong round-trip (the peer wakes for
+        // the request and again for the reply), so the unit is per RTT,
+        // matching the μs/RTT convention of bench_net_latency.
+        let r = context_switch_result(std::time::Duration::from_micros(200), 100);
+        assert_eq!(r.unit, "μs/RTT");
+        assert_eq!(r.name, "context switch");
+        assert!((r.value - 2.0).abs() < 1e-9);
     }
 }
