@@ -16,6 +16,27 @@ use crate::sys::{
     errno, mkdirat_leaf, open_dir_path, rename_noreplace, renameat2_leaf, unlinkat_leaf,
 };
 
+/// Which source directory a skill-dir rename addresses, and therefore
+/// how strictly the backing store entry must be identified below the
+/// source root. See [`SkillFs::rename_source_backs_store_entry`].
+enum RenameSourceIdentity<'a> {
+    /// A flat `/skills/<name>` slot. The virtual path resolves THROUGH
+    /// the store entry (`skill_physical_dir` reads the recorded
+    /// `source_path`), so the entry itself defines the backing
+    /// directory: a categorized source viewed through a flat mount
+    /// records a deeper origin (`catalog/demo`), and renaming the slot
+    /// legitimately migrates that entry. Any depth below the source
+    /// root is accepted.
+    FlatSlot,
+    /// The exact component chain below the source root. An inbox
+    /// candidate is always `source/<name>` (bare leaf); a Hermes
+    /// nested skill is `<category>/<leaf>`. A same-leaf entry with a
+    /// different chain — a real `beta/docs` skill while a plain
+    /// `source/docs` candidate is renamed through the inbox — does not
+    /// back the renamed directory and must be left alone.
+    ExactChain(&'a [String]),
+}
+
 impl SkillFs {
     pub(in crate::fs) fn mkdir_impl(
         &mut self,
@@ -1045,23 +1066,90 @@ impl SkillFs {
                 // Update inode mappings.
                 self.inodes.rename_path(&old_path, &new_path);
 
-                // Store sync for skill-level renames.
+                // Store sync for skill-level renames. SkillDir is a flat
+                // `/skills/<name>` rename; InboxSkillDir is an inbox-internal
+                // rename of the physical `source/<name>` candidate (mkdir /
+                // rmdir already sync inbox entries, so rename must too);
+                // NestedSkillDir is the Hermes-layout equivalent, whose store
+                // key is likewise the directory leaf name. Cross-namespace
+                // (inbox <-> /skills) renames were rejected with EXDEV above,
+                // so old and new are both in or both out of the inbox here.
                 let old_type = old_path_type.clone();
                 let new_type = new_path_type.clone();
                 match (&old_type, &new_type) {
                     (
                         PathType::SkillDir {
                             skill_name: old_name,
+                        }
+                        | PathType::InboxSkillDir {
+                            skill_name: old_name,
+                        }
+                        | PathType::NestedSkillDir {
+                            skill_name: old_name,
+                            ..
                         },
                         PathType::SkillDir {
                             skill_name: new_name,
+                        }
+                        | PathType::InboxSkillDir {
+                            skill_name: new_name,
+                        }
+                        | PathType::NestedSkillDir {
+                            skill_name: new_name,
+                            ..
                         },
                     ) => {
-                        self.update_store_after_skill_rename(old_name, new_name, &new_physical);
-                        info!(
-                            old = %old_name, new = %new_name,
-                            "sync: skill renamed (immediate store update)"
-                        );
+                        // Identity migration needs proof that the source
+                        // directory actually backs the managed skill keyed
+                        // by `old_name`. Lexical path classification is not
+                        // identity: path.rs deliberately classifies a plain
+                        // category child with no SKILL.md (e.g. `apple/docs`)
+                        // as NestedSkillDir for traversal, and the store keys
+                        // skills by bare leaf name, so a different category
+                        // may already own a real skill with the same leaf —
+                        // and the inbox chain is a single component, so even
+                        // a plain `source/docs` candidate rename could
+                        // collide with a real `beta/docs` skill. An ungated
+                        // remove+upsert would delete that unrelated entry
+                        // and/or fabricate a placeholder for a plain
+                        // directory. A flat `/skills` slot resolves through
+                        // the store entry itself and accepts any depth
+                        // below the source root (categorized source behind
+                        // a flat mount); inbox and Hermes nested renames
+                        // must match the entry's FULL relative chain below
+                        // the source root (category component included for
+                        // nested skills).
+                        let exact_chain: Vec<String> = match &old_type {
+                            PathType::NestedSkillDir {
+                                category,
+                                skill_name,
+                            } => vec![category.clone(), skill_name.clone()],
+                            _ => vec![old_name.clone()],
+                        };
+                        let identity = match &old_type {
+                            PathType::SkillDir { .. } => RenameSourceIdentity::FlatSlot,
+                            _ => RenameSourceIdentity::ExactChain(&exact_chain),
+                        };
+                        if !self.rename_source_backs_store_entry(old_name, identity) {
+                            // Plain (never-activated) directory rename: the
+                            // store holds no entry originating here, so
+                            // leave it untouched — same stance as the
+                            // sentinel-gated inbox activation flow.
+                            info!(
+                                old = %old_name, new = %new_name,
+                                "sync: non-skill dir rename left the store untouched"
+                            );
+                        } else {
+                            // Reuse the shared #3999 refresh helper so the
+                            // rename keeps its invalid-dirname Degraded
+                            // semantics (adopt_directory_name) instead of
+                            // the previously inlined remove+upsert.
+                            self.update_store_after_skill_rename(old_name, new_name, &new_physical);
+                            info!(
+                                old = %old_name, new = %new_name,
+                                "sync: skill renamed (immediate store update)"
+                            );
+                        }
                     }
                     _ => {
                         // File-level rename inside a skill — trigger re-parse
@@ -1299,6 +1387,70 @@ impl SkillFs {
         };
         adopt_directory_name(&mut new_entry, new_name);
         self.store.write().upsert(new_entry);
+    }
+
+    /// Whether the store entry keyed by `skill_name` demonstrably
+    /// originates from the source directory addressed by `identity`.
+    ///
+    /// For [`RenameSourceIdentity::ExactChain`] the entry's recorded
+    /// source must be the `SKILL.md` living under exactly that chain
+    /// below the source root — the FULL relative path, never a
+    /// trailing-segment match. The store keys skills by bare leaf
+    /// name, so the entry held under the old name may belong to a
+    /// different directory that merely shares the leaf: a real
+    /// `beta/docs` skill owns the key "docs" while a plain `source/docs`
+    /// inbox candidate (no SKILL.md, one-component chain) is being
+    /// renamed — `beta/docs` does not strip to `docs`, so that pair is
+    /// rejected instead of the rename deleting the real skill's entry
+    /// and fabricating a placeholder. Hermes nested renames likewise
+    /// must match the whole category chain.
+    ///
+    /// For [`RenameSourceIdentity::FlatSlot`] any origin below the
+    /// source root is accepted, because the flat slot resolves through
+    /// the store entry itself (see the enum).
+    ///
+    /// In either mode an entry whose origin does not strip below this
+    /// source root at all (a different root entirely) never backs the
+    /// renamed directory. Whole-path equality is unusable verbatim —
+    /// in-place mounts address the source through `/proc/self/fd/<n>`
+    /// while an initial scan records the real source prefix (and the
+    /// mkdir placeholder / the rename re-parse record the fd alias) —
+    /// so both spellings of the source root are accepted when
+    /// stripping, the same alias pair `snapshot_read_dir` reconciles.
+    fn rename_source_backs_store_entry(
+        &self,
+        skill_name: &str,
+        identity: RenameSourceIdentity<'_>,
+    ) -> bool {
+        let store = self.store.read();
+        let Some(entry) = store.get(skill_name) else {
+            return false;
+        };
+        if entry.source_path.file_name() != Some(std::ffi::OsStr::new("SKILL.md")) {
+            return false;
+        }
+        let Some(origin) = entry.source_path.parent() else {
+            return false;
+        };
+        // Accept both spellings of the source root: the real source
+        // path (initial scan) and the in-place `/proc/self/fd/<n>`
+        // alias (mkdir placeholder / post-mount re-parse).
+        let mut source_roots = vec![self.source.clone()];
+        if let Some(fd) = &self.source_dirfd {
+            use std::os::unix::io::AsRawFd;
+            source_roots.push(PathBuf::from(format!("/proc/self/fd/{}", fd.as_raw_fd())));
+        }
+        source_roots.iter().any(|root| {
+            origin
+                .strip_prefix(root)
+                .map(|relative| match identity {
+                    RenameSourceIdentity::FlatSlot => !relative.as_os_str().is_empty(),
+                    RenameSourceIdentity::ExactChain(chain) => {
+                        !chain.is_empty() && relative == chain.iter().collect::<PathBuf>()
+                    }
+                })
+                .unwrap_or(false)
+        })
     }
 }
 
