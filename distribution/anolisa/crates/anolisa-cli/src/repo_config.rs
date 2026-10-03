@@ -16,7 +16,9 @@
 //!   `$channel` substitute into `base_url` only. Values come from host
 //!   detection and can be overridden in `[vars]`; an unknown or unset
 //!   variable is a hard error — a URL with a silently-preserved `$typo`
-//!   is the hardest failure to diagnose downstream.
+//!   is the hardest failure to diagnose downstream. Substituted values
+//!   are re-validated: a `[vars]` or host value cannot inject what the
+//!   template rules reject.
 //! * **Schemes**: `file://` and `https://` always allowed; `http://`
 //!   requires `insecure = true` on the entry; query strings and
 //!   fragments are rejected.
@@ -553,6 +555,11 @@ impl RepoConfig {
             ),
         ]);
         let substituted = substitute_vars(backend_name, &backend.base_url, &values)?;
+        // A variable value ([vars] override or host detection) can inject
+        // exactly the shapes the raw template was validated against, so the
+        // substituted URL is re-checked before any caller derives index,
+        // artifact, or dnf baseurls from it.
+        validate_base_url(backend_name, &substituted, backend.insecure)?;
         Ok(substituted.trim_end_matches('/').to_string())
     }
 
@@ -589,8 +596,14 @@ pub fn normalize_override_url(url: &str) -> Result<String, RepoConfigError> {
     Ok(url.trim_end_matches('/').to_string())
 }
 
-/// Enforce the base_url shape rules (see module docs). Runs on the raw
-/// string before substitution — the scheme is always literal.
+/// Enforce the base_url shape rules (see module docs): scheme, non-empty
+/// authority/path, and no query string or fragment. Runs on the raw
+/// template at parse time — the scheme is always literal — and again on
+/// the substituted result in [`RepoConfig::resolved_base_url`], so a
+/// variable value cannot inject what the template rules reject. Path
+/// shape beyond that is untouched: the config author already controls
+/// the whole base_url, and local paths keep whatever characters the
+/// filesystem allows (a directory named `repo dir` works).
 fn validate_base_url(backend: &str, url: &str, insecure: bool) -> Result<(), RepoConfigError> {
     let invalid = |reason: &str| RepoConfigError::InvalidBaseUrl {
         backend: backend.to_string(),
@@ -1251,6 +1264,96 @@ agentsight = "anolis-agentsight"
             err,
             RepoConfigError::UnsetVariable { name, .. } if name == "releasever"
         ));
+    }
+
+    /// A `[vars]` value must not smuggle characters the base_url shape
+    /// rules reject: substitution happens after the raw template passed
+    /// `validate_base_url`, so the resolved URL is re-checked before any
+    /// caller derives index or artifact URLs from it. The re-check
+    /// enforces the same pre-existing rules (scheme, non-empty
+    /// authority/path, no query string or fragment); path shape is not
+    /// further restricted — the config author already controls the whole
+    /// base_url, and dot segments in any form are pre-existing behavior
+    /// (`https://example.com/../other/v1/` resolved the same way before
+    /// this change).
+    #[test]
+    fn vars_value_cannot_bypass_base_url_shape_rules() {
+        for poison in ["stable?token=1", "stable#frag"] {
+            let cfg = RepoConfig::from_toml_str(&format!(
+                r#"schema_version = 1
+default_backend = "raw"
+[vars]
+channel = "{poison}"
+[backends.raw]
+base_url = "https://example.com/anolisa/$channel/v1/"
+"#,
+            ))
+            .expect("raw template passes shape rules");
+            let (name, backend) = cfg.select_backend(None).expect("raw backend");
+            let err = match cfg.resolved_base_url(name, backend, &host()) {
+                Ok(url) => panic!("poison {poison:?} must be rejected, got {url}"),
+                Err(err) => err,
+            };
+            assert!(
+                matches!(err, RepoConfigError::InvalidBaseUrl { .. }),
+                "poison {poison:?}: got {err:?}"
+            );
+        }
+    }
+
+    /// Host-detected values feed the same substitution, so they get the
+    /// same post-substitution re-check.
+    #[test]
+    fn host_detected_value_cannot_bypass_base_url_shape_rules() {
+        let cfg = RepoConfig::from_toml_str(
+            r#"schema_version = 1
+default_backend = "raw"
+[backends.raw]
+base_url = "https://example.com/anolisa/$os/v1/"
+"#,
+        )
+        .expect("raw template passes shape rules");
+        let (name, backend) = cfg.select_backend(None).expect("raw backend");
+        let host = HostVars {
+            os: "linux?token=1".to_string(),
+            arch: "x86_64".to_string(),
+        };
+        let err = cfg
+            .resolved_base_url(name, backend, &host)
+            .expect_err("a query string in a host value must be rejected");
+        assert!(matches!(err, RepoConfigError::InvalidBaseUrl { .. }));
+    }
+
+    /// Local repositories keep whatever characters the filesystem allows:
+    /// the shape rules must not over-restrict paths that worked before
+    /// the post-substitution re-check existed. A `file://` base_url whose
+    /// path contains a space (and such a value substituted from `[vars]`)
+    /// still resolves, and a `--repo 'file:///tmp/repo dir'` override
+    /// still normalizes — `parse_file_url` builds a `PathBuf` verbatim,
+    /// with no percent-decoding, so percent-encoding would not be an
+    /// equivalent path.
+    #[test]
+    fn local_paths_with_spaces_still_resolve() {
+        let cfg = RepoConfig::from_toml_str(
+            r#"schema_version = 1
+default_backend = "raw"
+[vars]
+channel = "sta ble"
+[backends.raw]
+base_url = "file:///tmp/repo $channel/v1/"
+"#,
+        )
+        .expect("file template with spaces passes shape rules");
+        let (name, backend) = cfg.select_backend(None).expect("raw backend");
+        let resolved = cfg
+            .resolved_base_url(name, backend, &host())
+            .expect("local path with spaces must keep resolving");
+        assert_eq!(resolved, "file:///tmp/repo sta ble/v1");
+
+        assert_eq!(
+            normalize_override_url("file:///tmp/repo dir").expect("override with space"),
+            "file:///tmp/repo dir"
+        );
     }
 
     #[test]
