@@ -58,6 +58,23 @@ def _clear_agent_error() -> None:
     _tls.reason = ""
 
 
+# ── UserAgent LLM call budget (per dialogue round) ───────────────────────────
+#
+# ``_call_user_agent_llm`` used to construct its OpenAI client without a
+# timeout — the SDK default is 600s per call — and retry 10 times, so one
+# hung UA endpoint could stall a round for ~100 minutes with no overall
+# deadline.  Each call is now capped by ``UA_LLM_CALL_TIMEOUT_S`` and the
+# retry loop is clamped so retries x per-call timeout stay within
+# ``UA_LLM_DEADLINE_S`` — the same wall-budget approach
+# ``_run_first_turn_via_api`` applies to its HTTP attempts.  Both knobs are
+# env-overridable for slow endpoints and tests.
+
+UA_LLM_CALL_TIMEOUT_S = float(
+    os.environ.get("CE_RUNNER_UA_LLM_CALL_TIMEOUT_S", "120"))
+UA_LLM_DEADLINE_S = float(
+    os.environ.get("CE_RUNNER_UA_LLM_DEADLINE_S", "600"))
+
+
 # ── HTTP API (multimodal) ────────────────────────────────────────────────────
 
 def _run_first_turn_via_api(text: str,
@@ -634,10 +651,26 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
     client = OpenAI(
         api_key=ua_config["api_key"],
         base_url=ua_config["base_url"],
+        # Cap each call; the SDK default is 600s, so 10 retries could
+        # stall a round for ~100 minutes on a hung endpoint.  The loop
+        # below is the retry authority (it logs and honours the round
+        # deadline), so the SDK's own default 2 retries are disabled —
+        # they would multiply the effective attempts and break the
+        # deadline arithmetic.
+        timeout=UA_LLM_CALL_TIMEOUT_S,
+        max_retries=0,
     )
 
+    deadline = time.monotonic() + UA_LLM_DEADLINE_S
+    ua_max_attempts = max(1, min(10, int(UA_LLM_DEADLINE_S // UA_LLM_CALL_TIMEOUT_S)))
     max_retries = 10
     for attempt in range(max_retries):
+        if attempt and (attempt >= ua_max_attempts
+                        or time.monotonic() > deadline):
+            log(f"  [WARNING] UA LLM round budget ({UA_LLM_DEADLINE_S:.0f}s "
+                f"wall / {ua_max_attempts} attempts) reached, aborting "
+                f"before attempt {attempt + 1}")
+            break
         try:
             resp = client.chat.completions.create(
                 model=ua_config["model_id"],

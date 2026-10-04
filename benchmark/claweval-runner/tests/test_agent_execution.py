@@ -193,6 +193,212 @@ class TestServiceHealthCheck:
         assert task.get("services", []) == []
 
 
+class TestUserAgentLlmDeadline:
+    """``_call_user_agent_llm`` must bound UA LLM calls with a deadline.
+
+    Regression (e1a5de1cb9): the OpenAI client was constructed without a
+    timeout — the SDK default is 600s per call — and the retry loop ran 10
+    attempts, so one hung UA endpoint could stall a dialogue round for
+    ~100 minutes with no overall deadline.  Mirrors the wall-budget fix
+    ``_run_first_turn_via_api`` got for its HTTP attempts.
+    """
+
+    UA_CFG = {"api_key": "k", "base_url": "http://127.0.0.1:1/v1",
+              "model_id": "m"}
+
+    @staticmethod
+    def _clear_proxies(monkeypatch):
+        for var in ("http_proxy", "https_proxy", "all_proxy",
+                    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+    @staticmethod
+    def _failing_openai_module(client):
+        fake_openai = MagicMock()
+        fake_openai.OpenAI.return_value = client
+        return fake_openai
+
+    def test_client_wired_with_per_call_timeout(self, monkeypatch):
+        """The OpenAI client must be constructed with the module's per-call
+        timeout; without it every call inherits the SDK's 600s default."""
+        from ce_runner import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "UA_LLM_CALL_TIMEOUT_S", 12.5,
+                            raising=False)
+        monkeypatch.setattr(agent_mod, "UA_LLM_DEADLINE_S", 60.0,
+                            raising=False)
+        client = MagicMock()
+        client.chat.completions.create.side_effect = RuntimeError("boom")
+        fake_openai = self._failing_openai_module(client)
+
+        with (
+            patch.dict(sys.modules, {"openai": fake_openai}),
+            patch.object(agent_mod.time, "sleep", lambda *_: None),
+        ):
+            agent_mod._call_user_agent_llm(dict(self.UA_CFG), "p", [])
+
+        kwargs = fake_openai.OpenAI.call_args.kwargs
+        assert kwargs.get("timeout") == 12.5, (
+            f"OpenAI client constructed without UA_LLM_CALL_TIMEOUT_S "
+            f"(kwargs={kwargs}); every call inherits the 600s SDK default"
+        )
+
+    def test_retries_fit_round_deadline(self, monkeypatch):
+        """retries x per-call timeout must stay within the round deadline:
+        a 6s deadline with 2s calls allows at most 3 attempts, not 10."""
+        from ce_runner import agent as agent_mod
+
+        monkeypatch.setattr(agent_mod, "UA_LLM_CALL_TIMEOUT_S", 2.0,
+                            raising=False)
+        monkeypatch.setattr(agent_mod, "UA_LLM_DEADLINE_S", 6.0,
+                            raising=False)
+        client = MagicMock()
+        client.chat.completions.create.side_effect = RuntimeError("down")
+
+        with (
+            patch.dict(sys.modules, {"openai": self._failing_openai_module(client)}),
+            patch.object(agent_mod.time, "sleep", lambda *_: None),
+        ):
+            agent_mod._call_user_agent_llm(dict(self.UA_CFG), "p", [])
+
+        attempts = client.chat.completions.create.call_count
+        assert attempts <= 3, (
+            f"{attempts} attempts x 2s call timeout exceeds the 6s round "
+            f"deadline; retries must be clamped to deadline // call timeout"
+        )
+
+    def test_default_budget_bounds_ten_retries(self):
+        """Default constants must bound the historical 10-retry worst case:
+        deadline < 10 x per-call timeout, so the clamp actually bites."""
+        from ce_runner import agent as agent_mod
+
+        assert hasattr(agent_mod, "UA_LLM_CALL_TIMEOUT_S"), (
+            "UA_LLM_CALL_TIMEOUT_S module constant is missing"
+        )
+        assert hasattr(agent_mod, "UA_LLM_DEADLINE_S"), (
+            "UA_LLM_DEADLINE_S module constant is missing"
+        )
+        assert 0 < agent_mod.UA_LLM_CALL_TIMEOUT_S
+        assert agent_mod.UA_LLM_DEADLINE_S < 10 * agent_mod.UA_LLM_CALL_TIMEOUT_S, (
+            "defaults leave the 10 x per-call-timeout worst case unbounded"
+        )
+
+    def test_never_responding_endpoint_returns_within_budget(self,
+                                                             monkeypatch):
+        """A UA endpoint that accepts and never responds must give up within
+        the round deadline instead of hanging on the 600s default read."""
+        import socket
+        import threading
+        import time as _time
+        from ce_runner import agent as agent_mod
+
+        self._clear_proxies(monkeypatch)
+        monkeypatch.setattr(agent_mod, "UA_LLM_CALL_TIMEOUT_S", 2.0,
+                            raising=False)
+        monkeypatch.setattr(agent_mod, "UA_LLM_DEADLINE_S", 6.0,
+                            raising=False)
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        conns = []
+        stop = threading.Event()
+
+        def acceptor():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                    conns.append(conn)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        threading.Thread(target=acceptor, daemon=True).start()
+        result = {}
+        try:
+            port = listener.getsockname()[1]
+            ua_cfg = {"api_key": "k",
+                      "base_url": f"http://127.0.0.1:{port}/v1",
+                      "model_id": "m"}
+
+            def call():
+                with patch.object(agent_mod.time, "sleep", lambda *_: None):
+                    result["reply"] = agent_mod._call_user_agent_llm(
+                        ua_cfg, "p", [])
+
+            worker = threading.Thread(target=call, daemon=True)
+            t0 = _time.monotonic()
+            worker.start()
+            worker.join(10.0)  # 6s budget + 4s scheduling epsilon
+            wall = _time.monotonic() - t0
+        finally:
+            stop.set()
+            for conn in conns:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            listener.close()
+
+        assert not worker.is_alive(), (
+            "UA LLM call still hanging after 10s: a never-responding "
+            "endpoint is not bounded by the round deadline"
+        )
+        assert result.get("reply") is None
+        assert wall <= 9.0, (
+            f"wall={wall:.1f}s exceeded the 6s budget (+3s epsilon)"
+        )
+
+    def test_fast_ua_reply_unchanged(self, monkeypatch):
+        """A fast UA endpoint still returns its reply text on the first
+        attempt; the budget must not interfere with the normal path."""
+        import threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from ce_runner import agent as agent_mod
+
+        self._clear_proxies(monkeypatch)
+        monkeypatch.setattr(agent_mod, "UA_LLM_CALL_TIMEOUT_S", 30.0,
+                            raising=False)
+        monkeypatch.setattr(agent_mod, "UA_LLM_DEADLINE_S", 60.0,
+                            raising=False)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                body = json.dumps({
+                    "choices": [{"message": {
+                        "content": "OK, so what is the interest rate?"}}],
+                }).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            ua_cfg = {"api_key": "k",
+                      "base_url": f"http://127.0.0.1:{server.server_address[1]}/v1",
+                      "model_id": "m"}
+            t0 = _time.monotonic()
+            reply = agent_mod._call_user_agent_llm(ua_cfg, "p", [])
+            wall = _time.monotonic() - t0
+        finally:
+            server.shutdown()
+
+        assert reply == "OK, so what is the interest rate?"
+        assert wall < 10, f"fast UA reply took {wall:.1f}s"
+
+
 class TestTaskYamlLoading:
     """Test task.yaml loading and validation."""
 
