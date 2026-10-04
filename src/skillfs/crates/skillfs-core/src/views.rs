@@ -231,6 +231,36 @@ impl ViewsConfig {
         }
         result
     }
+
+    /// Publish a config without replacing an existing one.
+    ///
+    /// Same staging sequence as [`Self::save`], but the publication step is
+    /// no-replace: the target only ever appears as a fully written file, and
+    /// if it appeared since the caller's absence check — another process, or
+    /// an editor save — the call fails with `AlreadyExists` instead of
+    /// renaming over it. Use this where "create only when absent" is the
+    /// contract; [`Self::save`] remains the replace-in-place path for
+    /// updating an existing config.
+    pub fn save_new(&self, source_dir: &Path) -> std::io::Result<()> {
+        let path = source_dir.join("skillfs-views.toml");
+        let content = toml::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        let (tmp_path, mut file) = create_staging_file(source_dir)?;
+        let result = (|| {
+            use std::io::Write;
+            file.write_all(content.as_bytes())?;
+            // `hard_link` is the no-replace publication primitive: it fails
+            // with `AlreadyExists` when the name is taken (a symlink counts)
+            // and never follows or overwrites the target. The staging file is
+            // on the same directory, so the link cannot cross filesystems.
+            std::fs::hard_link(&tmp_path, &path)
+        })();
+        drop(file);
+        // Only this call stages at this path; dropping our own staging name is
+        // correct on success (the target is its second link) and on failure.
+        let _ = std::fs::remove_file(&tmp_path);
+        result
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +394,95 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn concurrent_save_new_publishes_exactly_once() {
+        // Create-only publication is the atomic gate: every thread passes the
+        // same absence state before publishing, and the no-replace link lets
+        // exactly one win while the others report `AlreadyExists`.
+        let dir = TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let directory = dir.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut config = make_config();
+                    config.views[0].skills = vec![format!("skill-{worker}")];
+                    barrier.wait();
+                    config.save_new(&directory)
+                })
+            })
+            .collect();
+        let outcomes: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            outcomes.iter().filter(|r| r.is_ok()).count(),
+            1,
+            "exactly one create-only save may publish: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().filter(|r| r.is_err()).all(|r| r
+                .as_ref()
+                .err()
+                .map(std::io::Error::kind)
+                == Some(std::io::ErrorKind::AlreadyExists)),
+            "losers must report AlreadyExists: {outcomes:?}"
+        );
+        assert!(
+            ViewsConfig::load(dir.path()).is_some(),
+            "one complete config"
+        );
+        assert!(
+            staging_names(dir.path()).is_empty(),
+            "no staging file may be left behind: {:?}",
+            staging_names(dir.path())
+        );
+    }
+
+    #[test]
+    fn save_new_refuses_to_replace_an_existing_config() {
+        // A target that exists — whether hand-written or created after the
+        // caller's absence check — must survive byte for byte.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("skillfs-views.toml");
+        std::fs::write(&path, "user-authored config\n").unwrap();
+
+        let error = make_config()
+            .save_new(dir.path())
+            .expect_err("an existing config must not be replaced");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "user-authored config\n"
+        );
+        assert!(
+            staging_names(dir.path()).is_empty(),
+            "the loser must clean up its staging file: {:?}",
+            staging_names(dir.path())
+        );
+
+        // Publishing into a config-less directory succeeds and is loadable.
+        let fresh = TempDir::new().unwrap();
+        make_config().save_new(fresh.path()).expect("publish");
+        assert!(ViewsConfig::load(fresh.path()).is_some());
+        assert!(
+            staging_names(fresh.path()).is_empty(),
+            "the winner must drop its staging name: {:?}",
+            staging_names(fresh.path())
+        );
+    }
+
+    fn staging_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|name| name.contains(".tmp"))
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     #[test]

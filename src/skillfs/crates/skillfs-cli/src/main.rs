@@ -2975,6 +2975,19 @@ async fn cmd_classify(
         return Ok(());
     }
 
+    // ViewsConfig::load reports a missing config the same way as one it could
+    // not read or parse. Only the missing case may be created from scratch:
+    // generating over an existing file that failed to load would silently
+    // discard the view assignments it still holds.
+    let views_path = source.join("skillfs-views.toml");
+    if views_path.symlink_metadata().is_ok() {
+        return Err(format!(
+            "{} exists but could not be read or parsed; fix or remove it before classifying",
+            views_path.display()
+        )
+        .into());
+    }
+
     // Generate a fresh config: first N skills in "major" (default), rest in "other".
     let n = primary_count.min(all_names.len());
     let primary: Vec<String> = all_names[..n].to_vec();
@@ -3013,7 +3026,21 @@ async fn cmd_classify(
             println!("  - {}", s);
         }
     } else {
-        cfg.save(&source)?;
+        // The absence check above is a point-in-time observation: another
+        // classify (or an editor save) can create the config in between.
+        // Publish with the create-only primitive so this run fails instead of
+        // replacing the file the other writer just produced.
+        if let Err(error) = cfg.save_new(&source) {
+            return Err(if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "{} was created by another writer while classifying; re-run to inspect it",
+                    views_path.display()
+                )
+                .into()
+            } else {
+                error.into()
+            });
+        }
         println!("Written skillfs-views.toml to {}", source.display());
         println!();
         println!("Primary view 'major' ({} skills):", primary.len());
