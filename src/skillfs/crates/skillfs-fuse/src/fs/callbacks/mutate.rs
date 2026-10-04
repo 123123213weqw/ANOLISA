@@ -9,7 +9,7 @@ use skillfs_core::{parser, store::adopt_directory_name};
 use tracing::{debug, info, warn};
 
 use super::super::SkillFs;
-use crate::path::{PathType, is_skill_discover_path};
+use crate::path::{PathType, is_hermes_management_path, is_skill_discover_path};
 use crate::security::{MutationKind, SkillEvent, SkillEventAction, SkillEventKind};
 use crate::sync::SyncEvent;
 use crate::sys::{
@@ -1535,6 +1535,63 @@ impl SkillFs {
                     if let Some((new_skill, new_rel, is_inbox)) = &new_skill_path {
                         observe_pair(self, new_skill, new_rel.as_deref(), *is_inbox);
                     }
+                    // H3: a Hermes category rename moves the source directory
+                    // of every nested skill inside it, so each moved skill
+                    // gets the same old/new refresh pair a direct skill
+                    // rename emits. Without these the resolver keeps only the
+                    // pre-rename ids and the moved skills read as hidden. The
+                    // leaf set is unchanged by the rename, so enumerating the
+                    // landed directory yields exactly the moved skills.
+                    if let (
+                        PathType::CategoryDir {
+                            category: old_category,
+                        },
+                        PathType::CategoryDir {
+                            category: new_category,
+                        }
+                        | PathType::HermesMeta { name: new_category },
+                    ) = (&old_type, &new_type)
+                    {
+                        // A management name (`.hub`, `.bundled_manifest`,
+                        // `.no-bundled-skills`) is never a Skill container:
+                        // renaming a category onto one leaves the skills in
+                        // a management path, which takes no part in
+                        // notify/activation. The same holds for any other
+                        // dot-prefixed name: the resolver refuses dot
+                        // components, the store loader skips them, and the
+                        // listing hides them, so they are managed/reserved
+                        // locations, not Skill containers.
+                        //
+                        // Both sides are judged independently. A hidden
+                        // source still registers its leaves in a visible
+                        // target, a hidden target only drops the visible
+                        // source's old ids, and two hidden categories
+                        // refresh nothing at all — no id is ever minted for
+                        // or cleared from a namespace the daemon does not
+                        // manage.
+                        let old_is_notifiable = !is_hermes_management_path(old_category)
+                            && !old_category.starts_with('.');
+                        let new_is_notifiable = !is_hermes_management_path(new_category)
+                            && !new_category.starts_with('.');
+                        if old_is_notifiable || new_is_notifiable {
+                            for leaf in Self::hermes_category_skill_leaves(&new_physical) {
+                                if old_is_notifiable {
+                                    self.observe_mutation(
+                                        &Self::hermes_skill_id(old_category, &leaf),
+                                        None,
+                                        MutationKind::Rename,
+                                    );
+                                }
+                                if new_is_notifiable {
+                                    self.observe_mutation(
+                                        &Self::hermes_skill_id(new_category, &leaf),
+                                        None,
+                                        MutationKind::Rename,
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 self.emit_event(
                     SkillEvent::new(SkillEventKind::Rename)
@@ -1564,6 +1621,35 @@ impl SkillFs {
                 reply.error(err);
             }
         }
+    }
+
+    /// Leaf names of the real nested skills directly under a Hermes category.
+    ///
+    /// A leaf counts only when it is a directory (no symlink following) with
+    /// a regular `SKILL.md`, mirroring [`Self::hermes_nested_is_skill`]:
+    /// plain category children (`docs/`, `README.md`) carry no skill
+    /// semantics and must not produce skill-id refreshes. Dot-prefixed
+    /// leaves are managed/reserved locations — the store loader skips them
+    /// and the category listing hides them — so they are never managed
+    /// Skills and are skipped here too.
+    fn hermes_category_skill_leaves(category_dir: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(category_dir) else {
+            return Vec::new();
+        };
+        let mut leaves: Vec<String> = entries
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .file_type()
+                    .map(|file_type| file_type.is_dir())
+                    .unwrap_or(false)
+                    && skillfs_core::store::has_regular_skill_md(&entry.path())
+            })
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_string))
+            .filter(|leaf| !leaf.starts_with('.'))
+            .collect();
+        leaves.sort();
+        leaves
     }
 
     /// Synchronously refresh the store after a skill-directory rename.
