@@ -149,17 +149,14 @@ build_copilot_shell() {
     )
 
     # Step 3: Create source tarball
+    # Full source only: the spec rebuilds the bundle in %build (make deps-ci &&
+    # make build), so dist/ and node_modules/ are deliberately excluded and no
+    # prebuilt output is staged here. The npm step above remains load-bearing:
+    # `npm run generate` writes packages/*/src/generated/ into the source tree.
     log "Step 2/3: Creating source tarball ${tarball_name}..."
     local tmp_dir
     tmp_dir=$(mktemp -d)
     local pkg_dir="${tmp_dir}/${pkg_name}-${version}"
-    mkdir -p "$pkg_dir"
-
-    # Copy the necessary files (same as spec %install expects)
-    cp -rp "${SHELL_DIR}/dist"/* "$pkg_dir/"
-    [ -f "${SHELL_DIR}/LICENSE" ] && cp "${SHELL_DIR}/LICENSE" "$pkg_dir/"
-    [ -f "${SHELL_DIR}/README.md" ] && cp "${SHELL_DIR}/README.md" "$pkg_dir/"
-    # Also include full source for rpmbuild %build section
     local excludes=(
         --exclude='.git'
         --exclude='node_modules'
@@ -167,7 +164,6 @@ build_copilot_shell() {
         --exclude='coverage'
         --exclude='.DS_Store'
     )
-    rm -rf "$pkg_dir"
     mkdir -p "$pkg_dir"
     tar -cf - -C "$SHELL_DIR" "${excludes[@]}" . | tar -xf - -C "$pkg_dir"
 
