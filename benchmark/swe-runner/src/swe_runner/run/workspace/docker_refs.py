@@ -16,23 +16,52 @@
 
 from __future__ import annotations
 
+import hashlib
 import re
 from pathlib import Path
 
 from swe_runner.common.models import SWEInstance
 
+# Length of the disambiguation digest appended to lossily-sanitized names.
+_DIGEST_CHARS = 12
+
+
+def _disambiguate_if_lossy(safe: str, original: str) -> str:
+    """Append a digest of *original* when sanitization changed it.
+
+    Character substitution is lossy — ``a/b`` and ``a-b`` sanitize to the
+    same string — so distinct ids could collide on one docker container
+    name / workspace path.  A deterministic digest keeps the sanitized
+    prefix readable while making the mapping injective in practice;
+    ids that sanitize to themselves keep their exact stable name.
+    """
+    if safe == original:
+        return safe
+    digest = hashlib.sha256(original.encode("utf-8")).hexdigest()[:_DIGEST_CHARS]
+    return f"{safe}-{digest}"
+
 
 def safe_docker_name(name: str) -> str:
-    """Sanitize *name* so it is a valid Docker container name."""
+    """Sanitize *name* so it is a valid Docker container name.
+
+    Docker container names must match ``[a-zA-Z0-9][a-zA-Z0-9_.-]*``.
+    When sanitization rewrites *name*, a digest suffix keeps distinct ids
+    from colliding on one container name (see ``_disambiguate_if_lossy``).
+    """
     safe = re.sub(r"[^A-Za-z0-9_.-]", "-", name)
     if safe and not safe[0].isalnum():
         safe = "s" + safe
-    return safe
+    return _disambiguate_if_lossy(safe, name)
 
 
 def default_work_dir(instance_id: str) -> Path:
-    """Return the default host work directory for an instance."""
+    """Return the default host work directory for an instance.
+
+    Distinct instance ids get distinct directories even when their ids
+    differ only in characters the path sanitization replaces.
+    """
     safe_instance_id = re.sub(r"[^A-Za-z0-9._-]", "_", instance_id)
+    safe_instance_id = _disambiguate_if_lossy(safe_instance_id, instance_id)
     return Path(f"/tmp/swebench_work_{safe_instance_id}")
 
 

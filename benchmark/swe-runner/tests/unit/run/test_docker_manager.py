@@ -255,11 +255,16 @@ class TestStableContainerName:
 
     def test_safe_docker_name_sanitizes(self) -> None:
         assert _safe_docker_name("django__django-1234") == "django__django-1234"
-        assert _safe_docker_name("foo bar/baz") == "foo-bar-baz"
-        assert _safe_docker_name("repo@sha256:abc") == "repo-sha256-abc"
+        assert _safe_docker_name("foo bar/baz") == "foo-bar-baz-9c07212b7b45"
+        assert _safe_docker_name("repo@sha256:abc") == "repo-sha256-abc-e20d8e490ae1"
 
     def test_safe_docker_name_leading_non_alnum(self) -> None:
-        assert _safe_docker_name("__leading") == "s__leading"
+        assert _safe_docker_name("__leading") == "s__leading-cf1b38990b80"
+
+    def test_safe_docker_name_disambiguates_colliding_ids(self) -> None:
+        """Ids differing only in sanitized-away characters must not collide."""
+        assert _safe_docker_name("astropy/astropy:1234") != _safe_docker_name("astropy-astropy-1234")
+        assert _safe_docker_name("a/b") != _safe_docker_name("a-b")
 
 
 class TestStaleContainerRemoval:

@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 from swe_runner.common.models import SWEInstance
@@ -43,15 +44,43 @@ def _instance(**overrides: object) -> SWEInstance:
 
 def test_safe_docker_name_sanitizes_and_prefixes_leading_non_alnum() -> None:
     assert safe_docker_name("django__django-1234") == "django__django-1234"
-    assert safe_docker_name("foo bar/baz") == "foo-bar-baz"
-    assert safe_docker_name("repo@sha256:abc") == "repo-sha256-abc"
-    assert safe_docker_name("__leading") == "s__leading"
+    assert safe_docker_name("foo bar/baz") == "foo-bar-baz-9c07212b7b45"
+    assert safe_docker_name("repo@sha256:abc") == "repo-sha256-abc-e20d8e490ae1"
+    assert safe_docker_name("__leading") == "s__leading-cf1b38990b80"
+
+
+def test_safe_docker_name_is_collision_free_across_distinct_ids() -> None:
+    """Ids that differ only in sanitized-away characters must not share a name.
+
+    safe_docker_name collapses every non ``[A-Za-z0-9_.-]`` character to
+    ``-``, so ``a/b`` and ``a-b`` used to map to the same docker name:
+    two DockerManager instances for such ids raced on one container
+    (``_remove_stale_container`` killing each other) and one workspace.
+    """
+    assert safe_docker_name("a/b") != safe_docker_name("a-b")
+    assert safe_docker_name("astropy/astropy:1234") != safe_docker_name("astropy-astropy-1234")
+    assert safe_docker_name("foo bar/baz") != safe_docker_name("foo-bar-baz")
+    assert safe_docker_name("__leading") != safe_docker_name("s__leading")
+
+
+def test_safe_docker_name_is_stable_for_the_same_id() -> None:
+    already_safe = "django__django-1234"
+    assert safe_docker_name(already_safe) == already_safe
+    lossy = "repo@sha256:abc"
+    assert safe_docker_name(lossy) == safe_docker_name(lossy)
+    assert re.fullmatch(r"repo-sha256-abc-[0-9a-f]{12}", safe_docker_name(lossy))
 
 
 def test_default_workspace_paths_are_instance_scoped() -> None:
     assert default_work_dir("django__django-1234") == Path("/tmp/swebench_work_django__django-1234")
-    assert default_work_dir("repo/name with space") == Path("/tmp/swebench_work_repo_name_with_space")
+    assert default_work_dir("repo/name with space") == Path("/tmp/swebench_work_repo_name_with_space-6a209037bdf3")
     assert default_workspace_root("repo/name with space") == default_work_dir("repo/name with space")
+
+
+def test_default_work_dir_is_collision_free_across_distinct_ids() -> None:
+    assert default_work_dir("a/b:c") != default_work_dir("a_b_c")
+    assert default_work_dir("x y") != default_work_dir("x_y")
+    assert default_work_dir("django__django-1234") == Path("/tmp/swebench_work_django__django-1234")
 
 
 def test_get_docker_image_name_prefers_explicit_fields() -> None:
