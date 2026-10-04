@@ -258,16 +258,62 @@ write_config() {
     info "Existing settings backed up to $backup"
   fi
 
-  cat > "$settings_file" <<JSONEOF
+  if command_exists python3; then
+    # Merge the env block into the existing document so unrelated user
+    # settings (permissions, hooks, statusLine, ...) survive, and write
+    # the key with real JSON escaping instead of raw heredoc
+    # interpolation (keys containing quotes/backslashes used to produce
+    # invalid JSON).
+    if ! python3 - "$settings_file" "$api_key" <<'PYEOF'
+import json
+import os
+import sys
+
+path, api_key = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, ValueError):
+    data = {}
+if not isinstance(data, dict):
+    data = {}
+env = data.get("env")
+if not isinstance(env, dict):
+    env = {}
+    data["env"] = env
+env.update({
+    "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
+    "ANTHROPIC_AUTH_TOKEN": api_key,
+    "ANTHROPIC_MODEL": "qwen3-coder-plus",
+    "ANTHROPIC_SMALL_FAST_MODEL": "qwen3-coder-plus",
+})
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2, ensure_ascii=False)
+    fh.write("\n")
+os.replace(tmp, path)
+PYEOF
+    then
+      err "Failed to write $settings_file"
+      return 1
+    fi
+  else
+    # No python3: keep the legacy full-file write, but escape the key so
+    # the result stays parseable JSON (unrelated settings are still only
+    # in the timestamped backup).
+    local esc_key="${api_key//\\/\\\\}"
+    esc_key="${esc_key//\"/\\\"}"
+    cat > "$settings_file" <<JSONEOF
 {
   "env": {
     "ANTHROPIC_BASE_URL": "https://dashscope.aliyuncs.com/apps/anthropic",
-    "ANTHROPIC_AUTH_TOKEN": "${api_key}",
+    "ANTHROPIC_AUTH_TOKEN": "${esc_key}",
     "ANTHROPIC_MODEL": "qwen3-coder-plus",
     "ANTHROPIC_SMALL_FAST_MODEL": "qwen3-coder-plus"
   }
 }
 JSONEOF
+  fi
 
   ok "Configuration written to $settings_file"
 }
