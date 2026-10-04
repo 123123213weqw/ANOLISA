@@ -7,6 +7,7 @@
 //! LLM-result merging and the Markdown export — so both handler sets stay
 //! thin and behave identically.
 
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -125,7 +126,10 @@ pub const MAX_TURNS_LIMIT: usize = 1000;
 /// source loaders apply: the Linux loader reverses the genai store's
 /// chronological rows, and the trajectory source emits each document's
 /// turns newest-first under the store's DESC document order. Both turns
-/// handlers pass the normalized rows straight through.
+/// handlers pass the normalized rows straight through. That contract is
+/// enforced by the loaders alone, so the LLM input path additionally
+/// derives recency from `timestamp_ns` (see [`llm_input_turns`]) to keep
+/// the prompt correct if a loader ever loses the normalization.
 fn select_newest_unique_turns<'a>(
     rows: impl Iterator<Item = &'a PreferenceEventRow>,
 ) -> Vec<String> {
@@ -159,14 +163,27 @@ pub fn select_unique_turns<'a>(
 
 /// Select the LLM layer's input turns: the same deduped, trimmed selection
 /// the turns endpoint reports (the endpoint documents handing back "the
-/// same text the `llm=true` path feeds to the server-side LLM"), reversed
-/// into chronological order so the analysis prompt's "most recent last"
-/// label is true. Unlike the endpoint there is no count limit — the
-/// prompt's own compaction budget (per-turn and total character caps in
+/// same text the `llm=true` path feeds to the server-side LLM"), in
+/// chronological order so the analysis prompt's "most recent last" label
+/// is true. Recency comes from `timestamp_ns`, not iteration position:
+/// the rows already arrive newest-first from the source loaders (see
+/// [`select_newest_unique_turns`]) and the stable sort below is a no-op
+/// on that order, but it keeps the prompt correct if a loader ever loses
+/// the normalization — the interleaving of newest *documents* first with
+/// turns chronological within each document made the plain `.reverse()`
+/// that used to sit here end the prompt on an old turn. A turn repeated
+/// across the window still dedupes at its newest occurrence, and rows
+/// without a usable timestamp sort as the oldest, keeping their relative
+/// input order.
+///
+/// Unlike the endpoint there is no count limit — the prompt's own
+/// compaction budget (per-turn and total character caps in
 /// `agentsight_opt::preference::build_analysis_input`) bounds how much of
 /// the window survives, dropping the OLDEST turns when it does not fit.
 pub fn llm_input_turns<'a>(rows: impl Iterator<Item = &'a PreferenceEventRow>) -> Vec<String> {
-    let mut turns = select_newest_unique_turns(rows);
+    let mut ordered: Vec<&PreferenceEventRow> = rows.collect();
+    ordered.sort_by_key(|row| Reverse(row.timestamp_ns));
+    let mut turns = select_newest_unique_turns(ordered.into_iter());
     turns.reverse();
     turns
 }
@@ -754,13 +771,14 @@ mod tests {
 
     #[test]
     fn llm_input_turns_are_identical_for_both_source_row_orders() {
-        // Twin consistency at the shared level: the genai store yields
-        // chronological rows (the Linux llm_findings reverses them before
-        // calling) while the trajectory source yields newest-first rows
-        // (the macOS llm_findings passes them through) — both must feed
-        // the model the same chronological list. The macOS twin is
-        // cfg-gated off Linux, so its handler cannot run there; this pins
-        // the shared contract both handlers call.
+        // Twin consistency at the shared level: the source loaders now
+        // normalize every source to newest-first (the Linux loader reverses
+        // the genai store's chronological rows; the trajectory source emits
+        // per-document newest-first), and both handlers pass the rows
+        // straight through. The macOS twin is cfg-gated off Linux, so its
+        // handler cannot run there; this pins the shared contract both
+        // handlers call: normalized input answers chronologically, and any
+        // order slip still converges on the same prompt.
         let texts = [
             "plan first",
             "write tests",
@@ -778,9 +796,78 @@ mod tests {
         assert_eq!(
             llm_input_turns(chronological.iter().rev()),
             llm_input_turns(newest_first.iter()),
-            "genai (reversed chronological) and trajectory (native DESC) \
-             inputs must answer identically"
+            "mirrored order slips around the normalized newest-first input \
+             must answer identically"
         );
         assert_eq!(llm_input_turns(newest_first.iter()), texts);
+    }
+
+    #[test]
+    fn llm_input_from_one_trajectory_keeps_most_recent_last() {
+        // Regression guard for the loader normalization: if a trajectory
+        // loader ever loses its per-document newest-first flip (the
+        // interleaving `rows_from_atif_json` used to emit before the
+        // loader-side fix landed), the handler passes the rows through
+        // un-reversed and the plain `.reverse()` of the pre-sort code
+        // answered newest-FIRST — the prompt ended on the oldest turn.
+        // The timestamp sort must make even that slipped order end the
+        // prompt on the newest turn.
+        let chronological = [
+            turn_row(1, "oldest turn"),
+            turn_row(2, "middle turn"),
+            turn_row(3, "newest turn"),
+        ];
+        assert_eq!(
+            llm_input_turns(chronological.iter()),
+            vec!["oldest turn", "middle turn", "newest turn"],
+            "the prompt must end on the newest turn even when the rows \
+             arrive chronologically"
+        );
+    }
+
+    #[test]
+    fn llm_input_from_two_trajectories_keeps_most_recent_last() {
+        // Across trajectory documents the newest document's OLDER turn
+        // arrives before the older document's NEWER turns, so iteration
+        // position is not a recency cue across documents. A loader that
+        // lost its per-document flip would interleave exactly like this,
+        // and the pre-sort plain `.reverse()` ended the prompt on
+        // "doc-new older" instead of the globally newest turn.
+        let rows = [
+            turn_row(5, "doc-new older"),
+            turn_row(6, "doc-new newer"),
+            turn_row(1, "doc-old older"),
+            turn_row(2, "doc-old newer"),
+        ];
+        let expected = vec![
+            "doc-old older",
+            "doc-old newer",
+            "doc-new older",
+            "doc-new newer",
+        ];
+        assert_eq!(
+            llm_input_turns(rows.iter()),
+            expected,
+            "the prompt must end on the globally newest turn"
+        );
+        // Any mirror of the same interleaving (a handler-side `.rev()`,
+        // as the Linux handler once applied) must answer identically
+        // rather than trade one wrong order for another.
+        assert_eq!(
+            llm_input_turns(rows.iter().rev()),
+            expected,
+            "the reversed interleaved order must answer identically"
+        );
+        // And the order the loaders normalize to today — globally
+        // newest-first, as `load_window_rows` now emits — answers the
+        // same prompt with the sort as a no-op.
+        let mut normalized = rows;
+        normalized.sort_by_key(|row| std::cmp::Reverse(row.timestamp_ns));
+        assert_eq!(normalized[0].user_text.as_deref(), Some("doc-new newer"));
+        assert_eq!(
+            llm_input_turns(normalized.iter()),
+            expected,
+            "the loader-normalized newest-first order must answer identically"
+        );
     }
 }
