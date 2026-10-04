@@ -331,6 +331,59 @@ fn install_preserves_not_found_away_from_index_path() {
 }
 
 #[test]
+fn malformed_file_url_diagnostic_is_withheld() {
+    // A `file://host/path` repository URL is accepted by validate_base_url
+    // (non-empty rest) but rejected by the downloader, whose rejection
+    // reason used to embed the literal `file://`. redact_known_urls
+    // withholds any message still containing '://' after removing the
+    // known URL run, so the whole diagnostic was replaced by "the failure
+    // text was withheld…" and the operator never learned the actual
+    // problem. The root cause must survive.
+    let tmp = tempdir().expect("tmpdir");
+    let index_url = "file://nas.example/share/repo/v1/index.toml";
+    let download_error = anolisa_core::download::DownloadCache::new(tmp.path().join("cache"))
+        .fetch(index_url, None)
+        .expect_err("a non-empty file URL host must be rejected by the downloader");
+
+    let err = super::super::raw::index_fetch_error(index_url, download_error, None);
+
+    let reason = err.reason();
+    assert!(
+        reason.contains("empty host"),
+        "the root cause must survive redaction; got: {reason}"
+    );
+    assert!(
+        !reason.contains("withheld"),
+        "the diagnostic must not be withheld wholesale; got: {reason}"
+    );
+    assert_eq!(err.code(), "EXECUTION_FAILED");
+}
+
+#[test]
+fn sidecar_meta_fetch_withhold_shares_the_file_literal_root_cause() {
+    // The sidecar-metadata fetch renders its transport error through the
+    // same redaction; the malformed-file-URL root cause must survive there
+    // too instead of being swallowed by the withhold notice.
+    let tmp = tempdir().expect("tmpdir");
+    let meta_url = "file://nas.example/share/repo/v1/anolisa/1.0.0/meta.toml";
+    let download_error = anolisa_core::download::DownloadCache::new(tmp.path().join("cache"))
+        .fetch(meta_url, None)
+        .expect_err("a non-empty file URL host must be rejected by the downloader");
+
+    let err = super::super::raw::sidecar_meta_fetch_error(meta_url, download_error);
+
+    let reason = err.reason();
+    assert!(
+        reason.contains("empty host"),
+        "the root cause must survive redaction; got: {reason}"
+    );
+    assert!(
+        !reason.contains("withheld"),
+        "the diagnostic must not be withheld wholesale; got: {reason}"
+    );
+}
+
+#[test]
 fn install_rejects_local_binary_before_artifact_fetch() {
     let tmp = tempdir().expect("tmpdir");
     let prefix = tmp.path().join("sys");

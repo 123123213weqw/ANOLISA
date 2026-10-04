@@ -72,6 +72,21 @@ pub(super) fn index_fetch_error(
     }
 }
 
+/// Terminal diagnostic for a failed sidecar metadata fetch. The transport
+/// error text passes through [`common::redact_known_urls`] against the exact
+/// URL that was asked for, so credentials carried by the URL never reach the
+/// reason.
+pub(super) fn sidecar_meta_fetch_error(meta_url: &str, err: DownloadError) -> CliError {
+    CliError::Runtime {
+        command: COMMAND.to_string(),
+        reason: format!(
+            "failed to fetch sidecar metadata {}: {}",
+            common::repository_url_label(meta_url),
+            common::redact_known_urls(&err.to_string(), &[meta_url.to_string()]),
+        ),
+    }
+}
+
 /// Whether a fetch failure means "this file is not published", as opposed to
 /// a transport or repository fault. Every optional-file fallback in this
 /// module is gated on it: falling back on a transient error would silently
@@ -422,16 +437,7 @@ pub(crate) fn load_dry_run_install_contract(
             // through would validate another target's contract and report a
             // preview the execution path would never honour.
             Err(err) if remote_file_absent(&err) => continue,
-            Err(err) => {
-                return Err(CliError::Runtime {
-                    command: COMMAND.to_string(),
-                    reason: format!(
-                        "failed to fetch sidecar metadata {}: {}",
-                        common::repository_url_label(&meta_url),
-                        common::redact_known_urls(&err.to_string(), &[meta_url.to_string()]),
-                    ),
-                });
-            }
+            Err(err) => return Err(sidecar_meta_fetch_error(&meta_url, err)),
         };
         let toml =
             std::fs::read_to_string(&downloaded.cached_path).map_err(|err| CliError::Runtime {

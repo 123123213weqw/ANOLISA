@@ -320,10 +320,15 @@ fn parse_file_url(url: &str) -> Result<PathBuf, DownloadError> {
         });
     }
     // file:// requires an empty host, leaving the absolute path starting at '/'.
+    // The reason must not embed the '://' literal: CLI diagnostics render
+    // this text through redact_known_urls, which withholds any message
+    // still carrying a scheme separator after removing the known URL run —
+    // hiding the actual problem (empty host / relative path) from the
+    // operator entirely.
     if !rest.starts_with('/') {
         return Err(DownloadError::MalformedUrl {
             url: url.to_string(),
-            reason: "file:// URL must have an empty host and absolute path".to_string(),
+            reason: "file URL must have an empty host and absolute path".to_string(),
         });
     }
     Ok(PathBuf::from(rest))
@@ -721,6 +726,35 @@ mod tests {
 
         match err {
             DownloadError::MalformedUrl { .. } => {}
+            other => panic!("expected MalformedUrl, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn file_url_rejection_reason_carries_no_scheme_separator() {
+        // The CLI renders this reason through redact_known_urls, which
+        // withholds any message still containing '://' after removing the
+        // known URL run; a reason embedding the literal would replace the
+        // whole diagnostic with a "failure text was withheld" notice and
+        // the operator would never learn the actual problem.
+        let cache_dir = tempdir().unwrap();
+        let cache = DownloadCache::new(cache_dir.path().to_path_buf());
+
+        let err = cache
+            .fetch("file://nas.example/share/repo/index.toml", None)
+            .expect_err("a non-empty file URL host must be rejected");
+
+        match err {
+            DownloadError::MalformedUrl { reason, .. } => {
+                assert!(
+                    !reason.contains("://"),
+                    "reason must stay renderable through URL redaction: {reason}"
+                );
+                assert!(
+                    reason.contains("empty host"),
+                    "reason must name the actual problem: {reason}"
+                );
+            }
             other => panic!("expected MalformedUrl, got {other:?}"),
         }
     }
