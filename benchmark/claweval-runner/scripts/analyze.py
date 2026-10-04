@@ -395,7 +395,7 @@ def build_summary_table(data: list, reports: dict) -> tuple:
         avg_passed = task.get("avg_passed")
 
         for i, trial in enumerate(task.get("trials", []), 1):
-            trace_field = trial.get("trace", "")
+            trace_field = trial.get("trace_file", "")
             trace_basename = os.path.basename(trace_field) if trace_field else ""
             trial_hash = extract_trial_hash(trace_field)
             report = reports.get(trace_basename) if reports else None

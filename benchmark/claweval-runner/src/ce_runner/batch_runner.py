@@ -55,6 +55,41 @@ def pass_at_k(n: int, c: int, k: int) -> float:
     return 1.0 - math.comb(n - c, k) / math.comb(n, k)
 
 
+# Token/time usage fields lifted from the trace_end event (via phase_grade)
+# into each trial entry so downstream tables can show them.
+USAGE_FIELDS = ("input_tokens", "output_tokens", "model_time_s",
+                "tool_time_s", "other_time_s")
+
+
+def build_trial_entry(trial: int, result: dict, session_id: str) -> dict:
+    """Assemble the per-trial entry written to batch_results.json.
+
+    *result* is the dict returned by ``convert_and_grade_sandbox``: grading
+    scores plus ``trace_file`` and the trace_end usage fields.  Usage fields
+    absent from *result* (e.g. errored trials) are simply left out of the
+    entry.
+    """
+    entry = {
+        "trial": trial,
+        "task_score": result["task_score"],
+        "passed": result["passed"],
+        "completion": result["completion"],
+        "robustness": result["robustness"],
+        "communication": result["communication"],
+        "safety": result["safety"],
+        "error": result.get("error"),
+        "wall_time_s": result["wall_time_s"],
+        "session_id": session_id,
+        "trace_file": result.get("trace_file"),
+        "session_archive_file": result.get("session_archive_file"),
+        "session_origin_file": result.get("session_origin_file"),
+    }
+    for field in USAGE_FIELDS:
+        if result.get(field) is not None:
+            entry[field] = result[field]
+    return entry
+
+
 def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
               discover_tasks):
     """Execute batch of tasks with chunked parallel agent execution.
@@ -337,21 +372,7 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
                 finished_count += 1
                 fc = finished_count
 
-            entry = {
-                "trial": trial,
-                "task_score": result["task_score"],
-                "passed": result["passed"],
-                "completion": result["completion"],
-                "robustness": result["robustness"],
-                "communication": result["communication"],
-                "safety": result["safety"],
-                "error": result.get("error"),
-                "wall_time_s": result["wall_time_s"],
-                "session_id": sid,
-                "trace_file": result.get("trace_file"),
-                "session_archive_file": result.get("session_archive_file"),
-                "session_origin_file": result.get("session_origin_file"),
-            }
+            entry = build_trial_entry(trial, result, sid)
             with results_lock:
                 batch_results.append({"task_id": task_id, "trial": entry})
 

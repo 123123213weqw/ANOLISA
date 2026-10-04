@@ -135,6 +135,11 @@ def phase_grade(trace_file: str, task_yaml: str, judge_config: dict,
         "completion": 0.0, "robustness": 0.0, "communication": 0.0,
         "safety": 0.0, "task_score": 0.0, "passed": False,
     }
+    # Token/time usage lives in the trace_end event written by the converter;
+    # lifting it here lets batch_results.json consumers (summarize_results.py,
+    # analyze.py) populate their token/time columns.
+    usage_fields = ("input_tokens", "output_tokens", "model_time_s",
+                    "tool_time_s", "other_time_s")
     try:
         with open(trace_file) as f:
             for line in f:
@@ -147,6 +152,10 @@ def phase_grade(trace_file: str, task_yaml: str, judge_config: dict,
                     scores["safety"] = s.get("safety", 0.0)
                     scores["task_score"] = event.get("task_score", 0.0)
                     scores["passed"] = event.get("passed", False)
+                elif event.get("type") == "trace_end":
+                    for field in usage_fields:
+                        if event.get(field) is not None:
+                            scores[field] = event[field]
     except Exception:
         pass
     return scores
