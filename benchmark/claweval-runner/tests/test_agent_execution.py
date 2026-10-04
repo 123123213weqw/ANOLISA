@@ -331,3 +331,178 @@ class TestTextAttachmentRouting:
 
         assert not mock_httpx.post.called
         assert mock_popen.called
+
+
+class TestApiDeadlineBudget:
+    """``timeout`` must cap the total wall-clock of all HTTP attempts.
+
+    Regression: the deadline was only checked *between* attempts while each
+    attempt's read timeout followed the inactivity ladder (120/240/480/960s
+    by default) regardless of the remaining budget, so e.g. ``--timeout 60``
+    let a single never-responding attempt read for 120s (2x budget), and a
+    late attempt up to 960s (16x).
+    """
+
+    def _write_config(self, tmp_path, port):
+        cfg = tmp_path / "openclaw.json"
+        cfg.write_text(json.dumps({
+            "gateway": {"port": port, "auth": {"token": "test-token"}}}))
+        return cfg
+
+    @staticmethod
+    def _clear_proxies(monkeypatch):
+        for var in ("http_proxy", "https_proxy", "all_proxy",
+                    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+            monkeypatch.delenv(var, raising=False)
+        monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+        monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+
+    def test_deadline_bounds_wall_clock(self, tmp_path, monkeypatch):
+        """A never-responding server must not push wall past the budget."""
+        import socket
+        import threading
+        import time as _time
+        from ce_runner import agent as agent_mod
+
+        self._clear_proxies(monkeypatch)
+        # Keep the pristine overshould bounded so the test fails fast:
+        # inactivity 6s means an unclamped first attempt reads for ~6s.
+        monkeypatch.setenv("CE_RUNNER_HTTP_INACTIVITY_S", "6")
+
+        listener = socket.socket()
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(16)
+        conns = []
+        stop = threading.Event()
+
+        def acceptor():
+            listener.settimeout(0.2)
+            while not stop.is_set():
+                try:
+                    conn, _ = listener.accept()
+                    conns.append(conn)
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+
+        threading.Thread(target=acceptor, daemon=True).start()
+        try:
+            port = listener.getsockname()[1]
+            cfg = self._write_config(tmp_path, port)
+            monkeypatch.setattr(agent_mod, "OPENCLAW_CONFIG", str(cfg))
+
+            t0 = _time.monotonic()
+            result = agent_mod._run_first_turn_via_api(
+                "hi", [], [], timeout=2, agent_id=None,
+                task_dir=str(tmp_path))
+            wall = _time.monotonic() - t0
+        finally:
+            stop.set()
+            for conn in conns:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+            listener.close()
+
+        assert result == ""
+        assert wall <= 3.5, (
+            f"wall={wall:.1f}s exceeded 2s budget (+1.5s epsilon): the "
+            f"in-flight attempt carried its full read timeout past the "
+            f"deadline"
+        )
+        assert "http_timeout_after" in agent_mod.last_agent_error()
+
+    def test_fast_response_unchanged(self, tmp_path, monkeypatch, capsys):
+        """A fast 200 response completes without retry or budget interference."""
+        import threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        from ce_runner import agent as agent_mod
+
+        self._clear_proxies(monkeypatch)
+        monkeypatch.delenv("CE_RUNNER_HTTP_INACTIVITY_S", raising=False)
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"{}")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            cfg = self._write_config(tmp_path, server.server_address[1])
+            sessions_dir = tmp_path / "sessions"
+            sessions_dir.mkdir()
+            session_file = sessions_dir / "sess.jsonl"
+            session_file.write_text('{"type": "message"}\n')
+            monkeypatch.setattr(agent_mod, "OPENCLAW_CONFIG", str(cfg))
+            monkeypatch.setattr(agent_mod, "SESSIONS_DIR", str(sessions_dir))
+
+            t0 = _time.monotonic()
+            result = agent_mod._run_first_turn_via_api(
+                "hi", [], [], timeout=30, agent_id=None,
+                task_dir=str(tmp_path))
+            wall = _time.monotonic() - t0
+        finally:
+            server.shutdown()
+
+        assert result == str(session_file)
+        assert wall < 10, f"fast response took {wall:.1f}s"
+        assert "[RETRY]" not in capsys.readouterr().out
+
+    def test_ladder_still_escalates_when_budget_allows(self, tmp_path,
+                                                       monkeypatch):
+        """Per-attempt clamping must not flatten the retry ladder itself."""
+        from ce_runner import agent as agent_mod
+        import httpx
+
+        self._clear_proxies(monkeypatch)
+        monkeypatch.setenv("CE_RUNNER_HTTP_INACTIVITY_S", "10")
+        monkeypatch.setenv("CE_RUNNER_HTTP_MAX_RETRIES", "3")
+
+        reads = []
+
+        class FakeStream:
+            def __enter__(self):
+                raise httpx.ReadTimeout("stall")
+
+            def __exit__(self, *args):
+                return False
+
+        class FakeClient:
+            def __init__(self, timeout=None):
+                self.timeout = timeout
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def stream(self, *args, **kwargs):
+                reads.append(self.timeout.read)
+                return FakeStream()
+
+        sessions_dir = tmp_path / "sessions"
+        sessions_dir.mkdir()
+        cfg = self._write_config(tmp_path, 18789)
+        with patch.object(agent_mod.httpx, "Client", FakeClient), \
+             patch.object(agent_mod.time, "sleep", lambda *_: None), \
+             patch.object(agent_mod, "OPENCLAW_CONFIG", str(cfg)), \
+             patch.object(agent_mod, "SESSIONS_DIR", str(sessions_dir)):
+            result = agent_mod._run_first_turn_via_api(
+                "hi", [], [], timeout=10000, agent_id=None,
+                task_dir=str(tmp_path))
+
+        assert result == ""
+        # inactivity=10 ladder: attempts 1-3 at 10s, attempt 4 at 20s.
+        assert reads == [10.0, 10.0, 10.0, 20.0], (
+            f"read-timeout ladder flattened: {reads}"
+        )

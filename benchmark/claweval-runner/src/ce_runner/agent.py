@@ -78,8 +78,11 @@ def _run_first_turn_via_api(text: str,
     multimodal request without crashing the model on non-image data.
 
     *timeout* caps the total wall-clock time (seconds) for all HTTP attempts
-    combined, honouring the user-supplied ``--timeout`` CLI flag.  Per-read
-    inactivity is still governed by ``CE_RUNNER_HTTP_INACTIVITY_S``.
+    combined, honouring the user-supplied ``--timeout`` CLI flag.  Each
+    attempt's connect/read/write timeouts are clamped to the budget still
+    remaining when that attempt starts, so a single in-flight attempt can
+    never overshoot; within that budget, per-read inactivity escalates per
+    ``CE_RUNNER_HTTP_INACTIVITY_S``.
 
     Returns the session file path or empty string on failure.
     """
@@ -190,11 +193,21 @@ def _run_first_turn_via_api(text: str,
         # transient stalls), then doubles from attempt 4 onward to accommodate
         # genuinely slow upstream paths.  With inactivity_s=120:
         #   attempts 1-3: 120s, attempt 4: 240s, 5: 480s, 6: 960s
+        # Every per-attempt timeout is additionally clamped to the wall-clock
+        # budget remaining at attempt start: the deadline used to be honoured
+        # only *between* attempts, so a single in-flight attempt could carry
+        # its full ladder read timeout far past ``timeout`` (e.g. --timeout 60
+        # with a 960s read on attempt 6).
         read_s = inactivity_s * max(1, 2 ** (attempt - 3))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log(f"  [WARNING] Wall-clock timeout ({timeout}s) reached, "
+                f"aborting before attempt {attempt}")
+            break
         http_timeout = httpx.Timeout(
-            connect=30.0,
-            read=read_s,
-            write=120.0,
+            connect=min(30.0, remaining),
+            read=min(read_s, remaining),
+            write=min(120.0, remaining),
             pool=5.0,
         )
         t_attempt = time.monotonic()
