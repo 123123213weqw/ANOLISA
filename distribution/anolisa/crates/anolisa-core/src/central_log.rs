@@ -284,6 +284,14 @@ impl CentralLog {
     /// the OS layer; we intentionally skip `sync_all` to avoid the per-
     /// append fsync cost — readers see the record via `query` as soon as
     /// the OS buffer accepts it.
+    ///
+    /// The same lock also covers terminating a torn trailing record left
+    /// behind by a crashed predecessor (see [`terminate_torn_tail`]):
+    /// a crash or ENOSPC cuts the write before its newline lands, and
+    /// splicing the new record onto that fragment would glue the two
+    /// into one line the per-line tolerance in [`CentralLog::query`]
+    /// skips — silently losing the new record even though its bytes
+    /// reached the disk.
     pub fn append(&self, record: &LogRecord) -> Result<(), CentralLogError> {
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
@@ -299,6 +307,7 @@ impl CentralLog {
 
         let mut file = OpenOptions::new()
             .create(true)
+            .read(true)
             .append(true)
             .open(&self.path)
             .map_err(|source| CentralLogError::Io {
@@ -309,7 +318,8 @@ impl CentralLog {
             path: self.path.clone(),
             source,
         })?;
-        let write_result = file.write_all(line.as_bytes()).and_then(|_| file.flush());
+        let write_result = terminate_torn_tail(&mut file)
+            .and_then(|()| file.write_all(line.as_bytes()).and_then(|_| file.flush()));
         let unlock_result = FileExt::unlock(&file);
         write_result.map_err(|source| CentralLogError::Io {
             path: self.path.clone(),
@@ -497,6 +507,37 @@ impl CentralLog {
         }
         Ok(matches.into_iter().collect())
     }
+}
+
+/// Terminate a torn trailing record before the next append splices
+/// onto it.
+///
+/// `append` writes each record as a single line whose last byte is the
+/// `\n`, so a SIGKILL mid-write or ENOSPC leaves a fragment with no
+/// terminating newline. Writing the next record straight after it would
+/// glue the two into one line, which never parses: the per-line
+/// tolerance in `scan_reader` then skips that line on every future
+/// query, silently and permanently dropping the first valid record
+/// appended after the tear. Closing the fragment with one `\n` instead
+/// makes it its own (skipped) line, so every later record stays
+/// recoverable exactly as written — and a fragment that happens to end
+/// in a complete JSON value becomes readable again. The caller holds
+/// the exclusive flock, so the check-then-write is race-free; writes
+/// go through `O_APPEND`, so the read cursor used here cannot move
+/// them. Lines glued by earlier, unhealed appends are left alone —
+/// rescuing those is read-side work.
+fn terminate_torn_tail(file: &mut File) -> io::Result<()> {
+    let len = file.metadata()?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    let mut last = [0u8; 1];
+    file.seek(SeekFrom::Start(len - 1))?;
+    file.read_exact(&mut last)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+    file.write_all(b"\n")
 }
 
 fn record_matches(
@@ -1450,6 +1491,66 @@ mod tests {
             .expect("query must survive");
         assert_eq!(records.len(), 2);
         assert_eq!(records[1].operation_id.as_deref(), Some("op-2"));
+    }
+
+    #[test]
+    fn append_terminates_a_torn_tail_so_later_records_survive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let log = CentralLog::open(dir.path().join("audit.jsonl"));
+        log.append(&operation_record(
+            "2026-06-01T10:00:00Z",
+            "op-1",
+            &[],
+            Severity::Info,
+        ))
+        .expect("append 1");
+        // Tear the tail without a trailing `\n` — exactly what a killed
+        // writer leaves behind, because the newline is the record's last
+        // byte, so a SIGKILL mid-write or ENOSPC always cuts before it.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(log.path())
+                .expect("open for torn append");
+            file.write_all(TORN_LINE.as_bytes())
+                .expect("inject torn tail without newline");
+        }
+        log.append(&operation_record(
+            "2026-06-01T10:00:01Z",
+            "op-2",
+            &[],
+            Severity::Info,
+        ))
+        .expect("append after the tear");
+        log.append(&operation_record(
+            "2026-06-01T10:00:02Z",
+            "op-3",
+            &[],
+            Severity::Info,
+        ))
+        .expect("append 3");
+
+        // op-2's bytes are on disk: whatever the query returns below, the
+        // write itself succeeded.
+        let contents = std::fs::read_to_string(log.path()).expect("read");
+        assert!(
+            contents.contains("\"operation_id\":\"op-2\""),
+            "op-2 bytes reached the disk: {contents}"
+        );
+
+        let records = log
+            .query(&LogFilter::default())
+            .expect("query must survive");
+        let ids: Vec<_> = records
+            .iter()
+            .filter_map(|r| r.operation_id.as_deref())
+            .collect();
+        // Splicing op-2 straight onto the fragment glues the two into one
+        // invalid line, which the per-line tolerance then skips forever —
+        // the first valid record after the tear would be lost even though
+        // its bytes are on disk. The fragment must be terminated instead.
+        assert_eq!(ids, ["op-1", "op-2", "op-3"]);
     }
 
     #[test]
