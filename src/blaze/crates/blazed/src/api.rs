@@ -212,24 +212,17 @@ fn metrics(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
 }
 
 fn admin_reload(state: &Arc<ServerState>) -> Result<Response<Full<Bytes>>> {
-    let policy_dir = {
-        let cfg = state
-            .config
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        cfg.policy.dir.clone()
-    };
-    let new_engine = blaze_core::policy::PolicyEngine::load_dir(&policy_dir)?;
-    let count = new_engine.policies().len();
-    {
-        let mut engine = state
-            .policy
-            .lock()
-            .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?;
-        *engine = new_engine;
+    let applied = crate::daemon::reload_policies(state)?;
+    let count = state
+        .policy
+        .lock()
+        .map_err(|_| BlazeDaemonError::Internal("policy lock poisoned".into()))?
+        .policies()
+        .len();
+    if applied {
+        tracing::info!(policies = count, "policy engine reloaded");
     }
-    tracing::info!(policies = count, "policy engine reloaded");
-    json_ok(&json!({ "reloaded": true, "policies": count }))
+    json_ok(&json!({ "reloaded": applied, "policies": count }))
 }
 
 // ---------------------------------------------------------------------------

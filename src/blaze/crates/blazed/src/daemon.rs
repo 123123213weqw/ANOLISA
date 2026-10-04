@@ -441,15 +441,34 @@ where
     });
 }
 
-fn reload_policies(state: &Arc<ServerState>) -> Result<()> {
-    let dir = {
+/// Swap in a freshly loaded policy engine, honoring `policy.on_load_error`.
+///
+/// Startup degrades a failed policy load to a warning and an empty engine when
+/// the configured mode is `warn`; the reload paths must honor the same
+/// operator intent. A reload cannot fall back to an empty engine without
+/// breaking policy evaluation for running sandboxes, so the degraded outcome
+/// keeps the currently loaded engine instead. Returns whether a freshly
+/// loaded engine was applied.
+pub(crate) fn reload_policies(state: &Arc<ServerState>) -> Result<bool> {
+    let (dir, on_load_error) = {
         let cfg = state
             .config
             .lock()
             .map_err(|_| BlazeDaemonError::Internal("config lock poisoned".into()))?;
-        cfg.policy.dir.clone()
+        (cfg.policy.dir.clone(), cfg.policy.on_load_error)
     };
-    let engine = PolicyEngine::load_dir(&dir)?;
+    let engine = match PolicyEngine::load_dir(&dir) {
+        Ok(engine) => engine,
+        Err(error) if on_load_error == PolicyLoadErrorMode::Warn => {
+            tracing::warn!(
+                ?error,
+                dir = %dir.display(),
+                "policy reload failed; keeping the currently loaded policies"
+            );
+            return Ok(false);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let count = engine.policies().len();
     {
         let mut policy = state
@@ -459,14 +478,154 @@ fn reload_policies(state: &Arc<ServerState>) -> Result<()> {
         *policy = engine;
     }
     tracing::info!(policies = count, "policy engine reloaded via SIGHUP");
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+    use std::sync::Mutex;
 
     use super::*;
+    use crate::sandbox::template::TemplateCatalog;
+    use crate::sandbox::{SandboxManager, SandboxManagerInit};
+    use crate::spawner::{MockSpawner, SpawnerRegistry};
+    use crate::state_store::StateStore;
+    use blaze_core::backend::BackendKind;
+    use blaze_core::kernel::HookRegistry;
+    use blaze_core::policy::PolicyEngine;
+    use blaze_core::storage::StorageProvider;
+
+    /// A policy body that parses and validates cleanly.
+    const VALID_POLICY: &str = r#"
+manifest_version = 1
+policy_name = "reload-probe"
+
+[match]
+workload_class = "agent-rl"
+
+[select]
+backend_priority = ["bubblewrap"]
+"#;
+
+    /// A policy body that fails TOML parsing, so `load_dir` rejects the file.
+    const BROKEN_POLICY: &str = "manifest_version = 1\npolicy_name = \"x\"\n[match]\nworkload_class = \"agent-rl\"\n[select]\nbackend_priority = [\n";
+
+    /// Build a `ServerState` around one policy file and an error mode.
+    ///
+    /// The state is assembled field by field instead of through
+    /// [`ServerState::build`] so the reload behavior stays testable on hosts
+    /// whose `/proc/self/mountinfo` cannot be parsed (for example containers
+    /// with nsfs mounts); the reload path itself never touches mount
+    /// boundaries.
+    fn reload_state(
+        temp: &std::path::Path,
+        policy_body: &str,
+        on_load_error: PolicyLoadErrorMode,
+    ) -> Arc<ServerState> {
+        let mut config = DaemonConfig::default();
+        config.daemon.state_dir = temp.join("state");
+        config.daemon.socket = temp.join("run/api.sock");
+        config.storage.images_dir = temp.join("images");
+        config.storage.instances_dir = temp.join("instances");
+        config.template.dir = temp.join("catalog");
+        config.template.import_root = Some(temp.join("imports"));
+        config.policy.dir = temp.join("policies");
+        config.policy.on_load_error = on_load_error;
+        for directory in [
+            &config.daemon.state_dir,
+            &config.storage.images_dir,
+            &config.storage.instances_dir,
+            &config.template.dir,
+            config.template.import_root.as_ref().expect("import root"),
+            &config.policy.dir,
+        ] {
+            std::fs::create_dir(directory).expect("test directory");
+        }
+        std::fs::write(config.policy.dir.join("probe.toml"), policy_body).expect("write policy");
+        let template_catalog = TemplateCatalog::open(&config.template).expect("catalog");
+        let mut spawners = SpawnerRegistry::new();
+        spawners.insert(BackendKind::Mock, Arc::new(MockSpawner));
+        let storage: Arc<dyn StorageProvider> =
+            Arc::new(crate::file_provider::FileStorageProvider::with_images(
+                config.storage.images_dir.clone(),
+                config.storage.instances_dir.clone(),
+            ));
+        let state_store = StateStore::new(config.daemon.state_dir.clone());
+        let (manager, resources) = SandboxManager::new(SandboxManagerInit {
+            instances: HashMap::new(),
+            spawners,
+            active_backend: BackendKind::Mock,
+            storage: storage.clone(),
+            state_store: state_store.clone(),
+            rootfs_size: 1024,
+            mem_size: 1024,
+            template_catalog,
+        });
+        Arc::new(ServerState {
+            config: Mutex::new(config),
+            policy: Mutex::new(PolicyEngine::new()),
+            hook: Mutex::new(HookRegistry::new()),
+            instances: resources.instances,
+            manager: Arc::new(manager),
+            active_backend: BackendKind::Mock,
+            storage,
+            state_store,
+            metrics: resources.metrics,
+        })
+    }
+
+    #[test]
+    fn reload_warn_mode_keeps_the_loaded_engine_on_a_broken_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = reload_state(temp.path(), BROKEN_POLICY, PolicyLoadErrorMode::Warn);
+
+        // Startup with the same directory and mode proceeds with a degraded
+        // engine, so the reload must not fail either.
+        let applied = reload_policies(&state).expect("warn-mode reload must degrade, not fail");
+
+        assert!(
+            !applied,
+            "a reload that kept the previous engine must report it was not applied"
+        );
+        assert_eq!(
+            state.policy.lock().expect("policy lock").policies().len(),
+            0,
+            "the previously loaded engine must survive a degraded reload"
+        );
+    }
+
+    #[test]
+    fn reload_warn_mode_applies_a_repaired_policy_directory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = reload_state(temp.path(), VALID_POLICY, PolicyLoadErrorMode::Warn);
+
+        let applied = reload_policies(&state).expect("valid policies must reload");
+
+        assert!(applied, "a successful reload must report it was applied");
+        assert_eq!(
+            state.policy.lock().expect("policy lock").policies().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn reload_fail_mode_still_propagates_a_broken_policy() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let state = reload_state(temp.path(), BROKEN_POLICY, PolicyLoadErrorMode::Fail);
+
+        let error = reload_policies(&state)
+            .expect_err("fail-mode reload must keep propagating load errors");
+
+        assert!(
+            matches!(
+                error,
+                BlazeDaemonError::Core(blaze_core::BlazeError::PolicyLoadError { .. })
+            ),
+            "unexpected error variant: {error:?}"
+        );
+    }
 
     #[test]
     fn policy_boundary_fallback_prevents_a_later_directory_rescan() {
