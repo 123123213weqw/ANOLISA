@@ -157,9 +157,17 @@ def grade_trace(trace_path: str, task_yaml_path: str, judge_config: dict | None 
         _existing = [e for e in _existing if e.get("type") != "grading_result"]
         for ev in _existing:
             if ev.get("type") == "trace_end":
-                # Preserve efficiency_* values already computed by converter when grader didn't set them
+                # Per-key merge. Graders receive (messages, dispatches, task)
+                # — never trace_end — so they cannot measure wall-time/token
+                # efficiency and leave efficiency_* at the 0.0 default.
+                # Preserve the efficiency_* values already computed by the
+                # converter when the grader didn't set them.
                 merged_scores = dict(ev.get("scores") or {})
-                merged_scores.update(real_scores)
+                for key, value in real_scores.items():
+                    if (key.startswith("efficiency_") and not value
+                            and key in merged_scores):
+                        continue
+                    merged_scores[key] = value
                 ev["scores"] = merged_scores
                 ev["task_score"] = task_score
                 ev["passed"] = passed
