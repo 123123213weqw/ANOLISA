@@ -1,6 +1,6 @@
 //! Package-owned adapter input revisions and materialized-file verification.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Component, Path, PathBuf};
 
 use anolisa_platform::pkg_files::{PackageFileDigestAlgorithm, PackageFileKind, PackageFileQuery};
@@ -282,6 +282,7 @@ pub fn materialized_files(
     mappings: &[MaterializedMapping],
 ) -> Result<Vec<MaterializedFile>, String> {
     let mut files = Vec::new();
+    let mut resolved_parents = HashMap::new();
     for mapping in mappings {
         let lexical_root = normalize_absolute(&mapping.source_root)?;
         let canonical_root = std::fs::canonicalize(&lexical_root).map_err(|err| {
@@ -292,9 +293,12 @@ pub fn materialized_files(
         })?;
         for file in &inventory.files {
             let path = normalize_absolute(&file.path)?;
-            let Some(relative_path) =
-                relative_below_root_aliases(&path, &lexical_root, &canonical_root)
-            else {
+            let Some(relative_path) = relative_below_root_aliases(
+                &path,
+                &lexical_root,
+                &canonical_root,
+                &mut resolved_parents,
+            ) else {
                 continue;
             };
             validate_relative(&relative_path)?;
@@ -712,9 +716,11 @@ fn source_files_below(
     excluded_prefixes: &[PathBuf],
 ) -> Result<Vec<ManagedSourceFile>, String> {
     let mut files = Vec::new();
+    let mut resolved_parents = HashMap::new();
     for file in &inventory.files {
         let path = normalize_absolute(&file.path)?;
-        let Some(relative_path) = relative_below_root_aliases(&path, lexical_root, canonical_root)
+        let Some(relative_path) =
+            relative_below_root_aliases(&path, lexical_root, canonical_root, &mut resolved_parents)
         else {
             continue;
         };
@@ -751,6 +757,7 @@ fn relative_below_root_aliases(
     path: &Path,
     lexical_root: &Path,
     canonical_root: &Path,
+    resolved_parents: &mut HashMap<PathBuf, Option<PathBuf>>,
 ) -> Option<PathBuf> {
     // Do not canonicalize the inventory entry itself: doing so would follow a
     // managed leaf symlink and discard the path whose literal target we verify.
@@ -765,9 +772,18 @@ fn relative_below_root_aliases(
     }
     // Resolve parent aliases without following the managed leaf: its literal
     // symlink target remains part of the package inventory's identity.
-    let resolved = std::fs::canonicalize(path.parent()?)
-        .ok()?
-        .join(path.file_name()?);
+    // Inventory entries share parents, so resolve each distinct parent once
+    // per scan instead of issuing one canonicalize per entry.
+    let parent = path.parent()?;
+    let resolved_parent = match resolved_parents.get(parent) {
+        Some(resolved) => resolved.clone(),
+        None => {
+            let resolved = std::fs::canonicalize(parent).ok();
+            resolved_parents.insert(parent.to_path_buf(), resolved.clone());
+            resolved
+        }
+    };
+    let resolved = resolved_parent?.join(path.file_name()?);
     let relative = resolved.strip_prefix(canonical_root).ok()?;
     (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
 }
@@ -1529,6 +1545,93 @@ mod tests {
                 .expect_err("conflicting materialized files")
                 .contains("conflicting metadata")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn memoized_parent_resolution_matches_uncached_reference() {
+        use std::os::unix::fs::symlink;
+        // Reference resolution as introduced by the parent-alias support:
+        // one canonicalize per entry, no memoization.
+        fn uncached(path: &Path, lexical_root: &Path, canonical_root: &Path) -> Option<PathBuf> {
+            if path == lexical_root || path == canonical_root {
+                return None;
+            }
+            if let Ok(relative) = path
+                .strip_prefix(lexical_root)
+                .or_else(|_| path.strip_prefix(canonical_root))
+            {
+                return Some(relative.to_path_buf());
+            }
+            let resolved = std::fs::canonicalize(path.parent()?)
+                .ok()?
+                .join(path.file_name()?);
+            let relative = resolved.strip_prefix(canonical_root).ok()?;
+            (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf())
+        }
+
+        let (tmp, source, release, mut inventory) = parent_alias_fixture();
+        let base = tmp.path().canonicalize().expect("canonical base");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&outside).expect("outside root");
+        symlink(&outside, base.join("outside-alias")).expect("outside alias");
+        inventory.files.extend([
+            // Outside alias: parent resolves outside the root.
+            ManagedFile {
+                path: base.join("outside-alias/hook.py"),
+                ..inventory.files[0].clone()
+            },
+            // Root entries under both spellings.
+            ManagedFile {
+                path: source.clone(),
+                kind: ManagedInventoryKind::Symlink,
+                sha256: None,
+                symlink_target: Some(PathBuf::from("releases/v2")),
+            },
+            ManagedFile {
+                path: release.clone(),
+                kind: ManagedInventoryKind::Symlink,
+                sha256: None,
+                symlink_target: Some(PathBuf::from("releases/v2")),
+            },
+            // Dangling leaf under an aliased parent.
+            ManagedFile {
+                path: inventory.files[0].path.with_file_name("dangling.py"),
+                ..inventory.files[0].clone()
+            },
+            // Missing parent: canonicalize fails.
+            ManagedFile {
+                path: base.join("missing-parent/leaf.py"),
+                ..inventory.files[0].clone()
+            },
+            // Lexical fast path below the canonical spelling.
+            ManagedFile {
+                path: release.join("lexical.py"),
+                ..inventory.files[0].clone()
+            },
+        ]);
+        let lexical_root = normalize_absolute(&source).expect("lexical root");
+        let canonical_root = std::fs::canonicalize(&lexical_root).expect("canonical root");
+        let mut resolved_parents = HashMap::new();
+        for pass in 0..2 {
+            for file in &inventory.files {
+                let path = normalize_absolute(&file.path).expect("normalized entry");
+                assert_eq!(
+                    relative_below_root_aliases(
+                        &path,
+                        &lexical_root,
+                        &canonical_root,
+                        &mut resolved_parents
+                    ),
+                    uncached(&path, &lexical_root, &canonical_root),
+                    "pass {pass} diverged for {}",
+                    path.display()
+                );
+            }
+        }
+        // Memoization must actually collapse shared parents: fewer cache
+        // entries than inventory entries means repeated parents hit the cache.
+        assert!(resolved_parents.len() < inventory.files.len());
     }
 
     #[test]
