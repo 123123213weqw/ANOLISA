@@ -36,8 +36,12 @@ pub(crate) async fn delete_snapshots_locked(
 ) -> CleanupOutcome {
     // Recheck the plan while serialized against every workspace mutation. Pins,
     // missing markers, and prior removals may have changed since selection.
+    // The head is excluded as well: retention must never reclaim the snapshot
+    // the live subvolume embodies, even if a future caller plans without the
+    // mutation mutex held.
     let requested = {
         let ws = arc.read().await;
+        let head = ws.index.head.clone();
         to_remove
             .iter()
             .filter(|id| {
@@ -45,6 +49,7 @@ pub(crate) async fn delete_snapshots_locked(
                     .snapshots
                     .get(*id)
                     .is_some_and(|meta| !meta.pinned && !meta.missing)
+                    && Some(id.as_str()) != head.as_deref()
             })
             .cloned()
             .collect::<Vec<_>>()
@@ -931,7 +936,9 @@ fn snapshot_resolve_error_response(reference: &str, err: ResolveError) -> Respon
     }
 }
 
-/// Cleanup old snapshots for a workspace, keeping the most recent `keep` unpinned ones.
+/// Cleanup old snapshots for a workspace, keeping the most recent `keep`
+/// unpinned ones. The live head is always kept: the live subvolume embodies
+/// it, and deleting it would erase the workspace's lineage.
 pub async fn cleanup_snapshots(
     state: &Arc<DaemonState>,
     workspace: &str,
@@ -963,11 +970,22 @@ pub async fn cleanup_snapshots(
         // `missing` entries are skipped: their subvolume is already gone
         // (flagged by reconcile or by a NotFound cleanup, #3053 review P2),
         // re-selecting them would retry-and-warn on every pass forever.
+        //
+        // The head is skipped too: the live subvolume embodies it. A rollback
+        // re-points head onto an OLD snapshot without touching created_at, so
+        // the head is first in line for age-based selection — deleting it
+        // makes `prune_chain` re-point head onto an abandoned branch or None
+        // while the live subvolume still descends from the deleted snapshot.
+        // Treat the head as implicitly pinned, exactly like the orphans the
+        // reconcile sweep adopts (rebuild_from_fs pins those for this reason).
+        let head = ws.index.head.clone();
         let mut unpinned: Vec<(String, chrono::DateTime<chrono::Utc>)> = ws
             .index
             .snapshots
             .iter()
-            .filter(|(_, meta)| !meta.pinned && !meta.missing)
+            .filter(|(id, meta)| {
+                !meta.pinned && !meta.missing && Some(id.as_str()) != head.as_deref()
+            })
             .map(|(id, meta)| (id.clone(), meta.created_at))
             .collect();
         unpinned.sort_by_key(|(_, ts)| *ts);
@@ -2456,7 +2474,7 @@ mod tests {
             .register_workspace(
                 ws_id.to_string(),
                 ws_path.clone(),
-                chain_index(&ws_path, ws_id, 2),
+                chain_index(&ws_path, ws_id, 3),
             )
             .unwrap();
 
@@ -2527,8 +2545,9 @@ mod tests {
     #[tokio::test]
     async fn cleanup_snapshots_persists_partial_success_and_bails() {
         // Five unpinned snapshots form a chain and the third deletion fails.
-        // Only confirmed removals are pruned, leaving snap-3 as the consistent
-        // root and head, and the partial result must still be persisted.
+        // Only confirmed removals are pruned, leaving snap-3 relinked as a
+        // root alongside the protected head snap-5, and the partial result
+        // must still be persisted.
         let tmp = tempfile::tempdir().unwrap();
         let data_root = tmp.path().join("pfb-data");
         let backend = Arc::new(PartialFailBackend::new(
@@ -2586,14 +2605,16 @@ mod tests {
             .register_workspace("ws-partial".to_string(), ws_path.clone(), idx)
             .unwrap();
 
-        // keep=0 → all 5 are removal candidates. cleanup_snapshots returns
-        // Ok(Response) for routing errors (e.g. WorkspaceNotFound) but Err
-        // for partial backend failure — so the user-facing CLI exits non-zero.
+        // keep=0 → every non-head snapshot is a removal candidate (the head
+        // snap-5 is implicitly pinned: the live subvolume embodies it).
+        // cleanup_snapshots returns Ok(Response) for routing errors (e.g.
+        // WorkspaceNotFound) but Err for partial backend failure — so the
+        // user-facing CLI exits non-zero.
         let result = cleanup_snapshots(&state, "ws-partial", Some(0)).await;
         let err = result.expect_err("partial failure must bubble up as Err");
         let msg = format!("{:#}", err);
         assert!(
-            msg.contains("4/5"),
+            msg.contains("3/4"),
             "error should report deleted/total, got: {}",
             msg
         );
@@ -2605,46 +2626,61 @@ mod tests {
 
         // In-memory index: the failed snapshot was never removed or rewritten
         // before the backend result, and pruning the confirmed removals leaves
-        // a consistent DAG.
+        // a consistent DAG (snap-3 relinked to a None parent; the surviving
+        // head snap-5 keeps the LIVE_CHILD marker).
         let arc = state
             .get_by_wsid("ws-partial")
             .expect("ws still registered");
         let ws = arc.read().await;
-        assert_eq!(ws.index.snapshots.len(), 1, "only the failed snap remains");
+        assert_eq!(
+            ws.index.snapshots.len(),
+            2,
+            "the failed snap and the protected head remain"
+        );
         let m3 = ws.index.snapshots.get("snap-3").expect("snap-3 retained");
         assert_eq!(
             m3.parent_id, None,
             "ancestors snap-1/2 were deleted — parent must be None, not dangling"
         );
         assert!(
-            m3.child_ids
+            !m3.child_ids
                 .contains(&ws_ckpt_common::LIVE_CHILD.to_string()),
-            "snap-3 became head — LIVE_CHILD marker must move with it, got {:?}",
+            "snap-3 did not become head — it must not carry the LIVE_CHILD marker, got {:?}",
             m3.child_ids
+        );
+        let m5 = ws.index.snapshots.get("snap-5").expect("head retained");
+        assert!(
+            m5.child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()),
+            "the surviving head keeps the LIVE_CHILD marker, got {:?}",
+            m5.child_ids
         );
         assert_eq!(
             ws.index.head.as_deref(),
-            Some("snap-3"),
-            "head must move onto the retained snap"
+            Some("snap-5"),
+            "head must stay on the protected live baseline"
         );
-        assert_eq!(ws.index.governed_evidence.len(), 1);
+        assert_eq!(ws.index.governed_evidence.len(), 2);
         assert!(ws.index.governed_evidence.contains_key("snap-3"));
+        assert!(ws.index.governed_evidence.contains_key("snap-5"));
 
         // Persisted index reflects the same — earlier successes were saved
         // even though the caller bailed.
         let on_disk = crate::index_store::load(&state.index_dir("ws-partial"))
             .await
             .expect("index.json saved");
-        assert_eq!(on_disk.snapshots.len(), 1);
+        assert_eq!(on_disk.snapshots.len(), 2);
         assert!(on_disk.snapshots.contains_key("snap-3"));
+        assert!(on_disk.snapshots.contains_key("snap-5"));
         assert_eq!(
             on_disk.head.as_deref(),
-            Some("snap-3"),
+            Some("snap-5"),
             "the reconciled index must be what got persisted"
         );
         assert_eq!(on_disk.snapshots["snap-3"].parent_id, None);
-        assert_eq!(on_disk.governed_evidence.len(), 1);
+        assert_eq!(on_disk.governed_evidence.len(), 2);
         assert!(on_disk.governed_evidence.contains_key("snap-3"));
+        assert!(on_disk.governed_evidence.contains_key("snap-5"));
     }
 
     /// Chain fixture: snap-1 <- ... <- snap-`n`, head at snap-n carrying the
@@ -2856,6 +2892,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retention_deletes_live_baseline_head() {
+        // Audit regression: after `rollback -n 4` the live subvolume embodies
+        // an OLD snapshot whose created_at is unchanged, so age-based
+        // retention selects the head first. Deleting it erases the lineage —
+        // head becomes None while the live subvolume still descends from the
+        // deleted snapshot, and the next checkpoint parents onto None.
+        let tmp = tempfile::tempdir().unwrap();
+        let data_root = tmp.path().join("live-head-data");
+        let backend = Arc::new(PartialFailBackend::new(
+            data_root.clone(),
+            std::iter::empty(),
+        ));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend as Arc<dyn StorageBackend>,
+            tmp.path().to_path_buf(),
+        ));
+
+        let subvol = data_root.join("ws-live-head");
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("content"), "non-empty").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        state
+            .register_workspace(
+                "ws-live-head".to_string(),
+                ws_path.clone(),
+                chain_index(&ws_path, "ws-live-head", 5),
+            )
+            .unwrap();
+
+        // head snap-5 -> snap-2. snap-2 keeps its old created_at, so it is
+        // first in line for age-based retention.
+        assert!(matches!(
+            rollback(&state, "ws-live-head", None, Some(4))
+                .await
+                .unwrap(),
+            Response::RollbackOk { to, .. } if to == "snap-2"
+        ));
+
+        // Count retention keep=2: the selector must spare the head while
+        // still pruning older non-head snapshots.
+        match cleanup_snapshots(&state, "ws-live-head", Some(2))
+            .await
+            .unwrap()
+        {
+            Response::CleanupOk { removed } => {
+                assert!(
+                    !removed.contains(&"snap-2".to_string()),
+                    "retention deleted the live baseline head: {removed:?}"
+                );
+                assert!(
+                    removed.contains(&"snap-1".to_string()),
+                    "retention must still prune older non-head snapshots: {removed:?}"
+                );
+            }
+            other => panic!("expected CleanupOk, got {other:?}"),
+        }
+
+        let arc = state.get_by_wsid("ws-live-head").unwrap();
+        {
+            let ws = arc.read().await;
+            assert_eq!(
+                ws.index.head.as_deref(),
+                Some("snap-2"),
+                "head must survive retention"
+            );
+            assert!(ws.index.snapshots["snap-2"]
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+        }
+
+        // Lineage stays usable: ancestor rollback still resolves from the head.
+        assert!(matches!(
+            rollback(&state, "ws-live-head", None, Some(1))
+                .await
+                .unwrap(),
+            Response::RollbackOk { to, .. } if to == "snap-2"
+        ));
+
+        // And the next checkpoint parents onto the live baseline.
+        assert!(matches!(
+            checkpoint(&state, "ws-live-head", "snap-6", None, None, false)
+                .await
+                .unwrap(),
+            Response::CheckpointOk { .. }
+        ));
+        let ws = arc.read().await;
+        assert_eq!(
+            ws.index.snapshots["snap-6"].parent_id.as_deref(),
+            Some("snap-2"),
+            "new checkpoint must descend from the surviving head"
+        );
+    }
+
+    #[tokio::test]
     async fn cleanup_not_found_prunes_ordinary_record_but_keeps_failed_delete() {
         let temp = tempfile::tempdir().unwrap();
         let backend = Arc::new(
@@ -2871,7 +3003,10 @@ mod tests {
         std::fs::create_dir_all(&subvol).unwrap();
         let link = temp.path().join("workspace");
         std::os::unix::fs::symlink(&subvol, &link).unwrap();
-        let mut index = chain_index(&link, "ws-ordinary", 2);
+        // Chain of three with head snap-3: retention may select snap-1 and
+        // snap-2 but never the head, so a Failed snap-2 and a NotFound snap-1
+        // are both exercised while the head survives.
+        let mut index = chain_index(&link, "ws-ordinary", 3);
         index.governed_evidence.clear();
         state
             .register_workspace("ws-ordinary".into(), link, index)
@@ -2882,10 +3017,13 @@ mod tests {
         let index = index_store::load(&state.index_dir("ws-ordinary"))
             .await
             .unwrap();
-        assert_eq!(index.snapshots.len(), 1);
+        assert_eq!(index.snapshots.len(), 2);
         assert!(!index.snapshots["snap-2"].missing);
         assert_eq!(index.snapshots["snap-2"].parent_id, None);
-        assert_eq!(index.head.as_deref(), Some("snap-2"));
+        assert_eq!(index.head.as_deref(), Some("snap-3"));
+        assert!(index.snapshots["snap-3"]
+            .child_ids
+            .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
     }
 
     #[tokio::test]
@@ -2913,14 +3051,13 @@ mod tests {
             .register_workspace("ws-nf".to_string(), ws_path.clone(), idx)
             .unwrap();
 
-        // keep=0 → all three selected; snap-2 comes back NotFound. NotFound
-        // is not a failure → no bail, the CLI stays exit-zero.
+        // keep=0 → every non-head snapshot is selected; snap-2 comes back
+        // NotFound. The head snap-3 is implicitly pinned and survives.
+        // NotFound is not a failure → no bail, the CLI stays exit-zero.
         let resp = cleanup_snapshots(&state, "ws-nf", Some(0)).await.unwrap();
         match resp {
             Response::CleanupOk { removed } => {
-                let mut r = removed;
-                r.sort();
-                assert_eq!(r, vec!["snap-1".to_string(), "snap-3".to_string()]);
+                assert_eq!(removed, vec!["snap-1".to_string()]);
             }
             other => panic!("expected CleanupOk, got {:?}", other),
         }
@@ -2929,20 +3066,29 @@ mod tests {
         let arc = state.get_by_wsid("ws-nf").expect("registered");
         {
             let ws = arc.read().await;
-            assert_eq!(ws.index.snapshots.len(), 1);
+            assert_eq!(ws.index.snapshots.len(), 2);
             let m2 = ws.index.snapshots.get("snap-2").expect("retained");
             assert!(m2.missing, "NotFound entry must be flagged missing");
             assert_eq!(m2.parent_id, None, "deleted ancestors must relink");
-            assert_eq!(ws.index.head.as_deref(), Some("snap-2"));
-            assert!(m2
+            assert_eq!(
+                ws.index.head.as_deref(),
+                Some("snap-3"),
+                "the head must never be selected for retention"
+            );
+            assert!(!m2
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+            let m3 = ws.index.snapshots.get("snap-3").unwrap();
+            assert!(m3
                 .child_ids
                 .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
         }
-        let on_disk = crate::index_store::load(&state.index_dir("ws-nf"))
+        let on_disk = index_store::load(&state.index_dir("ws-nf"))
             .await
             .expect("NotFound marker persisted");
         assert!(on_disk.snapshots["snap-2"].missing);
         assert!(on_disk.governed_evidence.contains_key("snap-2"));
+        assert_eq!(on_disk.head.as_deref(), Some("snap-3"));
 
         // Second pass: the missing entry must NOT be re-selected — no
         // backend call, no churn, no repeated warnings.

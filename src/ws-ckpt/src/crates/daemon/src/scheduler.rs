@@ -97,6 +97,10 @@ async fn health_check_loop(state: Arc<DaemonState>) {
 /// - `Count(n)`: keep n newest per workspace.
 /// - `Age { secs, .. }`: delete if older than `secs` (strict, no count floor).
 ///
+/// The live head is always kept: the live subvolume embodies it, and a
+/// rollback can park the head on an old snapshot whose created_at puts it
+/// first in line for selection — deleting it would erase the lineage.
+///
 /// Each workspace pass holds its mutation mutex from planning through persistence;
 /// workspace `RwLock` guards are acquired only inside that serialized region.
 async fn auto_cleanup(state: &DaemonState) {
@@ -119,11 +123,18 @@ async fn auto_cleanup(state: &DaemonState) {
             }
             let retention = eff.auto_cleanup_keep.clone();
 
+            // Same eligibility rule as the user-triggered cleanup: pinned and
+            // missing entries are excluded, and so is the head — the live
+            // subvolume embodies it (a rollback keeps the head's old
+            // created_at), so deleting it erases the workspace's lineage.
+            let head = ws.index.head.clone();
             let mut unpinned: Vec<(String, chrono::DateTime<chrono::Utc>)> = ws
                 .index
                 .snapshots
                 .iter()
-                .filter(|(_, meta)| !meta.pinned && !meta.missing)
+                .filter(|(id, meta)| {
+                    !meta.pinned && !meta.missing && Some(id.as_str()) != head.as_deref()
+                })
                 .map(|(id, meta)| (id.clone(), meta.created_at))
                 .collect();
             unpinned.sort_by_key(|(_, ts)| *ts);
@@ -434,6 +445,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn auto_cleanup_spares_live_head_after_rollback() {
+        // Audit regression: after a rollback the head is an OLD snapshot that
+        // the live subvolume embodies. Count retention must prune older
+        // non-head snapshots but keep the head, or the lineage is erased
+        // (head becomes None while live still descends from the deleted
+        // snapshot).
+        use super::auto_cleanup;
+        use crate::index_store;
+        use crate::state::DaemonState;
+        use std::sync::Arc;
+        use ws_ckpt_common::{SnapshotIndex, SnapshotMeta, LIVE_CHILD};
+
+        let temp = tempfile::tempdir().unwrap();
+        let mut backend = UsageProbeBackend::new(Ok((100, 1)), Ok(vec![]));
+        backend.data_root = temp.path().join("data");
+        backend.snapshots_root = temp.path().join("snapshots");
+        let backend = Arc::new(backend);
+        let ws_id = "ws-head";
+        let live = backend.data_root.join(ws_id);
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::write(live.join("canary"), "live").unwrap();
+        let path = temp.path().join("workspace");
+        std::os::unix::fs::symlink(&live, &path).unwrap();
+        let snapshots = backend.snapshots_root.join(ws_id);
+
+        // Post-rollback topology: snap-2 is the head with an old created_at,
+        // embodied by the live subvolume; snap-3/snap-4 are newer.
+        let mut index = SnapshotIndex::new(path.clone());
+        let now = chrono::Utc::now();
+        let ages: [(&str, i64); 4] = [
+            ("snap-1", 400),
+            ("snap-2", 300),
+            ("snap-3", 200),
+            ("snap-4", 100),
+        ];
+        for (i, (id, age)) in ages.iter().enumerate() {
+            let mut meta = SnapshotMeta {
+                message: None,
+                metadata: None,
+                pinned: false,
+                created_at: now - chrono::Duration::seconds(*age),
+                missing: false,
+                parent_id: (i > 0).then(|| format!("snap-{i}")),
+                child_ids: Vec::new(),
+            };
+            if i < ages.len() - 1 {
+                meta.child_ids.push(format!("snap-{}", i + 2));
+            }
+            index.snapshots.insert((*id).to_string(), meta);
+            std::fs::create_dir_all(snapshots.join(id)).unwrap();
+            std::fs::write(snapshots.join(id).join("canary"), id).unwrap();
+        }
+        // The head is rolled back onto snap-2: the live marker moves there
+        // while its child snap-3 keeps the abandoned forward branch.
+        let head_meta = index.snapshots.get_mut("snap-2").unwrap();
+        head_meta.child_ids.push(LIVE_CHILD.to_string());
+        index.head = Some("snap-2".to_string());
+        let state = Arc::new(DaemonState::new(
+            cfg(true, CleanupRetention::Count(2)),
+            backend.clone(),
+            temp.path().join("state"),
+        ));
+        state.register_workspace(ws_id.into(), path, index).unwrap();
+
+        auto_cleanup(&state).await;
+
+        // Pristine: eligible [snap-1..snap-4], keep 2 removes snap-1 AND the
+        // head snap-2 -> head walks to None. Fixed: head is spared.
+        let arc = state.get_by_wsid(ws_id).unwrap();
+        let ws = arc.read().await;
+        assert_eq!(
+            ws.index.head.as_deref(),
+            Some("snap-2"),
+            "retention must not delete the live baseline head"
+        );
+        assert!(!ws.index.snapshots.contains_key("snap-1"));
+        assert!(ws.index.snapshots.contains_key("snap-2"));
+        assert!(ws.index.snapshots.contains_key("snap-3"));
+        assert!(ws.index.snapshots.contains_key("snap-4"));
+        assert_eq!(
+            std::fs::read_to_string(snapshots.join("snap-2").join("canary")).unwrap(),
+            "snap-2",
+            "head snapshot subvolume must survive on disk"
+        );
+        let on_disk = index_store::load(&state.index_dir(ws_id)).await.unwrap();
+        assert_eq!(on_disk.head.as_deref(), Some("snap-2"));
+    }
+
+    #[tokio::test]
     async fn recovered_orphans_survive_retention_checkpoint_and_restart_until_explicit_delete() {
         use super::auto_cleanup;
         use crate::state::DaemonState;
@@ -524,15 +624,33 @@ mod tests {
                 .unwrap(),
                 Response::CheckpointOk { .. }
             ));
+            // A final unpinned checkpoint keeps the head OFF the retention
+            // candidates: the head is implicitly pinned (the live subvolume
+            // embodies it), so retention selects only the non-head unpinned
+            // snapshots below.
+            assert!(matches!(
+                snapshot_mgr::checkpoint(
+                    &state,
+                    ws_id,
+                    &format!("snap-tail-{round}"),
+                    None,
+                    None,
+                    false
+                )
+                .await
+                .unwrap(),
+                Response::CheckpointOk { .. }
+            ));
             {
                 let arc = state.get_by_wsid(ws_id).unwrap();
                 let mut ws = arc.write().await;
                 // Count(0) and Age(0) disable retention. Make real candidates
                 // for Count(1) and Age(1s), including an older protected orphan.
                 for (id, age) in [
-                    ("snap-1".into(), 3),
-                    (format!("snap-new-{round}"), 2),
-                    (format!("snap-newer-{round}"), 1),
+                    ("snap-1".into(), 4),
+                    (format!("snap-new-{round}"), 3),
+                    (format!("snap-newer-{round}"), 2),
+                    (format!("snap-tail-{round}"), 1),
                 ] {
                     ws.index.snapshots.get_mut(&id).unwrap().created_at =
                         chrono::Utc::now() - chrono::Duration::days(age);
@@ -562,6 +680,15 @@ mod tests {
                 .index
                 .snapshots
                 .contains_key(&format!("snap-newer-{round}")));
+            // The head is implicitly pinned: it must survive both passes.
+            let expected_tail = format!("snap-tail-{round}");
+            let arc = state.get_by_wsid(ws_id).unwrap();
+            let ws = arc.read().await;
+            assert_eq!(ws.index.head.as_deref(), Some(expected_tail.as_str()));
+            assert!(ws
+                .index
+                .snapshots
+                .contains_key(&format!("snap-tail-{round}")));
             for workspace in [None, Some(ws_id.into())] {
                 let response = dispatch(&state, Request::ListOrphans { workspace }).await;
                 let Response::ListOk { snapshots } = response else {
