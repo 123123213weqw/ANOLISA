@@ -353,6 +353,62 @@ class PluginTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(items[0], "stream-chunk")
         self.assertEqual(items[1].content, [_TextBlock(text="small")])
 
+    async def test_model_call_fails_open_when_before_model_errors(self) -> None:
+        async def before_model(_request):
+            raise core.TokenlessError("2 stash write operation(s) failed")
+
+        self.sdk.before_model = before_model
+        tools = [
+            {"type": "function", "function": {"name": "read_file", "description": "long"}},
+            plugin.RETRIEVE_DECLARATION,
+        ]
+        snapshot = copy.deepcopy(tools)
+
+        async def next_handler(**kwargs):
+            return kwargs
+
+        with self.assertLogs(plugin.logger, level="WARNING"):
+            result = await self.middleware.on_model_call(
+                self.agent,
+                {"messages": [], "tools": tools, "tool_choice": "auto"},
+                next_handler,
+            )
+
+        self.assertEqual(result["tools"], snapshot)
+        self.assertEqual(result["tool_choice"], "auto")
+        self.assertNotIn("anolisa_tokenless", self.agent.state.middle_context)
+
+    async def test_shell_call_fails_open_when_pre_tool_errors(self) -> None:
+        async def pre_tool(_request):
+            raise core.TokenlessError("rtk probe failed")
+
+        seen = {}
+
+        async def post_tool(request):
+            seen["post"] = request
+            return _post_response(request.content)
+
+        self.sdk.pre_tool = pre_tool
+        self.sdk.post_tool = post_tool
+        call = _Call(id="call-1", name="execute_shell_command", input='{"command": "cargo test"}')
+        forwarded = {}
+
+        async def next_handler(**kwargs):
+            forwarded.update(kwargs)
+            yield "stream-chunk"
+            yield _ToolResponse(content=[_TextBlock(text="build output")])
+
+        with self.assertLogs(plugin.logger, level="WARNING"):
+            items = await _collect(
+                self.middleware.on_acting(self.agent, {"tool_call": call}, next_handler)
+            )
+
+        self.assertEqual(forwarded["tool_call"].input, '{"command": "cargo test"}')
+        self.assertEqual(items[0], "stream-chunk")
+        self.assertEqual(items[1].content, [_TextBlock(text="build output")])
+        self.assertEqual(seen["post"].command, "cargo test")
+        self.assertEqual(seen["post"].output_optimization, core.OutputOptimization.NONE)
+
     async def test_non_object_shell_arguments_are_rejected(self) -> None:
         call = _Call(id="call-1", name="execute_shell_command", input='["ls"]')
 

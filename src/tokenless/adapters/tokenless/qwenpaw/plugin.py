@@ -155,6 +155,7 @@ class TokenlessMiddleware(MiddlewareBase):
             BeforeModelCapabilities,
             BeforeModelRequest,
             RecoveryMethod,
+            TokenlessError,
         )
 
         tools = [
@@ -162,24 +163,35 @@ class TokenlessMiddleware(MiddlewareBase):
             for tool in input_kwargs["tools"]
             if tool.get("function", {}).get("name") != RETRIEVE_TOOL
         ]
-        transformed = await self.sdk.before_model(
-            BeforeModelRequest(
-                tools=tuple(tools),
-                visible_context=json.dumps(
-                    input_kwargs["messages"], ensure_ascii=False, default=str
-                ),
-                capabilities=BeforeModelCapabilities(
-                    replace_tools=True, recovery=RecoveryMethod.tool(RETRIEVE_TOOL)
-                ),
-                attribution=Attribution(AGENT_ID, agent.state.session_id),
+        try:
+            transformed = await self.sdk.before_model(
+                BeforeModelRequest(
+                    tools=tuple(tools),
+                    visible_context=json.dumps(
+                        input_kwargs["messages"], ensure_ascii=False, default=str
+                    ),
+                    capabilities=BeforeModelCapabilities(
+                        replace_tools=True, recovery=RecoveryMethod.tool(RETRIEVE_TOOL)
+                    ),
+                    attribution=Attribution(AGENT_ID, agent.state.session_id),
+                )
             )
-        )
-        agent.state.middle_context[STATE_KEY] = {
-            "visible_markers": sorted(transformed.visible_markers),
-            "agent_id": AGENT_ID,
-            "data_dir": self.data_dir,
-        }
-        tools = list(transformed.tools)
+        except TokenlessError as error:
+            # Fail open: a Core-side failure (stash backend, pipeline) must
+            # not abort the model call; keep the original tools and the
+            # previous marker state, with retrieval still available.
+            logger.warning(
+                "tokenless: BeforeModel failed for %s (%s); passing tools through",
+                agent.state.session_id,
+                error,
+            )
+        else:
+            agent.state.middle_context[STATE_KEY] = {
+                "visible_markers": sorted(transformed.visible_markers),
+                "agent_id": AGENT_ID,
+                "data_dir": self.data_dir,
+            }
+            tools = list(transformed.tools)
         tools.append(RETRIEVE_DECLARATION)
         return await next_handler(**{**input_kwargs, "tools": tools})
 
@@ -195,6 +207,7 @@ class TokenlessMiddleware(MiddlewareBase):
             PreToolAction,
             PreToolCapabilities,
             PreToolRequest,
+            TokenlessError,
         )
 
         source = input_kwargs["tool_call"]
@@ -212,32 +225,44 @@ class TokenlessMiddleware(MiddlewareBase):
             arguments = json.loads(source.input)
             if not isinstance(arguments, dict):
                 raise TypeError(f"{source.name} arguments must be a JSON object")
-            transformed = await self.sdk.pre_tool(
-                PreToolRequest(
-                    tool_name=source.name,
-                    arguments=arguments,
-                    command_field=command_field,
-                    capabilities=PreToolCapabilities(
-                        replace_arguments=True, block_and_suggest=False
-                    ),
-                    attribution=attribution,
-                )
-            )
-            if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
-                raise RuntimeError(
-                    "Core returned block_and_suggest without host capability"
-                )
-            optimization = transformed.output_optimization
-            forwarded = source.model_copy(
-                update={
-                    "input": json.dumps(
-                        transformed.arguments,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
+            command = arguments.get(command_field)
+            try:
+                transformed = await self.sdk.pre_tool(
+                    PreToolRequest(
+                        tool_name=source.name,
+                        arguments=arguments,
+                        command_field=command_field,
+                        capabilities=PreToolCapabilities(
+                            replace_arguments=True, block_and_suggest=False
+                        ),
+                        attribution=attribution,
                     )
-                }
-            )
-            command = transformed.arguments.get(command_field)
+                )
+            except TokenlessError as error:
+                # Fail open: forward the original arguments unchanged and
+                # keep lossless-only output handling.
+                logger.warning(
+                    "tokenless: PreTool failed for %s/%s (%s); forwarding as-is",
+                    source.name,
+                    source.id,
+                    error,
+                )
+            else:
+                if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
+                    raise RuntimeError(
+                        "Core returned block_and_suggest without host capability"
+                    )
+                optimization = transformed.output_optimization
+                forwarded = source.model_copy(
+                    update={
+                        "input": json.dumps(
+                            transformed.arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    }
+                )
+                command = transformed.arguments.get(command_field)
         async for item in next_handler(**{**input_kwargs, "tool_call": forwarded}):
             if isinstance(item, ToolResponse):
                 yield await self._after_response(

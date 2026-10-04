@@ -266,6 +266,39 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
             "agent-2",
         )
 
+    async def test_before_model_error_fails_open(self) -> None:
+        async def before_model(_request):
+            raise core.TokenlessError("2 stash write operation(s) failed")
+
+        self.middleware.sdk.before_model = before_model
+        observed = {}
+
+        async def next_handler(**kwargs):
+            observed.update(kwargs)
+            return "model-response"
+
+        input_kwargs = {
+            "messages": [],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {"name": "api", "parameters": {}},
+                },
+                self.middleware._retrieve_declaration.as_function_tool(),
+            ],
+        }
+        result = await self.middleware.on_model_call(
+            self.agent,
+            input_kwargs,
+            next_handler,
+        )
+        self.assertEqual(result, "model-response")
+        self.assertEqual(
+            [tool["function"]["name"] for tool in observed["tools"]],
+            ["api", "tokenless_retrieve"],
+        )
+        self.assertNotIn("anolisa_tokenless", self.agent.state.middle_context)
+
     async def test_acting_preserves_stream_and_transforms_final_text(self) -> None:
         observed = []
 
@@ -344,6 +377,48 @@ class MiddlewareTest(unittest.IsolatedAsyncioTestCase):
         self.assertIs(output[1], response)
         self.assertEqual(observed[0].output_optimization, core.OutputOptimization.RTK)
         self.assertEqual(observed[0].command, "rtk grep needle file.txt")
+
+    async def test_pre_tool_error_fails_open(self) -> None:
+        self.middleware.config = replace(self.middleware.config, rtk_enabled=True)
+
+        async def pre_tool(_request):
+            raise core.TokenlessError("rtk probe failed")
+
+        observed = []
+
+        async def post_tool(request):
+            observed.append(request)
+            return _post_response(request.content)
+
+        self.middleware.sdk.pre_tool = pre_tool
+        self.middleware.sdk.post_tool = post_tool
+        source = _Call(
+            "call-pre",
+            "shell",
+            json.dumps({"command": "cargo test"}),
+        )
+        chunk = _ToolChunk([_TextBlock("stream")])
+        response = _ToolResponse([_TextBlock("build output")])
+
+        async def next_handler(**kwargs):
+            self.assertEqual(
+                json.loads(kwargs["tool_call"].input)["command"], "cargo test"
+            )
+            yield chunk
+            yield response
+
+        output = await _collect(
+            self.middleware.on_acting(
+                self.agent,
+                {"tool_call": source},
+                next_handler,
+            )
+        )
+
+        self.assertIs(output[0], chunk)
+        self.assertIs(output[1], response)
+        self.assertEqual(observed[0].command, "cargo test")
+        self.assertEqual(observed[0].output_optimization, core.OutputOptimization.NONE)
 
     async def test_error_context_is_owned_by_core(self) -> None:
         async def post_tool(request):

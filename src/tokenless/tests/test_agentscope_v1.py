@@ -197,12 +197,50 @@ class AgentScopeV1Test(unittest.IsolatedAsyncioTestCase):
             ["hash_or_marker"],
         )
 
+    async def test_model_proxy_fails_open_when_before_model_errors(self) -> None:
+        async def before_model(_request):
+            raise core.TokenlessError("2 stash write operation(s) failed")
+
+        self.integration.sdk.before_model = before_model
+        original = [registered.json_schema for registered in self.toolkit.tools.values()]
+        args, kwargs = await self.agent.model([], tools=original)
+        self.assertEqual(args, ([],))
+        self.assertEqual(
+            [tool["function"]["name"] for tool in kwargs["tools"]],
+            ["large_result", "tokenless_retrieve"],
+        )
+        self.assertEqual(
+            kwargs["tools"][0], self.toolkit.tools["large_result"].json_schema
+        )
+        self.assertEqual(self.toolkit.visible_markers, frozenset())
+
     async def test_pre_acting_preserves_original_call(self) -> None:
         original = {"name": "api", "id": "call-2", "input": {"value": 1}}
         hook = self.agent.hooks[("pre_acting", "tokenless")]
         result = await hook(self.agent, {"tool_call": original})
         self.assertIsNot(result["tool_call"], original)
         self.assertEqual(original["input"], {"value": 1})
+
+    async def test_pre_acting_fails_open_when_pre_tool_errors(self) -> None:
+        self.integration.config = replace(self.integration.config, rtk_enabled=True)
+
+        async def pre_tool(_request):
+            raise core.TokenlessError("rtk probe failed")
+
+        self.integration.sdk.pre_tool = pre_tool
+        original = {
+            "name": "shell",
+            "id": "call-pre",
+            "input": {"command": "cargo test"},
+        }
+        hook = self.agent.hooks[("pre_acting", "tokenless")]
+        transformed = (await hook(self.agent, {"tool_call": original}))["tool_call"]
+        self.assertEqual(transformed["input"], {"command": "cargo test"})
+        self.assertEqual(original["input"], {"command": "cargo test"})
+        self.assertEqual(
+            self.toolkit.output_optimizations["call-pre"],
+            core.OutputOptimization.NONE,
+        )
 
     async def test_retrieve_bypasses_pre_acting_contracts(self) -> None:
         original = {

@@ -229,27 +229,34 @@ class TokenlessMiddleware(MiddlewareBase):
                 self.contract_for(name)
             tools.append(tool)
         agent_id = str(agent.name)
-        transformed = await self.sdk.before_model(
-            BeforeModelRequest(
-                tools=tuple(tools),
-                visible_context=json.dumps(
-                    input_kwargs["messages"], ensure_ascii=False, default=str
-                ),
-                capabilities=BeforeModelCapabilities(
-                    replace_tools=True,
-                    recovery=RecoveryMethod.tool(self.retrieve_tool_name),
-                ),
-                attribution=Attribution(agent_id, agent.state.session_id),
+        try:
+            transformed = await self.sdk.before_model(
+                BeforeModelRequest(
+                    tools=tuple(tools),
+                    visible_context=json.dumps(
+                        input_kwargs["messages"], ensure_ascii=False, default=str
+                    ),
+                    capabilities=BeforeModelCapabilities(
+                        replace_tools=True,
+                        recovery=RecoveryMethod.tool(self.retrieve_tool_name),
+                    ),
+                    attribution=Attribution(agent_id, agent.state.session_id),
+                )
             )
-        )
-        _set_marker_state(
-            agent.state,
-            transformed.visible_markers,
-            agent_id,
-            self._session_markers,
-            self._session_agents,
-        )
-        tools = list(transformed.tools)
+        except TokenlessError:
+            # Fail open: a Core-side failure (stash backend, pipeline) must
+            # not abort the model call; keep the original tools and the
+            # previous marker state, with retrieval still available.
+            pass
+        else:
+            _set_marker_state(
+                agent.state,
+                transformed.visible_markers,
+                agent_id,
+                self._session_markers,
+                self._session_agents,
+            )
+            tools = list(transformed.tools)
         tools.append(self._retrieve_declaration.as_function_tool())
         return await next_handler(**{**input_kwargs, "tools": tools})
 
@@ -274,31 +281,36 @@ class TokenlessMiddleware(MiddlewareBase):
         optimization = OutputOptimization.NONE
         forwarded = source
         if contract.command_field is not None and self.config.rtk_enabled:
-            transformed = await self.sdk.pre_tool(
-                PreToolRequest(
-                    tool_name=source.name,
-                    arguments=arguments,
-                    command_field=contract.command_field,
-                    capabilities=PreToolCapabilities(
-                        replace_arguments=True,
-                        block_and_suggest=False,
-                    ),
-                    attribution=attribution,
-                )
-            )
-            if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
-                raise RuntimeError("Core returned block_and_suggest without host capability")
-            optimization = transformed.output_optimization
-            arguments = transformed.arguments
-            forwarded = source.model_copy(
-                update={
-                    "input": json.dumps(
-                        arguments,
-                        ensure_ascii=False,
-                        separators=(",", ":"),
+            try:
+                transformed = await self.sdk.pre_tool(
+                    PreToolRequest(
+                        tool_name=source.name,
+                        arguments=arguments,
+                        command_field=contract.command_field,
+                        capabilities=PreToolCapabilities(
+                            replace_arguments=True,
+                            block_and_suggest=False,
+                        ),
+                        attribution=attribution,
                     )
-                }
-            )
+                )
+                if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
+                    raise RuntimeError("Core returned block_and_suggest without host capability")
+                optimization = transformed.output_optimization
+                arguments = transformed.arguments
+                forwarded = source.model_copy(
+                    update={
+                        "input": json.dumps(
+                            arguments,
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        )
+                    }
+                )
+            except TokenlessError:
+                # Fail open: forward the original arguments unchanged and
+                # keep lossless-only output handling.
+                pass
         command = None
         if contract.command_field is not None:
             command = arguments.get(contract.command_field)

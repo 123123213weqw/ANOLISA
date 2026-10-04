@@ -109,22 +109,29 @@ class _ModelProxy:
                 tool for tool in tools if tool.get("function", {}).get("name") != retrieve_name
             ]
             prompt = args[0] if args else kwargs.get("prompt", "")
-            transformed = await self._integration.sdk.before_model(
-                BeforeModelRequest(
-                    tools=tuple(model_tools),
-                    visible_context=json.dumps(prompt, ensure_ascii=False, default=str),
-                    capabilities=BeforeModelCapabilities(
-                        replace_tools=True,
-                        recovery=RecoveryMethod.tool(self._integration.config.retrieve_tool_name),
-                    ),
-                    attribution=self._integration._attribution(),
+            try:
+                transformed = await self._integration.sdk.before_model(
+                    BeforeModelRequest(
+                        tools=tuple(model_tools),
+                        visible_context=json.dumps(prompt, ensure_ascii=False, default=str),
+                        capabilities=BeforeModelCapabilities(
+                            replace_tools=True,
+                            recovery=RecoveryMethod.tool(self._integration.config.retrieve_tool_name),
+                        ),
+                        attribution=self._integration._attribution(),
+                    )
                 )
-            )
-            model_tools = list(transformed.tools)
+            except TokenlessError:
+                # Fail open: a Core-side failure (stash backend, pipeline)
+                # must not abort the model call; keep the original tools
+                # and the previous marker state, with retrieval available.
+                pass
+            else:
+                model_tools = list(transformed.tools)
+                self._toolkit.visible_markers = transformed.visible_markers
             model_tools.append(self._integration._retrieve_declaration.as_function_tool())
             kwargs = dict(kwargs)
             kwargs["tools"] = model_tools
-            self._toolkit.visible_markers = transformed.visible_markers
         return await self._model(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
@@ -206,22 +213,27 @@ class TokenlessAgentScope:
         arguments = dict(tool_call.get("input") or {})
         optimization = OutputOptimization.NONE
         if contract.command_field is not None and self.config.rtk_enabled:
-            transformed = await self.sdk.pre_tool(
-                PreToolRequest(
-                    tool_name=tool_call["name"],
-                    arguments=arguments,
-                    command_field=contract.command_field,
-                    capabilities=PreToolCapabilities(
-                        replace_arguments=True,
-                        block_and_suggest=False,
-                    ),
-                    attribution=self._attribution(tool_call["id"]),
+            try:
+                transformed = await self.sdk.pre_tool(
+                    PreToolRequest(
+                        tool_name=tool_call["name"],
+                        arguments=arguments,
+                        command_field=contract.command_field,
+                        capabilities=PreToolCapabilities(
+                            replace_arguments=True,
+                            block_and_suggest=False,
+                        ),
+                        attribution=self._attribution(tool_call["id"]),
+                    )
                 )
-            )
-            if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
-                raise RuntimeError("Core returned block_and_suggest without host capability")
-            arguments = transformed.arguments
-            optimization = transformed.output_optimization
+                if transformed.action is PreToolAction.BLOCK_AND_SUGGEST:
+                    raise RuntimeError("Core returned block_and_suggest without host capability")
+                arguments = transformed.arguments
+                optimization = transformed.output_optimization
+            except TokenlessError:
+                # Fail open: forward the original arguments unchanged and
+                # keep lossless-only output handling.
+                pass
         tool_call["input"] = arguments
         agent.toolkit.output_optimizations[tool_call["id"]] = optimization
         return {**kwargs, "tool_call": tool_call}
