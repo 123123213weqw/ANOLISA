@@ -329,4 +329,35 @@ describe("SelectiveContextEngine", () => {
       expect(engine.getActiveSessionId()).toBe("s1");
     });
   });
+
+  describe("expandTurns", () => {
+    it("merges cached turns and turns ingested after assembly in requested order", async () => {
+      await engine.assemble({
+        sessionId: "s1",
+        messages: [{ role: "user", content: "cached question" }, { role: "assistant", content: "cached answer" }],
+      });
+      await engine.ingest({ sessionId: "s1", message: { role: "user", content: "new question" } });
+      await engine.ingest({ sessionId: "s1", message: { role: "assistant", content: "new answer" } });
+
+      const result = engine.expandTurns("s1", [2, 999, 1]);
+      expect(result.found).toBe(2);
+      expect(result.turns.map((turn) => turn.turnSeq)).toEqual([2, 1]);
+      expect(result.turns[0].messages.map((message) => message.content)).toEqual(["new question", "new answer"]);
+      expect(result.turns[1].messages.map((message) => message.content)).toEqual(["cached question", "cached answer"]);
+    });
+
+    it("keeps the live cached content when an archived turn has the same number", async () => {
+      await engine.assemble({ sessionId: "s1", messages: [{ role: "user", content: "first version" }] });
+      await engine.assemble({ sessionId: "s1", messages: [{ role: "user", content: "current version" }] });
+
+      expect(engine.expandTurns("s1", [1]).turns[0].messages[0].content).toBe("current version");
+      expect(engine.expandTurns("s1", [])).toEqual({ found: 0, turns: [] });
+    });
+
+    it("returns stored turns when no live cache exists", async () => {
+      await engine.ingest({ sessionId: "s1", message: { role: "user", content: "stored question" } });
+      expect(engine.expandTurns("s1", [1]).turns[0].messages[0].content).toBe("stored question");
+      expect(engine.expandTurns("s1", [999])).toEqual({ found: 0, turns: [] });
+    });
+  });
 });

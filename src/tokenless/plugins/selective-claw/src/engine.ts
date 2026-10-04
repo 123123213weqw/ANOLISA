@@ -221,25 +221,19 @@ export class SelectiveContextEngine implements ContextEngine {
     turns: Array<{ turnSeq: number; messages: Array<{ role: string; content: string }> }>;
   } {
     const cache = this.turnMessagesCache.get(sessionId);
-    if (cache) {
-      const result: Array<{ turnSeq: number; messages: Array<{ role: string; content: string }> }> = [];
-      for (const seq of turnSeqs) {
-        const msgs = cache.get(seq);
-        if (msgs) {
-          result.push({
-            turnSeq: seq,
-            messages: msgs.map((m) => ({
-              role: m.role,
-              content: this.extractContent(m),
-            })),
-          });
-        }
+    const turnMap = new Map<number, Array<{ role: string; content: string }>>();
+    for (const seq of turnSeqs) {
+      const messages = cache?.get(seq);
+      if (messages) {
+        turnMap.set(seq, messages.map((message) => ({
+          role: message.role,
+          content: this.extractContent(message),
+        })));
       }
-      if (result.length > 0) return { found: result.length, turns: result };
     }
 
-    const storeMessages = this.store.getMessagesByTurnSeqs(sessionId, turnSeqs);
-    const turnMap = new Map<number, Array<{ role: string; content: string }>>();
+    const missingTurns = turnSeqs.filter((seq) => !turnMap.has(seq));
+    const storeMessages = this.store.getMessagesByTurnSeqs(sessionId, missingTurns);
     for (const m of storeMessages) {
       const arr = turnMap.get(m.turnSeq) ?? [];
       arr.push({ role: m.role, content: m.content });
