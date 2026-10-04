@@ -364,3 +364,43 @@ def test_sandbox_manager_rejects_wrong_explained_workspace(tmp_path: Path) -> No
 
 def test_build_openclaw_agent_scope_key_matches_local_agent_scope() -> None:
     assert build_openclaw_agent_scope_key("django__django-13448") == "agent:django__django-13448:main"
+
+
+def test_sandbox_manager_bounds_every_subprocess_call_with_a_timeout(tmp_path: Path) -> None:
+    """A wedged openclaw CLI or unresponsive docker daemon must fail the
+    instance visibly instead of blocking the worker thread forever, so every
+    ``run_command`` call issued by the manager (``sandbox recreate``,
+    ``docker ps``, ``docker rm``, ``sandbox explain``) has to pass a timeout.
+    """
+    config_path = tmp_path / "openclaw.json"
+    config_path.write_text('{"agents":{"list":[{"id":"main","default":true}]}}', encoding="utf-8")
+    spec = _spec(tmp_path)
+    timeouts: list[tuple[str, object]] = []
+
+    def fake_run(cmd: list[str], **kwargs: object) -> CommandResult:
+        timeouts.append((" ".join(cmd[:6]), kwargs.get("timeout")))
+        if cmd[:2] == ["docker", "ps"]:
+            # Report stale containers so the docker rm call runs as well.
+            return _completed(cmd, stdout="container-a\ncontainer-b\n")
+        if cmd[:5] == ["openclaw", "--profile", "profile-1", "sandbox", "explain"]:
+            return _completed(cmd, stdout=json.dumps({"sandbox": {"workspaceRoot": str(spec.workspace_root)}}))
+        return _completed(cmd)
+
+    manager = OpenClawSandboxManager(config_path=config_path, profile="profile-1", cli_path="openclaw")
+
+    with patch("swe_runner.agents.openclaw.sandbox.run_command", side_effect=fake_run):
+        manager.configure(spec)
+        manager.remove_agent_containers(spec.agent_id)
+
+    assert timeouts, "configure() must issue subprocess calls"
+    unbounded = [name for name, timeout in timeouts if not timeout]
+    assert not unbounded, f"run_command calls without a timeout: {unbounded}"
+    recreate = [t for name, t in timeouts if "sandbox recreate" in name]
+    docker = [t for name, t in timeouts if name.startswith("docker")]
+    explain = [t for name, t in timeouts if "sandbox explain" in name]
+    assert recreate, "sandbox recreate must be issued"
+    assert all(isinstance(t, (int, float)) and t > 0 for t in recreate)
+    assert docker, "docker ps/rm must be issued"
+    assert all(isinstance(t, (int, float)) and t > 0 for t in docker)
+    assert explain, "sandbox explain must be issued"
+    assert all(isinstance(t, (int, float)) and t > 0 for t in explain)

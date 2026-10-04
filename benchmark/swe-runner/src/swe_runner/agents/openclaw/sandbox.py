@@ -47,6 +47,13 @@ _PYTEST_CACHE_DIR = "/tmp/swe-runner-pytest-cache"
 _HYPOTHESIS_CACHE_DIR = "/tmp/swe-runner-hypothesis"
 _AGENTS_FILE = "AGENTS.md"
 _OPENCLAW_SANDBOX_SESSION_LABEL = "openclaw.sessionKey"
+# Every subprocess the manager spawns is bounded so a wedged openclaw CLI or
+# an unresponsive docker daemon fails the instance visibly instead of
+# blocking the worker thread forever (remove_agent_containers also runs in
+# the prepared.cleanup() callback, where nothing would ever interrupt it).
+_RECREATE_TIMEOUT_S = 120.0
+_DOCKER_TIMEOUT_S = 30.0
+_EXPLAIN_TIMEOUT_S = 60.0
 _SETUP_COMMAND = (
     f"mkdir -p {_PYTEST_CACHE_DIR} {_HYPOTHESIS_CACHE_DIR}/examples "
     "&& git config --global --add safe.directory /testbed || true"
@@ -292,6 +299,7 @@ class OpenClawSandboxManager:
         run_command(
             [self._cli_path, "--profile", self._profile, "sandbox", "recreate", "--agent", agent_id, "--force"],
             check=True,
+            timeout=_RECREATE_TIMEOUT_S,
         )
         self.remove_stale_agent_containers(agent_id)
 
@@ -299,6 +307,7 @@ class OpenClawSandboxManager:
         scope_key = build_openclaw_agent_scope_key(agent_id)
         result = run_command(
             ["docker", "ps", "-aq", "--filter", f"label={_OPENCLAW_SANDBOX_SESSION_LABEL}={scope_key}"],
+            timeout=_DOCKER_TIMEOUT_S,
         )
         if result.returncode != 0:
             logger.warning(
@@ -314,6 +323,7 @@ class OpenClawSandboxManager:
 
         remove_result = run_command(
             ["docker", "rm", "-f", *container_ids],
+            timeout=_DOCKER_TIMEOUT_S,
         )
         if remove_result.returncode != 0:
             logger.warning(
@@ -388,6 +398,7 @@ class OpenClawSandboxManager:
         result = run_command(
             [self._cli_path, "--profile", self._profile, "sandbox", "explain", "--agent", spec.agent_id, "--json"],
             check=True,
+            timeout=_EXPLAIN_TIMEOUT_S,
         )
         try:
             data = json.loads(result.stdout)
