@@ -301,6 +301,55 @@ impl DaemonState {
                         .await
                         .with_context(|| format!("save reconciled index for {ws_id}"))?;
                 }
+
+                // Complete a legacy rollback whose backend swap committed but
+                // whose head update never reached the index (crash between
+                // swap and save, or a failed save surfaced as a command
+                // error). reconcile_from_fs cannot see which snapshot the
+                // live subvolume embodies — the durable intent marker is the
+                // only signal. An uncommitted marker means the swap never
+                // finished (rollback_recovery restored any mid-swap rename
+                // at bootstrap): discard it and leave the head untouched.
+                let index_dir = state.index_dir(&ws_id);
+                if let Some(intent) = index_store::load_rollback_intent(&index_dir).await? {
+                    if intent.committed {
+                        if ws.index.snapshots.contains_key(&intent.target) {
+                            warn!(
+                                "Completing interrupted rollback to {} for workspace {}",
+                                intent.target, ws_id
+                            );
+                            crate::guarded_checkpoint::update_live_head(
+                                &mut ws.index,
+                                &intent.target,
+                            );
+                            index_store::save(&index_dir, &ws.index)
+                                .await
+                                .with_context(|| {
+                                    format!("save completed rollback head update for {ws_id}")
+                                })?;
+                        } else {
+                            warn!(
+                                "Committed rollback intent targets unknown snapshot {} for \
+                                 workspace {}; discarding the marker",
+                                intent.target, ws_id
+                            );
+                        }
+                    } else {
+                        warn!(
+                            "Discarding uncommitted rollback intent to {} for workspace {} \
+                             (the backend swap never completed)",
+                            intent.target, ws_id
+                        );
+                    }
+                    if let Err(e) = index_store::clear_rollback_intent(&index_dir).await {
+                        // Idempotent on the next restart; never block
+                        // startup on marker cleanup.
+                        warn!(
+                            "Failed to clear rollback intent for workspace {}: {:#}",
+                            ws_id, e
+                        );
+                    }
+                }
             }
         }
 

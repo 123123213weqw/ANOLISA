@@ -862,7 +862,13 @@ async fn mark_rollback_unknown(
     rollback_evidence_response(uncertain_evidence)
 }
 
-fn update_live_head(index: &mut ws_ckpt_common::SnapshotIndex, target_snapshot_id: &str) {
+/// Re-point the live head onto `target_snapshot_id`, migrating the LIVE_CHILD
+/// marker from the previous head. Idempotent: completing an already-completed
+/// head update is a no-op.
+pub(crate) fn update_live_head(
+    index: &mut ws_ckpt_common::SnapshotIndex,
+    target_snapshot_id: &str,
+) {
     if let Some(old_head) = index.head.clone() {
         if let Some(head) = index.snapshots.get_mut(&old_head) {
             head.child_ids.retain(|child| child != LIVE_CHILD);

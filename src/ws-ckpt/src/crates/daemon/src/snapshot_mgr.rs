@@ -368,10 +368,52 @@ pub async fn rollback(
         return Ok(*resp);
     }
 
-    // 5. Rollback via backend (includes warmup, snapshot, cleanup)
+    // 5. Durably record the rollback intent BEFORE the backend swap. If the
+    //    daemon dies — or the index save below fails — between the swap and
+    //    the index save, startup needs this record to complete the head
+    //    update: reconcile_from_fs has no live-vs-head signal of its own, and
+    //    a stale head silently re-parents every later checkpoint onto the
+    //    abandoned branch. Mirrors the guarded rollback's durable Started
+    //    evidence. Refuse to swap the live subvolume when the intent cannot
+    //    be recorded: an unwritable index dir must not produce a rollback
+    //    whose durable state diverges from the live subvolume.
+    let snap_dir = state.index_dir(&ws.ws_id);
+    tokio::fs::create_dir_all(&snap_dir).await?;
+    crate::index_store::save_rollback_intent(
+        &snap_dir,
+        &crate::index_store::RollbackIntent {
+            target: resolved_id.clone(),
+            committed: false,
+        },
+    )
+    .await
+    .with_context(|| {
+        format!("record rollback intent for {resolved_id}; refusing to swap the live subvolume")
+    })?;
+
+    // 6. Rollback via backend (includes warmup, snapshot, cleanup)
     state.backend.rollback(&ws.ws_id, &resolved_id).await?;
 
-    // 6. Update head + migrate LIVE_CHILD
+    // 6a. The swap completed: flip the marker so a crash before the index
+    //     save lets startup complete the head update. The remaining
+    //     unprotected window is this single small fsync, not the full index
+    //     serialization+save below.
+    if let Err(e) = crate::index_store::save_rollback_intent(
+        &snap_dir,
+        &crate::index_store::RollbackIntent {
+            target: resolved_id.clone(),
+            committed: true,
+        },
+    )
+    .await
+    {
+        tracing::warn!(
+            "rollback commit marker save failed (continuing to index save): {:#}",
+            e
+        );
+    }
+
+    // 7. Update head + migrate LIVE_CHILD
     if let Some(old_head) = ws.index.head.clone() {
         if let Some(hm) = ws.index.snapshots.get_mut(&old_head) {
             hm.child_ids.retain(|c| c != ws_ckpt_common::LIVE_CHILD);
@@ -386,12 +428,20 @@ pub async fn rollback(
         }
     }
     ws.index.head = Some(resolved_id.clone());
-    let snap_dir = state.index_dir(&ws.ws_id);
-    if let Err(e) = crate::index_store::save(&snap_dir, &ws.index).await {
-        tracing::warn!(
-            "rollback index save failed (in-memory state is correct): {:#}",
-            e
-        );
+
+    // 8. Persist index — no longer warn-only. Returning RollbackOk while the
+    //    durable index still describes the old chain leaves a stale head
+    //    after restart (live embodies resolved_id, the index does not), and
+    //    the durable committed marker from 6a is the only signal startup has.
+    //    In-memory state stays updated, so the running daemon remains
+    //    consistent; the error tells the caller the durable state lagged.
+    crate::index_store::save(&snap_dir, &ws.index).await?;
+
+    // 8a. The index is durable: drop the intent marker. Best-effort — a
+    //     leftover committed marker only makes startup re-apply the same
+    //     (idempotent) head update.
+    if let Err(e) = crate::index_store::clear_rollback_intent(&snap_dir).await {
+        tracing::warn!("failed to clear rollback intent marker: {:#}", e);
     }
 
     Ok(Response::RollbackOk {
@@ -2853,6 +2903,398 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Content-carrying stub for rollback-durability tests: every snapshot
+    /// stores a canary copied from the live subvolume at checkpoint time,
+    /// and rollback swaps the live canary for the target snapshot's — so
+    /// "which generation the live workspace embodies" is observable.
+    struct RollbackSwapBackend {
+        data_root: PathBuf,
+        snapshots_root: PathBuf,
+        rollback_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RollbackSwapBackend {
+        fn new(root: PathBuf) -> Self {
+            Self {
+                snapshots_root: root.join("snapshots"),
+                data_root: root,
+                rollback_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn generation(&self, ws_id: &str) -> String {
+            std::fs::read_to_string(self.data_root.join(ws_id).join("canary")).unwrap()
+        }
+
+        fn rollback_calls(&self) -> usize {
+            self.rollback_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageBackend for RollbackSwapBackend {
+        fn backend_type(&self) -> ws_ckpt_common::backend::BackendType {
+            ws_ckpt_common::backend::BackendType::BtrfsBase
+        }
+        fn data_root(&self) -> &std::path::Path {
+            &self.data_root
+        }
+        fn snapshots_root(&self) -> &std::path::Path {
+            &self.snapshots_root
+        }
+        async fn create_snapshot(&self, ws_id: &str, snapshot_id: &str) -> anyhow::Result<()> {
+            let dst = self.snapshots_root.join(ws_id).join(snapshot_id);
+            std::fs::create_dir_all(&dst)?;
+            std::fs::copy(
+                self.data_root.join(ws_id).join("canary"),
+                dst.join("canary"),
+            )?;
+            Ok(())
+        }
+        async fn rollback(&self, ws_id: &str, snapshot_id: &str) -> anyhow::Result<PathBuf> {
+            self.rollback_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let live = self.data_root.join(ws_id);
+            let staged = live.join("canary.rollback-tmp");
+            std::fs::copy(
+                self.snapshots_root
+                    .join(ws_id)
+                    .join(snapshot_id)
+                    .join("canary"),
+                &staged,
+            )?;
+            std::fs::rename(&staged, live.join("canary"))?;
+            Ok(live)
+        }
+        async fn cleanup_snapshots(
+            &self,
+            ws_id: &str,
+            snapshot_ids: &[String],
+        ) -> anyhow::Result<Vec<(String, ws_ckpt_common::backend::SnapshotDeleteOutcome)>> {
+            for id in snapshot_ids {
+                std::fs::remove_dir_all(self.snapshots_root.join(ws_id).join(id))?;
+            }
+            Ok(snapshot_ids
+                .iter()
+                .map(|id| {
+                    (
+                        id.clone(),
+                        ws_ckpt_common::backend::SnapshotDeleteOutcome::Removed,
+                    )
+                })
+                .collect())
+        }
+        async fn init_workspace(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> anyhow::Result<ws_ckpt_common::WorkspaceInfo> {
+            unimplemented!()
+        }
+        async fn delete_snapshot(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn recover_workspace(&self, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn diff(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+        ) -> anyhow::Result<Vec<ws_ckpt_common::DiffEntry>> {
+            unimplemented!()
+        }
+        async fn fork(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn gc_generations(
+            &self,
+            _: &str,
+        ) -> anyhow::Result<ws_ckpt_common::backend::GcResult> {
+            unimplemented!()
+        }
+        async fn check_environment(
+            &self,
+        ) -> anyhow::Result<ws_ckpt_common::backend::EnvironmentStatus> {
+            unimplemented!()
+        }
+        async fn get_usage(&self) -> anyhow::Result<(u64, u64)> {
+            Ok((100, 1))
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_index_save_failure_diverges_after_restart() {
+        // Audit regression: rollback swapped the live subvolume and then saved
+        // the index WARN-ONLY, so a failed save still returned RollbackOk.
+        // After a restart the head stayed on the abandoned chain while the
+        // live subvolume embodied the rollback target, and later checkpoints
+        // parented onto the wrong lineage.
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RollbackSwapBackend::new(tmp.path().join("data")));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+        let ws_id = "ws-rbfail";
+        let subvol = backend.data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("canary"), "gen-1").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        state
+            .register_workspace(
+                ws_id.to_string(),
+                ws_path.clone(),
+                SnapshotIndex::new(ws_path),
+            )
+            .unwrap();
+
+        // Three checkpoints over three live generations: snap-N's canary is
+        // gen-N, head = snap-3, live embodies gen-3.
+        for (gen, id) in [
+            ("gen-1", "snap-1"),
+            ("gen-2", "snap-2"),
+            ("gen-3", "snap-3"),
+        ] {
+            std::fs::write(subvol.join("canary"), gen).unwrap();
+            assert!(matches!(
+                checkpoint(&state, ws_id, id, None, None, false)
+                    .await
+                    .unwrap(),
+                Response::CheckpointOk { .. }
+            ));
+        }
+        assert_eq!(backend.generation(ws_id), "gen-3");
+        state.save_manifest().await.unwrap();
+
+        // The index directory becomes unwritable: no durable record of the
+        // rollback can be saved.
+        let index_dir = state.index_dir(ws_id);
+        let mut perms = std::fs::metadata(&index_dir)
+            .expect("index dir exists")
+            .permissions();
+        perms.set_mode(0o555);
+        std::fs::set_permissions(&index_dir, perms).unwrap();
+
+        // Pristine: RollbackOk is returned despite the unwritable index and
+        // the live subvolume has already swapped to gen-1. Fixed: rollback
+        // refuses to swap without a durable intent record and returns Err.
+        let result = rollback(&state, ws_id, None, Some(3)).await;
+        assert!(
+            result.is_err(),
+            "rollback must fail when its durable index state cannot be updated: {result:?}"
+        );
+        assert_eq!(
+            backend.rollback_calls(),
+            0,
+            "the backend swap must not run without a durable intent record"
+        );
+        assert_eq!(
+            backend.generation(ws_id),
+            "gen-3",
+            "live content must be untouched when the rollback is refused"
+        );
+
+        let mut perms = std::fs::metadata(&index_dir)
+            .expect("index dir exists")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&index_dir, perms).unwrap();
+
+        // Restart: no divergence — head and live still agree on snap-3.
+        let manifest = ws_ckpt_common::persist::load_state(&state.state_dir)
+            .unwrap()
+            .unwrap();
+        let restarted = Arc::new(
+            DaemonState::rebuild_from_persisted(
+                &manifest,
+                test_config(),
+                backend.clone(),
+                state.state_dir.clone(),
+                "persisted",
+            )
+            .await
+            .unwrap(),
+        );
+        {
+            let arc = restarted.get_by_wsid(ws_id).unwrap();
+            let ws = arc.read().await;
+            assert_eq!(ws.index.head.as_deref(), Some("snap-3"));
+        }
+
+        // Ancestor rollback after the restart resolves the live chain.
+        assert!(matches!(
+            rollback(&restarted, ws_id, None, Some(3))
+                .await
+                .unwrap(),
+            Response::RollbackOk { to, .. } if to == "snap-1"
+        ));
+        assert_eq!(backend.generation(ws_id), "gen-1");
+        assert!(
+            !index_dir.join("rollback-intent.json").exists(),
+            "a completed rollback must clear its intent marker"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_completes_committed_rollback_intent() {
+        // Crash window: the backend swap committed (live embodies snap-1) and
+        // a committed intent marker is durable, but the head update was never
+        // persisted. Startup must complete the head update instead of leaving
+        // a stale head that later checkpoints would parent onto.
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RollbackSwapBackend::new(tmp.path().join("data")));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+        let ws_id = "ws-commit";
+        let subvol = backend.data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("canary"), "gen-1").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        let index = chain_index(&ws_path, ws_id, 3);
+        state
+            .register_workspace(ws_id.to_string(), ws_path, index.clone())
+            .unwrap();
+        for i in 1..=3 {
+            let dir = backend.snapshots_root.join(ws_id).join(format!("snap-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("canary"), format!("gen-{i}")).unwrap();
+        }
+        index_store::save(&state.index_dir(ws_id), &index)
+            .await
+            .unwrap();
+        state.save_manifest().await.unwrap();
+        std::fs::write(
+            state.index_dir(ws_id).join("rollback-intent.json"),
+            r#"{"target":"snap-1","committed":true}"#,
+        )
+        .unwrap();
+
+        let manifest = ws_ckpt_common::persist::load_state(&state.state_dir)
+            .unwrap()
+            .unwrap();
+        let restarted = Arc::new(
+            DaemonState::rebuild_from_persisted(
+                &manifest,
+                test_config(),
+                backend.clone(),
+                state.state_dir.clone(),
+                "persisted",
+            )
+            .await
+            .unwrap(),
+        );
+        {
+            let arc = restarted.get_by_wsid(ws_id).unwrap();
+            let ws = arc.read().await;
+            assert_eq!(
+                ws.index.head.as_deref(),
+                Some("snap-1"),
+                "startup must complete the committed rollback head update"
+            );
+            assert!(ws.index.snapshots["snap-1"]
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+            assert!(!ws.index.snapshots["snap-3"]
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+        }
+        let on_disk = index_store::load(&restarted.index_dir(ws_id))
+            .await
+            .unwrap();
+        assert_eq!(on_disk.head.as_deref(), Some("snap-1"));
+        assert!(
+            !restarted
+                .index_dir(ws_id)
+                .join("rollback-intent.json")
+                .exists(),
+            "the consumed intent marker must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn restart_discards_uncommitted_rollback_intent() {
+        // Crash before the backend swap: only the intent marker is durable.
+        // The live subvolume still embodies the head, so startup must leave
+        // the head untouched (rollback_recovery already restored any mid-swap
+        // rename at bootstrap) and drop the marker.
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = Arc::new(RollbackSwapBackend::new(tmp.path().join("data")));
+        let state = Arc::new(DaemonState::new(
+            test_config(),
+            backend.clone() as Arc<dyn StorageBackend>,
+            tmp.path().join("state"),
+        ));
+        let ws_id = "ws-intent";
+        let subvol = backend.data_root.join(ws_id);
+        std::fs::create_dir_all(&subvol).unwrap();
+        std::fs::write(subvol.join("canary"), "gen-3").unwrap();
+        let ws_path = tmp.path().join("ws-link");
+        std::os::unix::fs::symlink(&subvol, &ws_path).unwrap();
+        let index = chain_index(&ws_path, ws_id, 3);
+        state
+            .register_workspace(ws_id.to_string(), ws_path, index.clone())
+            .unwrap();
+        for i in 1..=3 {
+            let dir = backend.snapshots_root.join(ws_id).join(format!("snap-{i}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("canary"), format!("gen-{i}")).unwrap();
+        }
+        index_store::save(&state.index_dir(ws_id), &index)
+            .await
+            .unwrap();
+        state.save_manifest().await.unwrap();
+        std::fs::write(
+            state.index_dir(ws_id).join("rollback-intent.json"),
+            r#"{"target":"snap-1","committed":false}"#,
+        )
+        .unwrap();
+
+        let manifest = ws_ckpt_common::persist::load_state(&state.state_dir)
+            .unwrap()
+            .unwrap();
+        let restarted = Arc::new(
+            DaemonState::rebuild_from_persisted(
+                &manifest,
+                test_config(),
+                backend.clone(),
+                state.state_dir.clone(),
+                "persisted",
+            )
+            .await
+            .unwrap(),
+        );
+        {
+            let arc = restarted.get_by_wsid(ws_id).unwrap();
+            let ws = arc.read().await;
+            assert_eq!(
+                ws.index.head.as_deref(),
+                Some("snap-3"),
+                "an uncommitted intent must not move the head"
+            );
+            assert!(ws.index.snapshots["snap-3"]
+                .child_ids
+                .contains(&ws_ckpt_common::LIVE_CHILD.to_string()));
+        }
+        assert!(
+            !restarted
+                .index_dir(ws_id)
+                .join("rollback-intent.json")
+                .exists(),
+            "the discarded intent marker must be removed"
+        );
     }
 
     #[tokio::test]
