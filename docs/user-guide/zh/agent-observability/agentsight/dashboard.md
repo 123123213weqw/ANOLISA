@@ -38,6 +38,9 @@ sudo agentsight dashboard --no-open
 
 登录成功后令牌会换成 httpOnly 会话 cookie，因此不必一直把令牌挂在 URL 上。
 
+无效令牌提示表示服务器拒绝了该令牌，请用上面的命令核对。连接错误提示也可能表示服务器或反向代理
+返回了 HTTP 错误。请确认 AgentSight 正在运行且可以访问，然后重试登录。
+
 关闭认证——只在可信内网这样做：
 
 ```json

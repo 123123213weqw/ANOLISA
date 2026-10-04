@@ -41,6 +41,10 @@ sudo agentsight dashboard --no-open
 A successful login exchanges the token for an httpOnly session cookie, so you do not have to keep
 the token in the URL.
 
+An invalid-token message means the server rejected the token; check it with the command above.
+A connection-error message can also mean the server or a reverse proxy returned an HTTP error.
+Check that AgentSight is running and reachable, then retry the login.
+
 To turn authentication off — only sensible on a trusted internal network:
 
 ```json
