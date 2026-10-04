@@ -551,3 +551,41 @@ fn approval_input_and_suspend_boundaries_fail_closed() {
     ));
     assert_eq!(suspended.aggregate, before);
 }
+
+#[test]
+fn run_cancelled_settles_exactly_once_like_sibling_outcomes() {
+    // Every sibling run-terminal outcome rejects its duplicate: RunSucceeded
+    // via require_active (outcome no longer Active), RunFailed and
+    // RunSuspended via their state/outcome guards, and TaskCancelled through
+    // the terminal-state list. RunCancelled used to be the exception: after
+    // the first RunCancelled the composite is Suspended+Cancelled, which
+    // re-satisfies every guard, so a second RunCancelled for the same Run
+    // silently re-applied the terminal transition. A Run settles its
+    // cancellation exactly once; the only designed successor of the
+    // cancelled-Run composite is TaskCancelled.
+    for state in [
+        TaskState::Queued,
+        TaskState::Running,
+        TaskState::WaitingApproval,
+        TaskState::WaitingInput,
+        TaskState::Suspended,
+    ] {
+        let mut fixture = fixture(state);
+        let first = prepare_event(&mut fixture, TaskEventKind::RunCancelled);
+        let first = envelope(&fixture.aggregate, first);
+        fixture.aggregate.apply(&first).unwrap();
+        assert_eq!(fixture.aggregate.run_outcome, RunOutcome::Cancelled);
+
+        let duplicate = prepare_event(&mut fixture, TaskEventKind::RunCancelled);
+        let duplicate = envelope(&fixture.aggregate, duplicate);
+        let before = fixture.aggregate.clone();
+        assert!(
+            matches!(
+                fixture.aggregate.apply(&duplicate),
+                Err(AggregateError::InvalidTransition { .. })
+            ),
+            "duplicate RunCancelled must fail closed from {state:?}"
+        );
+        assert_eq!(fixture.aggregate, before);
+    }
+}

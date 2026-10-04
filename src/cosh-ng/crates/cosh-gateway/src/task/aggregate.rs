@@ -389,6 +389,18 @@ impl TaskAggregate {
                     ],
                 )?;
                 self.require_run(run_id)?;
+                // A Run settles its cancellation exactly once, like every
+                // other run-terminal outcome (RunSucceeded/RunFailed/
+                // RunSuspended all reject their duplicates): after
+                // RunCancelled the composite is Suspended+Cancelled and the
+                // only designed successor is TaskCancelled, so a second
+                // RunCancelled for the same Run must fail closed instead of
+                // silently re-applying the terminal transition.
+                // CancellationRequested stays idempotent because the
+                // request flag is monotone; terminal outcomes are not.
+                if self.run_outcome == RunOutcome::Cancelled {
+                    return self.invalid(event);
+                }
                 if self.run_outcome == RunOutcome::Succeeded {
                     return self.invalid(event);
                 }
