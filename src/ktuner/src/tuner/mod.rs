@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
 use crate::bench::BenchResult;
@@ -540,6 +541,46 @@ where
     data
 }
 
+/// Guard holding an exclusive `flock` on the ledger's lockfile. The lock is
+/// released when the descriptor closes on drop; the file itself stays on
+/// disk (flock state belongs to the open descriptor, not the file).
+struct LedgerLock {
+    _file: fs::File,
+}
+
+/// Take an exclusive inter-process lock on `<ledger-path>.lock`, in the
+/// ledger's own directory, mirroring the repo's `libc::flock` guard idiom
+/// (blaze's pid handoff). The lock serializes every ledger transition:
+/// without it two concurrent `ktuner fix`/`tune` runs (cron + config
+/// management) freely interleaved load -> merge -> rename, so both loaded
+/// the same snapshot, each renamed its own merge result, and the loser's
+/// entry — a live kernel change with its only record of the pristine
+/// `previous` — was silently dropped: rollback then restored the wrong
+/// value or none, and the regenerated sysctl.d omitted the line.
+fn lock_ledger_at(path: &str) -> Result<LedgerLock> {
+    let dir = Path::new(path)
+        .parent()
+        .context("rollback path has no parent")?;
+    fs::create_dir_all(dir).context("创建 rollback 目录失败")?;
+    let lock_path = format!("{path}.lock");
+    // 0600 like the ledger itself; contents never matter, only the flock on
+    // the descriptor, so an existing file from an earlier run is fine.
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("打开 rollback 锁文件 {lock_path} 失败"))?;
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(anyhow::anyhow!(
+            "锁定 rollback 锁文件 {lock_path} 失败: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(LedgerLock { _file: file })
+}
+
 /// Merge the given entries into the on-disk rollback record and persist it.
 fn merge_rollback<I>(entries: I) -> Result<()>
 where
@@ -552,6 +593,10 @@ fn merge_rollback_at<I>(path: &str, entries: I) -> Result<()>
 where
     I: IntoIterator<Item = (String, String, String)>,
 {
+    // Hold the ledger lock across load -> merge -> publish: a concurrent
+    // fix/tune merging into the same snapshot is otherwise silently dropped
+    // by whichever write_atomic rename lands last (lost update).
+    let _guard = lock_ledger_at(path)?;
     let data = merge_entries(load_rollback_from(path)?, entries);
     let dir = Path::new(path)
         .parent()
@@ -666,6 +711,11 @@ fn render_persistence(
 /// files with only its own batch, silently dropping earlier params) and never
 /// persists a param that failed to apply (those are not in the record).
 fn persist_from_rollback() -> Result<()> {
+    // Hold the ledger lock across read -> render -> publish: this renders
+    // files derived from the ledger, so a stale snapshot written after a
+    // concurrent run's fresher render would silently drop that run's line
+    // from the persisted sysctl.d.
+    let _guard = lock_ledger_at(ROLLBACK_PATH)?;
     let data = load_rollback()?;
     let (sysctl_content, nonsysctl_script) = render_persistence(&data.entries);
 
@@ -847,6 +897,11 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
         anyhow::bail!("没有找到 rollback 文件 ({ROLLBACK_PATH})，可能尚未执行过 tune");
     }
 
+    // Hold the ledger lock across read -> restore -> finalize: a concurrent
+    // fix merging between the read and the finalize delete would record its
+    // pristine `previous` into a ledger that is then deleted unrestored —
+    // a live kernel change with no way back.
+    let _guard = lock_ledger_at(ROLLBACK_PATH)?;
     let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
     let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
     let RollbackOutcome {
@@ -1625,6 +1680,101 @@ mod tests {
         assert_eq!(e.previous, "10", "pristine previous must survive re-tuning");
         assert_eq!(e.applied, "30", "applied must refresh to the latest");
         assert_eq!(e.path, "/proc/sys/vm/swappiness");
+    }
+
+    #[test]
+    fn test_ledger_lock_excludes_a_second_descriptor() {
+        // The guard must actually hold an exclusive flock: a second open file
+        // description on the same lockfile cannot acquire (even in-process —
+        // flock contends per descriptor), and can once the guard drops.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_ledger_lock_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let ledger = dir.join("rollback.json");
+        let guard = lock_ledger_at(ledger.to_str().unwrap()).unwrap();
+        // The lockfile lives beside the ledger, private like the ledger.
+        let lock_path = dir.join("rollback.json.lock");
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let second = fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        let rc = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, -1, "non-blocking acquire while held must fail");
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+        drop(guard);
+        let rc = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "acquire after drop must succeed");
+        unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_UN) };
+        drop(second);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn test_concurrent_merges_retain_every_entry() {
+        // Barrier-synchronized lost-update repro at the merge level: two fix
+        // runs load the same (empty) ledger, each merges its own entry, and
+        // without the ledger lock whichever write_atomic rename lands last
+        // silently drops the other's entry — its pristine `previous` is then
+        // recorded nowhere. With the lock, every round retains both.
+        use std::sync::{Arc, Barrier};
+        let rounds = 50;
+        for round in 0..rounds {
+            let dir = std::env::temp_dir().join(format!(
+                "ktuner_ledger_race_{}_{:?}_{round}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            fs::create_dir_all(&dir).unwrap();
+            let ledger_a = dir.join("rollback.json");
+            let ledger_b = ledger_a.clone();
+            let barrier = Arc::new(Barrier::new(2));
+            let barrier_a = barrier.clone();
+            let barrier_b = barrier;
+            let join_a = std::thread::spawn(move || {
+                barrier_a.wait();
+                merge_rollback_at(
+                    ledger_a.to_str().unwrap(),
+                    [("vm.audit_a".to_string(), "60".to_string(), "10".to_string())],
+                )
+            });
+            let join_b = std::thread::spawn(move || {
+                barrier_b.wait();
+                merge_rollback_at(
+                    ledger_b.to_str().unwrap(),
+                    [(
+                        "net.core.audit_b".to_string(),
+                        "128".to_string(),
+                        "4096".to_string(),
+                    )],
+                )
+            });
+            join_a.join().unwrap().expect("merge a");
+            join_b.join().unwrap().expect("merge b");
+            let data = load_rollback_from(dir.join("rollback.json").to_str().unwrap()).unwrap();
+            let missing: Vec<&str> = ["vm.audit_a", "net.core.audit_b"]
+                .iter()
+                .filter(|p| !data.entries.contains_key(**p))
+                .copied()
+                .collect();
+            assert!(
+                missing.is_empty(),
+                "round {round}: lost ledger update, missing {missing:?} in {:?}",
+                data.entries.keys().collect::<Vec<_>>()
+            );
+            fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[test]
