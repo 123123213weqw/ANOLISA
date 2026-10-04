@@ -691,9 +691,13 @@ fn normalize_line(line: &str, has_uv: bool, node_pm: &str) -> String {
         // virtualenv <name> → uv venv <name> — only when `virtualenv` is the
         // command being invoked: mkvirtualenv, pyenv virtualenv, and
         // `pip install virtualenv` are different words or argument positions
-        // and must pass through untouched.
+        // and must pass through untouched. Like the pip and venv forms
+        // above, the rewrite runs behind the `Run: ` documentation label,
+        // which stays transparent.
         if result.contains("virtualenv ") {
-            result = rewrite_command_invocations(&result, "virtualenv ", "uv venv ");
+            result = rewrite_after_doc_label(&result, |commands| {
+                rewrite_command_invocations(commands, "virtualenv ", "uv venv ")
+            });
         }
     }
 
@@ -1129,6 +1133,26 @@ Run: pip install requests
         assert_eq!(result, expected);
         assert_eq!(compile(&result, &env), result);
         assert_eq!(compile(input, &env_linux_no_uv()), input);
+    }
+
+    #[test]
+    fn test_heuristic_virtualenv_behind_the_run_label() {
+        let env = env_darwin_uv();
+        // The `Run: ` documentation label is transparent for the pip and
+        // venv rewrites; the sibling virtualenv rewrite must honor it too.
+        assert_eq!(
+            compile("Run: virtualenv proj\n", &env),
+            "Run: uv venv proj\n"
+        );
+        assert_eq!(
+            compile("  Run: virtualenv proj\n", &env),
+            "  Run: uv venv proj\n"
+        );
+        // A label in argument position is not transparent.
+        assert_eq!(
+            compile("echo Run: virtualenv proj\n", &env),
+            "echo Run: virtualenv proj\n"
+        );
     }
 
     #[test]
