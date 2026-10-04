@@ -403,6 +403,16 @@ fn is_write_tool(name: &str) -> bool {
             | "mem_promote"
             | "memory_observe"
             | "mem_snapshot_restore"
+            // mem_import writes archive entries into the mount
+            // (tools/memory_import.rs, safe_fs::write per entry).
+            | "mem_import"
+            // memory_forget deletes memory files through the same
+            // svc.remove path mem_remove uses.
+            | "memory_forget"
+            // The task tools write tasks/<ulid>.md under the mount root
+            // (tools/memory_task.rs, save_task).
+            | "memory_task_save"
+            | "memory_task_close"
     )
 }
 
@@ -475,5 +485,79 @@ mod tests {
             std::fs::read_to_string(tmp.path().join("a.md")).unwrap(),
             "v2"
         );
+    }
+
+    #[test]
+    fn auto_commit_for_covers_import_task_and_forget_tools() {
+        // Each of these tools mutates git-tracked files under the mount but
+        // was missing from is_write_tool, so their changes were never
+        // auto-committed — files sat uncommitted until some other write
+        // tool happened to sweep them into a commit -am.
+        for tool in [
+            "mem_import",
+            "memory_forget",
+            "memory_task_save",
+            "memory_task_close",
+        ] {
+            let tmp = tempdir().unwrap();
+            let git = GitHandle::open(
+                GitConfig {
+                    enabled: true,
+                    auto_commit: true,
+                },
+                tmp.path(),
+            )
+            .unwrap()
+            .unwrap();
+            // The tool's write happens after the repo exists (init() folds
+            // files present at open time into its initial commit).
+            std::fs::write(tmp.path().join("changed.md"), "content").unwrap();
+            git.auto_commit_for(&crate::audit::AuditEntry::new(tool).path("changed.md"));
+            let entries = log(tmp.path(), 10, None).unwrap();
+            assert!(
+                entries.len() >= 2,
+                "{tool}: expected the auto-commit on top of the initial commit"
+            );
+            assert_eq!(
+                entries[0].summary,
+                format!("{tool} changed.md"),
+                "{tool} mutates the worktree; its audit entry must trigger the auto-commit"
+            );
+        }
+    }
+
+    #[test]
+    fn is_write_tool_still_excludes_non_worktree_tools() {
+        // Reads, index-internal ops, and tools writing outside the tracked
+        // tree (mem_export) or into the gitignored .anolisa/ (mem_snapshot)
+        // must not bump HEAD.
+        for tool in [
+            "mem_read",
+            "mem_list",
+            "mem_grep",
+            "mem_diff",
+            "mem_log",
+            "mem_revert", // already commits inside revert()
+            "mem_export",
+            "mem_snapshot",
+            "mem_snapshot_list",
+            "mem_index_refresh",
+            "mem_compact",
+            "memory_search",
+            "memory_get_context",
+            "memory_about",
+            "memory_task_resume",
+            "memory_task_list",
+            "mem_session_log",
+            "memory_sessions",
+            "memory_timeline",
+            "memory_summary",
+            "memory_session_context",
+        ] {
+            assert!(
+                !is_write_tool(tool),
+                "{tool} must stay excluded from the auto-commit predicate"
+            );
+        }
     }
 }
