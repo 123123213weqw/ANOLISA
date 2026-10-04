@@ -93,16 +93,33 @@ echo "  目录创建完成"
 # ── 步骤 4: 写入配置文件 ──────────────────────────────────
 echo "[4/6] 写入配置文件..."
 
+# 模板占位符用纯字符串替换完成: sed 的替换串会解释凭据中的
+# 元字符(& 展开为占位符本身、| 截断 s||| 表达式)，任何字节的
+# 密钥都必须原样写入。python3 是本脚本第 5 步的既有硬依赖。
+render_template() {  # <template> <output> <placeholder> <value> ...
+  python3 - "$@" <<'PYEOF'
+import sys
+
+template, output = sys.argv[1], sys.argv[2]
+pairs = sys.argv[3:]
+with open(template, "r", encoding="utf-8") as fh:
+    content = fh.read()
+for i in range(0, len(pairs) - 1, 2):
+    content = content.replace(pairs[i], pairs[i + 1])
+with open(output, "w", encoding="utf-8") as fh:
+    fh.write(content)
+PYEOF
+}
+
 # 3a: config.json — 从模板替换占位符
 CONFIG_TEMPLATE="$SKILL_DIR/reference/config.json.example"
 if [ ! -f "$CONFIG_TEMPLATE" ]; then
   echo "  错误: 找不到模板文件 $CONFIG_TEMPLATE"
   exit 1
 fi
-sed \
-  -e "s|{DINGTALK_CLIENT_ID}|${DINGTALK_CLIENT_ID}|g" \
-  -e "s|{DINGTALK_CLIENT_SECRET}|${DINGTALK_CLIENT_SECRET}|g" \
-  "$CONFIG_TEMPLATE" > "$QWENPAW_DIR/config.json"
+render_template "$CONFIG_TEMPLATE" "$QWENPAW_DIR/config.json" \
+  "{DINGTALK_CLIENT_ID}" "$DINGTALK_CLIENT_ID" \
+  "{DINGTALK_CLIENT_SECRET}" "$DINGTALK_CLIENT_SECRET"
 echo "  config.json 已写入"
 
 # 3b: dashscope.json — 百炼提供商
@@ -111,8 +128,8 @@ if [ ! -f "$DASHSCOPE_TEMPLATE" ]; then
   echo "  错误: 找不到模板文件 $DASHSCOPE_TEMPLATE"
   exit 1
 fi
-sed "s|{DASHSCOPE_API_KEY}|${DASHSCOPE_API_KEY}|g" \
-  "$DASHSCOPE_TEMPLATE" > "$SECRET_DIR/providers/builtin/dashscope.json"
+render_template "$DASHSCOPE_TEMPLATE" "$SECRET_DIR/providers/builtin/dashscope.json" \
+  "{DASHSCOPE_API_KEY}" "$DASHSCOPE_API_KEY"
 chmod 600 "$SECRET_DIR/providers/builtin/dashscope.json"
 echo "  dashscope.json 已写入"
 
@@ -122,8 +139,8 @@ if [ ! -f "$ACTIVE_MODEL_TEMPLATE" ]; then
   echo "  错误: 找不到模板文件 $ACTIVE_MODEL_TEMPLATE"
   exit 1
 fi
-sed "s|{MODEL_NAME}|${MODEL_NAME}|g" \
-  "$ACTIVE_MODEL_TEMPLATE" > "$SECRET_DIR/providers/active_model.json"
+render_template "$ACTIVE_MODEL_TEMPLATE" "$SECRET_DIR/providers/active_model.json" \
+  "{MODEL_NAME}" "$MODEL_NAME"
 chmod 600 "$SECRET_DIR/providers/active_model.json"
 echo "  active_model.json 已写入"
 
