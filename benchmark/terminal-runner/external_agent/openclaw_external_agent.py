@@ -1036,6 +1036,26 @@ class OpenClawExternalAgent(BaseAgent):
     # Container detection and setup
     # ==================================================================
 
+    @staticmethod
+    def _session_name_markers(session_id: str) -> list[str]:
+        """Name fragments that can identify this session's Harbor container.
+
+        Harbor runs each session as a compose project named after the
+        (sanitized) session id, so the session's container name embeds a
+        rewritten form of it.  Return the raw id and its plausible
+        rewrites; the fallback matches a container only when one of these
+        appears in its name.
+        """
+        lowered = session_id.lower()
+        markers = [
+            session_id,
+            lowered,
+            # Harbor's compose project-name sanitization: lowercase, any
+            # character outside [a-z0-9_-] becomes "-".
+            re.sub(r"[^a-z0-9_-]", "-", lowered),
+        ]
+        return list(dict.fromkeys(m for m in markers if m))
+
     async def _detect_harbor_container(
         self, environment: BaseEnvironment,
     ) -> str | None:
@@ -1045,10 +1065,17 @@ class OpenClawExternalAgent(BaseAgent):
 
         1. Filter by ``session_id`` (preferred).
         2. Fallback: scan ``docker ps`` for names containing ``"__"`` and
-           ``"-main-"``.  **Note**: this heuristic depends on Harbor's
-           internal container naming convention and may break if that
-           convention changes.
+           ``"-main-"``.  When the environment carries a ``session_id``,
+           candidates must also embed one of this session's name markers
+           (see ``_session_name_markers``) so parallel Harbor runs never
+           adopt each other's containers; a loose-pattern match from a
+           foreign session is skipped, and detection fails rather than
+           stealing a container.  Without a ``session_id`` the unscoped
+           heuristic is kept as a legacy best effort.
+           **Note**: this heuristic depends on Harbor's internal container
+           naming convention and may break if that convention changes.
         """
+        session_markers: list[str] = []
         try:
             if hasattr(environment, "session_id"):
                 proc = await asyncio.create_subprocess_exec(
@@ -1060,6 +1087,9 @@ class OpenClawExternalAgent(BaseAgent):
                 stdout, _ = await proc.communicate()
                 if stdout.decode().strip():
                     return stdout.decode().strip().split("\n")[0]
+                session_markers = self._session_name_markers(
+                    str(environment.session_id)
+                )
 
             # Fallback: heuristic container name matching, verified via inspect.
             proc = await asyncio.create_subprocess_exec(
@@ -1070,7 +1100,18 @@ class OpenClawExternalAgent(BaseAgent):
             stdout, _ = await proc.communicate()
             for line in stdout.decode().strip().split("\n"):
                 if "__" in line and "-main-" in line:
-                    candidate_id = line.split()[0]
+                    parts = line.split(maxsplit=1)
+                    candidate_id = parts[0]
+                    candidate_name = parts[1] if len(parts) > 1 else ""
+                    if session_markers and not any(
+                        marker in candidate_name
+                        for marker in session_markers
+                    ):
+                        _log.debug(
+                            "%s: skipping foreign session container %s (%s)",
+                            _LOG_PREFIX, candidate_id, candidate_name,
+                        )
+                        continue
                     # Verify the candidate actually exists.
                     chk = await asyncio.create_subprocess_exec(
                         "docker", "inspect", candidate_id,
