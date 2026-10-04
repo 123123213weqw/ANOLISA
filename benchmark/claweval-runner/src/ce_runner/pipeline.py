@@ -24,6 +24,14 @@ from pathlib import Path
 
 from ._common import _PYTHON, log
 
+# Wall-clock budget for a single convert/grade phase subprocess. Generous:
+# the grader retries judge calls internally and multimodal traces can be
+# large, but it must be finite — a hung converter/grader used to block its
+# grade-pool worker forever (batch_runner's `while grade_futures` never
+# drained, so the whole batch hung). Per-phase override via the `timeout`
+# argument.
+DEFAULT_PHASE_TIMEOUT_S = 1800
+
 
 def archive_session_alongside_trace(session_file: str, trace_file: str) -> str:
     """Copy an openclaw session JSONL to ``<trace_dir>/sessions/`` and
@@ -50,7 +58,8 @@ def archive_session_alongside_trace(session_file: str, trace_file: str) -> str:
 
 def phase_convert(session_file: str, task_yaml: str, output: str,
                   mock_port_offset: int = 0,
-                  audit_data_path: str = None) -> bool:
+                  audit_data_path: str = None,
+                  timeout: float = DEFAULT_PHASE_TIMEOUT_S) -> bool:
     """Convert openclaw session to claw-eval trace.
 
     *mock_port_offset* is added to every mock-service port when fetching
@@ -60,6 +69,11 @@ def phase_convert(session_file: str, task_yaml: str, output: str,
     *audit_data_path* (optional) points to a pre-saved audit JSON file.
     When provided, the converter reads this file instead of fetching live
     mock services, preventing cross-trial audit contamination.
+
+    *timeout* bounds the converter subprocess wall clock. A hung converter
+    (e.g. blocked on a network fetch with no internal timeout) returns
+    False — the trial is classified as errored by the caller — instead of
+    blocking the grade pool forever.
     """
     cmd = [
         _PYTHON, "-m", "ce_runner.session_trace_converter",
@@ -69,12 +83,18 @@ def phase_convert(session_file: str, task_yaml: str, output: str,
         cmd.extend(["--mock-port-offset", str(mock_port_offset)])
     if audit_data_path:
         cmd.extend(["--audit-data", audit_data_path])
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"  [ERROR] trace conversion timed out after {timeout}s "
+            f"(session={session_file}); treating trial as errored")
+        return False
     return r.returncode == 0 and os.path.exists(output)
 
 
 def phase_grade(trace_file: str, task_yaml: str, judge_config: dict,
-                env_snapshot_path: str = None) -> dict:
+                env_snapshot_path: str = None,
+                timeout: float = DEFAULT_PHASE_TIMEOUT_S) -> dict:
     """Grade the converted trace. Returns scores from the trace's grading_result event.
 
     The grader subprocess's stderr is written to
@@ -83,6 +103,11 @@ def phase_grade(trace_file: str, task_yaml: str, judge_config: dict,
     instead of being silently swallowed by ``capture_output=True``. The log
     file is removed when the subprocess succeeds with empty stderr to avoid
     cluttering the trace directory.
+
+    *timeout* bounds the grader subprocess wall clock. On timeout the zero
+    scores are returned with an ``error`` key so the trial is classified as
+    errored (excluded from avg_score) instead of blocking the grade pool
+    forever.
     """
     cmd = [
         _PYTHON, "-m", "ce_runner.grader_runner",
@@ -100,7 +125,17 @@ def phase_grade(trace_file: str, task_yaml: str, judge_config: dict,
         f"grader_{Path(trace_file).stem}.err.log",
     )
     with open(err_log, "wb") as ef:
-        rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=ef).returncode
+        try:
+            rc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=ef,
+                                timeout=timeout).returncode
+        except subprocess.TimeoutExpired:
+            log(f"  [ERROR] grader subprocess timed out after {timeout}s; "
+                f"see {err_log}")
+            return {
+                "completion": 0.0, "robustness": 0.0, "communication": 0.0,
+                "safety": 0.0, "task_score": 0.0, "passed": False,
+                "error": f"grader timed out after {timeout}s",
+            }
 
     # Cleanup judgement (tightened):
     #   rc != 0                                  -> keep, [ERROR]
