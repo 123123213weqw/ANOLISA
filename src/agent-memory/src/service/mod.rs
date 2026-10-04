@@ -112,6 +112,40 @@ impl MemoryService {
             None
         };
 
+        // One-shot scope repair. Index rows can be stranded
+        // `agent_id IS NULL` by writes that predate per-agent tagging or
+        // by an older memory_observe whose synchronous reindex upserted
+        // without the agent identity. Such a row is invisible to its
+        // writer under `isolated:<id>` and visible to every agent under
+        // `filter:<id>`, and the watcher never re-tags it unless the
+        // file's mtime changes (the overflow full-rescan skips rows with
+        // unchanged mtime). When this process runs under a scoped
+        // configuration with an agent identity, claim the leftovers once
+        // at startup instead. Shared deployments are left untouched:
+        // agent_id is never queried there.
+        if let Some(index) = index.as_ref() {
+            if matches!(config.memory.agent_scope.as_str(), "isolated" | "filter") {
+                if let Ok(agent) = std::env::var("MCP_CLIENT_NAME") {
+                    if !agent.is_empty() {
+                        match index.backfill_agent_id(&agent) {
+                            Ok(0) => {}
+                            Ok(claimed) => tracing::warn!(
+                                "claimed {claimed} unscoped index row(s) as agent \
+                                 {agent:?}: they predate per-agent tagging or were \
+                                 left untagged by an older memory_observe, and are \
+                                 now visible to this agent only under \
+                                 isolated/filter scope"
+                            ),
+                            Err(e) => tracing::warn!(
+                                "unscoped-row backfill failed (rows stay \
+                                 agent_id IS NULL): {e}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
         // Optional git versioning (P6.2). Best-effort: failure logs and
         // continues with git=None.
         let git = match crate::git_repo::GitHandle::open(config.memory.git.clone(), &mount.root) {

@@ -258,6 +258,30 @@ impl BM25Store {
         Ok(())
     }
 
+    /// One-shot scope repair: claim every row whose `agent_id` is still
+    /// NULL for `agent_id`. Returns how many rows were claimed.
+    ///
+    /// Rows can be stranded `agent_id IS NULL` by writes that predate
+    /// per-agent tagging (schema v5 migration) or by an older
+    /// `memory_observe` whose synchronous reindex upserted without the
+    /// agent identity. A NULL row is invisible to its writer under
+    /// `isolated:<id>` scope and visible to *every* agent under
+    /// `filter:<id>` scope, so a scoped process claims the leftovers once
+    /// at startup instead of waiting for the watcher: the watcher only
+    /// re-tags a row when its file's mtime changes, so an unchanged
+    /// stranded row would otherwise stay NULL forever.
+    ///
+    /// Owned rows are never re-assigned — the `WHERE agent_id IS NULL`
+    /// guard keeps the same first-owner-wins monotonicity as `upsert`'s
+    /// `agent_id = COALESCE(agent_id, ?)` UPDATE arm.
+    pub fn backfill_agent_id(&mut self, agent_id: &str) -> Result<usize> {
+        let n = self.conn.execute(
+            "UPDATE files SET agent_id = ?1 WHERE agent_id IS NULL",
+            params![agent_id],
+        )?;
+        Ok(n)
+    }
+
     /// Remove a file's index entry. Returns true if any row existed.
     ///
     /// Cascade semantics: if `rel_path` matches a stored row exactly, that
@@ -2063,6 +2087,39 @@ mod tests {
         let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
         assert!(paths.contains(&"u/legacy.md"));
         assert!(!paths.iter().any(|p| p.starts_with("b/")));
+    }
+
+    #[test]
+    fn backfill_agent_id_claims_only_unscoped_rows() {
+        let mut s = BM25Store::open_in_memory().unwrap();
+        s.upsert("own.md", 100, 10, "owned by alpha body", Some("alpha"))
+            .unwrap();
+        s.upsert("legacy.md", 100, 10, "unscoped legacy body", None)
+            .unwrap();
+        s.upsert("stranded.md", 100, 10, "unscoped stranded body", None)
+            .unwrap();
+
+        // alpha claims exactly the two NULL rows.
+        assert_eq!(s.backfill_agent_id("alpha").unwrap(), 2);
+
+        // Both are now visible under isolated:alpha.
+        let hits = s
+            .search_scoped("unscoped", 10, true, Some("isolated:alpha"))
+            .unwrap();
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"legacy.md"));
+        assert!(paths.contains(&"stranded.md"));
+
+        // A different agent cannot claim them: first owner wins, matching
+        // upsert's COALESCE monotonicity.
+        assert_eq!(s.backfill_agent_id("beta").unwrap(), 0);
+        let hits = s
+            .search_scoped("unscoped", 10, true, Some("isolated:beta"))
+            .unwrap();
+        assert!(hits.is_empty(), "beta must not see alpha-claimed rows");
+
+        // Idempotent: nothing left to claim.
+        assert_eq!(s.backfill_agent_id("alpha").unwrap(), 0);
     }
 
     #[test]

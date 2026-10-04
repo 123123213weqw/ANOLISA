@@ -134,6 +134,13 @@ impl IndexHandle {
     /// searchable, closing the race window between the file write and the
     /// notify watcher's next debounce flush (~200 ms).
     ///
+    /// `agent_id` tags the row with the writing agent's identity, exactly
+    /// like the watcher's own upsert path. Passing `None` would leave the
+    /// fresh row `agent_id IS NULL` until the watcher's flush re-tagged
+    /// it: invisible to its writer under `isolated:<id>` scope, visible
+    /// to every other agent under `filter:<id>` scope — a cross-agent
+    /// leak window that turns permanent if the inotify event is lost.
+    ///
     /// The notify watcher will later process the same inotify event and
     /// issue a redundant upsert — this is harmless because `upsert` is
     /// idempotent (DELETE + INSERT on the same rowid).
@@ -144,9 +151,23 @@ impl IndexHandle {
     /// behavioural divergence. The `compact()` method only marks files
     /// cold when `access_count = 0 AND mtime_ms < cutoff`, so a newly
     /// indexed file is unaffected regardless of which path inserts it.
-    pub fn reindex_file(&self, rel_path: &str, body: &str, mtime_ms: i64, size: u64) -> Result<()> {
+    pub fn reindex_file(
+        &self,
+        rel_path: &str,
+        body: &str,
+        mtime_ms: i64,
+        size: u64,
+        agent_id: Option<&str>,
+    ) -> Result<()> {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        store.upsert(rel_path, mtime_ms, size, body, None)
+        store.upsert(rel_path, mtime_ms, size, body, agent_id)
+    }
+
+    /// One-shot scope repair: claim index rows still `agent_id IS NULL`
+    /// for `agent_id`. See [`BM25Store::backfill_agent_id`].
+    pub fn backfill_agent_id(&self, agent_id: &str) -> Result<usize> {
+        let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.backfill_agent_id(agent_id)
     }
 
     /// Compact the index: mark old, never-accessed files as cold.

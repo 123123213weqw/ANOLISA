@@ -154,7 +154,15 @@ pub fn memory_observe(
         let mtime_ms = crate::safe_fs::metadata(svc.mount.root_fd.as_fd(), Path::new(&path))
             .map(|m| crate::index::store::mtime_ms_of(&m))
             .unwrap_or_else(|_| Utc::now().timestamp_millis());
-        if let Err(e) = index.reindex_file(&path, &body, mtime_ms, n) {
+        // Tag the row with the observing agent's identity — the same
+        // MCP_CLIENT_NAME the watcher reads at flush time. Upserting
+        // without it would leave the fresh row `agent_id IS NULL` until
+        // the watcher's ~200 ms debounce flush re-tagged it: the
+        // observing agent could not find its own memory under
+        // `isolated:<id>`, and every other agent could see it under
+        // `filter:<id>` — permanently, if the inotify event was lost.
+        let agent_id = std::env::var("MCP_CLIENT_NAME").ok();
+        if let Err(e) = index.reindex_file(&path, &body, mtime_ms, n, agent_id.as_deref()) {
             tracing::warn!("synchronous reindex after observe failed for {path}: {e}");
         }
     }

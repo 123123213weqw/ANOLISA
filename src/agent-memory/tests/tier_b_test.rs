@@ -36,6 +36,11 @@ fn wait_for_index(svc: &MemoryService, expected_min: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Serialises tests that mutate the process-global MCP_CLIENT_NAME: tests
+/// in this binary run on parallel threads and share one environment, so
+/// one test's teardown must not strip another's agent identity mid-flight.
+static AGENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 // ---------- memory_search ----------
 
 #[test]
@@ -202,6 +207,150 @@ fn observe_then_search_finds_it() {
     let hits = svc.memory_search("peanuts", 5, None, None, None).unwrap();
     assert_eq!(hits.len(), 1);
     assert!(hits[0].path.starts_with("notes/observed/"));
+}
+
+/// Regression test: memory_observe's synchronous reindex must tag the
+/// freshly upserted row with the observing agent's identity
+/// (MCP_CLIENT_NAME), exactly like the watcher's own upsert path.
+///
+/// Before the fix the row landed with `agent_id IS NULL`:
+/// - under `isolated:<self>` the observing agent could NOT find its own
+///   just-written memory (NULL fails `agent_id = '<self>'`),
+/// - under `filter:<other>` every OTHER agent could see it (NULL passes
+///   `agent_id IS NULL`) until the watcher's ~200 ms debounce flush
+///   re-tagged the row — and forever, if that inotify event was lost.
+///
+/// Deterministic: the queries run immediately after `memory_observe`
+/// returns, i.e. after the synchronous upsert committed but well inside
+/// the watcher's debounce window. The startup full_scan is drained first
+/// (README indexed) so it cannot race the observe and tag the row itself.
+#[test]
+fn observe_reindex_writes_scoped_row() {
+    const SELF_AGENT: &str = "observe-scope-self";
+    let _env_guard = AGENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempdir().unwrap();
+    let mut cfg = AppConfig::default();
+    cfg.global.user_id = "tester".into();
+    cfg.memory.paths.base_dir = tmp.path().to_string_lossy().into();
+    cfg.memory.session.base_dir = tmp.path().join("__sessions__").to_string_lossy().into();
+    cfg.memory.mount.strategy = agent_memory::mount::MountStrategyKind::Userland;
+    // The observing agent needs an identity for the row to be tagged.
+    unsafe { std::env::set_var("MCP_CLIENT_NAME", SELF_AGENT) };
+    let svc = MemoryService::new(cfg).unwrap();
+
+    // Drain the startup full_scan (README is auto-created → 1 file) so it
+    // cannot observe the file written below.
+    assert!(
+        wait_for_index(&svc, 1),
+        "startup full_scan did not finish; cannot test the reindex window"
+    );
+
+    let path = svc
+        .memory_observe("quixotic platinum zebra observation", None, None)
+        .unwrap();
+    assert!(path.starts_with("notes/observed/"));
+
+    // Query immediately: the synchronous reindex has committed the row (it
+    // exists), and the watcher's heal is still ~200 ms away. This is
+    // exactly the window the defect lived in.
+    let self_hits = svc
+        .memory_search(
+            "quixotic",
+            5,
+            None,
+            None,
+            Some("isolated:observe-scope-self"),
+        )
+        .unwrap();
+    let other_hits = svc
+        .memory_search(
+            "quixotic",
+            5,
+            None,
+            None,
+            Some("filter:observe-scope-other"),
+        )
+        .unwrap();
+
+    unsafe { std::env::remove_var("MCP_CLIENT_NAME") };
+
+    assert_eq!(
+        self_hits.len(),
+        1,
+        "observing agent cannot see its own just-written memory \
+         (isolated:{SELF_AGENT}, path={path}, self_hits={self_hits:?})"
+    );
+    assert!(
+        other_hits.is_empty(),
+        "another agent sees a freshly observed memory through the \
+         unscoped reindex row (filter:observe-scope-other, \
+         other_hits={other_hits:?})"
+    );
+}
+
+/// Service-level: a scoped process must claim stranded unscoped index rows
+/// once at startup. The seeded row stands in for one left `agent_id IS
+/// NULL` by an older memory_observe (or written before per-agent tagging):
+/// its file sits on disk with an mtime identical to the indexed value, so
+/// neither the watcher nor the overflow full-rescan would ever re-tag it
+/// (both skip rows with unchanged mtime). Without the startup backfill
+/// the row stays invisible to every agent under `isolated:<id>` forever.
+#[test]
+fn startup_backfill_claims_stranded_unscoped_rows() {
+    const AGENT: &str = "backfill-claimer";
+    let _env_guard = AGENT_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let tmp = tempdir().unwrap();
+    let mount_root = tmp.path().join("user-tester");
+    std::fs::create_dir_all(&mount_root).unwrap();
+    let body = "marzipan dolphin stranded note";
+    let file = mount_root.join("stranded.md");
+    std::fs::write(&file, body).unwrap();
+    let disk_mtime = std::fs::metadata(&file)
+        .map(|m| {
+            m.modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as i64
+        })
+        .unwrap();
+
+    // Pre-create the index DB with the stranded, untagged row, using the
+    // file's real mtime so the startup full_scan's unchanged-mtime skip
+    // keeps it exactly as stranded rows are kept in production.
+    let db_dir = mount_root.join(".anolisa").join("index");
+    std::fs::create_dir_all(&db_dir).unwrap();
+    {
+        let mut store =
+            agent_memory::index::BM25Store::open(&db_dir.join("bm25.db"), 0.01, 0.3, true).unwrap();
+        store
+            .upsert("stranded.md", disk_mtime, body.len() as u64, body, None)
+            .unwrap();
+    }
+
+    let mut cfg = AppConfig::default();
+    cfg.global.user_id = "tester".into();
+    cfg.memory.paths.base_dir = tmp.path().to_string_lossy().into();
+    cfg.memory.session.base_dir = tmp.path().join("__sessions__").to_string_lossy().into();
+    cfg.memory.mount.strategy = agent_memory::mount::MountStrategyKind::Userland;
+    cfg.memory.agent_scope = "isolated".into();
+    unsafe { std::env::set_var("MCP_CLIENT_NAME", AGENT) };
+    let svc = MemoryService::new(cfg).unwrap();
+
+    let hits = svc
+        .memory_search("marzipan", 5, None, None, Some("isolated:backfill-claimer"))
+        .unwrap();
+    unsafe { std::env::remove_var("MCP_CLIENT_NAME") };
+
+    assert_eq!(
+        hits.len(),
+        1,
+        "stranded unscoped row was not claimed at startup; \
+         isolated:{AGENT} sees {hits:?}"
+    );
+    assert_eq!(hits[0].path, "stranded.md");
 }
 
 // ---------- memory_get_context ----------
