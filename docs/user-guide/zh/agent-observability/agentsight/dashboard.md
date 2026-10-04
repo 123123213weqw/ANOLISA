@@ -124,6 +124,12 @@ Session 资源消耗。
 选好时间范围后需要点**查询**；这个页面初始为空是设计如此。接入方式见
 [集成](integrations.md#tokenlesstoken-节省)。
 
+**导出 CSV** 将上次成功查询后显示的会话按显示顺序下载为 `token-savings.csv`，
+包含 Session ID、Agent 名称、请求次数和 Token 指标；比例使用小数（如 `0.4` 表示 40%）。
+导出不包含工具内容，采用带 BOM 的 UTF-8 编码以兼容电子表格。
+以电子表格公式前缀开头的文本会添加单引号前缀。
+查询期间、查询失败后或没有会话时，导出按钮不可用。
+
 ## 优化分析
 
 对单个会话跑 LLM 辅助分析，共 6 个维度：`perf`、`perf-issues`、`cost`、`cost-waste`、`accuracy`、

@@ -139,6 +139,13 @@ optimization type, plus a savings ranking and concrete tips.
 Press **Query** after choosing a range; the page starts empty on purpose. Setup:
 [Integrations](integrations.md#tokenless-token-savings).
 
+**Export CSV** downloads the displayed sessions from the last successful query as
+`token-savings.csv`, in their displayed order. It includes session IDs, Agent names,
+request counts and Token metrics; rates use fractions (for example, `0.4` means 40%).
+The export omits tool content and uses UTF-8 with a BOM for spreadsheet compatibility.
+Text beginning with a spreadsheet formula prefix is prefixed with an apostrophe.
+Export is disabled while querying, after a query error, or when there are no sessions.
+
 ## Optimization
 
 Runs LLM-assisted analysis over one session in six dimensions: `perf`, `perf-issues`, `cost`,
