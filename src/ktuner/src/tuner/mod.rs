@@ -332,11 +332,50 @@ pub fn param_to_path(param: &str) -> String {
         }
     } else if let Some(rest) = param.strip_prefix("transparent_hugepage/") {
         format!("/sys/kernel/mm/transparent_hugepage/{}", sanitize_rel(rest))
+    } else if let Some(path) = net_conf_path(param) {
+        path
     } else {
         // sysctl: dots become slashes, so any ".." is turned into "//" and
         // cannot traverse; the result is always rooted at /proc/sys.
         format!("/proc/sys/{}", param.replace('.', "/"))
     }
+}
+
+/// Resolve `net.<proto>.conf.<interface>.<property>` (dotted or slashed
+/// spelling) with the INTERFACE segment kept verbatim. Under
+/// /proc/sys/net/{ipv4,ipv6}/conf/ every interface is a directory whose name
+/// may itself contain dots — a VLAN subinterface is `eth0.100`, so the real
+/// file is conf/eth0.100/forwarding (a literal-dot directory). The blanket
+/// dot->slash translation instead produced conf/eth0/100/forwarding, which
+/// never exists, so `ktuner why` answered "parameter not found" for BOTH
+/// spellings even though the file was right there. Property names under
+/// conf/ never contain dots or slashes, so the last separator splits
+/// interface from property and everything before it stays verbatim; for
+/// dot-free interfaces (all, default, eth0) the result is byte-identical to
+/// the blanket translation. Returns None for every other sysctl.
+fn net_conf_path(param: &str) -> Option<String> {
+    for proto in ["ipv4", "ipv6"] {
+        for sep in ['.', '/'] {
+            let prefix = format!("net{sep}{proto}{sep}conf{sep}");
+            if let Some(rest) = param.strip_prefix(&prefix) {
+                return Some(match split_conf_tail(rest) {
+                    Some((iface, prop)) => {
+                        format!("/proc/sys/net/{proto}/conf/{iface}/{prop}")
+                    }
+                    None => format!("/proc/sys/net/{proto}/conf/{rest}"),
+                });
+            }
+        }
+    }
+    None
+}
+
+/// Split a conf-family tail into (interface, property): the LAST separator
+/// is the boundary, because properties are plain names while interfaces may
+/// contain dots (VLAN `eth0.100`). None when the tail has no separator — an
+/// interface named without a property, a directory rather than a tunable.
+fn split_conf_tail(rest: &str) -> Option<(&str, &str)> {
+    rest.rsplit_once('/').or_else(|| rest.rsplit_once('.'))
 }
 
 /// Whether a parameter name is structurally legitimate to apply. Used to reject
@@ -1297,6 +1336,110 @@ mod tests {
             param_to_path("transparent_hugepage/enabled"),
             "/sys/kernel/mm/transparent_hugepage/enabled"
         );
+    }
+
+    #[test]
+    fn test_param_to_path_conf_vlan_interface() {
+        // VLAN subinterfaces are literal-dot directories under conf/
+        // (conf/eth0.100/forwarding). The blanket dot->slash translation
+        // resolved both spellings to conf/eth0/100/forwarding, which never
+        // exists — `ktuner why` then failed with "parameter not found" even
+        // though the file was present.
+        assert_eq!(
+            param_to_path("net.ipv4.conf.eth0.100.forwarding"),
+            "/proc/sys/net/ipv4/conf/eth0.100/forwarding"
+        );
+        assert_eq!(
+            param_to_path("net/ipv4/conf/eth0.100/forwarding"),
+            "/proc/sys/net/ipv4/conf/eth0.100/forwarding"
+        );
+        assert_eq!(
+            param_to_path("net.ipv6.conf.eth0.100.accept_ra"),
+            "/proc/sys/net/ipv6/conf/eth0.100/accept_ra"
+        );
+        // Dot-free interfaces keep the blanket translation's exact result.
+        assert_eq!(
+            param_to_path("net.ipv4.conf.all.send_redirects"),
+            "/proc/sys/net/ipv4/conf/all/send_redirects"
+        );
+        assert_eq!(
+            param_to_path("net.ipv4.conf.default.rp_filter"),
+            "/proc/sys/net/ipv4/conf/default/rp_filter"
+        );
+        // Interface-only tails are directories, same as before.
+        assert_eq!(
+            param_to_path("net.ipv4.conf.eth0"),
+            "/proc/sys/net/ipv4/conf/eth0"
+        );
+        // Degenerate double dots still resolve to a nonexistent literal-dot
+        // directory: fail-closed, never a wrong write.
+        assert_eq!(
+            param_to_path("net.ipv4.conf.eth0..100.forwarding"),
+            "/proc/sys/net/ipv4/conf/eth0..100/forwarding"
+        );
+    }
+
+    #[test]
+    fn test_conf_vlan_spellings_share_a_ledger_entry() {
+        // Equivalent dotted/slashed spellings must resolve to the same real
+        // file so merge_entries keeps ONE rollback entry pointing at it
+        // (the alias-dedup contract), instead of two aliases for a path
+        // that never existed.
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [(
+                "net.ipv4.conf.eth0.100.forwarding".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+            )],
+        );
+        let data = merge_entries(
+            data,
+            [(
+                "net/ipv4/conf/eth0.100/forwarding".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+            )],
+        );
+        assert_eq!(data.entries.len(), 1, "aliases must share one entry");
+        let entry = data.entries.values().next().unwrap();
+        assert_eq!(entry.path, "/proc/sys/net/ipv4/conf/eth0.100/forwarding");
+        assert_eq!(entry.previous, "0", "pristine value survives the alias");
+    }
+
+    #[test]
+    fn test_is_forbidden_param_conf_family_unaffected() {
+        // The deny-list compares resolved paths; conf-family resolution lands
+        // strictly under /proc/sys/net/, so no forbidden path becomes
+        // reachable, VLAN tunables are not denied, and the forbidden
+        // spellings keep their verdicts.
+        assert!(!is_forbidden_param("net.ipv4.conf.eth0.100.forwarding"));
+        assert!(!is_forbidden_param("net.ipv4.conf.all.send_redirects"));
+        for p in [
+            "kernel.core_pattern",
+            "kernel/core_pattern",
+            "kernel.modprobe",
+            "kernel//modprobe",
+        ] {
+            assert!(is_forbidden_param(p), "{p} must stay forbidden");
+        }
+    }
+
+    #[test]
+    fn test_is_safe_param_vlan_conf_spellings() {
+        // Both VLAN spellings remain legitimate names (the existing contract
+        // next door already pins the dotted and slashed pair), while
+        // degenerate double-dot interfaces stay rejected — the dot-preserving
+        // resolution must not loosen the structural name guard.
+        assert!(is_safe_param("net.ipv4.conf.eth0.100.forwarding"));
+        assert!(is_safe_param("net/ipv4/conf/eth0.100/forwarding"));
+        assert!(!is_safe_param("net.ipv4.conf.eth0..100.forwarding"));
+        assert!(!is_safe_param("net.ipv4.conf..forwarding"));
+        assert!(!is_safe_param("net.ipv4.conf.eth0.100."));
     }
 
     #[test]
