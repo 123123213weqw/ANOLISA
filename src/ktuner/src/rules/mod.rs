@@ -1733,11 +1733,30 @@ fn eval_send_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
 }
 
 fn eval_perf_event_paranoid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/perf_event_paranoid";
+    eval_perf_event_paranoid_at(info, recs, "/proc/sys/kernel/perf_event_paranoid")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the signed parse is
+/// unit-testable against a temp file. `kernel/perf/events/core.c` registers
+/// perf_event_paranoid over [-1, 2], where -1 means even unprivileged users
+/// may use perf events — a legal, common setting on profiling fleets. The
+/// unsigned reader parses "-1" to Err and falls back to 0, a DIFFERENT
+/// meaningful value (kernel-restricted), so `current_value` lied on -1 hosts
+/// and the rollback ledger's `previous` restored 0 instead of -1 — a silent
+/// wrong "Full" restore. Read signed, mirroring eval_sched_rt_runtime.
+fn eval_perf_event_paranoid_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let current = std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .trim()
+        .parse::<i64>()
+        .unwrap_or(0);
     if current < 2 {
         recs.push(Recommendation {
             param: "kernel.perf_event_paranoid".to_string(),
@@ -8768,6 +8787,76 @@ mod tests {
         if std::path::Path::new("/proc/sys/kernel/perf_cpu_time_max_percent").exists() {
             assert_eq!(checked, 1);
         }
+    }
+
+    #[test]
+    fn test_perf_event_paranoid_minus_one_reads_signed() {
+        // -1 is the kernel's "all users may use perf events" value, common on
+        // profiling fleets. The unsigned reader parsed "-1" to 0, so the
+        // recommendation reported current 0 and the rollback ledger later
+        // restored 0 instead of -1 — a silent wrong "Full" restore.
+        let path = std::env::temp_dir().join(format!(
+            "ktuner_perf_event_paranoid_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"-1\n").unwrap();
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        let checked = eval_perf_event_paranoid_at(&info, &mut recs, path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(checked, 1);
+        assert_eq!(recs.len(), 1, "-1 is looser than 2, so it must be flagged");
+        assert_eq!(recs[0].param, "kernel.perf_event_paranoid");
+        assert_eq!(recs[0].current_value, "-1", "current must be faithful");
+        assert_eq!(recs[0].recommended_value, "2");
+    }
+
+    #[test]
+    fn test_perf_event_paranoid_boundaries() {
+        let info = make_test_info();
+        for (value, expects_rec) in [
+            (-2, true),
+            (-1, true),
+            (0, true),
+            (1, true),
+            (2, false),
+            (3, false),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_perf_event_paranoid_bound_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            eval_perf_event_paranoid_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: below 2 must be flagged, 2 and above are already hardened"
+            );
+            if expects_rec {
+                assert_eq!(
+                    recs[0].current_value,
+                    value.to_string(),
+                    "current_value must echo the signed value verbatim"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_perf_event_paranoid_absent_counts_as_checked() {
+        // A path that never exists exercises the absent branch: 1 checked,
+        // 0 recommendations, no filesystem dependency in CI.
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        let checked =
+            eval_perf_event_paranoid_at(&info, &mut recs, "/proc/sys/kernel/ktuner_absent_pep");
+        assert_eq!(checked, 1);
+        assert!(recs.is_empty());
     }
 
     #[test]
