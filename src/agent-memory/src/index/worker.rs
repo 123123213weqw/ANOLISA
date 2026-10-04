@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc as stdmpsc};
@@ -356,61 +356,98 @@ fn full_scan(
 ) -> Result<()> {
     use walkdir::WalkDir;
 
+    // Phase 1 (brief lock): snapshot the index's current (path, mtime)
+    // pairs so the walk below can skip unchanged files and detect removals
+    // without holding the mutex. The scan used to take the lock for the
+    // entire walk+extract pass, blocking every concurrent `search` for its
+    // duration — the same shape `flush` was already restructured away from.
+    let known: HashMap<String, Option<i64>> = {
+        let store = store.lock().unwrap_or_else(|e| e.into_inner());
+        let paths = store.known_paths()?;
+        paths
+            .into_iter()
+            .map(|p| {
+                let mtime = store.mtime_for(&p);
+                (p, mtime)
+            })
+            .collect()
+    };
+
+    // Phase 2 (lock-free I/O): walk, stat and extract bodies.
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut to_upsert: Vec<(String, i64, u64, String)> = Vec::new();
+    for entry in WalkDir::new(&mount.root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !is_under_meta(mount, e.path()))
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let rel = match relative(mount, path) {
+            Some(r) => r,
+            None => continue,
+        };
+        let rel_path = Path::new(&rel);
+        let meta = match crate::safe_fs::metadata(mount.root_fd.as_fd(), rel_path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if !is_indexable(rel_path, meta.len()) {
+            continue;
+        }
+        let mtime = super::store::mtime_ms_of(&meta);
+        // Skip if already indexed with same mtime (checked against the
+        // phase-1 snapshot).
+        if known.get(&rel) == Some(&Some(mtime)) {
+            seen.insert(rel);
+            continue;
+        }
+        let body = match extract_text(mount.root_fd.as_fd(), rel_path) {
+            Some(b) => b,
+            None => continue,
+        };
+        to_upsert.push((rel.clone(), mtime, meta.len(), body));
+        seen.insert(rel);
+    }
+
+    // Phase 3 (brief lock): apply. Because the walk ran lock-free, a
+    // concurrent writer (a memory tool going through `IndexHandle::write`,
+    // or the consolidation writer) may have indexed a NEWER version of a
+    // file while we walked: guard each upsert so a stale scan result never
+    // clobbers a fresher stored mtime, and each removal so an entry that
+    // was re-indexed after the snapshot survives.
+    let agent_id = std::env::var("MCP_CLIENT_NAME").ok();
     {
         let mut store = store.lock().unwrap_or_else(|e| e.into_inner());
-        let mut seen: HashSet<String> = HashSet::new();
-        let agent_id = std::env::var("MCP_CLIENT_NAME").ok();
-
-        for entry in WalkDir::new(&mount.root)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|e| !is_under_meta(mount, e.path()))
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let rel = match relative(mount, path) {
-                Some(r) => r,
-                None => continue,
-            };
-            let rel_path = Path::new(&rel);
-            let meta = match crate::safe_fs::metadata(mount.root_fd.as_fd(), rel_path) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if !meta.is_file() {
-                continue;
-            }
-            if !is_indexable(rel_path, meta.len()) {
-                continue;
-            }
-            let body = match extract_text(mount.root_fd.as_fd(), rel_path) {
-                Some(b) => b,
-                None => continue,
-            };
-            let mtime = super::store::mtime_ms_of(&meta);
-            // Skip if already indexed with same mtime
-            if let Some(known) = store.mtime_for(&rel) {
-                if known == mtime {
-                    seen.insert(rel.clone());
+        for (rel, mtime, size, body) in to_upsert {
+            if let Some(stored) = store.mtime_for(&rel) {
+                if stored > mtime {
+                    // A concurrent writer indexed a newer version while the
+                    // scan walked; keep it.
                     continue;
                 }
             }
-            if let Err(e) = store.upsert(&rel, mtime, meta.len(), &body, agent_id.as_deref()) {
+            if let Err(e) = store.upsert(&rel, mtime, size, &body, agent_id.as_deref()) {
                 tracing::warn!("index full-scan upsert failed for {rel}: {e}");
             }
-            seen.insert(rel);
         }
 
         // Remove entries no longer on disk
-        let known = store.known_paths()?;
-        for p in known {
+        for (p, snap_mtime) in known {
             if !seen.contains(&p) {
+                if store.mtime_for(&p) != snap_mtime {
+                    // Re-indexed after the snapshot; the removal is stale.
+                    continue;
+                }
                 if let Err(e) = store.remove(&p) {
                     tracing::warn!("index full-scan remove failed for {p}: {e}");
                 }
@@ -535,5 +572,101 @@ fn is_overflow(e: &notify::Error) -> bool {
         }
         notify::ErrorKind::MaxFilesWatch => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    /// Build a MountPointLite over a plain tempdir, with the `.anolisa/`
+    /// meta dir the walker must skip.
+    fn test_mount(root: &Path) -> MountPointLite {
+        let meta_dir = root.join(".anolisa");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        let file = std::fs::File::open(root).unwrap();
+        MountPointLite {
+            root: root.to_path_buf(),
+            meta_dir,
+            meta_dir_name: ".anolisa".to_string(),
+            root_fd: Arc::new(file.into()),
+        }
+    }
+
+    #[test]
+    fn full_scan_preserves_a_newer_concurrent_upsert() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path());
+        let file = dir.path().join("a.md");
+        std::fs::write(&file, "stale body from the scan's point of view").unwrap();
+        let disk_mtime = super::super::store::mtime_ms_of(&std::fs::metadata(&file).unwrap());
+
+        let store = Arc::new(Mutex::new(BM25Store::open_in_memory().unwrap()));
+        // Simulate a concurrent writer that indexed a NEWER version of a.md
+        // while the scan was walking (a memory tool going through
+        // IndexHandle::write): the store holds a mtime strictly newer than
+        // the version on disk the scan is about to read.
+        {
+            let mut s = store.lock().unwrap();
+            s.upsert("a.md", disk_mtime + 60_000, 8, "fresh body", None)
+                .unwrap();
+        }
+
+        full_scan(&mount, &store, None, None).unwrap();
+
+        let s = store.lock().unwrap();
+        assert_eq!(
+            s.mtime_for("a.md"),
+            Some(disk_mtime + 60_000),
+            "a stale scan result must not clobber the newer indexed version"
+        );
+    }
+
+    #[test]
+    fn full_scan_walk_runs_without_the_store_lock() {
+        // Enough files that the walk+extract pass takes a measurable while.
+        // While the scan runs, probe the store mutex: with the collect-
+        // then-lock restructure the walk phase is lock-free, so a probe
+        // succeeds while the scan is still walking. Before the fix the
+        // mutex was held for the entire walk and every probe failed until
+        // the scan finished, blocking every concurrent search.
+        let dir = tempfile::tempdir().unwrap();
+        let mount = test_mount(dir.path());
+        let files_dir = dir.path().join("notes");
+        std::fs::create_dir_all(&files_dir).unwrap();
+        for i in 0..20_000u32 {
+            let path = files_dir.join(format!("f{i:05}.md"));
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "file {i} with some body text to extract").unwrap();
+        }
+
+        let store = Arc::new(Mutex::new(BM25Store::open_in_memory().unwrap()));
+        let scan_store = Arc::clone(&store);
+        let scan_mount = mount.clone();
+        let scan = thread::spawn(move || full_scan(&scan_mount, &scan_store, None, None).unwrap());
+
+        // Let the scan thread start and get into its walk (it takes the
+        // mutex only for the brief snapshot before releasing it).
+        thread::sleep(Duration::from_millis(100));
+
+        let mut observed_free = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && !scan.is_finished() {
+            if store.try_lock().is_ok() {
+                observed_free = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        scan.join().unwrap();
+
+        assert!(
+            observed_free,
+            "the store mutex was never free while full_scan was running; \
+             the walk must not hold it across I/O"
+        );
+        // Sanity: the scan did index the whole tree.
+        assert_eq!(store.lock().unwrap().known_paths().unwrap().len(), 20_000);
     }
 }
