@@ -1280,14 +1280,24 @@ fn validate_file_config(fc: &FileConfig, path: &Path) -> Result<(), WsCkptError>
 }
 
 /// Save config to a TOML file, creating parent directories as needed.
+///
+/// The write is atomic (tmp + fsync + rename + parent-dir fsync via
+/// [`persist::atomic_write`], the same idiom as `save_state` and
+/// `save_workspace_policy`): a crash or full disk mid-save can never leave
+/// a truncated `config.toml` behind — readers, and the daemon restarting
+/// after the crash, see either the previous complete file or the new one.
 pub fn save_config_file(path: &Path, config: &FileConfig) -> Result<(), WsCkptError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let content = toml::to_string_pretty(config)
         .map_err(|e| WsCkptError::Config(format!("serialize config: {}", e)))?;
-    std::fs::write(path, content)?;
-    Ok(())
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        WsCkptError::Config(format!("config path {:?} has no usable file name", path))
+    })?;
+    let dir = match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    persist::atomic_write(dir, name, content.as_bytes(), None)
+        .map_err(|e| WsCkptError::Config(format!("save config file: {:#}", e)))
 }
 
 impl Default for DaemonConfig {
@@ -2832,6 +2842,43 @@ mod tests {
         };
         save_config_file(&path, &fc).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn save_config_file_replaces_the_file_atomically() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let first = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(15)),
+            ..Default::default()
+        };
+        save_config_file(&path, &first).unwrap();
+
+        // A handle opened before the rewrite (the daemon reading its config,
+        // or an editor holding the file open) must keep seeing the complete
+        // previous config across the save: publishing by rename leaves the
+        // old inode untouched, while an in-place truncate+rewrite funnels
+        // the new bytes through the same inode and is observable as a
+        // truncated/partial file if the process dies mid-write.
+        let mut old_handle = std::fs::File::open(&path).unwrap();
+
+        let second = FileConfig {
+            auto_cleanup_keep: Some(CleanupRetention::Count(30)),
+            ..Default::default()
+        };
+        save_config_file(&path, &second).unwrap();
+
+        let mut through_old_handle = String::new();
+        std::io::Read::read_to_string(&mut old_handle, &mut through_old_handle).unwrap();
+        assert_eq!(
+            through_old_handle,
+            toml::to_string_pretty(&first).unwrap(),
+            "the pre-rewrite handle must still see the complete previous config"
+        );
+
+        // Fresh readers see the new config, and no temp file is left behind.
+        assert_eq!(load_config_file(&path).unwrap(), second);
+        assert!(!dir.path().join("config.toml.tmp").exists());
     }
 
     #[test]
