@@ -376,7 +376,7 @@ fn run_self_update_inner(
 ) -> Result<SelfUpdateExecution, CliError> {
     let manifest = match ops
         .check_update(endpoint_url, current_version)
-        .map_err(self_update_cli_err)?
+        .map_err(|error| self_update_cli_err(error, context))?
     {
         None => {
             return Ok(SelfUpdateExecution::AlreadyLatest {
@@ -395,7 +395,7 @@ fn run_self_update_inner(
             os: os.to_string(),
             arch: arch.to_string(),
         })
-        .map_err(self_update_cli_err)?;
+        .map_err(|error| self_update_cli_err(error, context))?;
     context.sensitive_urls.push(artifact.url.clone());
 
     if intent == ExecutionIntent::Plan {
@@ -405,7 +405,9 @@ fn run_self_update_inner(
         });
     }
 
-    let current_exe = ops.resolve_current_exe().map_err(self_update_cli_err)?;
+    let current_exe = ops
+        .resolve_current_exe()
+        .map_err(|error| self_update_cli_err(error, context))?;
     let applied = if let Some(package) = rpm_owner_for_current_exe(query, &current_exe)? {
         context.apply_mode = Some("rpm_package");
         context.package = Some(package.clone());
@@ -438,7 +440,7 @@ fn run_self_update_inner(
     } else {
         context.apply_mode = Some("binary");
         ops.perform_binary_update(artifact, &current_exe, on_progress)
-            .map_err(self_update_cli_err)?;
+            .map_err(|error| self_update_cli_err(error, context))?;
         SelfUpdateApplied::Binary {
             from: current_version.to_string(),
             to: manifest.version,
@@ -474,10 +476,18 @@ fn installed_package_version_best_effort(
         .map(|info| info.version.to_string())
 }
 
-fn self_update_cli_err(error: core_self_update::SelfUpdateError) -> CliError {
+fn self_update_cli_err(
+    error: core_self_update::SelfUpdateError,
+    context: &SelfUpdateFailureContext,
+) -> CliError {
     CliError::Runtime {
         command: "update self".to_string(),
-        reason: error.to_string(),
+        // The terminal reason gets the same URL hygiene the audit channel
+        // applies (see append_self_update_log): FetchManifest's Display
+        // embeds the full manifest endpoint, and an ANOLISA_UPDATE_URL
+        // internal mirror can carry credentials in it. `update self`
+        // renders this CliError verbatim on stderr.
+        reason: common::redact_known_urls(&error.to_string(), &context.sensitive_urls),
     }
 }
 
