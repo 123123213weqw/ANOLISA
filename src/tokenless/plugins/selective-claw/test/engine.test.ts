@@ -360,4 +360,20 @@ describe("SelectiveContextEngine", () => {
       expect(engine.expandTurns("s1", [999])).toEqual({ found: 0, turns: [] });
     });
   });
+
+  it.each(["assistant", "toolResult"])("keeps cached turn IDs consistent after a leading %s", async (role) => {
+    const messages: AgentMessage[] = [
+      { role, content: "leading context" },
+      { role: "user", content: "new question" },
+      { role: "assistant", content: "new answer" },
+    ];
+    await engine.bootstrap({ sessionId: "s1", messages });
+    await engine.assemble({ sessionId: "s1", messages });
+
+    expect(engine.getStore().getDistinctTurnSeqs("s1")).toEqual([1, 2]);
+    const recalled = engine.expandTurns("s1", [1, 2]);
+    expect(recalled.turns.map((turn) => turn.turnSeq)).toEqual([1, 2]);
+    expect(recalled.turns[0].messages).toEqual([{ role, content: "leading context" }]);
+    expect(recalled.turns[1].messages.map((message) => message.content)).toEqual(["new question", "new answer"]);
+  });
 });

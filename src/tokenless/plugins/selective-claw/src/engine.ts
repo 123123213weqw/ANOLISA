@@ -372,7 +372,8 @@ export class SelectiveContextEngine implements ContextEngine {
         turns.push(current);
       }
       if (!current) {
-        current = { turnSeq: 1, messages: [] };
+        turnSeq = 1;
+        current = { turnSeq, messages: [] };
         turns.push(current);
       }
       current.messages.push(msg);

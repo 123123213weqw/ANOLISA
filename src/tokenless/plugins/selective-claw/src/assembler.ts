@@ -39,7 +39,8 @@ function deriveTurns(messages: AgentMessage[]): Turn[] {
       turns.push(current);
     }
     if (!current) {
-      current = { turnSeq: 1, messages: [], tokenCount: 0 };
+      turnSeq = 1;
+      current = { turnSeq, messages: [], tokenCount: 0 };
       turns.push(current);
     }
     const tokens = estimateTokens(JSON.stringify(msg));

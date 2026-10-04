@@ -158,4 +158,22 @@ describe("Assembler", () => {
     expect(tailMsgs[0].content).toContain("Turn 3");
     expect(tailMsgs[tailMsgs.length - 1].content).toContain("Turn 5");
   });
+
+  it.each(["assistant", "toolResult"])("gives a leading %s its own summary turn", (role) => {
+    const messages: AgentMessage[] = [
+      { role, content: "leading context" },
+      { role: "user", content: "new question" },
+      { role: "assistant", content: "new answer" },
+      { role: "user", content: "latest question" },
+    ];
+    const result = assembler.assemble({
+      messages,
+      summaries: new Map([[1, "Leading turn summary"], [2, "New question summary"]]),
+      tokenBudget: 100000,
+      freshTailTurns: 1,
+    });
+    expect(result.messages[0].content).toContain("Turn 1: Leading turn summary");
+    expect(result.messages[0].content).toContain("Turn 2: New question summary");
+    expect(result.messages.slice(1)).toEqual(messages.slice(3));
+  });
 });
