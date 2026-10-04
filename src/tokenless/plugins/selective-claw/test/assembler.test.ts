@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { Assembler } from "../src/assembler.js";
+import { estimateTokens } from "../src/estimate-tokens.js";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 
 function makeTurns(turnCount: number): AgentMessage[] {
@@ -89,6 +90,41 @@ describe("Assembler", () => {
     const summaryMsg = result.messages[0];
     expect(summaryMsg.content).toContain("Turn 1: Old topic");
     expect(summaryMsg.content).not.toContain("Recent topic");
+  });
+
+  it("includes the inserted summary message in its token estimate", () => {
+    const msgs = makeTurns(4);
+    const result = assembler.assemble({
+      messages: msgs,
+      summaries: new Map([[1, "Detailed summary ".repeat(200)]]),
+      tokenBudget: 500,
+      freshTailTurns: 3,
+    });
+
+    const summaryTokens = estimateTokens(JSON.stringify(result.messages[0]));
+    expect(summaryTokens).toBeGreaterThan(500);
+    expect(result.estimatedTokens).toBeGreaterThan(summaryTokens);
+    for (let index = 0; index < msgs.length - 2; index++) {
+      expect(result.messages[index + 1]).toBe(msgs[index + 2]);
+    }
+  });
+
+  it("counts fallback previews as part of the returned context", () => {
+    const msgs = makeTurns(5);
+    const result = assembler.assemble({
+      messages: msgs,
+      summaries: new Map(),
+      tokenBudget: 100000,
+      freshTailTurns: 3,
+    });
+
+    const tailTokens = msgs.slice(4).reduce(
+      (total, message) => total + estimateTokens(JSON.stringify(message)),
+      0,
+    );
+    expect(result.estimatedTokens).toBe(
+      tailTokens + estimateTokens(JSON.stringify(result.messages[0])),
+    );
   });
 
   it("shows [no summary] for older turns without summaries", () => {

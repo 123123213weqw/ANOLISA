@@ -116,11 +116,11 @@ export class Assembler {
       result.push(...turn.messages);
     }
 
-    const tailTokens = tail.reduce((s, t) => s + t.tokenCount, 0);
+    const estimatedTokens = result.reduce((total, message) => total + estimateTokens(JSON.stringify(message)), 0);
 
     return {
       messages: result,
-      estimatedTokens: tailTokens,
+      estimatedTokens,
       stats: {
         totalTurns: turns.length,
         freshTailTurnCount: tail.length,
