@@ -352,11 +352,17 @@ impl ParsedHttp2Frame {
             }
         }
 
-        if pos + length > payload.len() {
+        // The extended-length accumulator can reach exactly usize::MAX (ten
+        // 0xFF continuation bytes), so `pos + length` can overflow: check the
+        // sum instead of adding it unchecked.
+        let Some(end) = pos.checked_add(length) else {
+            return (String::new(), pos - start);
+        };
+        if end > payload.len() {
             return (String::new(), pos - start);
         }
 
-        let string_bytes = &payload[pos..pos + length];
+        let string_bytes = &payload[pos..end];
 
         let result = if is_huffman {
             // Huffman decode
@@ -365,7 +371,7 @@ impl ParsedHttp2Frame {
             String::from_utf8_lossy(string_bytes).to_string()
         };
 
-        (result, pos + length - start)
+        (result, end - start)
     }
 
     /// Number of octets in the HPACK integer beginning at `start`.
@@ -797,5 +803,71 @@ mod tests {
                 .decode_headers_stateless()
                 .is_empty()
         );
+    /// Ten 0xFF continuation bytes accumulate the extended length to exactly
+    /// usize::MAX — every seven-bit group all-ones fills the integer, so the
+    /// saturating add never fires — and the following `pos + length` then
+    /// overflowed: debug builds aborted on the add, release builds wrapped
+    /// past the bounds check and panicked on the slice. The helper must keep
+    /// its corrupt-input contract instead: an empty string plus the bytes
+    /// consumed. This must hold in both profiles, so run the release test
+    /// binary too.
+    #[test]
+    fn test_decode_literal_string_hostile_continuation_chain_does_not_panic() {
+        let mut payload = vec![0x7f];
+        payload.extend(std::iter::repeat_n(0xff, 10));
+        // A terminator byte proves the chain is rejected by the length
+        // check, not by running out of payload; the loop consumes it as the
+        // final length group.
+        payload.push(b'a');
+
+        let (value, consumed) = ParsedHttp2Frame::decode_literal_string(&payload, 0);
+
+        assert_eq!(value, "");
+        assert_eq!(
+            consumed, 12,
+            "the prefix, ten continuation bytes, and the terminator"
+        );
+    }
+
+    /// A longer hostile chain (saturating past usize::MAX) must hit the same
+    /// corrupt-input contract, not a different arithmetic edge.
+    #[test]
+    fn test_decode_literal_string_saturated_continuation_chain_does_not_panic() {
+        let mut payload = vec![0x7f];
+        payload.extend(std::iter::repeat_n(0xff, 20));
+        payload.push(0x00); // terminator after the saturation point
+        payload.push(b'a');
+
+        let (value, consumed) = ParsedHttp2Frame::decode_literal_string(&payload, 0);
+
+        assert_eq!(value, "");
+        assert_eq!(consumed, 22, "the prefix plus twenty-one length bytes");
+    }
+
+    /// An extended length that reaches exactly the end of the payload decodes
+    /// the whole value (300 = 127 + 45 + (1 << 7), two continuation groups).
+    #[test]
+    fn test_decode_literal_string_extended_length_exact_fit() {
+        let mut payload = vec![0x7f, 0xad, 0x01];
+        payload.extend(std::iter::repeat_n(b'a', 300));
+
+        let (value, consumed) = ParsedHttp2Frame::decode_literal_string(&payload, 0);
+
+        assert_eq!(value.len(), 300);
+        assert_eq!(value.as_bytes(), &vec![b'a'; 300][..]);
+        assert_eq!(consumed, 3 + 300);
+    }
+
+    /// The same chain with one body byte missing is truncated: the contract
+    /// is an empty string and only the length bytes consumed.
+    #[test]
+    fn test_decode_literal_string_extended_length_one_short() {
+        let mut payload = vec![0x7f, 0xad, 0x01];
+        payload.extend(std::iter::repeat_n(b'a', 299));
+
+        let (value, consumed) = ParsedHttp2Frame::decode_literal_string(&payload, 0);
+
+        assert_eq!(value, "");
+        assert_eq!(consumed, 3, "only the length prefix is consumed");
     }
 }
