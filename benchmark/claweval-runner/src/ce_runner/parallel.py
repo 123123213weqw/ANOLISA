@@ -32,6 +32,42 @@ from .tool_injector import ToolInjector
 
 PORT_STRIDE = 50  # port gap between adjacent worker slots
 
+# ── Runner-scoped mock-service tagging ────────────────────────────────────────
+# cleanup_mock_services() used to SIGKILL *every* host process whose argv
+# mentioned "mock_services", with no notion of which runner batch owned it:
+# two ce-runner batches on one shared host killed each other's live services
+# mid-trial. Every service spawned by this runner is therefore tagged with a
+# per-batch id (env CE_RUNNER_BATCH_ID, overridable for nested runs) and its
+# pid is registered here, so cleanup only ever touches THIS batch's services.
+BATCH_SCOPE_ENV = "CE_RUNNER_BATCH_ID"
+
+_batch_scope_id: str | None = None
+_mock_service_pids: set[int] = set()
+
+
+def mock_services_batch_id() -> str:
+    """Return this runner's batch id, minting one on first use.
+
+    ``CE_RUNNER_BATCH_ID`` from the environment wins (so nested/child
+    runners share the parent's scope); otherwise the id is derived from the
+    pid, unique per concurrently-running runner process.
+    """
+    global _batch_scope_id
+    if _batch_scope_id is None:
+        _batch_scope_id = (os.environ.get(BATCH_SCOPE_ENV)
+                           or f"ce-runner-{os.getpid()}")
+    return _batch_scope_id
+
+
+def registered_mock_service_pids() -> set[int]:
+    """Return a snapshot of the mock-service pids spawned by this runner."""
+    return set(_mock_service_pids)
+
+
+def forget_mock_service_pids() -> None:
+    """Clear the pid registry (after cleanup has handled the pids)."""
+    _mock_service_pids.clear()
+
 
 def setup_parallel_workers(
     task_yamls: list[str],
@@ -93,17 +129,21 @@ def start_mock_services_with_offset(task_yaml: str, task_dir: str, port_offset: 
         env["no_proxy"] = "localhost,127.0.0.1"
         env["NO_PROXY"] = "localhost,127.0.0.1"
         env["PORT"] = str(port)
+        # Tag + register the service so cleanup only kills OUR services
+        # (see mock_services_batch_id above).
+        env[BATCH_SCOPE_ENV] = mock_services_batch_id()
         for k, v in svc.get("env", {}).items():
             if v.startswith("tasks/"):
                 v = os.path.join(project_root, v)
             env[k] = v
 
-        subprocess.Popen(
+        proc = subprocess.Popen(
             cmd, env=env, cwd=project_root,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             preexec_fn=lambda: resource.setrlimit(
                 resource.RLIMIT_AS, (512 * 1024 * 1024, 512 * 1024 * 1024)),
         )
+        _mock_service_pids.add(proc.pid)
 
         # Wait for health
         timeout_s = svc.get("ready_timeout", 15)

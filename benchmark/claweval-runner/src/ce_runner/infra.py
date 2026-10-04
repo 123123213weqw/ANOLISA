@@ -29,7 +29,9 @@ import httpx
 
 from ._common import (OPENCLAW_CONFIG, RESET_PATHS, _PYTHON,
                        atomic_write_config, load_task_yaml, log)
-from .parallel import (reset_services_with_offset,
+from .parallel import (forget_mock_service_pids, mock_services_batch_id,
+                       registered_mock_service_pids,
+                       reset_services_with_offset,
                        start_mock_services_with_offset)
 from .skill_generator import cleanup_task_skill
 from .tool_injector import ToolInjector
@@ -188,20 +190,51 @@ def configure_tools(
 
 # ── Mock service lifecycle ─────────────────────────────────────────────────────
 
-def cleanup_mock_services():
-    """Kill all mock service processes."""
-    result = subprocess.run(["ps", "auxww"], capture_output=True, text=True)
+def cleanup_mock_services(include_unmarked: bool = False):
+    """Kill mock service processes belonging to THIS runner batch.
+
+    Services spawned via ``parallel.start_mock_services_with_offset`` are
+    tagged with this runner's batch id (env ``CE_RUNNER_BATCH_ID``) and
+    tracked in a pid registry; only those pids are killed, so concurrent
+    ce-runner batches on a shared host cannot kill each other's live
+    services mid-trial. Gateway-spawned MCP bridges and their service
+    children are covered by :func:`kill_mcp_bridges` (process-group kill).
+
+    Legacy/unmarked "mock_services" processes are left alone by default.
+    Set *include_unmarked* to True for an explicit orphan sweep that kills
+    ANY process matching "mock_services" (the pre-scoping behavior, e.g.
+    for leftover services of a crashed pre-scoping runner).
+    """
+    killed: list[int] = []
     my_pid = os.getpid()
-    for line in result.stdout.splitlines():
-        if "mock_services" in line and "grep" not in line:
-            parts = line.split()
-            if len(parts) > 1:
-                pid = int(parts[1])
-                if pid != my_pid:
+    for pid in sorted(registered_mock_service_pids()):
+        if pid == my_pid:
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except Exception:
+            pass
+    forget_mock_service_pids()
+    if killed:
+        log(f"[mock-services] killed {len(killed)} own-batch service pid(s) "
+            f"{killed} (batch={mock_services_batch_id()})")
+
+    if include_unmarked:
+        result = subprocess.run(["ps", "auxww"], capture_output=True, text=True)
+        for line in result.stdout.splitlines():
+            if "mock_services" in line and "grep" not in line:
+                parts = line.split()
+                if len(parts) > 1:
                     try:
-                        os.kill(pid, signal.SIGKILL)
-                    except Exception:
-                        pass
+                        pid = int(parts[1])
+                    except ValueError:
+                        continue
+                    if pid != my_pid and pid not in killed:
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except Exception:
+                            pass
 
 
 def reap_orphan_agent_processes(markers: list[str] | None = None,
