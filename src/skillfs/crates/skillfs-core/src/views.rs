@@ -22,7 +22,8 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 // ---------------------------------------------------------------------------
@@ -59,6 +60,45 @@ pub struct ViewConfig {
 pub struct ViewsConfig {
     #[serde(rename = "view")]
     pub views: Vec<ViewConfig>,
+}
+
+/// Sequence that makes every staging path unique inside this process.
+static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// How many staging names one save may try before giving up. A name can only
+/// be taken by an entry stranded by a crashed save under the same pid.
+const MAX_STAGING_ATTEMPTS: usize = 16;
+
+/// Create the exclusive staging file for one save.
+///
+/// The name carries the pid (separating processes) and a fresh sequence
+/// number (separating saves inside one process, threads included), so no two
+/// saves ever share a path and no call can unlink or publish another call's
+/// staging file. `create_new` also refuses an entry stranded at that exact
+/// name by a crashed save instead of writing through it: the next sequence
+/// number is used instead, and the stranded entry is left alone — only the
+/// writer that created a staging file may remove it.
+fn create_staging_file(source_dir: &Path) -> std::io::Result<(PathBuf, std::fs::File)> {
+    for _ in 0..MAX_STAGING_ATTEMPTS {
+        let path = source_dir.join(format!(
+            ".skillfs-views.toml.{}.{}.tmp",
+            std::process::id(),
+            STAGING_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => return Ok((path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "every candidate staging path for skillfs-views.toml is taken",
+    ))
 }
 
 impl ViewsConfig {
@@ -170,15 +210,26 @@ impl ViewsConfig {
     /// Serialize and write to `<source_dir>/skillfs-views.toml`.
     ///
     /// Uses write-to-tmp + rename for atomicity: if the process crashes
-    /// mid-write the target file is never left in a truncated state.
+    /// mid-write the target file is never left in a truncated state. Every
+    /// save stages on its own exclusive path and removes only the file it
+    /// created, so concurrent saves — threads in one process included — never
+    /// unlink or publish another call's staging file.
     pub fn save(&self, source_dir: &Path) -> std::io::Result<()> {
         let path = source_dir.join("skillfs-views.toml");
-        let tmp_path = source_dir.join(".skillfs-views.toml.tmp");
         let content = toml::to_string_pretty(self)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        std::fs::write(&tmp_path, &content)?;
-        std::fs::rename(&tmp_path, &path)?;
-        Ok(())
+        let (tmp_path, mut file) = create_staging_file(source_dir)?;
+        let result = (|| {
+            use std::io::Write;
+            file.write_all(content.as_bytes())?;
+            std::fs::rename(&tmp_path, &path)
+        })();
+        if result.is_err() {
+            // No other save ever stages at this path, so this removes only the
+            // file this call created.
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        result
     }
 }
 
@@ -250,6 +301,103 @@ mod tests {
         let loaded = ViewsConfig::load(dir.path()).unwrap();
         assert_eq!(loaded.views.len(), 2);
         assert_eq!(loaded.default_skills(), vec!["github", "notion"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_save_does_not_publish_through_a_planted_staging_entry() {
+        // A fixed staging path makes any entry already sitting there the
+        // publication vehicle: writing through a symlink would clobber its
+        // target and rename the link itself onto the config path.
+        let dir = TempDir::new().unwrap();
+        let victim = dir.path().join("victim.toml");
+        std::fs::write(&victim, "untouched").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join(".skillfs-views.toml.tmp")).unwrap();
+
+        make_config().save(dir.path()).unwrap();
+
+        let saved = dir.path().join("skillfs-views.toml");
+        assert!(
+            !std::fs::symlink_metadata(&saved)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the published config must be a regular file"
+        );
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "untouched");
+        assert_eq!(
+            ViewsConfig::load(dir.path()).unwrap().default_skills(),
+            vec!["github", "notion"]
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_in_one_process_all_publish() {
+        // Every save must own its staging path. With one path shared by all
+        // saves in the process, concurrent callers unlink each other's
+        // half-written file and the rename fails: an 8-thread run of 40
+        // saves each published only 86 of the 320 calls.
+        let dir = TempDir::new().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let handles: Vec<_> = (0..8)
+            .map(|worker| {
+                let directory = dir.path().to_path_buf();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut config = make_config();
+                    config.views[0].skills = vec![format!("skill-{worker}")];
+                    barrier.wait();
+                    (0..40).filter(|_| config.save(&directory).is_ok()).count()
+                })
+            })
+            .collect();
+        let published: usize = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .sum();
+        assert_eq!(published, 320, "every concurrent save must publish");
+        // Whichever save won, the target is a complete config, never a torn one.
+        assert_eq!(
+            ViewsConfig::load(dir.path())
+                .expect("complete config")
+                .views
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn save_leaves_a_foreign_staging_entry_alone() {
+        // Only the call that created a staging file may remove it: an entry
+        // left by a crashed save (or a concurrent writer) must survive.
+        let dir = TempDir::new().unwrap();
+        let legacy = dir
+            .path()
+            .join(format!(".skillfs-views.toml.{}.tmp", std::process::id()));
+        std::fs::write(&legacy, "legacy leftover").unwrap();
+        let current = dir.path().join(format!(
+            ".skillfs-views.toml.{}.{}.tmp",
+            std::process::id(),
+            STAGING_SEQUENCE.load(Ordering::Relaxed)
+        ));
+        std::fs::write(&current, "stranded leftover").unwrap();
+
+        make_config().save(dir.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&legacy).unwrap(),
+            "legacy leftover",
+            "a foreign staging entry must be left alone"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&current).unwrap(),
+            "stranded leftover",
+            "a stranded entry at a staging name must be left alone"
+        );
+        assert_eq!(
+            ViewsConfig::load(dir.path()).unwrap().default_skills(),
+            vec!["github", "notion"]
+        );
     }
 
     #[test]
