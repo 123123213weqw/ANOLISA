@@ -322,3 +322,128 @@ class TestCleanupOnFailure:
 
         # Should remove empty err_log
         assert len(removed_files) > 0
+
+
+class TestMockServiceBootFailure:
+    """A mock service that crashes at boot must fail loudly.
+
+    Regression: ``start_mock_services_with_offset`` used to wait out
+    ``ready_timeout`` and return normally even when the service process
+    died immediately and its health endpoint was unreachable. The task's
+    trials then ran against a dead service and were graded as genuine
+    FAILs, polluting avg_score/pass@1 — the exact misclassification the
+    missing-fixture preflight exists to prevent.
+    """
+
+    def _write_task(self, tmp_path, port, ready_timeout,
+                    health_check_method="GET"):
+        task_dir = tmp_path / "tasks" / "T900_dead_service"
+        task_dir.mkdir(parents=True)
+        task_yaml = task_dir / "task.yaml"
+        task_yaml.write_text(
+            "task_id: T900_dead_service\n"
+            "services:\n"
+            "  - name: deadsvc\n"
+            f"    port: {port}\n"
+            f"    health_check: http://localhost:{port}/health\n"
+            f"    health_check_method: {health_check_method}\n"
+            f"    ready_timeout: {ready_timeout}\n"
+            "    command: /usr/bin/false\n"
+        )
+        return task_yaml
+
+    @staticmethod
+    def _free_port():
+        import socket
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+        return port
+
+    def test_dead_service_raises_and_logs(self, tmp_path, capsys):
+        """Dead service: error raised plus an ERROR log line."""
+        from ce_runner import parallel as parallel_mod
+
+        port = self._free_port()
+        task_yaml = self._write_task(tmp_path, port, ready_timeout=1)
+
+        # Patch Popen: the real preexec_fn setrlimit(RLIMIT_AS) is not
+        # supported on macOS, and the defect under test is the health
+        # loop's silence, not the spawn itself.
+        with patch.object(parallel_mod.subprocess, "Popen") as mock_popen:
+            with pytest.raises(parallel_mod.MockServiceBootError):
+                parallel_mod.start_mock_services_with_offset(
+                    str(task_yaml), str(task_yaml.parent), 0)
+        assert mock_popen.called, "dead service command must still be spawned"
+
+        out = capsys.readouterr().out
+        assert "[ERROR]" in out, f"no ERROR line logged: {out!r}"
+        assert "deadsvc" in out, f"service name missing from log: {out!r}"
+
+    def test_healthy_service_unchanged(self, tmp_path, capsys):
+        """An already-healthy service returns normally, no error log."""
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
+            task_yaml = self._write_task(tmp_path, port, ready_timeout=10)
+            from ce_runner import parallel as parallel_mod
+            # Must not raise: the pre-check sees 200 and skips the start.
+            parallel_mod.start_mock_services_with_offset(
+                str(task_yaml), str(task_yaml.parent), 0)
+        finally:
+            server.shutdown()
+        out = capsys.readouterr().out
+        assert "[ERROR]" not in out
+
+    def test_slow_then_healthy_within_timeout_unchanged(self, tmp_path, capsys):
+        """A service that turns healthy within ready_timeout must not raise."""
+        import threading
+        import time as _time
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        flip_at = _time.monotonic() + 1.0
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if _time.monotonic() < flip_at:
+                    self.send_response(503)
+                    self.end_headers()
+                    return
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
+            # The spawned command "boots" (and exits) instantly; the health
+            # loop must ride out the 503 window and succeed once it flips
+            # to 200. Popen is patched because preexec_fn's
+            # setrlimit(RLIMIT_AS) is unsupported on macOS.
+            task_yaml = self._write_task(tmp_path, port, ready_timeout=10)
+            from ce_runner import parallel as parallel_mod
+            with patch.object(parallel_mod.subprocess, "Popen"):
+                parallel_mod.start_mock_services_with_offset(
+                    str(task_yaml), str(task_yaml.parent), 0)
+        finally:
+            server.shutdown()
+        out = capsys.readouterr().out
+        assert "[ERROR]" not in out

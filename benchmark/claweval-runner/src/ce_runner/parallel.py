@@ -33,6 +33,10 @@ from .tool_injector import ToolInjector
 PORT_STRIDE = 50  # port gap between adjacent worker slots
 
 
+class MockServiceBootError(RuntimeError):
+    """A mock service failed to become healthy within its ready_timeout."""
+
+
 def setup_parallel_workers(
     task_yamls: list[str],
     parallel: int,
@@ -108,6 +112,7 @@ def start_mock_services_with_offset(task_yaml: str, task_dir: str, port_offset: 
         # Wait for health
         timeout_s = svc.get("ready_timeout", 15)
         deadline = time.monotonic() + timeout_s
+        healthy = False
         while time.monotonic() < deadline:
             try:
                 if health_method == "POST":
@@ -115,10 +120,24 @@ def start_mock_services_with_offset(task_yaml: str, task_dir: str, port_offset: 
                 else:
                     r = httpx.get(health_check, timeout=2)
                 if r.status_code == 200:
+                    healthy = True
                     break
             except Exception:
                 pass
             time.sleep(0.5)
+
+        if health_check and not healthy:
+            # A service whose command crashed at boot would previously be
+            # waited out silently; its trials then ran against a dead
+            # endpoint and were graded as genuine FAILs, polluting
+            # avg_score/pass@1 instead of being counted errored. Fail
+            # loudly so the batch never misgrades this task.
+            log(f"[ERROR] mock service '{name}' failed to become healthy "
+                f"on {health_check} within {timeout_s}s "
+                f"(port={port}, command={' '.join(cmd)})")
+            raise MockServiceBootError(
+                f"mock service '{name}' (port={port}) did not become healthy "
+                f"within {timeout_s}s: {health_check}")
 
 
 def reset_services_with_offset(task_yaml: str, port_offset: int):
