@@ -3,6 +3,7 @@ import { SelectiveContextEngine } from "../src/engine.js";
 import { executeExpandTurn } from "../src/recall-tool.js";
 import { createConnection, closeConnection } from "../src/db/connection.js";
 import { estimateTokens } from "../src/estimate-tokens.js";
+import { runMigrations } from "../src/db/migration.js";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentMessage } from "../src/openclaw-bridge.js";
 
@@ -266,6 +267,32 @@ describe("Integration: gateway lifecycle simulation", () => {
   // ─── 6. 端到端多轮对话 ───
 
   describe("6. end-to-end multi-turn conversation", () => {
+    it("uses migrated ordinal ids for summaries and archived recall", async () => {
+      const messages = buildMessages(5);
+      await engine.assemble({ sessionId: SESSION, messages, tokenBudget: 100000 });
+      db.exec("ALTER TABLE messages DROP COLUMN summary");
+      db.exec("ALTER TABLE messages DROP COLUMN turn_seq");
+      runMigrations(db);
+
+      const restored = new SelectiveContextEngine(db, {
+        freshTailTurns: FRESH_TAIL, dbPath: ":memory:", enabled: true,
+      });
+      restored.setSummarizeFn(async () => "migrated summary");
+      await restored.afterTurn({ sessionId: SESSION, messages: [] });
+      const result = await restored.assemble({ sessionId: SESSION, messages: [], tokenBudget: 100000 });
+
+      expect(restored.getStore().getTurnSummaries(SESSION)).toEqual([
+        { turnSeq: 1, summary: "migrated summary" },
+        { turnSeq: 2, summary: "migrated summary" },
+      ]);
+      expect(result.messages[0].content).toContain("Turn 2: migrated summary");
+      const expanded = executeExpandTurn(restored.getStore(), SESSION, [2]);
+      expect(expanded.found).toBe(1);
+      expect(expanded.turns[0].messages.map((message) => message.content)).toEqual([
+        "question about topic 2", "answer about topic 2",
+      ]);
+    });
+
     it("full 8-turn lifecycle: reconcile → summarize → trim → expand", async () => {
       const TOTAL_TURNS = 8;
 

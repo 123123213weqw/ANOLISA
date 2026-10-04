@@ -58,14 +58,20 @@ export function runMigrations(db: DatabaseSync): void {
     db.exec(`ALTER TABLE messages ADD COLUMN turn_seq INTEGER`);
 
     db.exec(`
+      WITH turn_ids AS (
+        SELECT message_id,
+          SUM(CASE WHEN role IN ('user', 'system') THEN 1 ELSE 0 END)
+            OVER (PARTITION BY session_id ORDER BY seq)
+          + CASE WHEN FIRST_VALUE(role)
+            OVER (PARTITION BY session_id ORDER BY seq)
+            IN ('user', 'system') THEN 0 ELSE 1 END AS turn_seq
+        FROM messages
+      )
       UPDATE messages SET turn_seq = (
-        SELECT MAX(m2.seq) FROM messages m2
-        WHERE m2.session_id = messages.session_id
-          AND m2.seq <= messages.seq
-          AND m2.role = 'user'
+        SELECT turn_ids.turn_seq FROM turn_ids
+        WHERE turn_ids.message_id = messages.message_id
       )
     `);
-    db.exec(`UPDATE messages SET turn_seq = seq WHERE turn_seq IS NULL`);
   }
 
   if (!columnExists(db, "messages", "summary")) {
