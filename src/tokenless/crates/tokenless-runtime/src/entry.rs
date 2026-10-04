@@ -496,7 +496,9 @@ fn segment_is_build_log_owned(words: &[String]) -> bool {
             index += 1;
         }
     }
-    if matches!(
+    // `command` and `exec` prefix each other (e.g. `command exec cargo
+    // test`), so skip consecutive builtin spellings, not just one word.
+    while matches!(
         words.get(index).map(|word| command_basename(word)),
         Some("command" | "exec")
     ) {
@@ -1312,6 +1314,9 @@ mod tests {
             "npx jest",
             "go test ./... 2>&1 | tail -40",
             "make -j8",
+            "command cargo test",
+            "command exec cargo test",
+            "exec command cargo test",
         ];
         for command in commands {
             assert!(
@@ -1328,6 +1333,7 @@ mod tests {
             "cat build.log",
             "echo 'cargo test'",
             "rg pytest README.md",
+            "command exec cat build.log",
         ] {
             assert!(
                 !is_build_log_owned_command(command),
