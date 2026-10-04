@@ -338,6 +338,15 @@ impl SkillFs {
         // `create`/`unlink`/`rename` apply, so a hidden skill cannot be
         // given new directory entries through `symlink`.
         if self.should_reject_hidden_write(&skill_name, Some(&relative_path)) {
+            self.emit_op_event_with_detail(
+                req,
+                &path_type,
+                SkillEventKind::SymlinkAttempt,
+                SkillEventAction::Rejected,
+                Some(libc::ENOENT),
+                None,
+                Some("class=hidden_skill".to_string()),
+            );
             reply.error(libc::ENOENT);
             return;
         }
@@ -706,9 +715,23 @@ impl SkillFs {
         // other mutating callbacks apply, so a hidden skill cannot be
         // given new directory entries (or have its files linked out)
         // through `link`.
-        if self.should_reject_hidden_write(&src_skill, Some(&src_rel))
-            || self.should_reject_hidden_write(&dst_skill, Some(&dst_rel))
-        {
+        let hidden_src = self.should_reject_hidden_write(&src_skill, Some(&src_rel));
+        let hidden_dst = self.should_reject_hidden_write(&dst_skill, Some(&dst_rel));
+        if hidden_src || hidden_dst {
+            let rejecting_side = if hidden_dst {
+                &new_path_type
+            } else {
+                &source_path_type
+            };
+            self.emit_op_event_with_detail(
+                req,
+                rejecting_side,
+                SkillEventKind::HardlinkAttempt,
+                SkillEventAction::Rejected,
+                Some(libc::ENOENT),
+                None,
+                Some("class=hidden_skill".to_string()),
+            );
             reply.error(libc::ENOENT);
             return;
         }

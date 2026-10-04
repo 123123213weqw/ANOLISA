@@ -116,6 +116,15 @@ impl SkillFs {
                 _ => false,
             };
             if reject {
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Create,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -345,6 +354,15 @@ impl SkillFs {
                 _ => false,
             };
             if reject {
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Delete,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -529,6 +547,15 @@ impl SkillFs {
                 _ => false,
             };
             if reject {
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Delete,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
@@ -880,6 +907,15 @@ impl SkillFs {
                 _ => false,
             };
             if reject {
+                self.emit_op_event_with_detail(
+                    req,
+                    pt,
+                    SkillEventKind::Rename,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
