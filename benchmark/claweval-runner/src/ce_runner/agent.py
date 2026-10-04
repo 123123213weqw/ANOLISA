@@ -591,8 +591,15 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
 
     Uses the same prompt format as claw-eval's UserAgent class.
     Returns the response text, or None if user is satisfied ([DONE]).
+
+    An unreachable UA endpoint (openai package missing, or every retry
+    exhausted) also returns None but records the reason via
+    ``_set_agent_error`` so callers can distinguish an outage from
+    satisfaction instead of grading a truncated dialogue.
     """
     import random
+
+    _clear_agent_error()
 
     system_prompt = f"""你是一个模拟用户。你的任务是根据以下人设与AI助手进行对话。
 
@@ -629,6 +636,7 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
         from openai import OpenAI
     except ImportError:
         log("[WARNING] openai package not available for UserAgent")
+        _set_agent_error("user_agent_llm_unavailable: openai package missing")
         return None
 
     client = OpenAI(
@@ -637,6 +645,7 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
     )
 
     max_retries = 10
+    last_exc: Exception | None = None
     for attempt in range(max_retries):
         try:
             resp = client.chat.completions.create(
@@ -655,11 +664,14 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
                 return text
             return None
         except Exception as exc:
+            last_exc = exc
             delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
             log(f"  [user-agent-retry] {type(exc).__name__}, "
                 f"attempt {attempt + 1}/{max_retries}, waiting {delay:.1f}s ...")
             time.sleep(delay)
 
+    detail = type(last_exc).__name__ if last_exc else "unknown"
+    _set_agent_error(f"user_agent_llm_failed_after_{max_retries}_retries: {detail}")
     return None
 
 
@@ -798,6 +810,14 @@ def run_agent_with_user_agent(session_id: str, task_yaml: str, timeout: int,
         ua_reply = _call_user_agent_llm(ua_config, persona, conversation)
 
         if ua_reply is None:
+            ua_error = last_agent_error()
+            if ua_error:
+                # UA endpoint outage (missing openai package or exhausted
+                # retries) — fail the trial so both callers mark it errored
+                # instead of grading a truncated dialogue as satisfied.
+                log(f"  [user-agent] UserAgent LLM failed at round "
+                    f"{round_num} ({ua_error})")
+                return ""
             log(f"  [user-agent] User satisfied ([DONE]) at round {round_num}")
             break
 

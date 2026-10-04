@@ -155,6 +155,112 @@ class TestUserAgentConversation:
         
         assert "user_agent" not in task
 
+    @staticmethod
+    def _failing_openai_client(exc: Exception) -> MagicMock:
+        fake_openai = MagicMock()
+        client = MagicMock()
+        client.chat.completions.create.side_effect = exc
+        fake_openai.OpenAI.return_value = client
+        return fake_openai
+
+    def test_user_agent_llm_outage_records_error_not_satisfaction(self):
+        """Exhausting every UserAgent LLM retry must record an agent error
+        instead of masquerading as the [DONE] satisfaction signal."""
+        import ce_runner.agent as agent_mod
+
+        fake_openai = self._failing_openai_client(RuntimeError("401 Unauthorized"))
+        agent_mod._clear_agent_error()
+        with (
+            patch.dict(sys.modules, {"openai": fake_openai}),
+            patch.object(agent_mod.time, "sleep"),
+        ):
+            reply = agent_mod._call_user_agent_llm(
+                {"api_key": "k", "base_url": "http://ua", "model_id": "m"},
+                "persona",
+                [],
+            )
+
+        assert reply is None
+        error = agent_mod.last_agent_error()
+        assert error, "outage must set the thread-local agent error"
+        assert "user_agent" in error
+
+    def test_user_agent_outage_ends_trial_errored(self, tmp_path):
+        """run_agent_with_user_agent must return "" on a UA-endpoint outage so
+        both callers mark the trial errored instead of grading a truncated
+        dialogue as a satisfied 1-round session."""
+        import ce_runner.agent as agent_mod
+
+        task_yaml = tmp_path / "task.yaml"
+        task_yaml.write_text(
+            "task_id: C01zh_mortgage_prepay\n"
+            "user_agent:\n"
+            "  enabled: true\n"
+            "  persona: p\n"
+            "  max_rounds: 3\n"
+        )
+        fake_session = str(tmp_path / "session.jsonl")
+        fake_openai = self._failing_openai_client(RuntimeError("401 Unauthorized"))
+        agent_mod._clear_agent_error()
+
+        with (
+            patch.dict(sys.modules, {"openai": fake_openai}),
+            patch.object(agent_mod.time, "sleep"),
+            patch.object(agent_mod, "run_agent", return_value=fake_session),
+            patch.object(agent_mod, "_get_last_assistant_has_tool_calls", return_value=False),
+            patch.object(agent_mod, "_build_conversation_for_user_agent", return_value=[]),
+        ):
+            result = agent_mod.run_agent_with_user_agent(
+                "sess-1", str(task_yaml), 60,
+                {"api_key": "k", "base_url": "http://ua", "model_id": "m"},
+            )
+
+        try:
+            assert result == "", "outage must fail the trial, not return a session file"
+            error = agent_mod.last_agent_error()
+            assert error and "user_agent" in error
+        finally:
+            agent_mod._clear_agent_error()
+
+    def test_user_agent_done_still_breaks_as_satisfied(self, tmp_path):
+        """A genuine [DONE] reply keeps the satisfied fast path: the session
+        file is returned and no agent error is recorded."""
+        import ce_runner.agent as agent_mod
+
+        task_yaml = tmp_path / "task.yaml"
+        task_yaml.write_text(
+            "task_id: C01zh_mortgage_prepay\n"
+            "user_agent:\n"
+            "  enabled: true\n"
+            "  persona: p\n"
+            "  max_rounds: 3\n"
+        )
+        fake_session = str(tmp_path / "session.jsonl")
+        fake_openai = MagicMock()
+        client = MagicMock()
+        done_resp = MagicMock()
+        done_resp.choices[0].message.content = "ok, [DONE]"
+        client.chat.completions.create.return_value = done_resp
+        fake_openai.OpenAI.return_value = client
+        agent_mod._clear_agent_error()
+
+        with (
+            patch.dict(sys.modules, {"openai": fake_openai}),
+            patch.object(agent_mod, "run_agent", return_value=fake_session),
+            patch.object(agent_mod, "_get_last_assistant_has_tool_calls", return_value=False),
+            patch.object(agent_mod, "_build_conversation_for_user_agent", return_value=[]),
+        ):
+            result = agent_mod.run_agent_with_user_agent(
+                "sess-1", str(task_yaml), 60,
+                {"api_key": "k", "base_url": "http://ua", "model_id": "m"},
+            )
+
+        try:
+            assert result == fake_session
+            assert agent_mod.last_agent_error() == ""
+        finally:
+            agent_mod._clear_agent_error()
+
 
 class TestServiceHealthCheck:
     """Test service health check before execution."""
