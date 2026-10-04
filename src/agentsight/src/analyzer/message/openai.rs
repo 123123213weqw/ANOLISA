@@ -220,7 +220,13 @@ impl OpenAIParser {
         // instead reject a request carrying both spellings as a duplicate
         // field, losing the request.
         let mut body = body.clone();
-        if body.get("max_tokens").is_none() {
+        // Some clients (e.g. LangChain JS) serialise an unset cap as an
+        // explicit `null` instead of omitting the key. Null is absence, not
+        // an explicit cap, so the modern spelling must still be read.
+        let explicit_max_tokens = body
+            .get("max_tokens")
+            .is_some_and(|cap| !cap.is_null());
+        if !explicit_max_tokens {
             if let Some(cap) = body
                 .get("max_completion_tokens")
                 .and_then(|cap| cap.as_u64())
@@ -295,8 +301,13 @@ impl OpenAIParser {
         // The Responses API spells the output cap `max_output_tokens`; the
         // normalized chat view must carry it into `max_tokens` so the
         // downstream consumers of the chat shape (token-limit interruption
-        // rules, telemetry) see the cap.
-        if body.get("max_tokens").is_none() {
+        // rules, telemetry) see the cap. A `max_tokens` that is present but
+        // null is an unset cap (some clients serialise absence that way), not
+        // an explicit value that must win.
+        let explicit_max_tokens = body
+            .get("max_tokens")
+            .is_some_and(|cap| !cap.is_null());
+        if !explicit_max_tokens {
             if let Some(max_output_tokens) = body.get("max_output_tokens") {
                 normalized["max_tokens"] = max_output_tokens.clone();
             }
@@ -877,6 +888,39 @@ mod tests {
         let request = OpenAIParser::parse_request(&json).expect("request must still parse");
         assert_eq!(request.max_tokens, None);
         assert_eq!(request.messages.len(), 1);
+    }
+
+    /// Some clients (e.g. LangChain JS) serialise an unset `max_tokens` as an
+    /// explicit `null` instead of omitting the key. Null is absence, not an
+    /// explicit cap, so the modern `max_completion_tokens` spelling must still
+    /// be read — `max_tokens: null` used to suppress the copy and the request
+    /// lost its output cap.
+    #[test]
+    fn test_parse_request_null_max_tokens_defers_to_max_completion_tokens() {
+        let json = serde_json::json!({
+            "model": "o3",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": null,
+            "max_completion_tokens": 2048
+        });
+
+        let request = OpenAIParser::parse_request(&json).expect("request must parse");
+        assert_eq!(request.max_tokens, Some(2048));
+    }
+
+    /// The Responses-API spelling of the same shape: `max_tokens: null` with
+    /// `max_output_tokens` carrying the real cap.
+    #[test]
+    fn test_parse_request_responses_null_max_tokens_defers_to_max_output_tokens() {
+        let json = serde_json::json!({
+            "model": "gpt-5",
+            "input": "Hello",
+            "max_tokens": null,
+            "max_output_tokens": 512
+        });
+
+        let request = OpenAIParser::parse_request(&json).expect("request must parse");
+        assert_eq!(request.max_tokens, Some(512));
     }
 
     #[test]
