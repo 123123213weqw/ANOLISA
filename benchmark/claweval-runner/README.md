@@ -113,6 +113,10 @@ ce-runner supports three task prefixes with different execution modes:
 | `--trace-prefix` | `openclaw` | Prefix for trace directory name |
 | `--skip-preflight` | false | Skip openclaw plugins + docker pre-flight checks |
 
+Task IDs selected via `--tasks-file`/`--tasks-string` must be unique. Duplicates are
+rejected before execution because worker slots and sandbox host ports are keyed by
+task, so a repeated task would run twice against one shared slot.
+
 ## Output
 
 ```

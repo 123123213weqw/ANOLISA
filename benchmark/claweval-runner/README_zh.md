@@ -113,6 +113,9 @@ ce-runner 支持三种任务前缀,对应不同执行模式:
 | `--trace-prefix` | `openclaw` | trace 目录名前缀 |
 | `--skip-preflight` | false | 跳过 openclaw 插件 + docker 预检 |
 
+通过 `--tasks-file`/`--tasks-string` 选择的任务 ID 必须唯一。重复 ID 会在执行前被拒绝，
+因为 worker 槽位和 sandbox 宿主端口按任务分配，重复任务会在同一个共享槽位上执行两次。
+
 ## 输出
 
 ```

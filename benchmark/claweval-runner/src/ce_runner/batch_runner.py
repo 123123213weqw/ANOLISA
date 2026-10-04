@@ -127,6 +127,20 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
         source_desc = None
 
     if task_names is not None:
+        # Reject duplicates up front (mirrors swe-runner's duplicate
+        # instance-id rejection): task_slots is keyed by task.yaml, so a
+        # duplicate would collapse both entries onto one agent slot and one
+        # sandbox host port while chunk_tasks still executes it twice.
+        name_counts = {}
+        for name in task_names:
+            name_counts[name] = name_counts.get(name, 0) + 1
+        duplicates = sorted(n for n, c in name_counts.items() if c > 1)
+        if duplicates:
+            log(f"[ERROR] Duplicate tasks in {source_desc}: "
+                f"{', '.join(duplicates)}. Each task must be listed exactly "
+                "once — a duplicate would share one agent slot and sandbox "
+                "host port between two concurrent trials.")
+            sys.exit(1)
         task_dirs = []
         for name in task_names:
             task_path = os.path.join(tasks_dir, name)
