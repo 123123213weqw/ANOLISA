@@ -65,6 +65,7 @@ from hook_utils import (
     parse_version,
     resolve_agent_id,
     resolve_binary,
+    resolve_session_id,
     resolve_tool_call_id,
     run_compress,
     secure_write_text,
@@ -229,7 +230,7 @@ def main() -> None:
         warn("failed to read PostToolUse payload. Passing through unchanged.")
         skip()
 
-    session_id = input_data.get("session_id", "")
+    session_id = resolve_session_id(input_data)
     tool_use_id = resolve_tool_call_id(agent_id, input_data)
     try:
         output_optimization = consume_output_optimization(agent_id, session_id, tool_use_id)

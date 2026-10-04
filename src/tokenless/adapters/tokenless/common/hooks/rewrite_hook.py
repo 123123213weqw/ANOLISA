@@ -28,6 +28,7 @@ from hook_utils import (
     mark_rtk_optimized,
     resolve_agent_id,
     resolve_binary,
+    resolve_session_id,
     resolve_tool_call_id,
     run_compress,
     skip,
@@ -61,7 +62,7 @@ def main() -> None:
     if not isinstance(command, str) or not command:
         skip()
 
-    session_id = input_data.get("session_id", "")
+    session_id = resolve_session_id(input_data)
     tool_use_id = resolve_tool_call_id(_AGENT_ID, input_data)
     if not tool_use_id:
         skip()

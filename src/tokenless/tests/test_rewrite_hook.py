@@ -232,6 +232,42 @@ class HookLifecycleStateTest(unittest.TestCase):
         unclaimed = [path for path in state_dir.iterdir() if ".consuming." not in path.name]
         self.assertLessEqual(len(unclaimed), 1024)
 
+    def test_hostile_session_id_shapes_fail_open(self) -> None:
+        for hostile in [{"weird": 1}, ["arr"], 7, True]:
+            with self.subTest(shape=hostile):
+                rewritten = self.run_hook(
+                    corpus.PRE_TOOL_HOOK,
+                    pre_tool_payload() | {"session_id": hostile},
+                )
+                self.assertIn("hookSpecificOutput", rewritten)
+                self.assertEqual(
+                    self.requests()[-1]["attribution"],
+                    {"agent_id": "qoder-cli", "tool_use_id": "call-1"},
+                )
+
+    def test_hostile_tool_use_id_shapes_skip_without_spawning(self) -> None:
+        before = len(self.requests()) if self.request_log.exists() else 0
+        for hostile in [{"weird": 1}, ["arr"], 7]:
+            with self.subTest(shape=hostile):
+                payload = pre_tool_payload() | {"tool_use_id": hostile}
+                self.assertEqual(self.run_hook(corpus.PRE_TOOL_HOOK, payload), {})
+        after = len(self.requests()) if self.request_log.exists() else 0
+        self.assertEqual(after, before)
+
+    def test_post_tool_hostile_identifier_shapes_fail_open(self) -> None:
+        for hostile in [{"weird": 1}, ["arr"], 7]:
+            with self.subTest(shape=hostile):
+                payload = post_tool_payload("call-1") | {
+                    "session_id": hostile,
+                    "tool_use_id": hostile,
+                }
+                envelope = self.run_hook(RESPONSE_HOOK, payload)
+                self.assertIn("hookSpecificOutput", envelope)
+                self.assertEqual(
+                    self.requests()[-1]["attribution"],
+                    {"agent_id": "qoder-cli"},
+                )
+
     def test_qwen_lifecycle_commands_pin_agent_id(self) -> None:
         manifest = json.loads(QWEN_MANIFEST.read_text().replace("@VERSION@", "test"))
         rewrite = manifest["hooks"]["PreToolUse"][1]["hooks"][0]["command"]

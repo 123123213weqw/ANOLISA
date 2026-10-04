@@ -472,14 +472,30 @@ def resolve_tool_call_id(agent_id: str, input_data: dict) -> str:
     normalizes to ``tool_call_id`` on the wire). For the qwencode agent,
     prefer the provider call ID and fall back to the internal one; for other
     agents, keep the existing priority (``tool_use_id`` first).
+
+    A hostile payload may carry a non-string identifier (number, list,
+    object); it fails open to ``""`` so the state key stays a string join.
     """
     if agent_id == "qwencode":
-        return (
+        candidate = (
             input_data.get("tool_call_id")
             or input_data.get("toolCallId")
             or input_data.get("tool_use_id", "")
         )
-    return input_data.get("tool_use_id") or input_data.get("toolCallId", "")
+    else:
+        candidate = input_data.get("tool_use_id") or input_data.get("toolCallId", "")
+    return candidate if isinstance(candidate, str) else ""
+
+
+def resolve_session_id(input_data: dict) -> str:
+    """Resolve the session identifier for hook state pairing.
+
+    Like resolve_tool_call_id, a non-string ``session_id`` (number, list,
+    object) from a hostile or foreign payload fails open to ``""`` instead
+    of crashing the "\0".join state key with a TypeError.
+    """
+    session_id = input_data.get("session_id", "")
+    return session_id if isinstance(session_id, str) else ""
 
 
 def secure_write_text(path: str, content: str) -> None:
