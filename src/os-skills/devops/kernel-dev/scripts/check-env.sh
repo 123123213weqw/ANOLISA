@@ -105,13 +105,38 @@ else
     for pkg in "${MISSING[@]}"; do
         echo "    - $pkg"
     done
+    # kernel-build-dir is a missing-directory marker, not a package.
+    # yum/dnf fail the whole transaction when one name has no match, so
+    # it must never appear in the suggested install command. The
+    # build-directory hint below only applies when the directory is
+    # actually one of the missing things.
+    INSTALLABLE=()
+    BUILD_DIR_MISSING=0
+    for pkg in "${MISSING[@]}"; do
+        if [ "$pkg" = "kernel-build-dir" ]; then
+            BUILD_DIR_MISSING=1
+        else
+            INSTALLABLE+=("$pkg")
+        fi
+    done
     echo ""
     echo -e "${YELLOW}To install missing packages, run:${NC}"
     echo ""
     if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "aarch64" ]; then
-        echo "  sudo yum install -y ${MISSING[*]}"
+        if [ ${#INSTALLABLE[@]} -gt 0 ]; then
+            echo "  sudo yum install -y ${INSTALLABLE[*]}"
+        fi
     else
         echo "  Please install the missing packages manually."
+    fi
+    if [ "$BUILD_DIR_MISSING" -eq 1 ]; then
+        echo ""
+        echo -e "${YELLOW}For the missing kernel build directory:${NC}"
+        echo ""
+        echo "  Install the matching devel package (kernel-devel-$KERNEL_VER) and"
+        echo "  verify /lib/modules/$KERNEL_VER/build exists afterwards; if the"
+        echo "  running kernel is newer than the installed kernel-devel, reboot"
+        echo "  into the kernel that has its devel package installed."
     fi
     exit 1
 fi
