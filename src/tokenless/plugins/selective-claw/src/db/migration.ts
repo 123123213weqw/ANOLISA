@@ -48,6 +48,8 @@ export function runMigrations(db: DatabaseSync): void {
           INSERT INTO messages_fts(messages_fts, rowid, content) VALUES('delete', old.message_id, old.content);
           INSERT INTO messages_fts(rowid, content) VALUES (new.message_id, new.content);
         END;
+
+        INSERT INTO messages_fts(messages_fts) VALUES('rebuild');
       `);
     } catch {
       // FTS5 not available in this SQLite build — full-text search will be unavailable

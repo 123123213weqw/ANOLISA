@@ -184,4 +184,30 @@ describe("MessageStore", () => {
       expect(store.getDistinctTurnSeqs("s1")).toEqual([]);
     });
   });
+
+  describe("FTS availability migration", () => {
+    it("indexes archived rows when the full-text table is created later", () => {
+      store.createMessage({ sessionId: "s1", seq: 1, turnSeq: 1, role: "user", content: "legacyunique", tokenCount: 1 });
+      db.exec("DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TRIGGER messages_au; DROP TABLE messages_fts;");
+
+      runMigrations(db);
+      expect(store.searchMessages("s1", "legacyunique", 10).map((message) => message.seq)).toEqual([1]);
+      runMigrations(db);
+      expect(store.searchMessages("s1", "legacyunique", 10)).toHaveLength(1);
+    });
+
+    it("keeps insert, update and delete triggers usable for rebuilt archive rows", () => {
+      store.createMessage({ sessionId: "s1", seq: 1, turnSeq: 1, role: "user", content: "archivedword", tokenCount: 1 });
+      db.exec("DROP TRIGGER messages_ai; DROP TRIGGER messages_ad; DROP TRIGGER messages_au; DROP TABLE messages_fts;");
+      runMigrations(db);
+
+      expect(() => db.exec("UPDATE messages SET content = 'updatedword' WHERE seq = 1")).not.toThrow();
+      expect(store.searchMessages("s1", "archivedword", 10)).toEqual([]);
+      expect(store.searchMessages("s1", "updatedword", 10)).toHaveLength(1);
+      store.createMessage({ sessionId: "s1", seq: 2, turnSeq: 2, role: "user", content: "insertedword", tokenCount: 1 });
+      expect(store.searchMessages("s1", "insertedword", 10)).toHaveLength(1);
+      db.exec("DELETE FROM messages WHERE seq = 1");
+      expect(store.searchMessages("s1", "updatedword", 10)).toEqual([]);
+    });
+  });
 });
