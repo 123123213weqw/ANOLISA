@@ -206,6 +206,41 @@ fn hermes_nested_skill_md_readable() {
 }
 
 // -----------------------------------------------------------------------
+// 5b. Hermes category listing hides store-hidden dot dirs
+// -----------------------------------------------------------------------
+
+#[test]
+fn hermes_category_listing_hides_a_hidden_skill_dir() {
+    skip_if_no_fuse!();
+
+    let fix = MountFixture::normal_hermes(|dir| {
+        seed_hermes_workspace(dir);
+        let apple = dir.join("apple");
+        // A dot-prefixed directory carrying SKILL.md: the store loader skips
+        // hidden directories, so it is never a managed Skill and the flat
+        // /skills listing cannot surface it. The category listing must not
+        // surface it either.
+        create_skill_dir(&apple, ".hidden-skill");
+        // Plain dot content is not a Skill and stays listed.
+        std::fs::write(apple.join(".DS_Store"), "").unwrap();
+    });
+
+    let entries = list_dir_names(&fix.mountpoint().join("skills/apple"));
+    assert!(
+        !entries.contains(&".hidden-skill".to_string()),
+        "a hidden skill directory must not be listed, got: {entries:?}"
+    );
+    assert!(
+        entries.contains(&"apple-notes".to_string()),
+        "ordinary nested skills must stay listed, got: {entries:?}"
+    );
+    assert!(
+        entries.contains(&".DS_Store".to_string()),
+        "plain dot content must stay listed, got: {entries:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // 6. Management path changes do not trigger notify
 //    (path classification unit test — management paths produce HermesMeta
 //     which mutate callbacks skip for observe_mutation)
