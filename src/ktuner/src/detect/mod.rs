@@ -551,6 +551,19 @@ fn read_comm_from(path: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
+/// Read a process's `/proc/<pid>/cmdline` as text, lossily.
+///
+/// The kernel stores argv as raw NUL-terminated bytes, so one non-UTF-8 byte
+/// anywhere in a command line makes `read_to_string` reject the whole file.
+/// The command line is where a JVM's concrete service and an exporter's full
+/// name live, so a rejected read dropped that mapping even though the workload
+/// was running. Lossy decoding keeps the ASCII tokens the matching below
+/// compares; the ordinary path is unchanged.
+fn read_cmdline_from(path: &str) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 fn read_processes() -> Result<Vec<ProcessInfo>> {
     let mut procs = Vec::new();
     let proc_dir = "/proc";
@@ -616,13 +629,11 @@ pub(crate) fn is_monitoring_helper_name(name: &str) -> bool {
 /// server by name alone. The command line keeps the full name the process was
 /// started with, so it decides when the truncated name does not.
 pub(crate) fn is_monitoring_helper(pid: &str) -> bool {
-    let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
-        .map(|comm| comm.trim().to_string())
-        .unwrap_or_default();
+    let comm = read_comm_from(&format!("/proc/{pid}/comm")).unwrap_or_default();
     if is_monitoring_helper_name(&comm) {
         return true;
     }
-    fs::read_to_string(format!("/proc/{pid}/cmdline"))
+    read_cmdline_from(&format!("/proc/{pid}/cmdline"))
         .map(|cmdline| cmdline_names_helper(cmdline.split('\0')))
         .unwrap_or(false)
 }
@@ -661,7 +672,7 @@ fn is_generic_runtime(comm: &str) -> bool {
 /// its cmdline (main class / jar / script). Returns a canonical service name
 /// that matches the has_process() checks used by rules and classification.
 fn detect_runtime_service(pid: &str) -> Option<String> {
-    let cmdline = fs::read_to_string(format!("/proc/{pid}/cmdline")).ok()?;
+    let cmdline = read_cmdline_from(&format!("/proc/{pid}/cmdline"))?;
     runtime_service_from_cmdline(&cmdline).map(str::to_string)
 }
 
@@ -1158,6 +1169,93 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Wait until a freshly spawned child's `/proc/<pid>/cmdline` carries
+    /// `needle`.
+    ///
+    /// `Command::spawn` can return before the kernel publishes the new argv —
+    /// an immediate read is usually empty — so the live-process probes below
+    /// wait for the raw bytes instead of racing the exec.
+    fn wait_for_cmdline(pid: &str, needle: &[u8]) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let found = fs::read(format!("/proc/{pid}/cmdline"))
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle));
+            if found {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "/proc/{pid}/cmdline never contained {needle:?}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// The kernel stores argv as raw NUL-terminated bytes, so one non-UTF-8
+    /// byte anywhere in a command line makes `read_to_string` reject the whole
+    /// file. The service a generic runtime (java/node/...) runs then disappears
+    /// from detection even though the workload is running.
+    #[test]
+    fn detect_runtime_service_reads_non_utf8_cmdline() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::process::CommandExt;
+        // The raw byte rides in argv[0]; /bin/sleep ignores argv[0] and reads
+        // only the "30" operand, so the process stays alive for the probe.
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg0(std::ffi::OsStr::from_bytes(b"/opt/apps/elasticsearch\xff"))
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a process with a non-UTF-8 cmdline");
+        let pid = child.id().to_string();
+        wait_for_cmdline(&pid, b"elasticsearch\xff");
+
+        let service = detect_runtime_service(&pid);
+
+        child.kill().ok();
+        child.wait().ok();
+
+        assert_eq!(
+            service.as_deref(),
+            Some("elasticsearch"),
+            "a raw argv byte must not hide the service the runtime runs"
+        );
+    }
+
+    /// An exporter's distinguishing suffix survives only in the command line
+    /// (comm truncates at 15 bytes), and that command line is raw argv bytes
+    /// too. A stray byte in the program path must not stop the collector from
+    /// being filtered out of the process list.
+    #[test]
+    fn monitoring_helper_detection_reads_non_utf8_cmdline() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("ktuner_stray_byte_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let dir = root.join(std::ffi::OsStr::from_bytes(b"apps\xff"));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let exporter_path = dir.join("postgres_exporter");
+        fs::copy("/bin/sleep", &exporter_path).expect("copy sleep to exporter name");
+
+        let mut exporter = std::process::Command::new(&exporter_path)
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn exporter-named process");
+        let pid = exporter.id().to_string();
+        wait_for_cmdline(&pid, b"postgres_exporter");
+
+        let helper = is_monitoring_helper(&pid);
+
+        exporter.kill().ok();
+        exporter.wait().ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            helper,
+            "a non-UTF-8 program path must not hide the collector"
+        );
     }
 
     #[test]
