@@ -572,16 +572,19 @@ impl GenAISqliteStore {
         limit: usize,
     ) -> Vec<crate::interruption::RecentCallSummary> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        // Subquery fetches latest N rows desc, outer query reverses to asc order
+        // Subquery fetches latest N rows desc, outer query reverses to asc order.
+        // Both sorts tiebreak on the autoincrement `id` in the primary sort's
+        // direction, so equal timestamps keep a deterministic order (and, at
+        // the LIMIT boundary, a deterministic row selection).
         let sql = "SELECT call_id, output_messages, COALESCE(input_tokens, 0), COALESCE(output_tokens, 0) \
-                   FROM (SELECT call_id, output_messages, input_tokens, output_tokens, start_timestamp_ns \
+                   FROM (SELECT call_id, output_messages, input_tokens, output_tokens, start_timestamp_ns, id \
                          FROM genai_events \
                          WHERE event_type = 'llm_call' \
                            AND conversation_id = ?1 \
                            AND status != 'pending' \
-                         ORDER BY start_timestamp_ns DESC \
+                         ORDER BY start_timestamp_ns DESC, id DESC \
                          LIMIT ?2) \
-                   ORDER BY start_timestamp_ns ASC";
+                   ORDER BY start_timestamp_ns ASC, id ASC";
         let mut stmt = match conn.prepare(sql) {
             Ok(s) => s,
             Err(_) => return vec![],

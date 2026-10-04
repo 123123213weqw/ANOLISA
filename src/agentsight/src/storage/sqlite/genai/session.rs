@@ -262,9 +262,11 @@ impl GenAISqliteStore {
         let mut result = std::collections::HashMap::new();
 
         for sid in session_ids {
+            // `id` (autoincrement) tiebreaks equal timestamps so turn numbers
+            // stay deterministic; its ASC direction matches the primary sort.
             let sql = "SELECT call_id FROM genai_events \
                        WHERE event_type = 'llm_call' AND session_id = ?1 \
-                       ORDER BY start_timestamp_ns ASC";
+                       ORDER BY start_timestamp_ns ASC, id ASC";
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![sid], |row| {
                 // `call_id` is nullable in the schema; a NULL (only producible
@@ -302,9 +304,11 @@ impl GenAISqliteStore {
         let mut result = std::collections::HashMap::new();
 
         for sid in session_ids {
+            // Same id tiebreak as get_call_turn_indices: deterministic turns
+            // when two calls share a timestamp.
             let sql = "SELECT call_id, tool_call_ids FROM genai_events \
                        WHERE event_type = 'llm_call' AND session_id = ?1 \
-                       ORDER BY start_timestamp_ns ASC";
+                       ORDER BY start_timestamp_ns ASC, id ASC";
             let mut stmt = conn.prepare(sql)?;
             let rows = stmt.query_map(params![sid], |row| {
                 // `call_id` is nullable in the schema; a NULL (only producible

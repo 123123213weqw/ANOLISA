@@ -1100,6 +1100,112 @@ fn call_turn_indices_survives_null_call_id_row() {
     // The malformed row must not poison other sessions either.
     assert_eq!(m["call-4"], 1);
     assert!(m.contains_key("call-5"));
+/// Raw fixture insert of a completed `llm_call` row with an explicit
+/// timestamp, so tests can build rows that tie on `start_timestamp_ns`.
+fn insert_tied_call(
+    store: &GenAISqliteStore,
+    call_id: &str,
+    ts_ns: i64,
+    tool_call_ids: Option<&str>,
+) {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO genai_events (\
+         call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns,\
+         provider, model, input_tokens, output_tokens, total_tokens,\
+         session_id, trace_id, conversation_id, agent_name, pid,\
+         status, tool_call_ids, event_json, process_name, user_query\
+         ) VALUES (?1,'llm_call',?2,?2,0,'openai','gpt-4',10,5,15,\
+         'sess-1','trace-1','conv-1','agent-a',100,'complete',?3,'{}','proc-a',NULL)",
+        params![call_id, ts_ns, tool_call_ids],
+    )
+    .unwrap();
+}
+
+/// Two calls that tie on `start_timestamp_ns` must get deterministic turn
+/// numbers: the tiebreak is the autoincrement `id` in the primary sort's ASC
+/// direction, i.e. insertion order (same shape as the prune ORDER BY).
+#[test]
+fn turn_indices_tiebreak_equal_timestamps_by_id() {
+    let (store, path) = create_populated_store("tc_tie_id");
+    // Both tied rows sit between call-3 (b+2s) and call-6 (b+5s); tie-a is
+    // inserted first, so its id is smaller and it must sort before tie-b.
+    insert_tied_call(
+        &store,
+        "tie-a",
+        BASE_NS + 3 * STEP_NS,
+        Some(r#"["tc-tie-a"]"#),
+    );
+    insert_tied_call(
+        &store,
+        "tie-b",
+        BASE_NS + 3 * STEP_NS,
+        Some(r#"["tc-tie-b"]"#),
+    );
+
+    let first = store.get_call_turn_indices(&["sess-1"]).unwrap();
+    assert_eq!(first["tie-a"], 4);
+    assert_eq!(first["tie-b"], 5);
+    // Untouched rows keep their turns, and a strictly later timestamp still
+    // sorts after both ties.
+    assert_eq!(first["call-1"], 1);
+    assert_eq!(first["call-2"], 2);
+    assert_eq!(first["call-3"], 3);
+    assert_eq!(first["call-6"], 6);
+
+    // Repeated queries must return the identical assignment.
+    for _ in 0..8 {
+        assert_eq!(store.get_call_turn_indices(&["sess-1"]).unwrap(), first);
+    }
+
+    let tools = store.get_tool_call_turn_indices(&["sess-1"]).unwrap();
+    assert_eq!(tools["tc-tie-a"].turn_index, 4);
+    assert_eq!(tools["tc-tie-b"].turn_index, 5);
+    assert_eq!(tools["tc-tie-a"].session_id, "sess-1");
+    assert_eq!(tools["tie-a"].turn_index, 4);
+    assert_eq!(tools["tie-b"].turn_index, 5);
+    for _ in 0..8 {
+        assert_eq!(
+            store.get_tool_call_turn_indices(&["sess-1"]).unwrap()["tie-b"].turn_index,
+            5
+        );
+    }
+    cleanup_db(&path);
+}
+
+/// `get_recent_calls_for_conversation` orders DESC with LIMIT then re-sorts
+/// ASC; both stages tiebreak on `id` in the primary sort's direction, so a
+/// tie at the LIMIT boundary selects and emits rows deterministically.
+#[test]
+fn recent_calls_tiebreak_equal_timestamps_by_id() {
+    let (store, path) = create_populated_store("recent_tie_id");
+    // conv-1 completed rows: call-1 (b), call-2 (b+1s), call-6 (b+5s) from the
+    // fixture, plus this tie at b+3s. tie-a is inserted first (smaller id).
+    insert_tied_call(&store, "tie-a", BASE_NS + 3 * STEP_NS, None);
+    insert_tied_call(&store, "tie-b", BASE_NS + 3 * STEP_NS, None);
+
+    let ids = |limit: usize| {
+        store
+            .get_recent_calls_for_conversation("conv-1", limit)
+            .into_iter()
+            .map(|r| r.call_id)
+            .collect::<Vec<_>>()
+    };
+
+    // limit=3 keeps the newest rows: call-6, then the b+3s tie in insertion
+    // order once the outer ASC sort re-orders it.
+    assert_eq!(ids(3), vec!["tie-a", "tie-b", "call-6"]);
+    // limit=2 cuts inside the tie: the later insert (larger id) wins the
+    // boundary slot under DESC, then the outer ASC sort puts it last.
+    assert_eq!(ids(2), vec!["tie-b", "call-6"]);
+    // No limit pressure: plain oldest-first, ties in insertion order.
+    assert_eq!(ids(5), vec!["call-1", "call-2", "tie-a", "tie-b", "call-6"]);
+
+    // Repeated queries must return the identical selection and order.
+    for _ in 0..8 {
+        assert_eq!(ids(3), vec!["tie-a", "tie-b", "call-6"]);
+        assert_eq!(ids(2), vec!["tie-b", "call-6"]);
+    }
     cleanup_db(&path);
 }
 
