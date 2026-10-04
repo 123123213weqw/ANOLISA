@@ -942,6 +942,19 @@ impl SkillFs {
                     return;
                 }
                 if self.should_reject_hidden_write(skill_name, None) {
+                    // Audit the rejection with the `hidden_skill` class the
+                    // xattr gate established (#5183) so a hidden skill's
+                    // metadata probes leave a trace — the same convention
+                    // the other mutating callbacks follow.
+                    self.emit_op_event_with_detail(
+                        req,
+                        &path_type,
+                        SkillEventKind::Metadata,
+                        SkillEventAction::Rejected,
+                        Some(libc::ENOENT),
+                        None,
+                        Some("class=hidden_skill".to_string()),
+                    );
                     reply.error(libc::ENOENT);
                     return;
                 }
@@ -1086,6 +1099,19 @@ impl SkillFs {
                 _ => false,
             };
             if reject {
+                // Audit the rejection with the `hidden_skill` class the
+                // xattr gate established (#5183) so a hidden skill's
+                // chmod/chown/truncate/utimens probes leave a trace — the
+                // same convention the other mutating callbacks follow.
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Metadata,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
                 reply.error(libc::ENOENT);
                 return;
             }
