@@ -126,8 +126,8 @@ but the current raw backend ignores their values.
 - Linux (x86_64 / aarch64) or macOS 11+ (arm64 / x86_64, limited)
 
 Intel macOS prebuilt and npm support requires a release containing the
-`darwin-x64` platform package. The website installer remains ARM-only until
-that release is published and the installer is enabled separately.
+`darwin-x64` platform package. The website installer accepts both ARM and
+Intel Macs running macOS 11 or later.
 - Rust ≥ 1.93 (for source build)
 
 ## License
