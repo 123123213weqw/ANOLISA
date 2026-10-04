@@ -770,6 +770,33 @@ fn err_reason<T>(result: &Result<T, Box<dyn std::error::Error>>) -> Option<Strin
     result.as_ref().err().map(|e| e.to_string())
 }
 
+/// Render untrusted source-tree text for one-line diagnostics.
+///
+/// Directory names and parser messages come from the source tree, so they
+/// can contain ESC (terminal control), newlines, or other control bytes.
+/// Printing them raw lets a name clear the screen, move the cursor, or forge
+/// additional diagnostic lines. Control characters become visible escapes
+/// (`\n`, `\u{1b}`, …) and a literal backslash is doubled so the rendering is
+/// unambiguous; ordinary text, including non-ASCII names, stays readable.
+fn escape_for_diagnostics(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut escaped = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '\\' => escaped.push_str("\\\\"),
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            ch if ch.is_control() => {
+                let _ = write!(escaped, "\\u{{{:x}}}", ch as u32);
+            }
+            ch => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
 /// Guarantees each CLI command emits exactly one SLS ops record on every exit
 /// path. It is armed in `main` before logging is initialized, so the `Drop`
 /// fallback is live if tracing's internal error report panics after an early
@@ -3257,7 +3284,35 @@ async fn cmd_list(source: PathBuf, enabled_only: bool) -> Result<(), Box<dyn std
     // Load skills
     let mut store = SkillStore::new();
     let config = ParseConfig::default();
-    let _errors = store.load_from_directory(&source, &config);
+    let load_errors = store.load_from_directory(&source, &config);
+
+    // A skill whose SKILL.md cannot be loaded (unreadable, oversized past
+    // max_skill_size, non-UTF-8 name, ...) is absent from the store, so list
+    // silently omitted it — and a tree where every skill fails to load looked
+    // empty ("No skills found", exit 0). Surface every load error like
+    // `mount` does; list stays a non-fatal inspection for the skills that did
+    // load.
+    if !load_errors.is_empty() {
+        warn!(count = load_errors.len(), "some skills failed to load");
+        for err in &load_errors {
+            warn!(
+                path = %escape_for_diagnostics(&err.path.display().to_string()),
+                error = %escape_for_diagnostics(&err.error),
+                "load error"
+            );
+        }
+        eprintln!(
+            "warning: skipped {} unloadable skill(s):",
+            load_errors.len()
+        );
+        for err in &load_errors {
+            eprintln!(
+                "  - {}: {}",
+                escape_for_diagnostics(&err.path.display().to_string()),
+                escape_for_diagnostics(&err.error)
+            );
+        }
+    }
 
     let names = store.list();
 
@@ -3427,6 +3482,16 @@ mod tests {
         )
         .expect("write snapshot skill");
         skill_dir.join(".skill-meta/activation.json")
+    }
+
+    #[test]
+    fn escape_for_diagnostics_renders_control_bytes_visibly() {
+        assert_eq!(
+            escape_for_diagnostics("evil\u{1b}[2J-name\nline2\t\\"),
+            "evil\\u{1b}[2J-name\\nline2\\t\\\\"
+        );
+        // Ordinary text, including non-ASCII names, stays readable.
+        assert_eq!(escape_for_diagnostics("技能/alpha"), "技能/alpha");
     }
 
     #[test]
