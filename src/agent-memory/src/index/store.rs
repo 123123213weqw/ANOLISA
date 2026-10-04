@@ -208,6 +208,25 @@ impl BM25Store {
         Ok(())
     }
 
+    /// Count index rows whose `agent_id` is still NULL.
+    ///
+    /// The schema-v5 migration adds `agent_id` with `DEFAULT NULL` and no
+    /// backfill, so every row indexed before the upgrade stays NULL
+    /// afterwards; an older write path could strand NULL rows the same
+    /// way. Under `isolated:<id>` such rows are invisible to every agent
+    /// via `memory_search` (still reachable through the unscoped Tier A
+    /// tools); under `filter:<id>` they are shared with everyone. This
+    /// count powers the startup operator warning — it is read-only and
+    /// deliberately never touches a query path.
+    pub fn count_unscoped_rows(&self) -> Result<usize> {
+        let n: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM files WHERE agent_id IS NULL",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(n as usize)
+    }
+
     /// Insert or replace a file's index entry. `body` is the extracted
     /// text. All writes happen inside one transaction so a crash mid-
     /// upsert can't leave `files` and `files_fts` out of sync.
@@ -1477,6 +1496,83 @@ mod tests {
         // FTS row for the cascaded body is also gone.
         let hits = s.search("alpha", 5, true).unwrap();
         assert!(hits.is_empty());
+    }
+
+    /// Documents the v4→v5 migration behavior that the startup warning
+    /// reports: the migration adds `agent_id` with DEFAULT NULL and no
+    /// backfill, so a pre-upgrade row ends up `agent_id IS NULL` —
+    /// invisible to its owner under `isolated:<id>`, shared with every
+    /// agent under `filter:<id>`. Asserted at the store level on a
+    /// faithful v4 database; if a future change makes the migration
+    /// assign ownership, this pin must be updated consciously.
+    #[test]
+    fn v4_to_v5_migration_leaves_rows_unscoped() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let path = tmp.path();
+        {
+            let conn = Connection::open(path).unwrap();
+            conn.execute_batch(
+                r#"
+                CREATE TABLE files (
+                    rowid       INTEGER PRIMARY KEY,
+                    path        TEXT NOT NULL UNIQUE,
+                    mtime_ms    INTEGER NOT NULL,
+                    size        INTEGER NOT NULL,
+                    indexed_at  TEXT NOT NULL
+                );
+                CREATE VIRTUAL TABLE files_fts USING fts5(
+                    path UNINDEXED, body, tokenize='trigram'
+                );
+                CREATE TABLE files_vec (
+                    path TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL
+                );
+                ALTER TABLE files ADD COLUMN access_count INTEGER DEFAULT 0;
+                ALTER TABLE files ADD COLUMN last_accessed_ms INTEGER DEFAULT 0;
+                ALTER TABLE files ADD COLUMN is_cold INTEGER DEFAULT 0;
+                ALTER TABLE files ADD COLUMN is_superseded INTEGER DEFAULT 0;
+                INSERT INTO files (path, mtime_ms, size, indexed_at)
+                    VALUES ('legacy.md', 1, 4, '2026-01-01T00:00:00Z');
+                INSERT INTO files_fts(rowid, path, body)
+                    VALUES (1, 'legacy.md', 'pomeranian falcon legacy body');
+                PRAGMA user_version = 4;
+                "#,
+            )
+            .unwrap();
+        }
+        let s = BM25Store::open_for_test(path).unwrap();
+
+        // The pre-upgrade row exists and is queryable unscoped...
+        assert_eq!(s.count().unwrap(), 1);
+        assert_eq!(s.count_unscoped_rows().unwrap(), 1);
+
+        // ...invisible to its owner under isolated scope...
+        let own = s
+            .search_scoped("pomeranian", 10, true, Some("isolated:owner"))
+            .unwrap();
+        assert!(own.is_empty(), "isolated:owner sees {own:?}");
+
+        // ...and visible to a different agent under filter scope (NULL
+        // passes `agent_id IS NULL`).
+        let other = s
+            .search_scoped("pomeranian", 10, true, Some("filter:someone-else"))
+            .unwrap();
+        assert_eq!(other.len(), 1);
+        assert_eq!(other[0].path, "legacy.md");
+    }
+
+    #[test]
+    fn count_unscoped_rows_counts_only_null_rows() {
+        let mut s = BM25Store::open_in_memory().unwrap();
+        assert_eq!(s.count_unscoped_rows().unwrap(), 0);
+        s.upsert("owned.md", 100, 10, "owned body", Some("alpha"))
+            .unwrap();
+        assert_eq!(s.count_unscoped_rows().unwrap(), 0);
+        s.upsert("null-a.md", 100, 10, "unscoped body a", None)
+            .unwrap();
+        s.upsert("null-b.md", 100, 10, "unscoped body b", None)
+            .unwrap();
+        assert_eq!(s.count_unscoped_rows().unwrap(), 2);
     }
 
     #[test]

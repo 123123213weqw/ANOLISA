@@ -149,6 +149,14 @@ impl IndexHandle {
         store.upsert(rel_path, mtime_ms, size, body, None)
     }
 
+    /// Count index rows whose `agent_id` is still NULL. Read-only
+    /// diagnostics for the startup operator warning — see
+    /// [`BM25Store::count_unscoped_rows`].
+    pub fn count_unscoped_rows(&self) -> Result<usize> {
+        let store = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        store.count_unscoped_rows()
+    }
+
     /// Compact the index: mark old, never-accessed files as cold.
     pub fn compact(&self, cold_after_days: u64) -> Result<usize> {
         let mut store = self.store.lock().unwrap_or_else(|e| e.into_inner());

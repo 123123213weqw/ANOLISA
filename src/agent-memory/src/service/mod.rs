@@ -122,6 +122,46 @@ impl MemoryService {
             }
         };
 
+        // Operator-visible migration diagnostic. The schema-v5 migration
+        // adds `files.agent_id` with DEFAULT NULL and no backfill, so
+        // every row indexed before the upgrade stays `agent_id IS NULL`
+        // afterwards (an older write path could strand NULL rows the same
+        // way). Under `isolated:<id>` those rows are invisible to every
+        // agent via memory_search — silent recall loss — while remaining
+        // reachable through the unscoped Tier A tools (mem_read,
+        // mem_list, mem_grep); under `filter:<id>` they are shared with
+        // every agent. Choosing an owner for the pre-upgrade corpus is an
+        // operator decision, so this reports the count loudly and leaves
+        // query semantics untouched.
+        if let Some(index) = index.as_ref() {
+            if matches!(config.memory.agent_scope.as_str(), "isolated" | "filter") {
+                if let Ok(agent) = std::env::var("MCP_CLIENT_NAME") {
+                    if !agent.is_empty() {
+                        match index.count_unscoped_rows() {
+                            Ok(n) if n > 0 => tracing::warn!(
+                                "memory.agent_scope={:?} is active but {n} index row(s) \
+                                 still have agent_id IS NULL (written before per-agent \
+                                 tagging, e.g. left NULL by the v4->v5 migration): they \
+                                 are invisible to isolated:{agent} memory_search and \
+                                 shared with every agent under filter scopes, while \
+                                 remaining reachable via the unscoped Tier A tools \
+                                 (mem_read, mem_list, mem_grep). Assign an owner to the \
+                                 pre-upgrade corpus (UPDATE files SET agent_id='<id>' \
+                                 WHERE agent_id IS NULL on <mount>/.anolisa/index/bm25.db) \
+                                 or keep agent_scope=\"shared\" to silence this warning",
+                                config.memory.agent_scope
+                            ),
+                            Ok(_) => {}
+                            Err(e) => tracing::warn!(
+                                "could not count unscoped index rows for the scope \
+                                 diagnostic: {e}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(Self {
             mount,
             audit,
