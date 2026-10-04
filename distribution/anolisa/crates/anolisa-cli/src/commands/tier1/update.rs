@@ -1720,6 +1720,35 @@ pub(crate) mod tests {
         }
     }
 
+    /// The terminal channel must match the audit channel's hygiene: the
+    /// failure CliError is rendered verbatim on stderr by
+    /// `self_update::handle` (`return Err(failure.error)`), and it embeds
+    /// the FetchManifest Display, which quotes the full endpoint — an
+    /// `ANOLISA_UPDATE_URL` internal mirror can carry credentials in it.
+    #[test]
+    fn terminal_error_echoes_credentialed_update_url() {
+        let endpoint = "https://ci:s3cret-token@mirror.invalid/release.toml";
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let ctx = self_ctx(tmp.path().to_path_buf(), false);
+        let ops = FakeSelfUpdateOps::new("/usr/bin/anolisa").failing_check_update(endpoint);
+        let query = FakeSelfQuery::new("/usr/bin/anolisa", Vec::new());
+        let txn = FakeSelfTxn::new("anolisa");
+
+        let failure =
+            run_self_update_with_deps(endpoint, "0.1.0", &ctx, &ops, &query, &txn, false, None)
+                .expect_err("an unreachable manifest endpoint must not report success");
+
+        let reason = failure.error.reason();
+        assert!(
+            !reason.contains("s3cret-token"),
+            "the terminal error must not echo the endpoint credential: {reason}"
+        );
+        assert!(
+            reason.contains("failed to fetch release manifest"),
+            "the terminal error must still name the failed step: {reason}"
+        );
+    }
+
     /// The endpoint stays recorded in a form that carries no credentials, so a
     /// withheld failure text still leaves the operator knowing what was
     /// contacted. Scheme and host only: a path segment can hold a bearer token
