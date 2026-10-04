@@ -62,6 +62,12 @@ Environment variables
    * - ``OPENCLAW_MAX_ITERATIONS``
      - ``"0"``
      - Max agent-loop iterations (0 = unlimited).
+   * - ``OPENCLAW_MAX_NO_PROGRESS``
+     - ``"20"``
+     - Abort after this many consecutive iterations in which OpenClaw
+       returns no bash commands (no-progress guard; also bounds unlimited
+       runs, see ``OPENCLAW_MAX_ITERATIONS=0``).  Values below 1 are
+       clamped to 1.
    * - ``OPENCLAW_MAX_STDOUT_BYTES``
      - ``"102400"``
      - Kill OpenClaw subprocess if stdout exceeds this (infinite-generation guard).
@@ -121,6 +127,12 @@ class OpenClawExternalAgent(BaseAgent):
       stdout (API hang).
     * **stdout cap** – kill when stdout exceeds ``_MAX_STDOUT_BYTES``
       (infinite-generation loop).
+
+    On top of those subprocess guardrails the agent loop itself carries a
+    **no-progress guard**: when OpenClaw answers without bash commands for
+    ``OPENCLAW_MAX_NO_PROGRESS`` consecutive iterations (default 20), the
+    loop aborts with a distinct error instead of re-prompting forever —
+    this is what bounds unlimited runs (``OPENCLAW_MAX_ITERATIONS=0``).
     """
 
     # ------------------------------------------------------------------
@@ -144,6 +156,11 @@ class OpenClawExternalAgent(BaseAgent):
     _DEFAULT_DOCKER_EXEC_TIMEOUT: int = 600
     _HEARTBEAT_INTERVAL_SEC: int = 30
     _SLOW_EXEC_THRESHOLD_SEC: int = 60
+
+    # ------------------------------------------------------------------
+    # Agent-loop guard constants
+    # ------------------------------------------------------------------
+    _DEFAULT_MAX_NO_PROGRESS: int = 20
 
     # ------------------------------------------------------------------
     # Path / file constants
@@ -394,9 +411,23 @@ class OpenClawExternalAgent(BaseAgent):
         timeout = os.environ.get("OPENCLAW_TIMEOUT", "600")
         thinking = os.environ.get("OPENCLAW_THINKING", "off")
         max_iterations = int(os.environ.get("OPENCLAW_MAX_ITERATIONS", "0"))
+        # No-progress guard: bound consecutive command-less iterations so
+        # unlimited runs (max_iterations == 0) cannot re-prompt forever.
+        # Values below 1 are clamped to 1 so the guard can never be
+        # configured away into another infinite loop.
+        no_progress_limit = max(
+            1,
+            int(
+                os.environ.get(
+                    "OPENCLAW_MAX_NO_PROGRESS",
+                    str(self._DEFAULT_MAX_NO_PROGRESS),
+                )
+            ),
+        )
 
         current_instruction = self._build_initial_instruction(instruction, container_id)
         iteration = 0
+        consecutive_no_progress = 0
         oc_session_id: str | None = None
 
         while not max_iterations or iteration < max_iterations:
@@ -505,6 +536,7 @@ class OpenClawExternalAgent(BaseAgent):
                 )
 
             if commands:
+                consecutive_no_progress = 0
                 cmd_outputs: list[str] = []
                 for i, cmd_str in enumerate(commands):
                     self.logger.info(
@@ -560,6 +592,14 @@ class OpenClawExternalAgent(BaseAgent):
                     "before claiming completion. Output bash commands in "
                     "```bash``` code blocks to actually perform the task."
                 )
+                consecutive_no_progress += 1
+                if consecutive_no_progress >= no_progress_limit:
+                    final_result = self._no_progress_result(
+                        stdout_text, stderr_text, parsed, container_id,
+                        iteration, all_executions,
+                        consecutive_no_progress, no_progress_limit,
+                    )
+                    break
                 continue
 
             # No commands and not complete – prompt OpenClaw again.
@@ -574,6 +614,14 @@ class OpenClawExternalAgent(BaseAgent):
                 "directly provide the commands. Output bash commands, or "
                 "say TASK_COMPLETE if the task is truly finished."
             )
+            consecutive_no_progress += 1
+            if consecutive_no_progress >= no_progress_limit:
+                final_result = self._no_progress_result(
+                    stdout_text, stderr_text, parsed, container_id,
+                    iteration, all_executions,
+                    consecutive_no_progress, no_progress_limit,
+                )
+                break
 
         if not final_result:
             final_result = {
@@ -1031,6 +1079,31 @@ class OpenClawExternalAgent(BaseAgent):
             "iterations": iteration,
             "harbor_executions": executions,
         }
+
+    def _no_progress_result(
+        self,
+        stdout: str,
+        stderr: str,
+        parsed: dict[str, Any] | None,
+        container_id: str,
+        iteration: int,
+        executions: list[dict[str, Any]],
+        consecutive_no_progress: int,
+        no_progress_limit: int,
+    ) -> dict[str, Any]:
+        """Build the failure result for the no-progress guard."""
+        result = self._build_result(
+            1, stdout, stderr, parsed, container_id, iteration, executions,
+        )
+        guard_message = (
+            "No-progress guard: no commands extracted for "
+            f"{consecutive_no_progress} consecutive iterations "
+            f"(limit {no_progress_limit})"
+        )
+        result["stderr"] = (
+            f"{stderr}\n{guard_message}" if stderr else guard_message
+        )
+        return result
 
     # ==================================================================
     # Container detection and setup
