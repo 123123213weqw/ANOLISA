@@ -21,11 +21,30 @@ impl I18n {
     }
 
     pub fn format(&self, id: MessageId, args: &[(&str, &str)]) -> String {
-        let mut text = self.t(id).to_string();
-        for (key, value) in args {
-            text = text.replace(&format!("{{{key}}}"), value);
+        // Single pass over the template: placeholders are matched only in
+        // the original text and substituted values are never rescanned, so
+        // an earlier argument's value cannot inject a later placeholder
+        // (a stored value containing the literal `{after}` must render in
+        // the `{before}` slot, not the pending one).
+        let template = self.t(id);
+        let mut rendered = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(open) = rest.find('{') {
+            rendered.push_str(&rest[..open]);
+            let after_open = &rest[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                rendered.push_str(rest);
+                return rendered;
+            };
+            let key = &after_open[..close];
+            match args.iter().find(|(name, _)| *name == key) {
+                Some((_, value)) => rendered.push_str(value),
+                None => rendered.push_str(&rest[..open + close + 2]),
+            }
+            rest = &after_open[close + 1..];
         }
-        text
+        rendered.push_str(rest);
+        rendered
     }
 
     pub fn language(&self) -> Language {
@@ -332,6 +351,67 @@ mod tests {
         assert_eq!(
             zh.t(MessageId::QuestionAnswerNotSentBody),
             "问题仍在等待回答，请重试或按 Ctrl+C 取消。"
+        );
+    }
+
+    #[test]
+    fn earlier_value_cannot_inject_later_placeholders() {
+        let i18n = I18n::new(Language::EnUs);
+        let text = i18n.format(
+            MessageId::ConfigPendingChangeLine,
+            &[
+                ("setting", "language"),
+                ("before", "{after}"),
+                ("after", "zh-cn"),
+            ],
+        );
+
+        assert_eq!(text, "ui.language: {after} -> zh-cn");
+    }
+
+    #[test]
+    fn substituted_values_are_never_rescanned() {
+        let i18n = I18n::new(Language::EnUs);
+        let text = i18n.format(
+            MessageId::SessionCompactCompletedBody,
+            &[("before", "{after}"), ("after", "5"), ("source", "auto")],
+        );
+
+        assert_eq!(text, "{after} → approximately 5 tokens (auto)");
+    }
+
+    #[test]
+    fn multi_arg_renders_stay_byte_identical() {
+        let i18n = I18n::new(Language::EnUs);
+        assert_eq!(
+            i18n.format(
+                MessageId::StartupAdapterLine,
+                &[
+                    ("adapter", "qwen"),
+                    ("shell", "bash"),
+                    ("approval", "auto"),
+                    ("analysis", "smart")
+                ]
+            ),
+            "Adapter: qwen · Shell: bash · Approval: auto · Analysis: smart"
+        );
+        assert_eq!(
+            i18n.format(
+                MessageId::ConfigPendingChangeLine,
+                &[
+                    ("setting", "language"),
+                    ("before", "en-us"),
+                    ("after", "zh-cn")
+                ]
+            ),
+            "ui.language: en-us -> zh-cn"
+        );
+        assert_eq!(
+            i18n.format(
+                MessageId::SessionCompactCompletedBody,
+                &[("before", "1000"), ("after", "200"), ("source", "auto")]
+            ),
+            "1000 → approximately 200 tokens (auto)"
         );
     }
 
