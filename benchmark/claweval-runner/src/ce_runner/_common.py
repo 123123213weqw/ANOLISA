@@ -299,14 +299,26 @@ def is_sandbox_task(task_yaml: str) -> bool:
 def make_trace_dir(prefix: str = "openclaw") -> str:
     """Return trace directory path: `<repo>/claw-eval/traces/<prefix>_YY-MM-DD-HH-MM`.
 
-    Creates the directory if it does not exist.
+    Creates the directory if it does not exist. The timestamp has minute
+    resolution, so two runners started within the same minute used to share
+    one trace dir and clobber each other's batch_results.json /
+    batch_summary.json (last writer wins). On collision a ``-2``, ``-3``, …
+    suffix is appended so every runner gets its own directory (the atomic
+    ``os.makedirs`` also closes the create/create race between runners).
     """
     from datetime import datetime
 
     ts = datetime.now().strftime("%y-%m-%d-%H-%M")
-    trace_dir = str(_REPO_DIR / "claw-eval" / "traces" / f"{prefix}_{ts}")
-    os.makedirs(trace_dir, exist_ok=True)
-    return trace_dir
+    base = str(_REPO_DIR / "claw-eval" / "traces" / f"{prefix}_{ts}")
+    trace_dir = base
+    n = 1
+    while True:
+        try:
+            os.makedirs(trace_dir)
+            return trace_dir
+        except FileExistsError:
+            n += 1
+            trace_dir = f"{base}-{n}"
 
 
 def atomic_write_config(config_path: str, config: dict) -> None:

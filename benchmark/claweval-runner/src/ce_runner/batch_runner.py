@@ -540,6 +540,156 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
             results.append(result)
         return results
 
+    def _persist_batch_outputs(checkpoint: bool = False):
+        """Aggregate results collected so far and (re)write the batch JSONs.
+
+        Writes ``batch_results.json``, ``batch_summary.json`` and
+        ``session_map.json`` into *trace_dir* from the current state of
+        ``batch_results``. Called after every chunk (a crash or cleanup
+        failure in a later chunk can no longer lose completed chunks'
+        results) and once more after the loop, which remains the
+        authoritative final output.
+
+        Returns ``(task_results, avg_score_final, n_pass_hat_1,
+        n_pass_at_1, n_errored, total_wall_time)`` for the console summary.
+        """
+        task_results = {}
+        for entry in batch_results:
+            tid = entry["task_id"]
+            if tid not in task_results:
+                task_results[tid] = {"task_id": tid, "trials": []}
+            task_results[tid]["trials"].append(entry["trial"])
+
+        total_wall_time = 0.0
+        n_pass_at_1 = 0
+        n_pass_hat_1 = 0
+        n_errored = 0
+        score_sum = 0.0
+        finished_tasks = 0
+
+        for tid, tr in task_results.items():
+            trials_list = tr["trials"]
+            n = len(trials_list)
+            c = sum(1 for t in trials_list if t["passed"])
+            errors = [t for t in trials_list if t.get("error")]
+
+            for t in trials_list:
+                total_wall_time += t["wall_time_s"]
+
+            if errors:
+                n_errored += 1
+
+            valid = [t for t in trials_list if not t.get("error")]
+            avg_score = sum(t["task_score"] for t in valid) / len(valid) if valid else 0.0
+            if valid:
+                score_sum += avg_score
+                finished_tasks += 1
+
+            if c > 0:
+                n_pass_at_1 += 1
+            if c == n and n > 0:
+                n_pass_hat_1 += 1
+
+            tr["avg_score"] = round(avg_score, 4)
+            tr["pass_at_1"] = pass_at_k(n, c, 1)
+            tr["pass_hat_k"] = (c / n) ** n if n > 0 else 0.0
+            tr["avg_passed"] = avg_score >= 0.75
+            tr["error"] = errors[0].get("error", "all trials errored") if (errors and not valid) else None
+            tr["n"] = n
+            tr["c"] = c
+
+        avg_score_final = score_sum / finished_tasks if finished_tasks > 0 else 0.0
+
+        # ── Write batch_results.json ─────────────────────────────────────
+        results_file = os.path.join(trace_dir, "batch_results.json")
+        with open(results_file, "w") as f:
+            json.dump([
+                {
+                    "task_id": tr["task_id"],
+                    "task_name": task_meta.get(tr["task_id"], {}).get("task_name", ""),
+                    "difficulty": task_meta.get(tr["task_id"], {}).get("difficulty", ""),
+                    "trials": tr["trials"],
+                    "error": tr["error"],
+                    "avg_score": tr["avg_score"],
+                    "pass_at_1": tr["pass_at_1"],
+                    "pass_hat_k": tr["pass_hat_k"],
+                    "avg_passed": tr["avg_passed"],
+                    "task_note": (
+                        ["SERP_DEV_KEY not set — web_search returns empty results"]
+                        if tr["task_id"] in _web_real_warned_tasks else []
+                    ),
+                }
+                for tr in task_results.values()
+            ], f, indent=2, ensure_ascii=False)
+
+        # ── Write batch_summary.json ─────────────────────────────────────
+        summary_file = os.path.join(trace_dir, "batch_summary.json")
+        with open(summary_file, "w") as f:
+            json.dump({
+                "tasks": len(task_results),
+                "trials_per_task": trials,
+                "chunk_size": chunk_size,
+                "n_chunks": n_chunks,
+                f"pass_hat_{trials}": n_pass_hat_1,
+                f"pass_at_{trials}": n_pass_at_1,
+                "errored": n_errored,
+                "avg_score": round(avg_score_final, 4),
+                "total_wall_time_s": round(total_wall_time, 2),
+            }, f, indent=2)
+
+        if not checkpoint:
+            log(f"Results: {results_file}")
+
+        # ── Write session_map.json (trace ↔ openclaw session mapping) ───────
+        session_map_entries = []
+        for entry in batch_results:
+            tid = entry["task_id"]
+            t = entry["trial"]
+            trace_path = t.get("trace_file")
+            archive_path = t.get("session_archive_file")
+            if not trace_path and not archive_path:
+                continue
+            session_map_entries.append({
+                "task_id": tid,
+                "trial": t.get("trial"),
+                "session_id": t.get("session_id", ""),
+                "trace_file": (os.path.relpath(trace_path, trace_dir)
+                               if trace_path else ""),
+                "session_file": (os.path.relpath(archive_path, trace_dir)
+                                 if archive_path else ""),
+                "original_session_path": t.get("session_origin_file") or "",
+            })
+        session_map_file = os.path.join(trace_dir, "session_map.json")
+        with open(session_map_file, "w") as f:
+            json.dump({
+                "trace_dir": trace_dir,
+                "sessions_dir": "sessions",
+                "entries": session_map_entries,
+            }, f, indent=2, ensure_ascii=False)
+
+        if checkpoint:
+            log(f"[checkpoint] {len(batch_results)} trial result(s) persisted "
+                f"to {results_file}")
+        else:
+            log(f"Session map: {session_map_file}")
+
+        return (task_results, avg_score_final, n_pass_hat_1, n_pass_at_1,
+                n_errored, total_wall_time)
+
+    def _cleanup_step(name, fn, *args, **kwargs):
+        """Run one chunk-cleanup step, logging instead of raising.
+
+        Cleanup used to run unguarded: a single raising step — e.g.
+        ``openclaw gateway stop`` timing out — propagated out of
+        :func:`run_batch` and silently lost every completed chunk's results.
+        Best-effort, mirroring ``_emergency_cleanup``; the atexit hook
+        retries the same steps at process exit.
+        """
+        try:
+            fn(*args, **kwargs)
+        except Exception as e:
+            log(f"[WARN] cleanup step {name} failed (continuing): {e}")
+
     # ── Chunk loop ────────────────────────────────────────────────────────
     skip_cleanup_dirs = cfg.get("runner", {}).get("skip_cleanup_agent_dirs", False)
 
@@ -695,13 +845,16 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
             _collect_completed()
 
         # ── Phase 3: Cleanup this chunk ───────────────────────────────────
+        # Each step is best-effort: one raising (e.g. `openclaw gateway stop`
+        # timing out) must not abort the batch and lose every completed
+        # chunk's results. The atexit emergency cleanup retries at exit.
         log(f"[chunk {chunk_idx + 1}/{n_chunks}] Cleaning up...")
-        stop_gateway()
-        cleanup_mock_services()
-        kill_mcp_bridges()
-        cleanup_parallel_workers(
-            OPENCLAW_CONFIG, setup_info, skip_dirs=skip_cleanup_dirs)
-        reap_orphan_agent_processes()
+        _cleanup_step("stop_gateway", stop_gateway)
+        _cleanup_step("cleanup_mock_services", cleanup_mock_services)
+        _cleanup_step("kill_mcp_bridges", kill_mcp_bridges)
+        _cleanup_step("cleanup_parallel_workers", cleanup_parallel_workers,
+                      OPENCLAW_CONFIG, setup_info, skip_dirs=skip_cleanup_dirs)
+        _cleanup_step("reap_orphan_agent_processes", reap_orphan_agent_processes)
         _current_setup_info["ref"] = None
 
         # Release memory between chunks
@@ -715,6 +868,13 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
             pass
 
         log(f"[chunk {chunk_idx + 1}/{n_chunks}] Chunk complete.\n")
+
+        # Persist results collected so far: a crash or cleanup failure in a
+        # later chunk must not lose this chunk's completed trials.
+        try:
+            _persist_batch_outputs(checkpoint=True)
+        except Exception as e:
+            log(f"[WARN] results checkpoint failed: {e}")
         time.sleep(3)
 
     # Mark cleanup done so atexit doesn't repeat
@@ -733,53 +893,9 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
 
     grade_pool.shutdown(wait=True)
 
-    # ── Aggregate results per task ───────────────────────────────────────
-    task_results = {}
-    for entry in batch_results:
-        tid = entry["task_id"]
-        if tid not in task_results:
-            task_results[tid] = {"task_id": tid, "trials": []}
-        task_results[tid]["trials"].append(entry["trial"])
-
-    total_wall_time = 0.0
-    n_pass_at_1 = 0
-    n_pass_hat_1 = 0
-    n_errored = 0
-    score_sum = 0.0
-    finished_tasks = 0
-
-    for tid, tr in task_results.items():
-        trials_list = tr["trials"]
-        n = len(trials_list)
-        c = sum(1 for t in trials_list if t["passed"])
-        errors = [t for t in trials_list if t.get("error")]
-
-        for t in trials_list:
-            total_wall_time += t["wall_time_s"]
-
-        if errors:
-            n_errored += 1
-
-        valid = [t for t in trials_list if not t.get("error")]
-        avg_score = sum(t["task_score"] for t in valid) / len(valid) if valid else 0.0
-        if valid:
-            score_sum += avg_score
-            finished_tasks += 1
-
-        if c > 0:
-            n_pass_at_1 += 1
-        if c == n and n > 0:
-            n_pass_hat_1 += 1
-
-        tr["avg_score"] = round(avg_score, 4)
-        tr["pass_at_1"] = pass_at_k(n, c, 1)
-        tr["pass_hat_k"] = (c / n) ** n if n > 0 else 0.0
-        tr["avg_passed"] = avg_score >= 0.75
-        tr["error"] = errors[0].get("error", "all trials errored") if (errors and not valid) else None
-        tr["n"] = n
-        tr["c"] = c
-
-    avg_score_final = score_sum / finished_tasks if finished_tasks > 0 else 0.0
+    # ── Aggregate + write final results (authoritative full output) ──────
+    (task_results, avg_score_final, n_pass_hat_1, n_pass_at_1, n_errored,
+     total_wall_time) = _persist_batch_outputs()
 
     # ── Print summary ────────────────────────────────────────────────────
     log("=" * 60)
@@ -822,72 +938,5 @@ def run_batch(args, get_judge_config, get_model_config, get_user_agent_config,
 
     log("\u2500" * 60)
     log(f"Trace dir: {trace_dir}")
-
-    # ── Write batch_results.json ─────────────────────────────────────────
-    results_file = os.path.join(trace_dir, "batch_results.json")
-    with open(results_file, "w") as f:
-        json.dump([
-            {
-                "task_id": tr["task_id"],
-                "task_name": task_meta.get(tr["task_id"], {}).get("task_name", ""),
-                "difficulty": task_meta.get(tr["task_id"], {}).get("difficulty", ""),
-                "trials": tr["trials"],
-                "error": tr["error"],
-                "avg_score": tr["avg_score"],
-                "pass_at_1": tr["pass_at_1"],
-                "pass_hat_k": tr["pass_hat_k"],
-                "avg_passed": tr["avg_passed"],
-                "task_note": (
-                    ["SERP_DEV_KEY not set — web_search returns empty results"]
-                    if tr["task_id"] in _web_real_warned_tasks else []
-                ),
-            }
-            for tr in task_results.values()
-        ], f, indent=2, ensure_ascii=False)
-
-    # ── Write batch_summary.json ─────────────────────────────────────────
-    summary_file = os.path.join(trace_dir, "batch_summary.json")
-    with open(summary_file, "w") as f:
-        json.dump({
-            "tasks": len(task_results),
-            "trials_per_task": trials,
-            "chunk_size": chunk_size,
-            "n_chunks": n_chunks,
-            f"pass_hat_{trials}": n_pass_hat_1,
-            f"pass_at_{trials}": n_pass_at_1,
-            "errored": n_errored,
-            "avg_score": round(avg_score_final, 4),
-            "total_wall_time_s": round(total_wall_time, 2),
-        }, f, indent=2)
-
-    log(f"Results: {results_file}")
-
-    # ── Write session_map.json (trace ↔ openclaw session mapping) ───────────
-    session_map_entries = []
-    for entry in batch_results:
-        tid = entry["task_id"]
-        t = entry["trial"]
-        trace_path = t.get("trace_file")
-        archive_path = t.get("session_archive_file")
-        if not trace_path and not archive_path:
-            continue
-        session_map_entries.append({
-            "task_id": tid,
-            "trial": t.get("trial"),
-            "session_id": t.get("session_id", ""),
-            "trace_file": (os.path.relpath(trace_path, trace_dir)
-                           if trace_path else ""),
-            "session_file": (os.path.relpath(archive_path, trace_dir)
-                             if archive_path else ""),
-            "original_session_path": t.get("session_origin_file") or "",
-        })
-    session_map_file = os.path.join(trace_dir, "session_map.json")
-    with open(session_map_file, "w") as f:
-        json.dump({
-            "trace_dir": trace_dir,
-            "sessions_dir": "sessions",
-            "entries": session_map_entries,
-        }, f, indent=2, ensure_ascii=False)
-    log(f"Session map: {session_map_file}")
 
     detach_log_file()
