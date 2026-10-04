@@ -68,10 +68,12 @@ fn validate_stat(pid: i32, stat: &str) -> Result<u64, TargetValidationError> {
         .filter(|close| *close > open)
         .ok_or(TargetValidationError::InvalidStat(pid))?;
     let process_name = &stat[open + 1..close];
-    if matches!(
-        process_name,
-        "agentsight" | "agentsight-enfo" | "agentsight-enforcer"
-    ) {
+    // The kernel truncates comm to TASK_COMM_LEN-1 = 15 bytes, so the
+    // `agentsight-enforcer` daemon runs as "agentsight-enfor". Match the
+    // prefix so every truncation length of the binary name stays protected;
+    // an exact-literal list cannot (the previous 14- and 19-byte spellings
+    // both missed the 15-byte comm the daemon actually runs with).
+    if process_name == "agentsight" || process_name.starts_with("agentsight-enfo") {
         return Err(TargetValidationError::ProtectedProcess(pid));
     }
 
@@ -457,6 +459,23 @@ mod tests {
         // lossily in front of the NSpid line the resolver needs.
         let status = "Name:\tcl\u{fffd}ude\nPid:\t39560\nNSpid:\t39560\t1\nTgid:\t39560\n";
         assert_eq!(parse_nspid_from_status(status), vec![39560, 1]);
+    }
+
+    #[test]
+    fn validate_stat_rejects_the_kernel_truncated_enforcer_comm() {
+        // The kernel truncates comm to TASK_COMM_LEN-1 = 15 bytes, so the
+        // agentsight-enforcer daemon appears in /proc/<pid>/stat as
+        // "agentsight-enfor". The protected list's exact literals are 14 and
+        // 19 bytes long, so neither could match the running daemon's comm
+        // and the enforcement service itself was an eligible target.
+        let stat = "99 (agentsight-enfor) S 1 99 99 0 -1 4194304 100 0 0 0 10 5 0 0 20 0 1 0 4242 1000 100 0 0 0 0 0 0 0 0 0 0 0 0 17 0 0 0 0 0 0";
+        assert!(
+            matches!(
+                validate_stat(99, stat),
+                Err(TargetValidationError::ProtectedProcess(_))
+            ),
+            "the 15-byte truncated comm of agentsight-enforcer must stay protected"
+        );
     }
 
     #[test]
