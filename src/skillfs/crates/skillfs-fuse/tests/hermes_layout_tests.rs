@@ -151,6 +151,41 @@ fn hermes_category_dir_readdir() {
 }
 
 // -----------------------------------------------------------------------
+// 4b. Hermes root listing hides store-hidden dot directories
+// -----------------------------------------------------------------------
+
+#[test]
+fn hermes_root_listing_hides_a_hidden_skill_dir() {
+    skip_if_no_fuse!();
+
+    let fix = MountFixture::normal_hermes(|dir| {
+        seed_hermes_workspace(dir);
+        create_skill_dir(dir, "alpha");
+        // A dot-prefixed directory carrying SKILL.md: the store loader
+        // skips hidden directories, so it is never a managed Skill and the
+        // flat /skills listing cannot surface it. The physical Hermes root
+        // listing must not surface it either.
+        create_skill_dir(dir, ".hidden-skill");
+    });
+
+    let entries = list_dir_names(&fix.mountpoint().join("skills"));
+    assert!(
+        !entries.contains(&".hidden-skill".to_string()),
+        "a hidden skill directory must not be listed, got: {:?}",
+        entries
+    );
+    // Reverse: ordinary top-level skills and management entries stay.
+    assert!(
+        entries.contains(&"alpha".to_string()),
+        "ordinary top-level skill must stay listed, got: {entries:?}"
+    );
+    assert!(
+        entries.contains(&".hub".to_string()),
+        "management entries must stay listed, got: {entries:?}"
+    );
+}
+
+// -----------------------------------------------------------------------
 // 5. Hermes mode nested skill leaf readable
 // -----------------------------------------------------------------------
 
