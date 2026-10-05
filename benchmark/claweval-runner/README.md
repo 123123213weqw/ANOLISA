@@ -197,6 +197,18 @@ Core logic: `src/ce_runner/tool_injector.py`
 | `scripts/prompt_task.py` | Display the system prompt for a given task |
 | `scripts/check_api_key.py` | Test API key connectivity |
 | `scripts/check_openclaw_env.py` | Inspect openclaw environment (`--fix` to cleanup) |
+### Failure Classification Contract
+
+`scripts/generate_trial_reports.py` and `scripts/analyze.py` only accept an LLM
+failure classification that is a JSON object whose `category` is one of the
+listed `FAILURE_CATEGORIES` and whose `key_reason_zh` is a nonblank string.
+Any other decoded response — arrays, null, scalars, objects with an unknown or
+non-string category, or a missing/blank/non-string reason — is routed through
+the existing structured fallback
+`{"category": "other", "key_reason_zh": "LLM error: ..."}`, so reports always
+carry a usable classification and remain consumable by summary extraction.
+Valid plain and fenced JSON model responses are preserved unchanged.
+
 
 ## Troubleshooting
 

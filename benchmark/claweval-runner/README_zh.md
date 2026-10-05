@@ -209,4 +209,14 @@ ce-runner 使用 openclaw 原生的 MCP 运行时(stdio)向 agent 暴露任务�
 | Docker permission denied | `sudo usermod -aG docker $USER && newgrp docker` |
 | Sandbox 镜像构建慢 / 在 TUNA 上失败 | 已处理 —— setup 会把 Dockerfile 修补到官方 PyPI;需要时通过 `Dockerfile.agent.bak` 恢复 |
 | 环境被污染 | `uv run python scripts/check_openclaw_env.py --fix` |
+### 失败分类契约
+
+`scripts/generate_trial_reports.py` 与 `scripts/analyze.py` 只接受这样的 LLM
+失败分类：一个 JSON 对象，`category` 是 \`FAILURE_CATEGORIES\` 列表中的值，
+且 \`key_reason_zh\` 是非空字符串。任何其他解码结果——数组、null、标量、
+category 未知或非字符串的对象、reason 缺失/空白/非字符串——都会走既有的
+结构化回退 \`{"category": "other", "key_reason_zh": "LLM error: ..."}\`，
+因此报告始终携带可用的分类，并保持可被汇总提取消费。有效的裸 JSON 与围栏
+JSON 模型响应原样保留。
+
 | Mock 服务端口冲突(9100–9116) | `ss -tlnp \| grep 91` 定位后 kill |

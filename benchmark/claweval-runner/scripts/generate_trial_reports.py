@@ -235,6 +235,23 @@ def infer_failure_reason(grading: dict, scores: dict, primary_dimensions: list |
     return reasons
 
 
+def _validated_classification(decoded: object) -> dict | None:
+    """Return a usable classification, or None for an unsupported response.
+
+    A usable classification is an object whose ``category`` is one of
+    FAILURE_CATEGORIES and whose ``key_reason_zh`` is a nonblank string;
+    anything else routes through the structured LLM-error fallback.
+    """
+    if not isinstance(decoded, dict):
+        return None
+    category = decoded.get("category")
+    reason = decoded.get("key_reason_zh")
+    if not isinstance(category, str) or category not in FAILURE_CATEGORIES:
+        return None
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    return {"category": category, "key_reason_zh": reason}
+
 def llm_classify_failure(task_info: dict, grading: dict, trace_end: dict,
                          api_key: str, base_url: str, model_id: str) -> dict:
     """Use LLM to classify failure category + one-sentence key reason."""
@@ -324,7 +341,10 @@ Do NOT include any other text or explanation. Only output the JSON."""
         text = resp.choices[0].message.content.strip()
         if text.startswith("```"):
             text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        return json.loads(text)
+        classification = _validated_classification(json.loads(text))
+        if classification is not None:
+            return classification
+        raise ValueError(f"unsupported classification response: {text[:100]}")
     except Exception as e:
         return {"category": "other", "key_reason_zh": f"LLM error: {str(e)[:100]}"}
 
