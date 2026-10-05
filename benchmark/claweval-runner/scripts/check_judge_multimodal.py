@@ -16,8 +16,12 @@
 
 """Check whether a judge model supports multimodal (vision) input.
 
-Sends a tiny 1x1 red PNG and asks what color it is. If the model can
-"see" the image it responds with a color name; otherwise "NO_IMAGE".
+Sends a tiny 1x1 opaque red PNG and asks what color it is. The prompt
+requires the single word naming the color, so a capable model answers
+exactly "red"; a text-only model answers "NO_IMAGE". Only the exact
+case-insensitive, whitespace-stripped "red" reply counts as evidence the
+model inspected the fixture — wrong colors, inability statements and
+other prose are not.
 
 Usage:
     python scripts/check_judge_multimodal.py --config claw-eval/config.yaml
@@ -34,9 +38,9 @@ import argparse
 import os
 import sys
 
-# ── Tiny 1x1 red PNG (base64) ──────────────────────────────────────────
+# ── Tiny 1x1 opaque red PNG (base64; sole RGBA pixel FF 00 00 FF) ──────
 TINY_RED_PNG_B64 = (
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8/5+hHgAHggJ/PchI7wAAAABJRU5ErkJggg=="
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg=="
 )
 
 PROBE_PROMPT = (
@@ -87,7 +91,12 @@ def check_multimodal(model: str, base_url: str, api_key: str,
         return False
     if not text:
         return False
-    return True
+    # The prompt demands the single word for the fixture's color. Only
+    # that exact (case-insensitive, whitespace-stripped) reply is
+    # evidence the model inspected the image; wrong colors, unrelated
+    # acknowledgements, statements of inability and any other
+    # out-of-protocol prose must not pass the probe.
+    return text == "red"
 
 
 def _load_config_yaml(config_path: str) -> dict:
