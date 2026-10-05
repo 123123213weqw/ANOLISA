@@ -495,7 +495,22 @@ export default definePluginEntry({
           ];
           if (!triggers.some((re) => re.test(contentStr))) return;
 
-          const content = contentStr.slice(0, 2000);
+          // Bound the observation at 2000 UTF-16 code units, but never
+          // split a supplementary character: `slice` indexes code units,
+          // so a surrogate pair straddling the 2000-unit boundary would
+          // leave an unpaired high surrogate in `memory_observe.content`.
+          // That is not a complete Unicode prefix and strict string
+          // consumers (the store's JSON string decoder among them)
+          // reject it, silently dropping the observation. Drop the
+          // orphaned leading surrogate instead — the cap is unchanged
+          // and no replacement characters are introduced.
+          let content = contentStr.slice(0, 2000);
+          if (content.length === 2000) {
+            const lastUnit = content.charCodeAt(1999);
+            if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+              content = content.slice(0, 1999);
+            }
+          }
 
           // Refuse to persist content that looks like a prompt injection —
           // an attacker could coerce the agent into emitting a message
