@@ -891,23 +891,25 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
   }, []);
 
   const handleQuery = useCallback(async () => {
-    const effectiveEnd = Date.now();
-    setEndMs(effectiveEnd);
     setError(null);
     setHasQueried(true);
     setSessionPage(0); // reset to first page on new query
 
+    // The End Time picker is a real filter: query exactly the picked window,
+    // like the sibling pages and like the URL-restore path below. Recomputing
+    // the end from the wall clock silently discarded whatever the user picked
+    // and snapped the picker back to "now" on every query.
     const startNs = startMs * 1_000_000;
-    const endNs = effectiveEnd * 1_000_000;
+    const endNs = endMs * 1_000_000;
     const agent = selectedAgent || undefined;
     setQueryRangeNs([startNs, endNs]);
-    syncParams(startMs, effectiveEnd, selectedAgent);
+    syncParams(startMs, endMs, selectedAgent);
 
     const { ok, error, requestId } = await runQuery(startNs, endNs, agent);
     if (!ok && requestId === loadRequestIdRef.current) {
       setError((error as Error)?.message ?? t('cl.queryFailed'));
     }
-  }, [startMs, selectedAgent, syncParams, runQuery, t]);
+  }, [startMs, endMs, selectedAgent, syncParams, runQuery, t]);
 
   // Auto-load on mount: show all records for the default time range immediately
   const hasRestoredRef = React.useRef(false);
