@@ -26,6 +26,10 @@ use crate::system_helper::{
 const DEFAULT_RATE_LIMIT: usize = 30;
 const AUDIT_LOG_DIR: &str = "/var/log/anolisa";
 const AUDIT_LOG_PATH: &str = "/var/log/anolisa/system-helper.log";
+/// Idle wait between accept attempts while polling the shutdown flag.
+/// Small enough that a shutdown request stops the daemon promptly, large
+/// enough that the idle loop is invisible.
+const ACCEPT_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 // ─── DaemonServer ────────────────────────────────────────────────────────────
 
@@ -104,21 +108,24 @@ impl DaemonServer {
         fs::set_permissions(&self.socket_path, fs::Permissions::from_mode(0o660))?;
         Self::chgrp_anolisa(std::path::Path::new(&self.socket_path))?;
 
-        // Set a non-blocking accept timeout so we can check the shutdown flag.
-        listener.set_nonblocking(false)?;
+        // Non-blocking accept polled at ACCEPT_POLL_INTERVAL so the shutdown
+        // flag is honored without waiting for the next connection to arrive.
+        // (Accepted streams keep their own blocking mode: on Unix the flag is
+        // a property of the listener, not inherited by accepted sockets.)
+        listener.set_nonblocking(true)?;
 
         eprintln!(
             "[anolisa-helper] listening on {} (v{})",
             self.socket_path, self.version
         );
 
-        for stream in listener.incoming() {
+        loop {
             if self.shutdown.load(Ordering::Relaxed) {
                 break;
             }
 
-            match stream {
-                Ok(stream) => {
+            match listener.accept() {
+                Ok((stream, _)) => {
                     let rate_limiter = Arc::clone(&self.rate_limiter);
                     let last_operation = Arc::clone(&self.last_operation);
                     let shutdown = Arc::clone(&self.shutdown);
@@ -138,9 +145,12 @@ impl DaemonServer {
                         }
                     });
                 }
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    thread::sleep(ACCEPT_POLL_INTERVAL);
+                }
                 Err(e) => {
                     eprintln!("[anolisa-helper] accept error: {e}");
-                    continue;
+                    thread::sleep(ACCEPT_POLL_INTERVAL);
                 }
             }
         }
@@ -603,6 +613,45 @@ fn write_audit_log(peer: &PeerCredential, op: &str, args: &str, exit_code: i32, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_stops_after_request_shutdown_without_a_new_connection() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("helper.sock");
+        let server = Arc::new(DaemonServer::new(&socket.to_string_lossy()));
+        let runner = Arc::clone(&server);
+        let (done_tx, done_rx) = mpsc::channel();
+        let bound_socket = socket.clone();
+        let serve = thread::spawn(move || {
+            let result = runner.run();
+            let _ = done_tx.send(());
+            result
+        });
+
+        // Wait for the listener to bind before requesting shutdown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !bound_socket.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(bound_socket.exists(), "daemon never bound its socket");
+
+        server.request_shutdown();
+
+        // A shutdown request must stop the daemon on its own: the accept
+        // loop may not sit blocked in accept() until some future client
+        // happens to connect (and then be dropped mid-handshake).
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("run() must return after request_shutdown without a new connection");
+        serve.join().unwrap().expect("clean shutdown exit");
+        assert!(
+            !bound_socket.exists(),
+            "socket file must be removed on shutdown"
+        );
+    }
 
     #[test]
     fn version_compatible_same_major() {
