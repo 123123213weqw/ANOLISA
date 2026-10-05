@@ -719,9 +719,12 @@ const RUNTIME_SERVICE_MARKERS: &[(&str, &str)] = &[
     ("org.apache.hadoop", "hadoop"),
     ("hadoop", "hadoop"),
     ("hbase", "hbase"),
+    ("org.apache.solr", "solr"),
     ("solr", "solr"),
     ("logstash", "logstash"),
+    ("org.apache.pulsar", "pulsar"),
     ("pulsar", "pulsar"),
+    ("org.apache.catalina", "tomcat"),
     ("catalina", "tomcat"),
     ("tomcat", "tomcat"),
     ("jenkins", "jenkins"),
@@ -768,23 +771,71 @@ fn runtime_service_from_cmdline(cmdline: &str) -> Option<&'static str> {
         .iter()
         .map(|(marker, _)| name_tokens(marker))
         .collect();
-    let names: Vec<Vec<String>> = candidates
+    let names: Vec<CandidateName> = candidates
         .iter()
         .map(|c| {
             let basename = c.rsplit('/').next().unwrap_or(c);
-            name_tokens(basename)
+            CandidateName {
+                // The class name is the last dotted component: a main class is
+                // the program, its package only says where the program lives.
+                class_tokens: name_tokens(basename.rsplit('.').next().unwrap_or(basename)),
+                tokens: name_tokens(basename),
+                is_class: is_class_name(basename),
+            }
         })
         .collect();
 
     for ((_, svc), needle) in RUNTIME_SERVICE_MARKERS.iter().zip(marker_tokens.iter()) {
-        if names
-            .iter()
-            .any(|tokens| token_run_contains(tokens, needle))
-        {
+        if names.iter().any(|name| name.matches(needle)) {
             return Some(svc);
         }
     }
     None
+}
+
+/// One candidate argument, tokenized for marker matching.
+struct CandidateName {
+    /// Tokens of the whole (basename) argument.
+    tokens: Vec<String>,
+    /// Tokens of its last dotted component, i.e. the class name.
+    class_tokens: Vec<String>,
+    /// Whether the argument is a dotted identifier chain rather than a file.
+    is_class: bool,
+}
+
+impl CandidateName {
+    /// Whether `needle` identifies this candidate.
+    ///
+    /// A file name (`kafka_2.13-3.7.0.jar`, `sparklesh-report.py`) is matched
+    /// anywhere in its tokens, as before. A class is decided by its own name or
+    /// by a package run it owns from the root: `kafka.Kafka` and
+    /// `org.apache.zookeeper.server.quorum.QuorumPeerMain` are the services,
+    /// while `com.example.kafka.ConsumerApp` merely lives under a package that
+    /// mentions kafka and is a client of it, not a broker.
+    fn matches(&self, needle: &[String]) -> bool {
+        if !self.is_class {
+            return token_run_contains(&self.tokens, needle);
+        }
+        token_run_starts_at(&self.tokens, needle) || token_run_contains(&self.class_tokens, needle)
+    }
+}
+
+/// Whether an argument reads as a Java class (`com.example.Main`) rather than
+/// a file name: every dot-separated component is an identifier.
+fn is_class_name(candidate: &str) -> bool {
+    candidate.contains('.')
+        && candidate.split('.').all(|part| {
+            let mut chars = part.chars();
+            chars
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        })
+}
+
+/// Whether `haystack` begins with `needle` as a run of tokens.
+fn token_run_starts_at(haystack: &[String], needle: &[String]) -> bool {
+    !needle.is_empty() && haystack.len() >= needle.len() && haystack[..needle.len()] == *needle
 }
 
 /// Split a name into its runs of ASCII alphanumeric characters (lowercased).
@@ -1352,6 +1403,25 @@ mod tests {
     }
 
     #[test]
+    fn test_runtime_service_ignores_package_mentions_in_a_main_class() {
+        // A main class whose *package* mentions a service is a client of it,
+        // not the service: `com.example.kafka.ConsumerApp` consumes Kafka, it
+        // does not run a broker, and classifying it fired the streaming rules
+        // on an unrelated workload. Only the class's own name, or a package
+        // run the service owns from the root, decides.
+        let cmdline =
+            "java\u{0}-cp\u{0}/opt/kafka/libs/kafka_2.13-3.7.0.jar\u{0}com.example.kafka.ConsumerApp";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
+
+        let cmdline = "java\u{0}com.example.spark.JobLauncher";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
+
+        // Kafka's own broker class still decides, through its class name.
+        let cmdline = "java\u{0}kafka.Kafka";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
+    }
+
+    #[test]
     fn test_runtime_service_matches_main_classes_and_jars() {
         // Zookeeper's main class.
         let cmdline = "java\0-Xmx1g\0org.apache.zookeeper.server.quorum.QuorumPeerMain";
@@ -1361,10 +1431,17 @@ mod tests {
         let cmdline = "java\0-jar\0/opt/kafka/libs/kafka_2.13-3.7.0.jar\0kafka.Kafka";
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
 
-        // Tomcat's bootstrap class carries `catalina` mid-class, so the
-        // marker must match as a token run anywhere in the class name.
+        // Tomcat's bootstrap class names neither tomcat nor catalina, so the
+        // `org.apache.catalina` package run decides.
         let cmdline = "java\0org.apache.catalina.startup.Bootstrap\0start";
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("tomcat"));
+
+        // Solr and Pulsar main classes likewise carry the service only in
+        // their package run, not in the class name.
+        let cmdline = "java\0org.apache.solr.servlet.SolrDispatchFilter";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("solr"));
+        let cmdline = "java\0org.apache.pulsar.PulsarBrokerStarter\0--broker-conf";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("pulsar"));
 
         // Elasticsearch, including a versioned jar basename.
         let cmdline = "java\0-jar\0/usr/share/elasticsearch-8.12.0/lib/elasticsearch-8.12.0.jar";
