@@ -19,4 +19,6 @@ Options: `-p "1-5,7"` page range, `--format json` structured output, `--metadata
 
 Tables: `--tables --format json` adds a `tables` array to each selected page: `{"bbox": [x0,y0,x1,y1], "rows": [[cell, ...], ...]}` from PyMuPDF table detection; pages without ruled tables report `"tables": []`. Plain page text and the default schemas are unchanged; the flag is rejected for text output.
 
+`--outline` includes the document-wide bookmark outline in `--format json` output as `[level, title, page]` entries (1-based pages, `-1` when a bookmark has no page destination); JSON only.
+
 Setup: `pip install PyMuPDF`
