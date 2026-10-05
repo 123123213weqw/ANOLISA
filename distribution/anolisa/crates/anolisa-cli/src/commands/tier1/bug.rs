@@ -549,7 +549,6 @@ fn render_cosh_ng_section(out: &mut String, diagnostics: &cosh_ng::CoshNgDiagnos
             out.push_str("typeset -p _COSH_AI_ENABLED _COSH_HAS_USER_COMMAND_NOT_FOUND\n");
             out.push_str("whence -v command_not_found_handler\n");
             out.push_str("whence -v _cosh_user_command_not_found_handler\n");
-            out.push_str("?? 测试\n");
             out.push_str("```\n\n");
             out.push_str("Then, from a separate terminal:\n\n");
             out.push_str("```sh\n");
@@ -1015,6 +1014,29 @@ mod tests {
                     items: 3,
                 },
             ],
+        }
+    }
+
+    /// The reproduction checklist is presented as copy-paste runnable (the
+    /// same invariant the manual retry command upholds): every line in the
+    /// zsh block must be one of the intended probe commands, never editing
+    /// debris or placeholder text.
+    #[test]
+    fn reproduction_checklist_contains_only_probe_commands() {
+        let diagnostics = available_diagnostics();
+
+        let markdown = render_markdown(&env_summary(), &[], &[], None, Some(&diagnostics));
+
+        let block = markdown
+            .split("```zsh\n")
+            .nth(1)
+            .and_then(|rest| rest.split("```").next())
+            .expect("reproduction checklist zsh block");
+        for line in block.lines().filter(|line| !line.trim().is_empty()) {
+            assert!(
+                line.starts_with("typeset ") || line.starts_with("whence "),
+                "checklist line is not a runnable probe command: {line:?}\n{markdown}"
+            );
         }
     }
 
