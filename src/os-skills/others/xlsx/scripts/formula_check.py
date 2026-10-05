@@ -70,16 +70,54 @@ def get_sheet_names(z: zipfile.ZipFile) -> dict[str, str]:
     return sheets
 
 
-def get_defined_names(z: zipfile.ZipFile) -> set[str]:
-    """Return set of named ranges defined in workbook.xml <definedNames>."""
+def get_defined_names(z: zipfile.ZipFile) -> list[tuple[str, int | None]]:
+    """Return defined names from workbook.xml <definedNames> as
+    (name, local_sheet_ordinal) pairs.
+
+    local_sheet_ordinal is None for globally visible names; otherwise it
+    is the parsed localSheetId — the 0-based position of the owning
+    worksheet in the <sheets> element order, which is what localSheetId
+    references. It is NOT the relationship id, the numeric sheetId
+    attribute or the worksheet filename, all of which may differ from
+    the ordinal. A malformed (non-integer) or out-of-range scope makes
+    the name invisible everywhere instead of promoting it to global
+    visibility; out-of-range detection is the caller's job (it knows how
+    many sheets exist).
+    """
     wb_xml = z.read("xl/workbook.xml")
     wb = ET.fromstring(wb_xml)
-    names = set()
+    entries: list[tuple[str, int | None]] = []
     for dn in wb.findall(f".//{NSP}definedName"):
         n = dn.get("name", "")
-        if n:
-            names.add(n)
-    return names
+        if not n:
+            continue
+        raw_local = dn.get("localSheetId")
+        ordinal: int | None = None
+        if raw_local is not None:
+            try:
+                ordinal = int(raw_local)
+            except ValueError:
+                # Malformed scope: visible nowhere, never global.
+                ordinal = -1
+        entries.append((n, ordinal))
+    return entries
+
+
+def names_visible_on(
+    entries: list[tuple[str, int | None]], sheet_ordinal: int, sheet_count: int,
+) -> set[str]:
+    """Resolve the defined names visible on the worksheet at
+    *sheet_ordinal*: global definitions everywhere, local definitions
+    only on their declared worksheet (a local name shadowing a global
+    one remains valid on both). Invalid or out-of-range local scopes
+    are visible nowhere."""
+    visible: set[str] = set()
+    for n, local in entries:
+        if local is None:
+            visible.add(n)
+        elif 0 <= local < sheet_count and local == sheet_ordinal:
+            visible.add(n)
+    return visible
 
 
 def get_sheet_files(z: zipfile.ZipFile) -> dict[str, str]:
@@ -181,12 +219,21 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
         sheet_names = get_sheet_names(z)
         sheet_files = get_sheet_files(z)
         valid_sheet_names = set(sheet_names.values())
-        defined_names = get_defined_names(z)
+        defined_name_entries = get_defined_names(z)
+        sheet_count = len(sheet_names)
 
-        for rid, sheet_name in sheet_names.items():
+        # sheet_names preserves the <sheets> document order, so the
+        # enumeration index is exactly the ordinal localSheetId refers
+        # to. Filtering skips sheets without renumbering the survivors,
+        # and hidden sheets still occupy their position.
+        for sheet_ordinal, (rid, sheet_name) in enumerate(sheet_names.items()):
             # Apply sheet filter if requested
             if sheet_filter and sheet_name != sheet_filter:
                 continue
+
+            visible_names = names_visible_on(
+                defined_name_entries, sheet_ordinal, sheet_count,
+            )
 
             ws_file = sheet_files.get(rid)
             if not ws_file or ws_file not in z.namelist():
@@ -276,9 +323,11 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
                             results["error_count"] += 1
 
                     # Check 3: named range references
-                    # Only flag if the name is not a built-in and not a sheet-prefixed ref
+                    # Only flag if the name is not a built-in and not a sheet-prefixed
+                    # ref; visibility is resolved per worksheet so a name scoped to
+                    # another sheet (localSheetId) is not treated as defined here.
                     for name_ref in extract_name_refs(formula):
-                        if name_ref not in defined_names:
+                        if name_ref not in visible_names:
                             results["errors"].append(
                                 {
                                     "type": "unknown_name_ref",
@@ -286,7 +335,7 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
                                     "cell": cell_ref,
                                     "formula": formula,
                                     "unknown_name": name_ref,
-                                    "defined_names": sorted(defined_names),
+                                    "defined_names": sorted(visible_names),
                                     "note": "Heuristic check — verify manually if this is a false positive",
                                 }
                             )
