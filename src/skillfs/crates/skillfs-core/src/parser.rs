@@ -136,16 +136,22 @@ fn extract_frontmatter(content: &str) -> (String, String) {
         return (String::new(), content.to_string());
     }
 
-    // Find the first line of `rest` that is exactly `---` (trailing
-    // whitespace tolerated, leading whitespace not — an indented `---` is
-    // content). A line that merely *starts* with `---` (`----`, `---text`)
-    // must NOT close the frontmatter: the previous prefix match landed the
-    // body slice mid-line and leaked the remainder (a stray `-`, a space,
-    // or the text) into the body.
+    // Find the first line of `rest` that closes the frontmatter: a run of
+    // three or more dashes and nothing else (trailing whitespace
+    // tolerated, leading whitespace not — an indented `---` is content).
+    // The exact `---` closer is the canonical form; a longer all-dash run
+    // (`----`, `-----` — a Markdown thematic break) also closes when the
+    // opener was an exact `---`, which legacy authors used and which the
+    // exact-line rule silently degraded (the yaml block fell into the
+    // body and the first-paragraph description fallback smeared it into
+    // the served description). A line that merely *starts* with dashes
+    // (`---text`) is content and never closes — that is the mid-line leak
+    // the exact-line rule fixed, and an all-dash run can never leak one.
     let mut offset = 0usize;
     for line in rest.split_inclusive('\n') {
         let bare = line.strip_suffix('\n').unwrap_or(line);
-        if bare.trim_end() == "---" {
+        let trimmed = bare.trim_end();
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| c == '-') {
             // yaml spans from the start of `rest` to this line, minus the
             // newline that terminates the last yaml line (byte-compatible
             // with the previous `after_open[len..close_pos]` region).
@@ -594,6 +600,41 @@ Search the web.
         assert_eq!(entry.metadata.description, "Search the web");
         assert!(!entry.body.contains("---"));
         assert!(entry.parse_status.is_ok());
+    }
+
+    #[test]
+    fn test_parse_thematic_break_closes_exact_opener() {
+        // A longer all-dash run (`----`, `-----`) is a valid Markdown
+        // thematic break, and legacy authors closed frontmatter with it.
+        // The exact-closer rule silently degraded those files into the
+        // body (the yaml block then smeared into the description
+        // fallback), so the closer accepts any all-dash run of >= 3
+        // dashes — while the opener stays exact and a `---text` line
+        // still never closes.
+        let content = "---\nname: legacy\ndescription: ok\n----\nBody.\n";
+        let entry = parse_skill_md(content, "dir-name");
+        assert_eq!(entry.metadata.name, "legacy");
+        assert_eq!(entry.metadata.description, "ok");
+        assert_eq!(entry.body, "Body.\n");
+        assert!(entry.parse_status.is_ok());
+
+        // Five dashes with CRLF and a trailing space behave the same.
+        let crlf = "---\r\nname: five\r\ndescription: ok\r\n----- \r\nBody\r\n";
+        let entry = parse_skill_md(crlf, "dir-name");
+        assert_eq!(entry.metadata.description, "ok");
+        assert_eq!(entry.body, "Body\r\n");
+        assert!(entry.parse_status.is_ok());
+
+        // A thematic-break OPENER still never opens frontmatter (the
+        // yaml inside the body is not honored).
+        let opener = parse_skill_md("----\n---\nname: never\n---\nBody\n", "dir-name");
+        assert!(opener.parse_status.is_degraded());
+        assert_ne!(opener.metadata.name, "never");
+
+        // `---text` is content, not a closer: bare-opener shape.
+        let text = parse_skill_md("---\nname: x\n---text\nBody\n", "dir-name");
+        assert!(text.parse_status.is_degraded());
+        assert_ne!(text.metadata.name, "x");
     }
 
     #[test]
@@ -1082,24 +1123,29 @@ Body.
     }
 
     #[test]
-    fn test_closer_requires_exact_fence_line() {
-        // A typo'd 4-dash closer is not a fence: the old prefix match
-        // landed the body slice on the fourth dash and parsed the skill
-        // as Ok with a stray `-` line leaking into the body.
+    fn test_closer_accepts_dash_run_after_exact_opener() {
+        // A longer all-dash closer (`----`, `-----`) is a Markdown
+        // thematic break legacy authors used to close frontmatter; the
+        // exact-line rule silently degraded those files into the body
+        // (the yaml block then smeared into the description fallback),
+        // so the closer accepts any all-dash run. The mid-line leak the
+        // old prefix match allowed stays fixed: a `---text` line never
+        // closes (pinned in test_parse_thematic_break_closes_exact_opener).
         let content = "---\nname: demo\ndescription: d\n----\n\n# Body\n";
 
         let entry = parse_skill_md(content, "demo");
 
         assert!(
-            entry.parse_status.is_degraded(),
-            "a frontmatter block closed by `----` is unclosed, not Ok: {:?}",
+            entry.parse_status.is_ok(),
+            "a thematic-break closer after an exact opener closes: {:?}",
             entry.parse_status
         );
-        assert!(
-            entry.body.contains("name: demo") && entry.body.contains("# Body"),
-            "the whole file must be the body when no exact closer exists: {:?}",
+        assert_eq!(
+            entry.body, "\n# Body\n",
+            "the closer line itself must not leak into the body: {:?}",
             entry.body
         );
+        assert_eq!(entry.metadata.description, "d");
     }
 
     #[test]
