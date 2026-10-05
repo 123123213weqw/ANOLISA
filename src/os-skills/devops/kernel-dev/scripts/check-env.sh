@@ -72,11 +72,11 @@ echo ""
 # Check kernel build directory
 echo "Kernel Build Directory:"
 BUILD_DIR="/lib/modules/$KERNEL_VER/build"
-if [ -L "$BUILD_DIR" ] || [ -d "$BUILD_DIR" ]; then
-    REAL_PATH=$(readlink -f "$BUILD_DIR" 2>/dev/null || echo "$BUILD_DIR")
+REAL_PATH=$(readlink -f "$BUILD_DIR" 2>/dev/null || echo "")
+if [ -n "$REAL_PATH" ] && [ -d "$REAL_PATH" ] && [ -f "$REAL_PATH/Makefile" ]; then
     echo -e "  ${GREEN}✓${NC} $BUILD_DIR -> $REAL_PATH"
 else
-    echo -e "  ${RED}✗${NC} $BUILD_DIR (not found)"
+    echo -e "  ${RED}✗${NC} $BUILD_DIR (not found or unusable)"
     MISSING+=("kernel-build-dir")
 fi
 echo ""
