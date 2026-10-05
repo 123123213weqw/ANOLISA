@@ -16,4 +16,17 @@
 
 __version__ = "1.0.0"
 
-from .run_task import main  # noqa: F401
+
+def main():
+    """Delegate to the real CLI entry point.
+
+    The agent runtime (run_task and its Docker/OpenAI/MCP/platform
+    imports) is loaded only when an evaluation is actually invoked, so
+    importing ``ce_runner`` for metadata (the version probe, the
+    ``ce-runner`` console script target) stays lightweight. The
+    delegation, SystemExit and error propagation of the real entry
+    point are preserved unchanged.
+    """
+    from .run_task import main as _run_task_main
+
+    return _run_task_main()
