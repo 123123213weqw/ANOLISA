@@ -16,7 +16,7 @@ interface PendingRequest {
 }
 
 class JsonRpcConnection {
-  private buffer = '';
+  private buffer = Buffer.alloc(0);
   private nextId = 1;
   private disposed = false;
   private pendingRequests = new Map<string | number, PendingRequest>();
@@ -143,7 +143,11 @@ class JsonRpcConnection {
       return;
     }
 
-    this.buffer += chunk.toString('utf8');
+    // Content-Length counts bytes of the UTF-8 encoded body, so framing must
+    // operate on the raw buffer. Decoding to a string first would compare
+    // UTF-16 code units against the byte length and desynchronize the parser
+    // whenever a body contains multibyte characters.
+    this.buffer = Buffer.concat([this.buffer, chunk]);
 
     while (true) {
       const headerEnd = this.buffer.indexOf('\r\n\r\n');
@@ -151,10 +155,10 @@ class JsonRpcConnection {
         break;
       }
 
-      const header = this.buffer.slice(0, headerEnd);
+      const header = this.buffer.subarray(0, headerEnd).toString('latin1');
       const lengthMatch = /Content-Length:\s*(\d+)/i.exec(header);
       if (!lengthMatch) {
-        this.buffer = this.buffer.slice(headerEnd + 4);
+        this.consume(headerEnd + 4);
         continue;
       }
 
@@ -166,8 +170,10 @@ class JsonRpcConnection {
         break;
       }
 
-      const body = this.buffer.slice(messageStart, messageEnd);
-      this.buffer = this.buffer.slice(messageEnd);
+      const body = this.buffer
+        .subarray(messageStart, messageEnd)
+        .toString('utf8');
+      this.consume(messageEnd);
 
       try {
         const message = JSON.parse(body);
@@ -176,6 +182,22 @@ class JsonRpcConnection {
         // ignore malformed messages
       }
     }
+  }
+
+  /**
+   * Drops the first `bytes` bytes from the receive buffer. When the buffer
+   * is fully drained this must NOT keep a zero-length subarray view: such a
+   * view still shares the backing ArrayBuffer of the received data, so an
+   * idle connection would pin the whole backing store (e.g. a 1 MiB
+   * semantic-tokens or workspace-symbol response) and keep it unreachable
+   * for garbage collection. Reset to a fresh empty buffer instead and only
+   * retain a view while leftover bytes remain.
+   */
+  private consume(bytes: number): void {
+    this.buffer =
+      bytes >= this.buffer.length
+        ? Buffer.alloc(0)
+        : this.buffer.subarray(bytes);
   }
 
   private routeMessage(message: JsonRpcMessage): void {
