@@ -191,9 +191,9 @@ ce-runner 使用 openclaw 原生的 MCP 运行时(stdio)向 agent 暴露任务�
 | `scripts/run_task_compare.py` | 以原生 + ce-runner 两种模式运行任务做对比 |
 | `scripts/list_tasks.py` | 按前缀(T/M/C)和难度列出任务 |
 | `scripts/debug_task.py` | 单任务交互式调试,输出详细信息 |
-| `scripts/analyze.py` | 分析批量 trace 产物 |
+| `scripts/analyze.py` | 分析批量 trace 产物(无法读取的任务 YAML/trace JSONL 会生成单次试验的错误报告,不会中断整体运行) |
 | `scripts/summarize_results.py` | 汇总多次运行的批量结果 |
-| `scripts/generate_trial_reports.py` | 生成每次试验的详细报告 |
+| `scripts/generate_trial_reports.py` | 生成每次试验的详细报告(读取失败的证据按单次试验隔离) |
 | `scripts/prompt_task.py` | 显示指定任务的 system prompt |
 | `scripts/check_api_key.py` | 测试 API key 连通性 |
 | `scripts/check_openclaw_env.py` | 检查 openclaw 环境(`--fix` 可清理) |

@@ -74,6 +74,10 @@ FAILURE_CATEGORIES = [
     "other",                 # Unclassifiable
 ]
 
+# Known input-read failures isolated at each per-trial evidence-loading
+# boundary. Anything else (unexpected loader/programming errors) propagates.
+INPUT_READ_ERRORS = (yaml.YAMLError, json.JSONDecodeError, UnicodeDecodeError, OSError)
+
 
 def load_config(config_path: str | None, args) -> dict:
     """Load settings from config YAML, with CLI overrides.
@@ -329,17 +333,43 @@ Do NOT include any other text or explanation. Only output the JSON."""
         return {"category": "other", "key_reason_zh": f"LLM error: {str(e)[:100]}"}
 
 
+def evidence_read_error_report(trace_filename: str, task_id: str, trial_id: str,
+                               source: str, exc: Exception) -> dict:
+    """Explicit error report for a trial whose evidence could not be read."""
+    return {
+        "trace_file": trace_filename,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "status": "error",
+        "evidence_read_error": {
+            "source": source,
+            "exception": type(exc).__name__,
+            "message": str(exc),
+        },
+    }
+
+
 def process_one_trace(trace_path: str, settings: dict) -> tuple:
     """Process a single trace file and return (filename, report)."""
     trace_filename = os.path.basename(trace_path)
     task_id = resolve_task_id(trace_filename)
-    task_info = load_task_info(task_id, settings["tasks_dir"])
-    grading, trace_end = load_grading_result(trace_path)
+    trial_id = trace_filename.replace(".jsonl", "").rsplit("_", 1)[-1]
+
+    try:
+        task_info = load_task_info(task_id, settings["tasks_dir"])
+    except INPUT_READ_ERRORS as exc:
+        source = os.path.join(settings["tasks_dir"], task_id, "task.yaml")
+        return trace_filename, evidence_read_error_report(
+            trace_filename, task_id, trial_id, source, exc)
+    try:
+        grading, trace_end = load_grading_result(trace_path)
+    except INPUT_READ_ERRORS as exc:
+        return trace_filename, evidence_read_error_report(
+            trace_filename, task_id, trial_id, trace_path, exc)
 
     scores = grading.get("scores", {}) if grading else {}
     passed = grading.get("passed", False) if grading else False
     task_score = grading.get("task_score", 0) if grading else 0
-    trial_id = trace_filename.replace(".jsonl", "").rsplit("_", 1)[-1]
 
     report = {
         "trace_file": trace_filename,

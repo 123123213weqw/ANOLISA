@@ -125,6 +125,27 @@ def load_config(config_path: str | None, cli_args) -> dict:
 
 # ── Trial report generation ─────────────────────────────────────────────────
 
+# Known input-read failures isolated at each per-trial evidence-loading
+# boundary. Anything else (unexpected loader/programming errors) propagates.
+INPUT_READ_ERRORS = (yaml.YAMLError, json.JSONDecodeError, UnicodeDecodeError, OSError)
+
+
+def evidence_read_error_report(trace_filename: str, task_id: str, trial_id: str,
+                               source: str, exc: Exception) -> dict:
+    """Explicit error report for a trial whose evidence could not be read."""
+    return {
+        "trace_file": trace_filename,
+        "task_id": task_id,
+        "trial_id": trial_id,
+        "status": "error",
+        "evidence_read_error": {
+            "source": source,
+            "exception": type(exc).__name__,
+            "message": str(exc),
+        },
+    }
+
+
 def load_task_info(task_id: str, tasks_dir: str) -> dict:
     yaml_path = os.path.join(tasks_dir, task_id, "task.yaml")
     if not os.path.exists(yaml_path):
@@ -267,40 +288,53 @@ def generate_reports(trace_dir: str, tasks_dir: str, report_dir: str,
     for i, trace_path in enumerate(trace_files, 1):
         trace_filename = os.path.basename(trace_path)
         task_id = resolve_task_id(trace_filename)
-        task_info = load_task_info(task_id, tasks_dir)
-        grading, trace_end = load_grading_result(trace_path)
-
-        scores = grading.get("scores", {}) if grading else {}
-        passed = grading.get("passed", False) if grading else False
-        task_score = grading.get("task_score", 0) if grading else 0
         trial_id = trace_filename.replace(".jsonl", "").rsplit("_", 1)[-1]
 
-        report = {
-            "trace_file": trace_filename,
-            "task_id": task_id,
-            "task_name": task_info.get("task_name", ""),
-            "trial_id": trial_id,
-            "status": "succ" if passed else "fail",
-            "task_score": task_score,
-            "scores": scores,
-        }
+        report = None
+        try:
+            task_info = load_task_info(task_id, tasks_dir)
+        except INPUT_READ_ERRORS as exc:
+            source = os.path.join(tasks_dir, task_id, "task.yaml")
+            report = evidence_read_error_report(
+                trace_filename, task_id, trial_id, source, exc)
+        if report is None:
+            try:
+                grading, trace_end = load_grading_result(trace_path)
+            except INPUT_READ_ERRORS as exc:
+                report = evidence_read_error_report(
+                    trace_filename, task_id, trial_id, trace_path, exc)
 
-        if not grading:
-            report["status"] = "error"
-            report["failure_reason"] = [{"message": "No grading_result found in trace"}]
-        elif not passed:
-            report["failure_reason"] = infer_failure_reason(grading, scores)
-            report["task_scoring_components"] = task_info.get("scoring_components", [])
-            report["task_judge_rubric"] = task_info.get("judge_rubric", "")[:500]
-            report["task_primary_dimensions"] = task_info.get("primary_dimensions", [])
-            if trace_end:
-                report["total_turns"] = trace_end.get("total_turns")
-                report["wall_time_s"] = trace_end.get("wall_time_s")
-            classification = llm_classify_failure(
-                task_info, grading, trace_end,
-                judge_api_key, judge_base_url, judge_model_id,
-            )
-            report["failure_classification"] = classification
+        if report is None:
+            scores = grading.get("scores", {}) if grading else {}
+            passed = grading.get("passed", False) if grading else False
+            task_score = grading.get("task_score", 0) if grading else 0
+
+            report = {
+                "trace_file": trace_filename,
+                "task_id": task_id,
+                "task_name": task_info.get("task_name", ""),
+                "trial_id": trial_id,
+                "status": "succ" if passed else "fail",
+                "task_score": task_score,
+                "scores": scores,
+            }
+
+            if not grading:
+                report["status"] = "error"
+                report["failure_reason"] = [{"message": "No grading_result found in trace"}]
+            elif not passed:
+                report["failure_reason"] = infer_failure_reason(grading, scores)
+                report["task_scoring_components"] = task_info.get("scoring_components", [])
+                report["task_judge_rubric"] = task_info.get("judge_rubric", "")[:500]
+                report["task_primary_dimensions"] = task_info.get("primary_dimensions", [])
+                if trace_end:
+                    report["total_turns"] = trace_end.get("total_turns")
+                    report["wall_time_s"] = trace_end.get("wall_time_s")
+                classification = llm_classify_failure(
+                    task_info, grading, trace_end,
+                    judge_api_key, judge_base_url, judge_model_id,
+                )
+                report["failure_classification"] = classification
 
         out_path = os.path.join(report_dir, trace_filename.replace(".jsonl", ".json"))
         with open(out_path, "w") as f:

@@ -191,9 +191,9 @@ Core logic: `src/ce_runner/tool_injector.py`
 | `scripts/run_task_compare.py` | Run a task in native + ce-runner modes for comparison |
 | `scripts/list_tasks.py` | List tasks grouped by prefix (T/M/C) and difficulty |
 | `scripts/debug_task.py` | Single-task interactive debug with verbose output |
-| `scripts/analyze.py` | Analyze batch trace artifacts |
+| `scripts/analyze.py` | Analyze batch trace artifacts (unreadable task YAML/trace JSONL becomes a per-trial error report instead of aborting the run) |
 | `scripts/summarize_results.py` | Summarize batch results across runs |
-| `scripts/generate_trial_reports.py` | Generate per-trial detailed reports |
+| `scripts/generate_trial_reports.py` | Generate per-trial detailed reports (unreadable evidence is isolated per trial) |
 | `scripts/prompt_task.py` | Display the system prompt for a given task |
 | `scripts/check_api_key.py` | Test API key connectivity |
 | `scripts/check_openclaw_env.py` | Inspect openclaw environment (`--fix` to cleanup) |
