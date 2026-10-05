@@ -2824,3 +2824,66 @@ def test_rolling_max_increase_bounds_comparison_work() -> None:
     # The rescan baseline performs 1,499,500 value comparisons here; a
     # monotonic minimum deque performs amortized constant work per sample.
     assert _ComparisonCountingValue.comparisons <= 3 * size
+# Regression (#5644): a missing executable (e.g. rustup) used to raise
+# FileNotFoundError before the checks record was appended, so the durable
+# regression JSON omitted the failed command and later gates were never
+# attempted, contrary to the runner's preserve-all-logs behavior.
+
+
+def test_run_check_records_missing_executable_and_continues(tmp_path: Path) -> None:
+    checks: list[dict[str, object]] = []
+    log_missing = tmp_path / "missing.log"
+    status_missing = run_regression.run_check(
+        ["/nonexistent-anolisa-5644/missing-tool", "--version"],
+        tmp_path,
+        log_missing,
+        checks,
+    )
+    assert status_missing != 0
+    assert len(checks) == 1
+    record = checks[0]
+    assert record["command"].startswith("/nonexistent-anolisa-5644/missing-tool")
+    assert record["exit_code"] != 0
+    assert "launch_error" in record
+    assert "missing-tool" in str(record["launch_error"])
+    assert "missing-tool" in log_missing.read_text()
+
+    # The failure is recorded, not raised: later gates still run and are
+    # recorded through the same durable path.
+    log_next = tmp_path / "next.log"
+    status_next = run_regression.run_check(
+        [sys.executable, "-c", "print('next gate ran')"],
+        tmp_path,
+        log_next,
+        checks,
+    )
+    assert status_next == 0
+    assert len(checks) == 2
+    assert checks[1]["exit_code"] == 0
+
+
+def test_run_check_preserves_success_and_nonzero_exit_controls(tmp_path: Path) -> None:
+    checks: list[dict[str, object]] = []
+    log_ok = tmp_path / "ok.log"
+    assert (
+        run_regression.run_check(
+            [sys.executable, "-c", "print('green')"], tmp_path, log_ok, checks
+        )
+        == 0
+    )
+    assert checks[0]["exit_code"] == 0
+    assert "launch_error" not in checks[0]
+    assert "green" in log_ok.read_text()
+
+    log_fail = tmp_path / "fail.log"
+    assert (
+        run_regression.run_check(
+            [sys.executable, "-c", "raise SystemExit(3)"],
+            tmp_path,
+            log_fail,
+            checks,
+        )
+        == 3
+    )
+    assert checks[1]["exit_code"] == 3
+    assert "launch_error" not in checks[1]

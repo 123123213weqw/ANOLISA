@@ -99,28 +99,45 @@ def missing_python_modules() -> list[str]:
 def run_check(
     command: list[str], cwd: Path, log_path: Path, checks: list[dict[str, object]]
 ) -> int:
-    """Run one check, append its durable record, and return its exit code."""
+    """Run one check, append its durable record, and return its exit code.
+
+    A subprocess launch failure (absent executable, permission problem)
+    is recorded in the owned log and checks entry with a nonzero exit
+    code instead of escaping before the record is appended, so the main
+    loop keeps preserving report progress and later gates still run.
+    """
     started = time.time()
+    exit_code = 0
+    launch_error: str | None = None
     with log_path.open("w", encoding="utf-8") as log:
-        result = subprocess.run(
-            command,
-            cwd=cwd,
-            stdout=log,
-            stderr=subprocess.STDOUT,
-            text=True,
-            check=False,
-        )
-    checks.append(
-        {
-            "command": shlex.join(command),
-            "cwd": str(cwd),
-            "log": log_path.name,
-            "started_at_unix": started,
-            "duration_seconds": time.time() - started,
-            "exit_code": result.returncode,
-        }
-    )
-    return result.returncode
+        try:
+            result = subprocess.run(
+                command,
+                cwd=cwd,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            # 127: the shell convention for a command that could not run.
+            exit_code = 127
+            launch_error = f"{type(exc).__name__}: {exc}"
+            log.write(f"regression: launch failed: {launch_error}\n")
+        else:
+            exit_code = result.returncode
+    record: dict[str, object] = {
+        "command": shlex.join(command),
+        "cwd": str(cwd),
+        "log": log_path.name,
+        "started_at_unix": started,
+        "duration_seconds": time.time() - started,
+        "exit_code": exit_code,
+    }
+    if launch_error is not None:
+        record["launch_error"] = launch_error
+    checks.append(record)
+    return exit_code
 
 
 def write_report(
