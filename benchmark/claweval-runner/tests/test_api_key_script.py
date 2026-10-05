@@ -151,3 +151,95 @@ def test_main_returns_1_on_failure(script_mod):
             "--model-id", "m1",
         ])
     assert rc == 1
+
+
+BAD_BASE_URL = "https://api.invalid:notaport"
+
+
+def _fake_openai_factory(monkeypatch):
+    """Patch openai.OpenAI: real constructor for the malformed URL, stub otherwise."""
+    from unittest.mock import MagicMock
+
+    import openai
+
+    real_openai = openai.OpenAI
+
+    def _make_client(**kwargs):
+        if kwargs.get("base_url") == BAD_BASE_URL:
+            return real_openai(**kwargs)
+        client = MagicMock()
+        message = MagicMock()
+        message.content = "pong"
+        choice = MagicMock()
+        choice.message = message
+        resp = MagicMock()
+        resp.choices = [choice]
+        client.chat.completions.create.return_value = resp
+        return client
+
+    monkeypatch.setattr(openai, "OpenAI", _make_client)
+    return _make_client
+
+
+def test_test_one_reports_constructor_failure_as_result(script_mod, monkeypatch):
+    _fake_openai_factory(monkeypatch)
+    target = {
+        "role": "model",
+        "api_key": "sk-x",
+        "base_url": BAD_BASE_URL,
+        "model_id": "m1",
+    }
+    result = script_mod.test_one(target, timeout=1.0, max_tokens=5)
+    assert result["ok"] is False
+    assert "InvalidURL" in result["error"]
+    assert result["reply"] == ""
+
+
+def test_main_constructor_failure_keeps_other_roles_and_summary(script_mod, monkeypatch, tmp_path, capsys):
+    _fake_openai_factory(monkeypatch)
+    cfg = tmp_path / "config.yaml"
+    cfg.write_text(
+        f"model:\n  api_key: k-bad\n  base_url: {BAD_BASE_URL}\n  model_id: m1\n"
+        "judge:\n  api_key: k2\n  base_url: https://ok-a/v1\n  model_id: m2\n"
+        "user_agent_model:\n  api_key: k3\n  base_url: https://ok-b/v1\n  model_id: m3\n"
+    )
+    rc = script_mod.main(["--config", str(cfg), "--no-dedupe"])
+    assert rc == 1
+    out = capsys.readouterr().out
+    assert "[judge]" in out and "OK" in out
+    assert "[user_agent_model]" in out
+    assert "InvalidURL" in out
+    assert "2/3 passed" in out
+
+
+def test_test_one_success_path_with_stubbed_client(script_mod, monkeypatch):
+    _fake_openai_factory(monkeypatch)
+    target = {
+        "role": "model",
+        "api_key": "sk-x",
+        "base_url": "https://ok-a/v1",
+        "model_id": "m1",
+    }
+    result = script_mod.test_one(target, timeout=1.0, max_tokens=5)
+    assert result["ok"] is True
+    assert result["error"] == ""
+    assert result["reply"] == "pong"
+
+
+def test_test_one_propagates_keyboard_interrupt_from_constructor(script_mod, monkeypatch):
+    from unittest.mock import MagicMock
+
+    import openai
+
+    def _raising_client(**_kwargs):
+        raise KeyboardInterrupt()
+
+    monkeypatch.setattr(openai, "OpenAI", _raising_client)
+    target = {
+        "role": "model",
+        "api_key": "sk-x",
+        "base_url": "https://ok-a/v1",
+        "model_id": "m1",
+    }
+    with pytest.raises(KeyboardInterrupt):
+        script_mod.test_one(target, timeout=1.0, max_tokens=5)

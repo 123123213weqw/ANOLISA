@@ -116,13 +116,13 @@ def test_one(target: dict, timeout: float, max_tokens: int) -> dict:
             "reply": "",
         }
 
-    client = OpenAI(
-        api_key=target["api_key"],
-        base_url=target["base_url"],
-        timeout=timeout,
-    )
     start = time.monotonic()
     try:
+        client = OpenAI(
+            api_key=target["api_key"],
+            base_url=target["base_url"],
+            timeout=timeout,
+        )
         resp = client.chat.completions.create(
             model=target["model_id"],
             messages=[{"role": "user", "content": "ping"}],
