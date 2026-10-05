@@ -479,8 +479,20 @@ fn read_rq_affinity(name: &str) -> u64 {
 }
 
 fn read_network_info() -> Result<Vec<NetInfo>> {
+    read_network_info_from(Path::new("/sys/class/net"))
+}
+
+/// Read every interface under `net_dir` together with its link speed.
+///
+/// The speed lookup is built from the directory entry's raw name, not from
+/// its lossy display form: interface names may contain any byte the kernel's
+/// naming rules allow (`dev_valid_name` accepts everything except `/`, `:`
+/// and whitespace), so a non-UTF-8 name came out of `to_string_lossy` with
+/// U+FFFD replacement bytes and the rebuilt `/sys/class/net/<mangled>/speed`
+/// path no longer resolved — the interface was reported with speed 0.
+/// `net_dir` is a parameter so tests can build a fake sysfs tree.
+fn read_network_info_from(net_dir: &Path) -> Result<Vec<NetInfo>> {
     let mut nets = Vec::new();
-    let net_dir = "/sys/class/net";
 
     if let Ok(entries) = fs::read_dir(net_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -495,7 +507,7 @@ fn read_network_info() -> Result<Vec<NetInfo>> {
                 continue;
             }
 
-            let speed_path = format!("/sys/class/net/{name}/speed");
+            let speed_path = entry.path().join("speed");
             let speed_mbps = fs::read_to_string(&speed_path)
                 .ok()
                 .and_then(|s| s.trim().parse::<i64>().ok())
@@ -1161,6 +1173,51 @@ mod tests {
         std::fs::write(&path, b"2\n").unwrap();
         assert_eq!(read_sysctl_i64(path.to_str().unwrap()), 2);
         std::fs::remove_file(&path).ok();
+    }
+
+    /// The kernel's `dev_valid_name` accepts any interface name without `/`,
+    /// `:` or whitespace, so a name can be non-UTF-8. The speed lookup must be
+    /// built from the directory entry's raw name: rebuilding the path from the
+    /// lossy display form (`to_string_lossy` → U+FFFD) made the `speed` file
+    /// unresolvable and reported the interface as having no known speed.
+    #[test]
+    fn network_info_reads_speed_for_a_non_utf8_interface_name() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // One interface whose name carries a raw 0xFF byte, one ordinary
+        // interface, and the loopback shorthand that must stay skipped.
+        let raw = dir.join(std::ffi::OsStr::from_bytes(b"eth\xff0"));
+        fs::create_dir_all(&raw).expect("create fake interface dir");
+        fs::write(raw.join("speed"), b"10000\n").expect("write speed");
+        let plain = dir.join("ens5");
+        fs::create_dir_all(&plain).expect("create plain interface dir");
+        fs::write(plain.join("speed"), b"1000\n").expect("write speed");
+        let lo = dir.join("lo");
+        fs::create_dir_all(&lo).expect("create loopback dir");
+        fs::write(lo.join("speed"), b"1000\n").expect("write speed");
+
+        let nets = read_network_info_from(&dir).expect("read fake sysfs tree");
+        assert_eq!(nets.len(), 2, "lo is skipped: {nets:?}");
+
+        let non_utf8 = nets
+            .iter()
+            .find(|n| n.speed_mbps == 10000)
+            .expect("the non-UTF-8 interface must report its speed");
+        // The stored display name is lossy, but the lookup used the raw name.
+        assert_eq!(non_utf8.name, "eth\u{fffd}0");
+        assert_eq!(
+            nets.iter().find(|n| n.name == "ens5").unwrap().speed_mbps,
+            1000
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
