@@ -185,6 +185,25 @@ fn dry_run_output(applicable: &[Recommendation], requested: usize) -> serde_json
     })
 }
 
+/// Extend a short-circuit body with the keys a `--dry-run` caller reads.
+///
+/// `--dry-run` answers with `dry_run` and `would_apply` on every host: the
+/// short-circuit shapes predate the flag, so a host where every recommendation
+/// was filtered out answered with neither key and a script could not tell that
+/// invocation from a non-dry-run one — it read `would_apply`, found nothing and
+/// had no way to distinguish "nothing to plan" from "the flag was ignored".
+/// `would_apply` is empty here because nothing is applicable, and `status`
+/// keeps the short-circuit vocabulary (`optimal` / `blocked`).
+fn dry_run_preview(mut body: serde_json::Value) -> serde_json::Value {
+    if let Some(object) = body.as_object_mut() {
+        object.insert("dry_run".to_string(), json!(true));
+        object
+            .entry("would_apply".to_string())
+            .or_insert_with(|| json!([]));
+    }
+    body
+}
+
 fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i32> {
     if !dry_run {
         let is_root = unsafe { libc::geteuid() } == 0;
@@ -217,6 +236,11 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
         .collect();
     let requested = recs.len();
     if let Some((output, code)) = tune_short_circuit(&recs, applicable.len()) {
+        let output = if dry_run {
+            dry_run_preview(output)
+        } else {
+            output
+        };
         println!("{}", serde_json::to_string_pretty(&output)?);
         return Ok(code);
     }
@@ -598,6 +622,35 @@ mod tests {
         let full = dry_run_output(&recs, 2);
         assert_eq!(full["status"], json!("planned"));
         assert_eq!(full["blocked"], json!(0));
+    }
+
+    #[test]
+    fn dry_run_preview_keeps_its_keys_on_a_short_circuit() {
+        // A host whose every recommendation is filtered out short-circuits
+        // before the preview is built. Under --dry-run the answer must still
+        // carry the two keys that flag promises: a script reading
+        // `would_apply` has no other way to tell "nothing to plan" from "the
+        // flag was ignored".
+        let recs = vec![rec("vm.swappiness", false)];
+        let (blocked, code) =
+            tune_short_circuit(&recs, 0).expect("everything blocked short-circuits");
+        assert_eq!(code, 1);
+
+        let preview = dry_run_preview(blocked);
+        assert_eq!(preview["dry_run"], json!(true));
+        assert_eq!(preview["would_apply"], json!([]));
+        // The short-circuit vocabulary and its counts are untouched.
+        assert_eq!(preview["status"], json!("blocked"));
+        assert_eq!(preview["recommendations"], json!(1));
+        assert_eq!(preview["blocked_unwritable"], json!(1));
+
+        // The truly-optimal body takes the same keys.
+        let (optimal, code) = tune_short_circuit(&[], 0).expect("nothing to recommend");
+        assert_eq!(code, 0);
+        let preview = dry_run_preview(optimal);
+        assert_eq!(preview["dry_run"], json!(true));
+        assert_eq!(preview["would_apply"], json!([]));
+        assert_eq!(preview["status"], json!("optimal"));
     }
 
     #[test]
