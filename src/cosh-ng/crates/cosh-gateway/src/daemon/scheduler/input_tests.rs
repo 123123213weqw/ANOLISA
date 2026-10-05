@@ -583,6 +583,77 @@ fn replay_of_started_dispatch_never_writes_and_converges_unknown() {
 }
 
 #[test]
+fn late_input_resolution_honors_durable_cancellation_over_expiry() {
+    let (_root, mut cancelling, actor_id, task, probe, _started_at) = setup(false);
+    let request = probe.lock().unwrap().request.clone().unwrap();
+    let expires_at_ms = cancelling
+        .coordinator
+        .store
+        .load_runtime_input_request(request.request_id())
+        .unwrap()
+        .expires_at_ms;
+    // Keep the Run lease renewed while the input deadline elapses, exactly
+    // like a live daemon whose poll loop keeps ticking.
+    let mut renewal_at = cancelling
+        .coordinator
+        .store
+        .load_runtime_input_request(request.request_id())
+        .unwrap()
+        .updated_at_ms
+        + 100_000;
+    while renewal_at < expires_at_ms {
+        assert_eq!(cancelling.tick(renewal_at).unwrap(), SchedulerTick::Idle);
+        renewal_at = renewal_at.saturating_add(100_000);
+    }
+    let waiting = cancelling.coordinator.store.load_task(&task.task_id).unwrap();
+    cancelling
+        .coordinator
+        .cancel(
+            &actor_id,
+            crate::daemon::CancelTask {
+                request_id: RequestId::new(),
+                idempotency_key: IdempotencyKey::new("cancel-late-input").unwrap(),
+                task_id: task.task_id.clone(),
+                run_id: waiting.active_run_id().unwrap().clone(),
+                expected_revision: Some(waiting.revision()),
+            },
+        )
+        .unwrap();
+    assert!(cancelling
+        .coordinator
+        .store
+        .load_task(&task.task_id)
+        .unwrap()
+        .cancellation_requested());
+    assert!(matches!(
+        cancelling.resolve_input(
+            &actor_id,
+            IdempotencyKey::new("late-input").unwrap(),
+            &task.task_id,
+            request.request_id(),
+            selected_main(),
+            None,
+            expires_at_ms,
+        ),
+        Ok(SchedulerTick::Settled(TaskView {
+            state: TaskState::Cancelled,
+            ..
+        }))
+    ));
+    let settled = cancelling.coordinator.store.load_task(&task.task_id).unwrap();
+    assert_eq!(settled.state(), TaskState::Cancelled);
+    assert_eq!(
+        cancelling
+            .coordinator
+            .store
+            .load_runtime_input_request(request.request_id())
+            .unwrap()
+            .state,
+        RuntimeInputRequestState::Cancelled
+    );
+}
+
+#[test]
 fn pending_input_expiry_and_cancellation_are_fail_closed() {
     let (_root, mut expiring, _actor_id, _task, probe, _started_at) = setup(false);
     let request = probe.lock().unwrap().request.clone().unwrap();

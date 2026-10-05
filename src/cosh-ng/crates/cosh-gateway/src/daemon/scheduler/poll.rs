@@ -1,4 +1,30 @@
 impl<F: RuntimeFactory> TaskScheduler<F> {
+    fn converge_active_cancellation(
+        &mut self,
+        now_ms: u64,
+    ) -> Result<SchedulerTick, GatewayDaemonError> {
+        let cancellation_at_ms = refreshed_now_ms(now_ms)?;
+        self.require_active_lease_time(cancellation_at_ms)?;
+        self.cancel_pending_input(cancellation_at_ms)?;
+        let cancel_result = self
+            .active
+            .as_mut()
+            .ok_or_else(no_active_run)?
+            .handle
+            .shutdown(CancelReason::UserRequested);
+        let cancelled_at_ms = refreshed_now_ms(now_ms)?;
+        self.require_active_lease_time(cancelled_at_ms)?;
+        match cancel_result {
+            Ok(()) => self.finish_cancelled(cancelled_at_ms),
+            Err(error) => {
+                self.active.as_mut().ok_or_else(no_active_run)?.abort_error = Some(error);
+                Err(GatewayDaemonError::Protocol(
+                    "Runtime cancellation was not acknowledged".to_owned(),
+                ))
+            }
+        }
+    }
+
     fn poll_active(&mut self, now_ms: u64) -> Result<SchedulerTick, GatewayDaemonError> {
         if self
             .active
@@ -16,26 +42,7 @@ impl<F: RuntimeFactory> TaskScheduler<F> {
                 .run_cancellation_requested(&active.scheduled.task_id, &active.scheduled.run_id)?
         };
         if cancellation_requested {
-            let cancellation_at_ms = refreshed_now_ms(now_ms)?;
-            self.require_active_lease_time(cancellation_at_ms)?;
-            self.cancel_pending_input(cancellation_at_ms)?;
-            let cancel_result = self
-                .active
-                .as_mut()
-                .ok_or_else(no_active_run)?
-                .handle
-                .shutdown(CancelReason::UserRequested);
-            let cancelled_at_ms = refreshed_now_ms(now_ms)?;
-            self.require_active_lease_time(cancelled_at_ms)?;
-            return match cancel_result {
-                Ok(()) => self.finish_cancelled(cancelled_at_ms),
-                Err(error) => {
-                    self.active.as_mut().ok_or_else(no_active_run)?.abort_error = Some(error);
-                    Err(GatewayDaemonError::Protocol(
-                        "Runtime cancellation was not acknowledged".to_owned(),
-                    ))
-                }
-            };
+            return self.converge_active_cancellation(now_ms);
         }
         if let Some(pending) = self
             .active

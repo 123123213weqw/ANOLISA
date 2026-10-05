@@ -37,6 +37,16 @@ impl<F: RuntimeFactory> TaskScheduler<F> {
             ));
         }
         if request.state == RuntimeInputRequestState::Pending && now_ms >= request.expires_at_ms {
+            if self
+                .coordinator
+                .store
+                .run_cancellation_requested(task_id, &request.run_id)?
+            {
+                // A durable cancellation outranks the elapsed input deadline,
+                // exactly like the poll loop and lease-expiry recovery.
+                self.ensure_active_operation_budget(now_ms)?;
+                return self.converge_active_cancellation(now_ms);
+            }
             self.expire_active_input(now_ms)?;
             return Err(GatewayDaemonError::Protocol(
                 "Runtime input request is no longer resolvable".to_owned(),
