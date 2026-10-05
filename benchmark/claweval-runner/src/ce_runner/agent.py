@@ -590,7 +590,8 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
     """Call the UserAgent LLM to generate a simulated user response.
 
     Uses the same prompt format as claw-eval's UserAgent class.
-    Returns the response text, or None if user is satisfied ([DONE]).
+    Returns the response text, or None if user is satisfied (the stripped
+    response is exactly "[DONE]").
     """
     import random
 
@@ -603,9 +604,10 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
 1. 始终保持人设角色，用自然口语回复，不要暴露你是AI
 2. 根据助手的提问如实回答（基于你的人设信息）
 3. 如果助手问了你人设中没有的信息，说"不太清楚具体数字"或类似自然回复
-4. 如果助手已经给出了完整的计算结果和建议，且你没有更多问题，输出 [DONE]
-5. 如果你对回答满意或助手已充分回答了你的问题，输出 [DONE]
+4. 如果助手已经给出了完整的计算结果和建议，且你没有更多问题，只回复 [DONE] 本身，不要附加任何其他文字
+5. 如果你对回答满意或助手已充分回答了你的问题，只回复 [DONE] 本身，不要附加任何其他文字
 6. 回复要简短自然，像真实用户一样（1-3句话）
+7. [DONE] 是结束对话的标记：只有想结束对话时才单独回复 [DONE]；在句子中引用、举例或讨论 [DONE] 时，必须把它作为正常对话内容的一部分继续说明
 """
 
     # Format transcript
@@ -622,7 +624,8 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
 
     user_msg = (
         f"以下是到目前为止的对话：\n\n{transcript}\n\n"
-        "请根据你的人设回复助手的最新消息。如果你满意了就输出 [DONE]。"
+        "请根据你的人设回复助手的最新消息。如果你满意了，请单独回复 [DONE] 本身，"
+        "不要附加任何其他文字。"
     )
 
     try:
@@ -649,7 +652,7 @@ def _call_user_agent_llm(ua_config: dict, persona: str,
                 max_tokens=65536,
             )
             text = (resp.choices[0].message.content or "").strip()
-            if "[DONE]" in text:
+            if text == "[DONE]":
                 return None
             if text:
                 return text
