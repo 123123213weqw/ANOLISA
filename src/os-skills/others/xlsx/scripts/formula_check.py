@@ -32,6 +32,9 @@ import zipfile
 import xml.etree.ElementTree as ET
 import re
 import json
+import os
+import stat
+import tempfile
 
 # OOXML SpreadsheetML namespace
 NS = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -320,6 +323,81 @@ def build_report(results: dict) -> dict:
     }
 
 
+def _default_report_mode() -> int:
+    """Return the permission bits a plain ``open(..., "w")`` would use."""
+    mask = os.umask(0)
+    os.umask(mask)
+    return 0o666 & ~mask
+
+
+def _remove_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
+def publish_report_file(output_file: str, payload: str, input_path: str) -> None:
+    """Publish the JSON report at ``output_file`` as a complete protected output.
+
+    Refuses aliases of the input workbook (identical path, hard link or
+    symlink), writes and flushes/fsyncs the complete UTF-8 payload in a
+    private same-parent staging file, retains existing destination
+    permissions and non-input symlink targets, then atomically replaces the
+    destination. On any write/replace/path failure the input workbook and the
+    previous report are preserved, no partial report is published, owned
+    staging is removed, and the CLI exits nonzero with an actionable error.
+    """
+    def fail(message: str) -> None:
+        print(f"Error: {message}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        target = os.path.realpath(output_file)
+        input_real = os.path.realpath(input_path)
+    except OSError as exc:
+        fail(f"cannot resolve report path {output_file!r}: {exc}")
+        return
+
+    if target == input_real:
+        fail(f"report path {output_file!r} is the input workbook {input_path!r}; "
+             "refusing to overwrite the workbook with the report")
+    if os.path.exists(target):
+        try:
+            if os.path.samefile(target, input_real):
+                fail(f"report path {output_file!r} is an alias of the input workbook "
+                     f"{input_path!r}; refusing to overwrite the workbook with the report")
+        except OSError:
+            pass
+
+    parent = os.path.dirname(target) or "."
+    try:
+        fd, staging = tempfile.mkstemp(
+            prefix=f".{os.path.basename(target)}.", suffix=".tmp", dir=parent
+        )
+    except OSError as exc:
+        fail(f"cannot create report staging file in {parent!r}: {exc}")
+        return
+
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            mode = stat.S_IMODE(os.stat(target).st_mode)
+        except FileNotFoundError:
+            mode = _default_report_mode()
+        os.chmod(staging, mode)
+        os.replace(staging, target)
+    except OSError as exc:
+        _remove_quietly(staging)
+        fail(f"cannot write report to {output_file!r}: {exc}")
+    except BaseException:
+        _remove_quietly(staging)
+        raise
+
+
 def main() -> None:
     use_json = "--json" in sys.argv
     use_report = "--report" in sys.argv
@@ -353,8 +431,7 @@ def main() -> None:
         report = build_report(results)
         output = json.dumps(report, indent=2, ensure_ascii=False)
         if output_file:
-            with open(output_file, "w", encoding="utf-8") as f:
-                f.write(output + "\n")
+            publish_report_file(output_file, output, args_clean[0])
         else:
             print(output)
         sys.exit(1 if results["error_count"] > 0 else 0)
