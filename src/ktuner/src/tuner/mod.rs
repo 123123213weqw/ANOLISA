@@ -924,7 +924,12 @@ pub fn rollback_preview() -> Result<Vec<(String, String, String)>> {
 
 /// Read the pending rollback set for `--list` from the ledger at `path`.
 ///
-/// The whole exists -> read pair runs under the ledger's lock, matching
+/// An absent ledger short-circuits before the lock: lock acquisition creates
+/// the ledger directory and its `<path>.lock` file, and `--list` is
+/// documented as read-only ("nothing is written or deleted"), so a fresh
+/// install must not gain either from a preview.
+///
+/// Otherwise the exists -> read pair runs under the ledger's lock, matching
 /// rollback_inner's transaction shape: a concurrent rollback finalize holds
 /// LOCK_EX while it deletes the ledger, so an unlocked preview could pass
 /// exists() and then lose the file to that delete before read_to_string —
@@ -933,9 +938,16 @@ pub fn rollback_preview() -> Result<Vec<(String, String, String)>> {
 /// writer/finalizer takes LOCK_EX on the same `<ledger>.lock`, so LOCK_SH
 /// keeps them out of the window without serializing parallel listings.
 fn rollback_preview_at(path: &str) -> Result<Vec<(String, String, String)>> {
-    let _guard = lock_ledger_shared_at(path)?;
     // No ledger = nothing pending, which is not an error (a fresh install, or
-    // a completed rollback): --list reports an empty pending set.
+    // a completed rollback): --list reports an empty pending set without
+    // creating the ledger directory or lock file.
+    if !Path::new(path).exists() {
+        return Ok(Vec::new());
+    }
+    let _guard = lock_ledger_shared_at(path)?;
+    // Re-check under the shared lock: a concurrent finalize holds LOCK_EX
+    // while it deletes the ledger, so the state observed here is the state
+    // the read below sees.
     if !Path::new(path).exists() {
         return Ok(Vec::new());
     }
@@ -2348,6 +2360,29 @@ mod tests {
         assert!(rollback_preview_at(ledger.to_str().unwrap())
             .unwrap()
             .is_empty());
+    }
+
+    /// `rollback --list` is a documented read-only preview ("Read-only: no
+    /// writes" in cmd_rollback, "nothing is written or deleted" in the
+    /// README), but the shared-lock acquisition ran before the
+    /// ledger-exists check and created the ledger directory (default umask
+    /// mode, not the writer's 0700) plus `<ledger>.lock`. A preview with no
+    /// ledger must leave the filesystem untouched.
+    #[test]
+    fn test_rollback_preview_absent_ledger_creates_nothing() {
+        let dir = AtomicTestDir::new("preview-absent-no-write");
+        let ledger = dir.0.join("nested").join("rollback.json");
+        let entries = rollback_preview_at(ledger.to_str().unwrap()).unwrap();
+        assert!(entries.is_empty());
+        assert!(!ledger.exists(), "preview must not create the ledger");
+        assert!(
+            !ledger.parent().unwrap().exists(),
+            "preview must not create the ledger directory"
+        );
+        assert!(
+            !std::path::Path::new(&format!("{}.lock", ledger.display())).exists(),
+            "preview must not create the lock file"
+        );
     }
 
     #[test]
