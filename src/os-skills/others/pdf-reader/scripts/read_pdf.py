@@ -31,6 +31,22 @@ def _page_tables(page):
         out.append({"bbox": [float(v) for v in t.bbox], "rows": rows})
     return out
 
+def _engine_version(fitz):
+    v = getattr(fitz, "VersionFitz", "") or ""
+    if not v:
+        t = getattr(fitz, "version", ())
+        if isinstance(t, (tuple, list)) and t and isinstance(t[0], str):
+            v = t[0]
+    return v
+
+def _engine_supports_sort(fitz):
+    # Page.get_text(sort=True) exists since PyMuPDF 1.19.1
+    try:
+        major, minor = (int(p) for p in _engine_version(fitz).split(".")[:2])
+    except ValueError:
+        return True
+    return (major, minor) >= (1, 19)
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-f","--file",required=True)
@@ -40,11 +56,16 @@ def main():
                     help="report per-page table bboxes and cell rows (JSON output only)")
     ap.add_argument("--format",default="text",choices=["text","json"])
     ap.add_argument("-m","--max-length",type=int,default=0)
+    ap.add_argument("--sort",action="store_true",
+                    help="extract text in spatial reading order (PyMuPDF >= 1.19.1)")
     a = ap.parse_args()
     if a.tables and a.format != "json":
         ap.error("--tables requires --format json")
 
     fitz = _install()
+    if a.sort and not _engine_supports_sort(fitz):
+        print(f"ERROR: --sort requires PyMuPDF >= 1.19.1, engine is {_engine_version(fitz) or 'unknown'}",
+              file=sys.stderr); sys.exit(1)
     if not os.path.exists(a.file):
         print(f"ERROR: {a.file} not found",file=sys.stderr); sys.exit(1)
     doc = fitz.open(a.file)
@@ -57,7 +78,7 @@ def main():
 
     pages = []
     for i in idx:
-        t = doc[i].get_text("text").strip()
+        t = doc[i].get_text("text", sort=a.sort).strip()
         if not t:
             blocks = doc[i].get_text("blocks")
             t = "\n".join(b[4] for b in sorted(blocks,key=lambda b:(b[1],b[0])) if b[-1]==0).strip()
