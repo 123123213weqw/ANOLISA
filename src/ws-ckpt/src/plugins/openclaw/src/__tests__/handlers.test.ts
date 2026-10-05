@@ -22,7 +22,8 @@ import {
 } from "../handlers.js";
 import { pluginState, UNAVAILABLE_MSG } from "../state.js";
 import { CrontabManager } from "../cron.js";
-import type { BtrfsManager } from "../btrfs-manager.js";
+import { BtrfsManager } from "../btrfs-manager.js";
+import type { SnapshotInfo } from "../types.js";
 
 const promisifiedMock = (execFile as any)[
   Symbol.for("nodejs.util.promisify.custom")
@@ -139,6 +140,7 @@ describe("handlers — validation", () => {
       listCheckpoints: vi.fn(),
       execDiffRaw: vi.fn(),
       getStatus: vi.fn(),
+      getWorkspacePath: vi.fn().mockReturnValue("/ws"),
       getStore: vi.fn().mockReturnValue({ remove: vi.fn() }),
     };
     pluginState.manager = mockManager as unknown as BtrfsManager;
@@ -322,6 +324,7 @@ describe("handlers — explicit workspace", () => {
       createCheckpoint: vi.fn(),
       rollback: vi.fn(),
       listCheckpoints: vi.fn(),
+      getWorkspacePath: vi.fn().mockReturnValue("/ws"),
       getStore: vi.fn().mockReturnValue({ remove: vi.fn() }),
       execDiffRaw: vi.fn(),
       getStatus: vi.fn(),
@@ -882,5 +885,126 @@ describe("handleRollback — numAncestors", () => {
     const r = await handleRollback(undefined, undefined, 2);
     expect(r.isError).toBe(false);
     expect(mockManager.rollback).toHaveBeenCalledWith(undefined, 2, false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Workspace-scoped cache eviction on delete (snapshot IDs are per-workspace)
+// ---------------------------------------------------------------------------
+
+describe("handleDelete — workspace-scoped cache eviction", () => {
+  let origManager: typeof pluginState.manager;
+  let origReady: typeof pluginState.environmentReady;
+  let origConfig: typeof pluginState.resolvedConfig;
+  let origCwd: () => string;
+  let manager: BtrfsManager;
+
+  const snap = (id: string): SnapshotInfo => ({
+    snapshot: id,
+    message: `snapshot ${id}`,
+    createdAt: "2026-10-05T00:00:00Z",
+  });
+
+  /** CLI list payload used for cache refreshes: each workspace owns shared-id. */
+  const listPayload = JSON.stringify([
+    { snapshot: "shared-id", meta: { message: "own copy" } },
+  ]);
+
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    origManager = pluginState.manager;
+    origReady = pluginState.environmentReady;
+    origConfig = pluginState.resolvedConfig;
+    origCwd = process.cwd;
+    process.cwd = () => "/home/user";
+
+    // Controlled CommandExecutor I/O: status ok, list reports shared-id, delete ok.
+    promisifiedMock.mockImplementation(
+      async (_bin: unknown, args: string[]) => {
+        if (args.includes("status")) return { stdout: "ready", stderr: "" };
+        if (args.includes("list")) return { stdout: listPayload, stderr: "" };
+        if (args.includes("delete")) return { stdout: "deleted", stderr: "" };
+        return { stdout: "", stderr: "" };
+      },
+    );
+
+    manager = new BtrfsManager({ workspace: "/primary", autoCheckpoint: false });
+    await manager.ensureWorkspace("/primary");
+    pluginState.manager = manager;
+    pluginState.environmentReady = true;
+    pluginState.resolvedConfig = { workspace: "/primary", autoCheckpoint: false };
+  });
+
+  afterEach(() => {
+    pluginState.manager = origManager;
+    pluginState.environmentReady = origReady;
+    pluginState.resolvedConfig = origConfig;
+    process.cwd = origCwd;
+  });
+
+  it("keeps the active workspace snapshot when another workspace deletes the same ID", async () => {
+    manager.getStore().setAll([snap("shared-id"), snap("primary-only")]);
+    const r = await handleDelete("shared-id", "/secondary");
+    expect(r.isError).toBe(false);
+    const ids = manager.getStore().getAll().map((s) => s.snapshot);
+    expect(ids).toContain("shared-id");
+    expect(ids).toContain("primary-only");
+  });
+
+  it("does not evict when the active workspace changes while the delete is in flight", async () => {
+    manager.getStore().setAll([snap("shared-id")]);
+    promisifiedMock.mockImplementationOnce(async () => {
+      // A concurrent activation of /secondary completes before delete returns;
+      // its cache refresh reports /secondary's own shared-id.
+      await manager.ensureWorkspace("/secondary");
+      return { stdout: "deleted", stderr: "" };
+    });
+    const r = await handleDelete("shared-id", "/primary");
+    expect(r.isError).toBe(false);
+    expect(manager.getWorkspacePath()).toBe("/secondary");
+    expect(
+      manager.getStore().getAll().map((s) => s.snapshot),
+    ).toContain("shared-id");
+  });
+
+  it("does not evict when resolved config and manager activation disagree", async () => {
+    await manager.ensureWorkspace("/secondary");
+    manager.getStore().setAll([snap("shared-id")]);
+    // Implicit workspace resolves to the stale configured /primary.
+    const r = await handleDelete("shared-id");
+    expect(r.isError).toBe(false);
+    expect(
+      manager.getStore().getAll().map((s) => s.snapshot),
+    ).toContain("shared-id");
+  });
+
+  it("evicts the snapshot when deleting from the active workspace (explicit)", async () => {
+    manager.getStore().setAll([snap("shared-id"), snap("keep-me")]);
+    const r = await handleDelete("shared-id", "/primary");
+    expect(r.isError).toBe(false);
+    expect(manager.getStore().getAll().map((s) => s.snapshot)).toEqual([
+      "keep-me",
+    ]);
+  });
+
+  it("evicts the snapshot when deleting from the active workspace (implicit)", async () => {
+    manager.getStore().setAll([snap("shared-id")]);
+    const r = await handleDelete("shared-id");
+    expect(r.isError).toBe(false);
+    expect(manager.getStore().getAll()).toEqual([]);
+  });
+
+  it("keeps the cache unchanged when the delete CLI fails", async () => {
+    const err: any = new Error("fail");
+    err.code = 1;
+    err.stdout = "";
+    err.stderr = "Snapshot not found";
+    promisifiedMock.mockRejectedValue(err);
+    manager.getStore().setAll([snap("shared-id")]);
+    const r = await handleDelete("shared-id", "/primary");
+    expect(r.isError).toBe(true);
+    expect(manager.getStore().getAll().map((s) => s.snapshot)).toEqual([
+      "shared-id",
+    ]);
   });
 });

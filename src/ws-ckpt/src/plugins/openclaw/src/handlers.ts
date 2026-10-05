@@ -234,7 +234,14 @@ export async function handleDelete(
     if (output.exitCode !== 0) {
       return { text: mapErrorToLLMMessage(output.stderr, { id: snapshot }), isError: true };
     }
-    pluginState.manager.getStore().remove(snapshot);
+    // Snapshot IDs are workspace-scoped and the store caches only the
+    // manager's active workspace, so evict only when the deletion target is
+    // still that workspace after the command completes. This guards against
+    // cross-workspace identical IDs, resolved-config/activation disagreement
+    // and pending deletes that outlive an in-flight workspace switch.
+    if (pluginState.manager.getWorkspacePath() === ws) {
+      pluginState.manager.getStore().remove(snapshot);
+    }
     return { text: `Snapshot ${snapshot} deleted${extractTiming(output.stdout)}`, isError: false };
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
