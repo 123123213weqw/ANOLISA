@@ -781,6 +781,44 @@ impl SkillFs {
             return;
         }
 
+        // I4/H3: reject FIFO creation inside a hidden skill unless the
+        // path matches the post-publish grace whitelist — the same gate
+        // `create`/`symlink`/`link` apply. The kernel keeps the skill
+        // directory's dentries warm across a ledger flip, so without
+        // this arm a stale dentry let `mkfifo` inject a new entry into a
+        // hidden skill whose content is otherwise unreachable.
+        {
+            let reject = match &path_type {
+                PathType::Passthrough {
+                    skill_name,
+                    relative_path,
+                } => self.should_reject_hidden_write(skill_name, Some(relative_path)),
+                PathType::NestedPassthrough {
+                    category,
+                    skill_name,
+                    relative_path,
+                } => self.should_reject_hermes_nested_hidden_write(
+                    category,
+                    skill_name,
+                    Some(relative_path),
+                ),
+                _ => false,
+            };
+            if reject {
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Create,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
         let physical = match self.resolve_physical_path(&path_str) {
             Some(p) => p,
             None => {
