@@ -62,6 +62,7 @@
 //! behind explicit follow-up packages (H1 hook protocol, C2 active
 //! mapping persistence) and not behind silent fallbacks here.
 
+use std::ffi::OsString;
 use std::io::Read;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
@@ -726,22 +727,27 @@ impl DecisionCommand {
     }
 
     /// Full argv (without the program) for a `scan <skill_dir> --json`
-    /// invocation. Pinned by tests so the contract cannot drift.
-    pub fn build_scan_args(&self, skill_dir: &Path) -> Vec<String> {
-        let mut argv = self.fixed_args.clone();
-        argv.push("scan".to_string());
-        argv.push(skill_dir.to_string_lossy().into_owned());
-        argv.push("--json".to_string());
+    /// invocation. Pinned by tests so the contract cannot drift. The
+    /// `skill_dir` rides as the raw OS string: the CLI accepts non-UTF-8
+    /// source paths, and a `to_string_lossy()` view would replace those
+    /// bytes with U+FFFD so the provider would be asked about a different
+    /// path (same class as the unmount argv and the metadata syscalls).
+    pub fn build_scan_args(&self, skill_dir: &Path) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = self.fixed_args.iter().map(OsString::from).collect();
+        argv.push(OsString::from("scan"));
+        argv.push(skill_dir.as_os_str().to_os_string());
+        argv.push(OsString::from("--json"));
         argv
     }
 
     /// Full argv (without the program) for a `resolve <skill_dir> --json`
-    /// invocation. Pinned by tests so the contract cannot drift.
-    pub fn build_resolve_args(&self, skill_dir: &Path) -> Vec<String> {
-        let mut argv = self.fixed_args.clone();
-        argv.push("resolve".to_string());
-        argv.push(skill_dir.to_string_lossy().into_owned());
-        argv.push("--json".to_string());
+    /// invocation. Pinned by tests so the contract cannot drift. The
+    /// `skill_dir` rides as the raw OS string (see [`Self::build_scan_args`]).
+    pub fn build_resolve_args(&self, skill_dir: &Path) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = self.fixed_args.iter().map(OsString::from).collect();
+        argv.push(OsString::from("resolve"));
+        argv.push(skill_dir.as_os_str().to_os_string());
+        argv.push(OsString::from("--json"));
         argv
     }
 }
@@ -899,7 +905,7 @@ fn drain_pass<R: Read + AsRawFd>(pipe: &mut Option<R>, buf: &mut Vec<u8>, limit:
 
 fn run_with_timeout(
     program: &Path,
-    args: &[String],
+    args: &[OsString],
     timeout: Duration,
     kind: &'static str,
 ) -> Result<std::process::Output, LedgerError> {
@@ -1718,19 +1724,19 @@ mod tests {
         assert_eq!(
             cmd.build_scan_args(Path::new("/srv/skills/demo-weather")),
             vec![
-                "skill-ledger".to_string(),
-                "scan".to_string(),
-                "/srv/skills/demo-weather".to_string(),
-                "--json".to_string(),
+                OsString::from("skill-ledger"),
+                OsString::from("scan"),
+                OsString::from("/srv/skills/demo-weather"),
+                OsString::from("--json"),
             ]
         );
         let single = DecisionCommand::parse("/usr/local/bin/xxx-cli").unwrap();
         assert_eq!(
             single.build_scan_args(Path::new("/srv/skills/demo-weather")),
             vec![
-                "scan".to_string(),
-                "/srv/skills/demo-weather".to_string(),
-                "--json".to_string(),
+                OsString::from("scan"),
+                OsString::from("/srv/skills/demo-weather"),
+                OsString::from("--json"),
             ]
         );
     }
@@ -1741,20 +1747,50 @@ mod tests {
         assert_eq!(
             cmd.build_resolve_args(Path::new("/srv/skills/demo-weather")),
             vec![
-                "skill-ledger".to_string(),
-                "resolve".to_string(),
-                "/srv/skills/demo-weather".to_string(),
-                "--json".to_string(),
+                OsString::from("skill-ledger"),
+                OsString::from("resolve"),
+                OsString::from("/srv/skills/demo-weather"),
+                OsString::from("--json"),
             ]
         );
         let single = DecisionCommand::parse("/usr/local/bin/xxx-cli").unwrap();
         assert_eq!(
             single.build_resolve_args(Path::new("/srv/skills/demo-weather")),
             vec![
-                "resolve".to_string(),
-                "/srv/skills/demo-weather".to_string(),
-                "--json".to_string(),
+                OsString::from("resolve"),
+                OsString::from("/srv/skills/demo-weather"),
+                OsString::from("--json"),
             ]
+        );
+    }
+
+    /// The physical skill directory can contain non-UTF-8 bytes: the CLI
+    /// accepts non-UTF-8 source paths, and the codebase already passes raw
+    /// paths to the unmount argv (#4629) and to the chown / utimensat /
+    /// statfs syscalls (#4916). `to_string_lossy()` here replaces every
+    /// invalid byte with U+FFFD, so the provider would be asked about a
+    /// different, usually nonexistent path — or, worst case, one that
+    /// collides with another real directory.
+    #[test]
+    fn decision_command_argv_preserves_non_utf8_skill_dir_bytes() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let cmd = DecisionCommand::parse("/usr/local/bin/xxx-cli").unwrap();
+        let skill_dir = Path::new(OsStr::from_bytes(b"/srv/caf\xe9/skills/demo-weather"));
+
+        let scan = cmd.build_scan_args(skill_dir);
+        assert_eq!(
+            OsStr::new(&scan[1]).as_bytes(),
+            b"/srv/caf\xe9/skills/demo-weather",
+            "scan argv must carry the raw skill_dir bytes"
+        );
+
+        let resolve = cmd.build_resolve_args(skill_dir);
+        assert_eq!(
+            OsStr::new(&resolve[1]).as_bytes(),
+            b"/srv/caf\xe9/skills/demo-weather",
+            "resolve argv must carry the raw skill_dir bytes"
         );
     }
 
@@ -1809,7 +1845,7 @@ mod tests {
         let started = std::time::Instant::now();
         let output = run_with_timeout(
             Path::new("/bin/sh"),
-            &[script.display().to_string()],
+            &[script.as_os_str().to_os_string()],
             Duration::from_millis(200),
             "scan",
         )
@@ -1838,7 +1874,7 @@ mod tests {
 
         let output = run_with_timeout(
             Path::new("/bin/sh"),
-            &[script.display().to_string()],
+            &[script.as_os_str().to_os_string()],
             Duration::from_secs(10),
             "scan",
         )
