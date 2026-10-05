@@ -667,6 +667,101 @@ describe('subagent.ts', () => {
 
         expect(scope.getTerminateMode()).toBe(SubagentTerminateMode.GOAL);
       });
+
+      it('should finish the run when the postToolUse hook rejects', async () => {
+        const listFilesToolDef: FunctionDeclaration = {
+          name: 'list_files',
+          description: 'Lists files',
+          parameters: { type: Type.OBJECT, properties: {} },
+        };
+
+        const { config } = await createMockConfig({
+          getFunctionDeclarationsFiltered: vi
+            .fn()
+            .mockReturnValue([listFilesToolDef]),
+          getTool: vi.fn().mockReturnValue(undefined),
+        });
+        const toolConfig: ToolConfig = { tools: ['list_files'] };
+
+        // Turn 1: Model calls the external tool
+        // Turn 2: Model stops
+        mockSendMessageStream.mockImplementation(
+          createMockStream([
+            [
+              {
+                id: 'call_1',
+                name: 'list_files',
+                args: { path: '.' },
+              },
+            ],
+            'stop',
+          ]),
+        );
+
+        const listFilesInvocation = {
+          params: { path: '.' },
+          getDescription: vi.fn().mockReturnValue('List files'),
+          toolLocations: vi.fn().mockReturnValue([]),
+          shouldConfirmExecute: vi.fn().mockResolvedValue(false),
+          execute: vi.fn().mockResolvedValue({
+            llmContent: 'file1.txt\nfile2.ts',
+            returnDisplay: 'Listed 2 files',
+          }),
+        };
+        const listFilesTool = {
+          name: 'list_files',
+          displayName: 'List Files',
+          description: 'List files in directory',
+          kind: 'READ' as const,
+          schema: listFilesToolDef,
+          build: vi.fn().mockImplementation(() => listFilesInvocation),
+          canUpdateOutput: false,
+          isOutputMarkdown: true,
+        } as unknown as AnyDeclarativeTool;
+        vi.mocked(
+          (config.getToolRegistry() as unknown as ToolRegistry).getTool,
+        ).mockImplementation((name: string) =>
+          name === 'list_files' ? listFilesTool : undefined,
+        );
+
+        // The post-tool hook fails on the completed batch. The batch
+        // completion signal must still settle: processFunctionCalls awaits
+        // batchDone, so leaving it pending would wedge the whole subagent
+        // loop even though every tool call is already terminal.
+        const postToolUse = vi
+          .fn()
+          .mockRejectedValue(new Error('post-tool hook failure'));
+        const scope = await SubAgentScope.create(
+          'test-agent',
+          config,
+          promptConfig,
+          defaultModelConfig,
+          defaultRunConfig,
+          toolConfig,
+          undefined,
+          { postToolUse },
+        );
+
+        await expect(
+          Promise.race([
+            scope.runNonInteractive(new ContextState()),
+            new Promise<never>((_, reject) =>
+              setTimeout(
+                () =>
+                  reject(
+                    new Error(
+                      'runNonInteractive never settled: batch completion signal lost after postToolUse rejection',
+                    ),
+                  ),
+                5_000,
+              ),
+            ),
+          ]),
+        ).resolves.toBeUndefined();
+
+        expect(postToolUse).toHaveBeenCalled();
+        expect(scope.getTerminateMode()).toBe(SubagentTerminateMode.GOAL);
+      }, 15_000);
     });
 
     describe('runNonInteractive - Termination and Recovery', () => {

@@ -1815,8 +1815,22 @@ export class CoreToolScheduler {
 
       if (this.onAllToolCallsComplete) {
         this.isFinalizingToolCalls = true;
-        await this.onAllToolCallsComplete(completedCalls);
-        this.isFinalizingToolCalls = false;
+        try {
+          await this.onAllToolCallsComplete(completedCalls);
+        } catch (error) {
+          // The completion handler runs after every tool call in the batch is
+          // already terminal, so a failure here must not take down the
+          // scheduler: the calls have been handed off and the queue still
+          // holds pending requests. Swallow the error (it is surfaced below)
+          // so `isFinalizingToolCalls` is always reset and later batches can
+          // still be scheduled.
+          console.error(
+            'Error in onAllToolCallsComplete handler:',
+            error instanceof Error ? error.message : error,
+          );
+        } finally {
+          this.isFinalizingToolCalls = false;
+        }
       }
       this.notifyToolCallsUpdate();
       // After completion, process the next item in the queue.

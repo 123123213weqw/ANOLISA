@@ -50,7 +50,7 @@ import {
   SubagentStatistics,
   type SubagentStatsSummary,
 } from './subagent-statistics.js';
-import type { SubagentHooks } from './subagent-hooks.js';
+import type { PostToolUseResult, SubagentHooks } from './subagent-hooks.js';
 import { logSubagentExecution } from '../telemetry/loggers.js';
 import { SubagentExecutionEvent } from '../telemetry/types.js';
 import { TaskTool } from '../tools/task.js';
@@ -596,105 +596,125 @@ export class SubAgentScope {
       config: this.runtimeContext,
       outputUpdateHandler: undefined,
       onAllToolCallsComplete: async (completedCalls) => {
-        for (const call of completedCalls) {
-          const toolName = call.request.name;
-          const duration = call.durationMs ?? 0;
-          const success = call.status === 'success';
-          const errorMessage =
-            call.status === 'error' || call.status === 'cancelled'
-              ? call.response.error?.message
-              : undefined;
+        // processFunctionCalls awaits the batchDone promise below, so the
+        // completion signal must settle no matter what happens while
+        // aggregating results (e.g. a rejecting postToolUse hook). Skip
+        // that settlement and the subagent loop waits on batchDone forever
+        // even though every tool call in the batch is already terminal.
+        try {
+          for (const call of completedCalls) {
+            const toolName = call.request.name;
+            const duration = call.durationMs ?? 0;
+            const success = call.status === 'success';
+            const errorMessage =
+              call.status === 'error' || call.status === 'cancelled'
+                ? call.response.error?.message
+                : undefined;
 
-          // Update aggregate stats
-          this.executionStats.totalToolCalls += 1;
-          if (success) {
-            this.executionStats.successfulToolCalls += 1;
-          } else {
-            this.executionStats.failedToolCalls += 1;
-          }
+            // Update aggregate stats
+            this.executionStats.totalToolCalls += 1;
+            if (success) {
+              this.executionStats.successfulToolCalls += 1;
+            } else {
+              this.executionStats.failedToolCalls += 1;
+            }
 
-          // Per-tool usage
-          const tu = this.toolUsage.get(toolName) || {
-            count: 0,
-            success: 0,
-            failure: 0,
-            totalDurationMs: 0,
-            averageDurationMs: 0,
-          };
-          tu.count += 1;
-          if (success) {
-            tu.success += 1;
-          } else {
-            tu.failure += 1;
-            tu.lastError = errorMessage || 'Unknown error';
-          }
-          tu.totalDurationMs = (tu.totalDurationMs || 0) + duration;
-          tu.averageDurationMs =
-            tu.count > 0 ? tu.totalDurationMs / tu.count : 0;
-          this.toolUsage.set(toolName, tu);
+            // Per-tool usage
+            const tu = this.toolUsage.get(toolName) || {
+              count: 0,
+              success: 0,
+              failure: 0,
+              totalDurationMs: 0,
+              averageDurationMs: 0,
+            };
+            tu.count += 1;
+            if (success) {
+              tu.success += 1;
+            } else {
+              tu.failure += 1;
+              tu.lastError = errorMessage || 'Unknown error';
+            }
+            tu.totalDurationMs = (tu.totalDurationMs || 0) + duration;
+            tu.averageDurationMs =
+              tu.count > 0 ? tu.totalDurationMs / tu.count : 0;
+            this.toolUsage.set(toolName, tu);
 
-          // Emit tool result event
-          this.eventEmitter?.emit(SubAgentEventType.TOOL_RESULT, {
-            subagentId: this.subagentId,
-            round: currentRound,
-            callId: call.request.callId,
-            name: toolName,
-            success,
-            error: errorMessage,
-            responseParts: call.response.responseParts,
-            /**
-             * Tools like todoWrite will add some extra contents to the result,
-             * making it unable to deserialize the `responseParts` to a JSON object.
-             * While `resultDisplay` is normally a string, if not we stringify it,
-             * so that we can deserialize it to a JSON object when needed.
-             */
-            resultDisplay: call.response.resultDisplay
-              ? typeof call.response.resultDisplay === 'string'
-                ? call.response.resultDisplay
-                : JSON.stringify(call.response.resultDisplay)
-              : undefined,
-            durationMs: duration,
-            timestamp: Date.now(),
-          } as SubAgentToolResultEvent);
+            // Emit tool result event
+            this.eventEmitter?.emit(SubAgentEventType.TOOL_RESULT, {
+              subagentId: this.subagentId,
+              round: currentRound,
+              callId: call.request.callId,
+              name: toolName,
+              success,
+              error: errorMessage,
+              responseParts: call.response.responseParts,
+              /**
+               * Tools like todoWrite will add some extra contents to the result,
+               * making it unable to deserialize the `responseParts` to a JSON object.
+               * While `resultDisplay` is normally a string, if not we stringify it,
+               * so that we can deserialize it to a JSON object when needed.
+               */
+              resultDisplay: call.response.resultDisplay
+                ? typeof call.response.resultDisplay === 'string'
+                  ? call.response.resultDisplay
+                  : JSON.stringify(call.response.resultDisplay)
+                : undefined,
+              durationMs: duration,
+              timestamp: Date.now(),
+            } as SubAgentToolResultEvent);
 
-          // Update statistics service
-          this.stats.recordToolCall(
-            toolName,
-            success,
-            duration,
-            this.toolUsage.get(toolName)?.lastError,
-          );
+            // Update statistics service
+            this.stats.recordToolCall(
+              toolName,
+              success,
+              duration,
+              this.toolUsage.get(toolName)?.lastError,
+            );
 
-          // post-tool hook
-          const hookResult = await this.hooks?.postToolUse?.({
-            subagentId: this.subagentId,
-            name: this.name,
-            toolName,
-            args: call.request.args,
-            success,
-            durationMs: duration,
-            errorMessage,
-            timestamp: Date.now(),
-          });
-          if (hookResult?.additionalContent) {
-            toolResponseParts.push({ text: hookResult.additionalContent });
-          }
+            // post-tool hook. Report a failing hook but keep going: the tool
+            // result is already terminal, and letting the rejection escape
+            // would drop this tool's response and every later tool's too.
+            let hookResult: PostToolUseResult | void = undefined;
+            try {
+              hookResult = await this.hooks?.postToolUse?.({
+                subagentId: this.subagentId,
+                name: this.name,
+                toolName,
+                args: call.request.args,
+                success,
+                durationMs: duration,
+                errorMessage,
+                timestamp: Date.now(),
+              });
+            } catch (error) {
+              console.error(
+                `Error in postToolUse hook for tool ${toolName}:`,
+                error instanceof Error ? error.message : error,
+              );
+            }
+            if (hookResult?.additionalContent) {
+              toolResponseParts.push({ text: hookResult.additionalContent });
+            }
 
-          // Append response parts
-          const respParts = call.response.responseParts;
-          if (respParts) {
-            const parts = Array.isArray(respParts) ? respParts : [respParts];
-            for (const part of parts) {
-              if (typeof part === 'string') {
-                toolResponseParts.push({ text: part });
-              } else if (part) {
-                toolResponseParts.push(part);
+            // Append response parts
+            const respParts = call.response.responseParts;
+            if (respParts) {
+              const parts = Array.isArray(respParts) ? respParts : [respParts];
+              for (const part of parts) {
+                if (typeof part === 'string') {
+                  toolResponseParts.push({ text: part });
+                } else if (part) {
+                  toolResponseParts.push(part);
+                }
               }
             }
           }
+        } finally {
+          // Signal that this batch is complete (all tools terminal). This
+          // must run even when result aggregation above threw, otherwise
+          // processFunctionCalls would wait on batchDone forever.
+          resolveBatch?.();
         }
-        // Signal that this batch is complete (all tools terminal)
-        resolveBatch?.();
       },
       onToolCallsUpdate: (calls: ToolCall[]) => {
         for (const call of calls) {

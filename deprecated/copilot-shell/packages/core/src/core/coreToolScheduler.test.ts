@@ -370,6 +370,117 @@ describe('CoreToolScheduler', () => {
     expect(statuses).not.toContain('error');
   });
 
+  it('should keep scheduling tool calls after onAllToolCallsComplete throws', async () => {
+    const mockTool = new MockTool({
+      name: 'mockTool',
+      shouldConfirmExecute: MOCK_TOOL_SHOULD_CONFIRM_EXECUTE,
+    });
+    const declarativeTool = mockTool;
+    const mockToolRegistry = {
+      getTool: () => declarativeTool,
+      getFunctionDeclarations: () => [],
+      tools: new Map(),
+      discovery: {},
+      registerTool: () => {},
+      getToolByName: () => declarativeTool,
+      getToolByDisplayName: () => declarativeTool,
+      getTools: () => [],
+      discoverTools: async () => {},
+      getAllTools: () => [],
+      getToolsByServer: () => [],
+    } as unknown as ToolRegistry;
+
+    const onAllToolCallsComplete = vi
+      .fn()
+      .mockRejectedValue(new Error('completion handler failure'));
+    const onToolCallsUpdate = vi.fn();
+
+    const mockConfig = {
+      getSessionId: () => 'test-session-id',
+      getUsageStatisticsEnabled: () => true,
+      getDebugMode: () => false,
+      getApprovalMode: () => ApprovalMode.DEFAULT,
+      getAllowedTools: () => [],
+      getContentGeneratorConfig: () => ({
+        model: 'test-model',
+        authType: 'gemini',
+      }),
+      getShellExecutionConfig: () => ({
+        terminalWidth: 90,
+        terminalHeight: 30,
+      }),
+      storage: {
+        getProjectTempDir: () => '/tmp',
+      },
+      getTruncateToolOutputThreshold: () =>
+        DEFAULT_TRUNCATE_TOOL_OUTPUT_THRESHOLD,
+      getTruncateToolOutputLines: () => DEFAULT_TRUNCATE_TOOL_OUTPUT_LINES,
+      getToolRegistry: () => mockToolRegistry,
+      getUseSmartEdit: () => false,
+      getUseModelRouter: () => false,
+      getGeminiClient: () => null, // No client needed for these tests
+      getChatRecordingService: () => undefined,
+      getEnableHooks: () => false,
+      getHookSystem: () => undefined,
+    } as unknown as Config;
+
+    const scheduler = new CoreToolScheduler({
+      config: mockConfig,
+      onAllToolCallsComplete,
+      onToolCallsUpdate,
+      getPreferredEditor: () => 'vscode',
+      onEditorClose: vi.fn(),
+    });
+
+    // First batch completes (cancelled before confirmation) but the
+    // completion handler rejects.
+    const abortController = new AbortController();
+    abortController.abort();
+    await scheduler.schedule(
+      [
+        {
+          callId: 'recover-1',
+          name: 'mockTool',
+          args: {},
+          isClientInitiated: false,
+          prompt_id: 'prompt-id-recover',
+        },
+      ],
+      abortController.signal,
+    );
+
+    // Give the floating completion notification a chance to settle.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(onAllToolCallsComplete).toHaveBeenCalled();
+
+    // A subsequent batch must still be schedulable instead of being queued
+    // forever behind a stuck finalizing flag.
+    const secondAbortController = new AbortController();
+    secondAbortController.abort();
+    await expect(
+      Promise.race([
+        scheduler.schedule(
+          [
+            {
+              callId: 'recover-2',
+              name: 'mockTool',
+              args: {},
+              isClientInitiated: false,
+              prompt_id: 'prompt-id-recover',
+            },
+          ],
+          secondAbortController.signal,
+        ),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new Error('scheduler never resolved the next batch')),
+            3000,
+          ),
+        ),
+      ]),
+    ).resolves.toBeUndefined();
+  });
+
   describe('getToolSuggestion', () => {
     it('should suggest the top N closest tool names for a typo', () => {
       // Create mocked tool registry

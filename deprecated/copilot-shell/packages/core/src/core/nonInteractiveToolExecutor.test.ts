@@ -350,6 +350,54 @@ describe('executeToolCall', () => {
     );
   });
 
+  it('should resolve even when the onAllToolCallsComplete callback rejects', async () => {
+    const request: ToolCallRequestInfo = {
+      callId: 'call9',
+      name: 'testTool',
+      args: {},
+      isClientInitiated: false,
+      prompt_id: 'prompt-id-9',
+    };
+    const toolResult: ToolResult = {
+      llmContent: 'Tool executed successfully',
+      returnDisplay: 'Success!',
+    };
+    vi.mocked(mockToolRegistry.getTool).mockReturnValue(mockTool);
+    executeFn.mockResolvedValue(toolResult);
+
+    const onAllToolCallsComplete = vi
+      .fn()
+      .mockRejectedValue(new Error('completion callback failure'));
+
+    // The outer promise must settle with the tool response even though the
+    // caller-supplied completion callback rejects: the tool call is already
+    // terminal at that point, and leaving the promise pending would hang
+    // every awaiter of executeToolCall forever.
+    const response = await Promise.race([
+      executeToolCall(mockConfig, request, abortController.signal, {
+        onAllToolCallsComplete,
+      }),
+      new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new Error(
+                'executeToolCall never settled after onAllToolCallsComplete rejected',
+              ),
+            ),
+          5_000,
+        ),
+      ),
+    ]);
+
+    expect(onAllToolCallsComplete).toHaveBeenCalled();
+    expect(response.callId).toBe('call9');
+    expect(response.error).toBeUndefined();
+    expect(
+      response.responseParts[0].functionResponse?.response?.['output'],
+    ).toBe('Tool executed successfully');
+  }, 15_000);
+
   it('should have undefined contentLength for array llmContent with no string parts', async () => {
     const request: ToolCallRequestInfo = {
       callId: 'call8',

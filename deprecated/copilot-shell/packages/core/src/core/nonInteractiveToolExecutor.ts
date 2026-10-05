@@ -37,10 +37,17 @@ export async function executeToolCall(
       chatRecordingService: config.getChatRecordingService(),
       outputUpdateHandler: options.outputUpdateHandler,
       onAllToolCallsComplete: async (completedToolCalls) => {
-        if (options.onAllToolCallsComplete) {
-          await options.onAllToolCallsComplete(completedToolCalls);
+        try {
+          if (options.onAllToolCallsComplete) {
+            await options.onAllToolCallsComplete(completedToolCalls);
+          }
+        } finally {
+          // The tool call is already terminal here, and the rejection is
+          // reported by the scheduler's completion error handling. This
+          // promise must still settle, otherwise every awaiter of
+          // executeToolCall hangs forever.
+          resolve(completedToolCalls[0].response);
         }
-        resolve(completedToolCalls[0].response);
       },
       onToolCallsUpdate: options.onToolCallsUpdate,
       getPreferredEditor: () => undefined,
