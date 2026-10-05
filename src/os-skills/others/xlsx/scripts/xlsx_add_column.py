@@ -76,6 +76,30 @@ def col_letter(n: int) -> str:
     return r
 
 
+def cell_ref_coords(ref: str) -> tuple[int, int] | None:
+    """Return (column_number, row) for a cell reference like B12, else None."""
+    m = re.fullmatch(r"([A-Z]+)([0-9]+)", ref or "")
+    if not m:
+        return None
+    return col_number(m.group(1)), int(m.group(2))
+
+
+def dimension_bounds(ref: str) -> tuple[int, int, int, int] | None:
+    """Return (min_col, min_row, max_col, max_row) for "B2" or "A1:F2" refs."""
+    parts = ref.split(":")
+    if len(parts) == 1:
+        start = end = cell_ref_coords(parts[0])
+    elif len(parts) == 2:
+        start = cell_ref_coords(parts[0])
+        end = cell_ref_coords(parts[1])
+    else:
+        return None
+    if start is None or end is None:
+        return None
+    return (min(start[0], end[0]), min(start[1], end[1]),
+            max(start[0], end[0]), max(start[1], end[1]))
+
+
 def find_ws_path(work_dir: str, sheet_name: str | None) -> str:
     wb_tree = ET.parse(os.path.join(work_dir, "xl", "workbook.xml"))
     rid = None
@@ -353,17 +377,49 @@ def main() -> None:
         changes += 1
         print(f"  {col}{args.total_row} = ={total_f} (style={total_style})")
 
-    # Update dimension
-    for dim in root.iter(_tag("dimension")):
-        old_ref = dim.get("ref", "")
-        if ":" in old_ref:
-            start_ref, end_ref = old_ref.split(":")
-            end_col_str = re.match(r"([A-Z]+)", end_ref).group(1)
-            end_row_str = re.search(r"(\d+)", end_ref).group(1)
-            if col_number(col) > col_number(end_col_str):
-                new_ref = f"{start_ref}:{col}{end_row_str}"
-                dim.set("ref", new_ref)
-                print(f"  Dimension: {old_ref} → {new_ref}")
+    # Update dimension to the rectangle the cells actually occupy now.
+    # Readers (Excel, LibreOffice, openpyxl read-only mode) trust the
+    # declared extent, so every added cell must lie inside it.
+    if changes:
+        used: tuple[int, int, int, int] | None = None
+        for row_el in sheet_data:
+            for c in row_el:
+                coords = cell_ref_coords(c.get("r", ""))
+                if coords is None:
+                    continue
+                c_col, c_row = coords
+                if used is None:
+                    used = (c_col, c_row, c_col, c_row)
+                else:
+                    used = (min(used[0], c_col), min(used[1], c_row),
+                            max(used[2], c_col), max(used[3], c_row))
+
+        if used is not None:
+            dim_el = root.find(_tag("dimension"))
+            if dim_el is None:
+                # Worksheet schema order: sheetPr?, dimension?, sheetViews?,
+                # sheetFormatPr?, cols*, sheetData — insert the missing
+                # dimension before whichever of those follows it.
+                dim_el = ET.Element(_tag("dimension"))
+                anchor_idx = len(root)
+                for i, child in enumerate(root):
+                    if child.tag in (_tag("sheetViews"), _tag("sheetFormatPr"),
+                                     _tag("cols"), _tag("sheetData")):
+                        anchor_idx = i
+                        break
+                root.insert(anchor_idx, dim_el)
+                old_ref = "(absent)"
+            else:
+                old_ref = dim_el.get("ref", "")
+                declared = dimension_bounds(old_ref)
+                if declared is not None:
+                    # Preserve a larger declared extent, expand a smaller one.
+                    used = (min(used[0], declared[0]), min(used[1], declared[1]),
+                            max(used[2], declared[2]), max(used[3], declared[3]))
+            new_ref = (f"{col_letter(used[0])}{used[1]}:"
+                       f"{col_letter(used[2])}{used[3]}")
+            dim_el.set("ref", new_ref)
+            print(f"  Dimension: {old_ref} → {new_ref}")
 
     # Extend <cols> to cover new column
     cols_el = root.find(_tag("cols"))
