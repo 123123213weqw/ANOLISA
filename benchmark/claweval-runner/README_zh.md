@@ -122,6 +122,18 @@ claw-eval/traces/openclaw_<YY-MM-DD-HH-MM>/
 └── batch_summary.json     # 聚合汇总
 ```
 
+### 会话转换输入
+
+`session_trace_converter.py` 接受 message 记录为对象、且 `message` 负载为
+对象的 OpenClaw 会话 JSONL。消息 `content` 可以是块列表，也可以是
+OpenClaw 支持的纯字符串形式（对 user/assistant/toolResult 角色都保留为
+普通 text 块）。结构性偏差——非对象 JSONL 记录、非对象 message 负载、
+null 或非列表 content 容器、非对象内容块、缺少字符串 text 的 text 块以
+及非对象 usage 容器——不会中断转换：省略畸形的记录或块，保留有效的相邻
+证据，并向 stderr 打印带会话文件和行号的
+`[converter] WARN: skipped malformed ...` 诊断。时间戳策略、token 计数和
+全部有效 trace 字段保持不变。
+
 ## 架构:MCP 工具注入与防作弊隔离
 
 ce-runner 使用 openclaw 原生的 MCP 运行时(stdio)向 agent 暴露任务专属工具。核心挑战在于确保 agent **只能**访问自己任务的工具,无法读取宿主机文件(如 `grader.py`)作弊。

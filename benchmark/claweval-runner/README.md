@@ -122,6 +122,20 @@ claw-eval/traces/openclaw_<YY-MM-DD-HH-MM>/
 └── batch_summary.json     # Aggregate summary
 ```
 
+### Session Conversion Input
+
+`session_trace_converter.py` accepts OpenClaw session JSONL with object message
+records whose `message` payload is an object. Message `content` may be a block
+list or OpenClaw's plain string form (preserved as a normal text block for
+user/assistant/toolResult roles). Structural deviations — non-object JSONL
+records, non-object message payloads, null or non-list content containers,
+non-object content blocks, text blocks without string text, and non-object
+usage containers — do not stop the conversion: the malformed record or block is
+omitted, valid neighboring evidence is retained, and a
+`[converter] WARN: skipped malformed ...` diagnostic naming the session file
+and line number is printed to stderr. Timestamp policy, token accounting and
+all valid trace fields are unchanged.
+
 ## Architecture: MCP Tool Injection & Anti-Cheat Isolation
 
 ce-runner uses openclaw's native MCP runtime (stdio) to expose task-specific tools to the agent. The key challenge is ensuring the agent can **only** access its own task's tools and cannot read host files (e.g. `grader.py`) to cheat.

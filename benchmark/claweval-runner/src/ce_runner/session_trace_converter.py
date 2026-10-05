@@ -85,6 +85,66 @@ def strip_timestamp_prefix(text: str) -> str:
     return _TIMESTAMP_PREFIX_RE.sub("", text)
 
 
+def _warn_malformed(kind: str, source: str, line_number: int | None = None) -> None:
+    """Diagnose an omitted malformed record/block with its source context."""
+    where = f"session={source}" + (f" line={line_number}" if line_number is not None else "")
+    print(f"[converter] WARN: skipped malformed {kind} ({where})", file=sys.stderr)
+
+
+def _event_timestamp(event: dict, msg: dict) -> str:
+    """Return the record timestamp, falling back like the raw reader did."""
+    ts = event.get("timestamp")
+    if not isinstance(ts, str):
+        ts = msg.get("timestamp")
+    if not isinstance(ts, str) or not ts:
+        return now_iso()
+    return normalize_timestamp(ts)
+
+
+def _normalize_message_content(content: Any, source: str, line_number: int) -> list[dict]:
+    """Normalize one message payload's content into usable mapping blocks.
+
+    Null or non-list content containers become empty; OpenClaw's plain string
+    content is preserved as a normal text block; non-object blocks and text
+    blocks without string text are omitted with a diagnostic.
+    """
+    if content is None:
+        _warn_malformed("null content container", source, line_number)
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    if not isinstance(content, list):
+        _warn_malformed("non-list content container", source, line_number)
+        return []
+    blocks: list[dict] = []
+    for block in content:
+        if not isinstance(block, dict):
+            _warn_malformed("non-object content block", source, line_number)
+            continue
+        if block.get("type") == "text" and not isinstance(block.get("text"), str):
+            _warn_malformed("text block without string text", source, line_number)
+            continue
+        blocks.append(block)
+    return blocks
+
+
+def _usage_tokens(msg: dict, source: str, line_number: int) -> tuple[int, int]:
+    """Return (input, output) token counts; non-object usage counts as zero."""
+    usage = msg.get("usage")
+    if usage is None:
+        return 0, 0
+    if not isinstance(usage, dict):
+        _warn_malformed("non-object usage container", source, line_number)
+        return 0, 0
+
+    def _count(value: Any) -> int:
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value
+        return 0
+
+    return _count(usage.get("input", 0)), _count(usage.get("output", 0))
+
+
 def load_task_yaml(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -204,22 +264,42 @@ def convert_session_to_trace(
     task_id = task.get("task_id", "unknown")
     model = "openclaw"
 
-    # Read session events
+    # Read session events, keeping each record's source line for diagnostics
     session_events = []
     with open(session_path) as f:
-        for line in f:
+        for line_number, line in enumerate(f, start=1):
             line = line.strip()
             if line:
                 try:
-                    session_events.append(json.loads(line))
+                    session_events.append((line_number, json.loads(line)))
                 except json.JSONDecodeError:
                     pass
 
+    def _iter_message_records():
+        """Yield (line_number, event, msg, content_blocks) for usable message records."""
+        for line_number, event in session_events:
+            if not isinstance(event, dict):
+                _warn_malformed("non-object record", session_path, line_number)
+                continue
+            if event.get("type", "") != "message":
+                continue
+            msg = event.get("message")
+            if not isinstance(msg, dict):
+                _warn_malformed("message payload", session_path, line_number)
+                continue
+            content = _normalize_message_content(msg.get("content", []), session_path, line_number)
+            yield line_number, event, msg, content
+
     # 1. trace_start — use first session event's timestamp as the real start time
     first_ts = now_iso()
-    for event in session_events:
-        ts = event.get("timestamp", "") or event.get("message", {}).get("timestamp", "")
-        if ts:
+    for line_number, event in session_events:
+        if not isinstance(event, dict):
+            continue
+        msg = event.get("message")
+        ts = event.get("timestamp")
+        if not isinstance(ts, str):
+            ts = msg.get("timestamp") if isinstance(msg, dict) else None
+        if isinstance(ts, str) and ts:
             first_ts = normalize_timestamp(ts)
             break
 
@@ -346,16 +426,9 @@ def convert_session_to_trace(
             "timestamp": tc_info.get("timestamp", now_iso()),
         }
 
-    for event in session_events:
-        etype = event.get("type", "")
-
-        if etype != "message":
-            continue
-
-        msg = event.get("message", {})
+    for line_number, event, msg, content in _iter_message_records():
         role = msg.get("role")
-        content = msg.get("content", [])
-        timestamp = normalize_timestamp(event.get("timestamp", now_iso()))
+        timestamp = _event_timestamp(event, msg)
 
         if role == "user":
             # Convert user message
@@ -389,9 +462,7 @@ def convert_session_to_trace(
 
         elif role == "assistant":
             stop_reason = msg.get("stopReason", "")
-            usage = msg.get("usage", {})
-            input_tok = usage.get("input", 0)
-            output_tok = usage.get("output", 0)
+            input_tok, output_tok = _usage_tokens(msg, session_path, line_number)
             total_input_tokens += input_tok
             total_output_tokens += output_tok
 
@@ -457,8 +528,10 @@ def convert_session_to_trace(
 
         elif role == "toolResult":
             # Convert tool result to tool_result block in a user message
-            tool_name = msg.get("toolName", "")
-            tool_call_id = msg.get("toolCallId", "")
+            raw_tool_name = msg.get("toolName", "")
+            raw_tool_call_id = msg.get("toolCallId", "")
+            tool_name = raw_tool_name if isinstance(raw_tool_name, str) else ""
+            tool_call_id = raw_tool_call_id if isinstance(raw_tool_call_id, str) else str(raw_tool_call_id)
             is_error = msg.get("isError", False)
 
             # Extract text content
@@ -530,13 +603,9 @@ def convert_session_to_trace(
 
     # Extract final_text from the last assistant message with text content
     final_text = ""
-    for event in reversed(session_events):
-        if event.get("type") != "message":
-            continue
-        msg = event.get("message", {})
+    for _ln, _event, msg, content in reversed(list(_iter_message_records())):
         if msg.get("role") != "assistant":
             continue
-        content = msg.get("content", [])
         for block in content:
             if block.get("type") == "text" and block.get("text", "").strip():
                 final_text = block["text"].strip()
@@ -572,9 +641,11 @@ def convert_session_to_trace(
     if session_events:
         _first_ts = None
         _last_ts = None
-        for _ev in session_events:
+        for _line_number, _ev in session_events:
+            if not isinstance(_ev, dict):
+                continue
             _ts = _ev.get("timestamp", "")
-            if _ts:
+            if isinstance(_ts, str) and _ts:
                 try:
                     _dt_val = datetime.fromisoformat(normalize_timestamp(_ts))
                     _epoch = _dt_val.timestamp()
