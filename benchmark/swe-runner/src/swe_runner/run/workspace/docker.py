@@ -94,19 +94,27 @@ def prepare_workspace_from_image(
     if target_dir.exists():
         shutil.rmtree(target_dir, ignore_errors=True)
     target_dir.mkdir(parents=True, exist_ok=True)
-    run_command(["docker", "rm", "-f", container_name], timeout=30)
     try:
-        run_command(
-            ["docker", "create", "--name", container_name, image_name, "sleep", "1"],
-            check=True,
-        )
-        run_command(
-            ["docker", "cp", f"{container_name}:/testbed/.", str(target_dir)],
-            check=True,
-        )
-    finally:
         run_command(["docker", "rm", "-f", container_name], timeout=30)
-    install_repo_exclude_rules(target_dir, instance_id=instance_id)
+        try:
+            run_command(
+                ["docker", "create", "--name", container_name, image_name, "sleep", "1"],
+                check=True,
+            )
+            run_command(
+                ["docker", "cp", f"{container_name}:/testbed/.", str(target_dir)],
+                check=True,
+            )
+        finally:
+            # A failed removal must not mask the primary preparation error.
+            with contextlib.suppress(Exception):
+                run_command(["docker", "rm", "-f", container_name], timeout=30)
+        install_repo_exclude_rules(target_dir, instance_id=instance_id)
+    except BaseException:
+        # Own the target directory only until preparation returns; release the
+        # failed attempt's partial directory while preserving the primary error.
+        shutil.rmtree(target_dir, ignore_errors=True)
+        raise
     return target_dir
 
 

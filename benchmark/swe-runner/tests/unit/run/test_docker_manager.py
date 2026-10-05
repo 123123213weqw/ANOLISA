@@ -149,6 +149,126 @@ class TestStart:
             assert manager.work_dir.exists()
 
 
+class TestPrepareWorkspaceRollback:
+    """Failed image preparation must not leave a partial workspace behind."""
+
+    @staticmethod
+    def _failing_run_command(fail_pred):
+        """Return a side_effect raising CalledProcessError when *fail_pred* matches."""
+
+        def _side_effect(args, **kwargs):
+            if fail_pred(args):
+                raise subprocess.CalledProcessError(1, args)
+            return _mock_run_success()
+
+        return _side_effect
+
+    def test_copy_failure_releases_partial_workspace(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        with patch(
+            "swe_runner.run.workspace.docker.run_command",
+            side_effect=self._failing_run_command(lambda args: args[1] == "cp"),
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                prepare_workspace_from_image(
+                    "test-image:latest", instance_id="inst-1", work_dir=workdir
+                )
+
+        assert not workdir.exists()
+
+    def test_stale_removal_failure_releases_workspace(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        with patch(
+            "swe_runner.run.workspace.docker.run_command",
+            side_effect=self._failing_run_command(
+                lambda args: args[:2] == ["docker", "rm"]
+            ),
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                prepare_workspace_from_image(
+                    "test-image:latest", instance_id="inst-1", work_dir=workdir
+                )
+
+        assert not workdir.exists()
+
+    def test_exclude_install_failure_releases_workspace(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        with patch("swe_runner.run.workspace.docker.run_command") as mock_run, patch(
+            "swe_runner.run.workspace.docker.install_repo_exclude_rules",
+            side_effect=OSError("disk full"),
+        ):
+            mock_run.return_value = _mock_run_success()
+
+            with pytest.raises(OSError):
+                prepare_workspace_from_image(
+                    "test-image:latest", instance_id="inst-1", work_dir=workdir
+                )
+
+        assert not workdir.exists()
+
+    def test_secondary_cleanup_failure_preserves_primary_error(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        rm_calls = {"count": 0}
+
+        def _side_effect(args, **kwargs):
+            if args[1] == "cp":
+                raise subprocess.CalledProcessError(2, args)
+            if args[:2] == ["docker", "rm"]:
+                rm_calls["count"] += 1
+                if rm_calls["count"] >= 2:  # the final container removal
+                    raise subprocess.TimeoutExpired(cmd=list(args), timeout=30)
+            return _mock_run_success()
+
+        with patch("swe_runner.run.workspace.docker.run_command", side_effect=_side_effect):
+            with pytest.raises(subprocess.CalledProcessError) as excinfo:
+                prepare_workspace_from_image(
+                    "test-image:latest", instance_id="inst-1", work_dir=workdir
+                )
+
+        assert excinfo.value.returncode == 2
+        assert not workdir.exists()
+
+    def test_pull_failure_preserves_existing_workspace(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        workdir.mkdir()
+        (workdir / "keep.txt").write_text("kept")
+
+        with patch(
+            "swe_runner.run.workspace.docker.run_command",
+            side_effect=self._failing_run_command(
+                lambda args: args[:2] == ["docker", "pull"]
+            ),
+        ):
+            with pytest.raises(subprocess.CalledProcessError):
+                prepare_workspace_from_image(
+                    "test-image:latest", instance_id="inst-1", work_dir=workdir
+                )
+
+        assert (workdir / "keep.txt").read_text() == "kept"
+
+    def test_success_keeps_command_and_exclusion_order(self, tmp_path: Path):
+        workdir = tmp_path / "workdir"
+        with patch("swe_runner.run.workspace.docker.run_command") as mock_run, patch(
+            "swe_runner.run.workspace.docker.install_repo_exclude_rules"
+        ) as mock_excludes:
+            mock_run.return_value = _mock_run_success()
+
+            result = prepare_workspace_from_image(
+                "test-image:latest", instance_id="inst-1", work_dir=workdir
+            )
+
+        assert result == workdir
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert [cmd[:2] for cmd in commands] == [
+            ["docker", "pull"],
+            ["docker", "rm"],
+            ["docker", "create"],
+            ["docker", "cp"],
+            ["docker", "rm"],
+        ]
+        mock_excludes.assert_called_once_with(workdir, instance_id="inst-1")
+
+
 class TestExecute:
     def test_execute_calls_docker_exec(self, manager: DockerManager):
         """verify execute() calls docker exec with correct args"""
