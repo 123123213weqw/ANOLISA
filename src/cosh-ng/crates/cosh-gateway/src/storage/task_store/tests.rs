@@ -1193,6 +1193,96 @@ fn retry_commit_guard_rejects_live_previous_lease_without_mutation() {
 }
 
 #[test]
+fn suspended_cancel_accepts_a_run_that_never_acquired_a_lease() {
+    let mut store = SqliteTaskStore::open_in_memory().unwrap();
+    let task_id = TaskId::new();
+    let actor_id = ActorId::new();
+    let run_id = RunId::new();
+    // A pre-Runtime checkpoint that cannot be proven suspends its Task before
+    // any Run lease or Runtime binding can exist.
+    let events = vec![
+        submitted(&task_id, &actor_id),
+        envelope(
+            &task_id,
+            &actor_id,
+            2,
+            TaskEvent::TaskQueued {
+                run_id: run_id.clone(),
+                runtime: RuntimeSelector {
+                    runtime: BoundedName::new("core").unwrap(),
+                    profile: None,
+                },
+            },
+        ),
+        envelope(
+            &task_id,
+            &actor_id,
+            3,
+            TaskEvent::RunSuspended {
+                run_id: run_id.clone(),
+                reason: SuspensionCode::OperatorRequired,
+            },
+        ),
+    ];
+    store
+        .commit_task(&task_commit(
+            &task_id,
+            &actor_id,
+            "never-started-suspension",
+            '9',
+            events,
+            Vec::new(),
+        ))
+        .unwrap();
+    assert_eq!(
+        store
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM run_leases WHERE run_id=?1",
+                params![run_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0
+    );
+    let requested = envelope(
+        &task_id,
+        &actor_id,
+        4,
+        TaskEvent::CancellationRequested {
+            run_id: run_id.clone(),
+            cause: CancelReason::UserRequested,
+        },
+    );
+    let run_cancelled = envelope(
+        &task_id,
+        &actor_id,
+        5,
+        TaskEvent::RunCancelled {
+            run_id: run_id.clone(),
+            stage: CancellationStage::Runtime,
+        },
+    );
+    let task_cancelled = envelope(&task_id, &actor_id, 6, TaskEvent::TaskCancelled);
+    let commit = task_commit(
+        &task_id,
+        &actor_id,
+        "never-started-cancel",
+        'a',
+        vec![requested, run_cancelled, task_cancelled],
+        Vec::new(),
+    );
+    assert!(matches!(
+        store.commit_suspended_cancel(&commit, &run_id),
+        Ok(CommitOutcome::Applied(_))
+    ));
+    assert_eq!(
+        store.load_task(&task_id).unwrap().state(),
+        TaskState::Cancelled
+    );
+}
+
+#[test]
 fn event_page_is_owner_scoped_and_sql_bounded() {
     let mut store = SqliteTaskStore::open_in_memory().unwrap();
     let task_id = TaskId::new();

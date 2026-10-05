@@ -146,21 +146,21 @@ fn require_run_quiescent(
             },
         )
         .optional()?;
-    let Some((lease_task_id, lease_actor_id, expires_at_ms)) = lease else {
-        return Err(StoreError::LedgerConflict {
-            message: "retry requires the previous Run lease".to_owned(),
-        });
-    };
-    let expires_at_ms = u64::try_from(expires_at_ms)
-        .map_err(|_| corrupt("previous Run lease has a negative deadline"))?;
-    if lease_task_id != task_id.as_str()
-        || lease_actor_id != commit.actor_id.as_str()
-        || expires_at_ms > commit.committed_at_ms
-    {
-        return Err(StoreError::LedgerConflict {
-            message: "previous Run lease is live or does not match retry ownership".to_owned(),
-        });
+    if let Some((lease_task_id, lease_actor_id, expires_at_ms)) = lease {
+        let expires_at_ms = u64::try_from(expires_at_ms)
+            .map_err(|_| corrupt("previous Run lease has a negative deadline"))?;
+        if lease_task_id != task_id.as_str()
+            || lease_actor_id != commit.actor_id.as_str()
+            || expires_at_ms > commit.committed_at_ms
+        {
+            return Err(StoreError::LedgerConflict {
+                message: "previous Run lease is live or does not match retry ownership".to_owned(),
+            });
+        }
     }
+    // A Run with no lease row never started: a Runtime binding cannot exist
+    // without one (for example a Run suspended by an uncertain pre-Runtime
+    // checkpoint). Only the per-Run tables below can still hold it back.
     let active_bindings = transaction.query_row(
         "SELECT COUNT(*) FROM runtime_bindings WHERE run_id=?1 AND state='active'",
         params![run_id.as_str()],
