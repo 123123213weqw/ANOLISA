@@ -54,6 +54,8 @@ def main():
     ap.add_argument("-d","--metadata",action="store_true")
     ap.add_argument("-t","--tables",action="store_true",
                     help="report per-page table bboxes and cell rows (JSON output only)")
+    ap.add_argument("--outline",action="store_true",
+                    help="include the document bookmark outline in --format json output")
     ap.add_argument("--format",default="text",choices=["text","json"])
     ap.add_argument("-m","--max-length",type=int,default=0)
     ap.add_argument("--sort",action="store_true",
@@ -62,6 +64,8 @@ def main():
     if a.tables and a.format != "json":
         ap.error("--tables requires --format json")
 
+    if a.outline and a.format != "json":
+        print("ERROR: --outline requires --format json",file=sys.stderr); sys.exit(1)
     fitz = _install()
     if a.sort and not _engine_supports_sort(fitz):
         print(f"ERROR: --sort requires PyMuPDF >= 1.19.1, engine is {_engine_version(fitz) or 'unknown'}",
@@ -71,6 +75,8 @@ def main():
     doc = fitz.open(a.file)
     n = len(doc)
     idx = _pages(a.pages, n) if a.pages else list(range(n))
+
+    toc = doc.get_toc() if a.outline else None
 
     meta = {}
     if a.metadata and doc.metadata:
@@ -91,6 +97,7 @@ def main():
     if a.format == "json":
         out = {"total_pages":n,"pages":pages}
         if meta: out["metadata"] = meta
+        if toc is not None: out["outline"] = [list(e) for e in toc]
         r = json.dumps(out,ensure_ascii=False,indent=2)
     else:
         parts = []
