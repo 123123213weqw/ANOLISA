@@ -22,13 +22,16 @@ What it updates in every XML file under <work_dir>:
   - Table <table ref="A1:D20"> in xl/tables/*.xml
   - Chart series <numRef><f> and <strRef><f> range references in xl/charts/*.xml
   - PivotCache source <worksheetSource ref="..."> in xl/pivotCaches/*.xml
+  - Direct definedName references in xl/workbook.xml <definedNames>:
+    A1 cells/ranges, whole rows/columns and comma unions (including print
+    areas and print titles). Complex name expressions, external `[...]`
+    references, 3D `Sheet1:Sheet3!` references and malformed/out-of-grid
+    ranges are left untouched for manual review.
 
 IMPORTANT: Run this script on the UNPACKED directory before repacking.
 After running, repack with xlsx_pack.py and re-validate with formula_check.py.
 
 Limitations:
-  - Named ranges in workbook.xml <definedNames> are NOT updated automatically.
-    Review them manually after running this script.
   - Structured table references (Table[@Column]) are NOT updated.
   - External workbook links in xl/externalLinks/ are NOT updated.
 """
@@ -138,6 +141,208 @@ def shift_chart_range(text: str, at: int, delta: int) -> str:
     sheet_part = text[:bang + 1]
     range_part = text[bang + 1:]
     return sheet_part + shift_formula(range_part, at, delta)
+
+
+# ---------------------------------------------------------------------------
+# definedNames support (xl/workbook.xml)
+# ---------------------------------------------------------------------------
+
+MAX_ROW = 1048576   # Excel maximum row
+MAX_COL = 16384     # Excel maximum column (XFD)
+
+_REF_CELL_RE = re.compile(r'^(\$?)([A-Za-z]{1,3})(\$?)([0-9]+)$')
+_REF_ROW_RE = re.compile(r'^(\$?)([0-9]+)$')
+_REF_COL_RE = re.compile(r'^(\$?)([A-Za-z]{1,3})$')
+
+# Characters that can never appear in an unquoted sheet name prefix.
+_BAD_SHEET_CHARS = set(":[]'\"(),+-*/^&%=<>! ")
+
+
+def _split_union_members(value: str) -> list[str]:
+    """Split a definedName value on top-level commas.
+
+    Commas inside quoted sheet qualifiers (e.g. 'A, B'!$A$1) do not split the
+    union. Returns the members verbatim.
+    """
+    members: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    i, n = 0, len(value)
+    while i < n:
+        ch = value[i]
+        if in_quote:
+            if ch == "'":
+                if i + 1 < n and value[i + 1] == "'":
+                    buf.append("''")
+                    i += 2
+                    continue
+                in_quote = False
+            buf.append(ch)
+        elif ch == "'":
+            in_quote = True
+            buf.append(ch)
+        elif ch == ",":
+            members.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+        i += 1
+    members.append("".join(buf))
+    return members
+
+
+def _split_sheet_qualifier(member: str) -> tuple[str, str] | None:
+    """Split a union member into (sheet_qualifier, refpart).
+
+    Returns None when the member is not a plain reference that this script
+    can rewrite safely: external `[...]` references (brackets anywhere),
+    unquoted 3D references (Sheet1:Sheet3!), malformed quoting or a sheet
+    prefix with characters that require quoting.
+    """
+    if "[" in member or "]" in member:
+        return None  # external workbook reference — manual review
+    if member.startswith("'"):
+        i, n = 1, len(member)
+        while i < n:
+            if member[i] == "'":
+                if i + 1 < n and member[i + 1] == "'":
+                    i += 2
+                    continue
+                break
+            i += 1
+        if i >= n or member[i] != "'":
+            return None  # unterminated quoted sheet name
+        if i + 1 >= n or member[i + 1] != "!":
+            return None  # missing '!' after the quoted sheet name
+        return member[:i + 2], member[i + 2:]
+    if "!" in member:
+        sheet, _, refpart = member.partition("!")
+        if not sheet or not refpart or any(c in _BAD_SHEET_CHARS for c in sheet):
+            return None  # 3D reference or sheet name that should be quoted
+        return sheet + "!", refpart
+    return "", member
+
+
+def _parse_ref_token(token: str):
+    """Categorise a single address token.
+
+    Returns ('cell', dollar_col, col, dollar_row, row), ('row', dollar, row)
+    or ('col', dollar, col), or None when the token is malformed or outside
+    the worksheet grid.
+    """
+    m = _REF_CELL_RE.match(token)
+    if m:
+        dc, col, dr, row = m.group(1), m.group(2), m.group(3), int(m.group(4))
+        if 1 <= col_number(col) <= MAX_COL and 1 <= row <= MAX_ROW:
+            return ("cell", dc, col, dr, row)
+        return None
+    m = _REF_ROW_RE.match(token)
+    if m:
+        row = int(m.group(2))
+        if 1 <= row <= MAX_ROW:
+            return ("row", m.group(1), row)
+        return None
+    m = _REF_COL_RE.match(token)
+    if m:
+        col = m.group(2)
+        if 1 <= col_number(col) <= MAX_COL:
+            return ("col", m.group(1), col)
+    return None
+
+
+def _shift_row_number(row: int, at: int, delta: int) -> int:
+    if row >= at:
+        return max(1, row + delta)
+    return row
+
+
+def _shift_defined_refpart(refpart: str, at: int, delta: int, qualified: bool):
+    """Shift one refpart (cell, range, whole rows or whole columns).
+
+    Returns the rewritten refpart, or None when the refpart is not a direct
+    reference this script can rewrite safely. Whole-column refs are returned
+    unchanged (a row shift never moves them). A bare number without a sheet
+    qualifier and without a ':' is treated as a constant, not a row ref.
+    """
+    if ":" in refpart:
+        left, _, right = refpart.partition(":")
+        if ":" in right:
+            return None
+        lt = _parse_ref_token(left)
+        rt = _parse_ref_token(right)
+        if lt is None or rt is None or lt[0] != rt[0]:
+            return None  # malformed or mixed-kind range
+        if lt[0] == "cell":
+            left2 = f"{lt[1]}{lt[2]}{lt[3]}{_shift_row_number(lt[4], at, delta)}"
+            rt_shifted = _shift_row_number(rt[4], at, delta)
+            right2 = f"{rt[1]}{rt[2]}{rt[3]}{rt_shifted}"
+            return f"{left2}:{right2}"
+        if lt[0] == "row":
+            left2 = f"{lt[1]}{_shift_row_number(lt[2], at, delta)}"
+            right2 = f"{rt[1]}{_shift_row_number(rt[2], at, delta)}"
+            return f"{left2}:{right2}"
+        return refpart  # whole-column range — rows unaffected
+    token = _parse_ref_token(refpart)
+    if token is None:
+        return None
+    if token[0] == "cell":
+        return f"{token[1]}{token[2]}{token[3]}{_shift_row_number(token[4], at, delta)}"
+    if token[0] == "row":
+        if not qualified:
+            return None  # bare number — likely a constant, leave untouched
+        return f"{token[1]}{_shift_row_number(token[2], at, delta)}"
+    return refpart  # whole-column ref — rows unaffected
+
+
+def shift_defined_name_value(value: str, at: int, delta: int) -> str:
+    """Shift rows in a definedName value following the global row-shift policy.
+
+    Supports direct A1 cells/ranges (with or without '$' markers), whole-row
+    and whole-column refs and comma unions, each optionally qualified by a
+    plain or quoted sheet name (preserved exactly, including embedded '!',
+    doubled apostrophes and commas). Any unsupported member — a complex
+    expression, an external or 3D reference, a malformed or out-of-grid
+    range — makes the whole value be returned unchanged for manual review.
+    """
+    if not value or value != value.strip():
+        return value
+    members = _split_union_members(value)
+    rewritten = []
+    for member in members:
+        split = _split_sheet_qualifier(member)
+        if split is None:
+            return value
+        qualifier, refpart = split
+        if not refpart:
+            return value
+        new_refpart = _shift_defined_refpart(refpart, at, delta, bool(qualifier))
+        if new_refpart is None:
+            return value
+        rewritten.append(qualifier + new_refpart)
+    return ",".join(rewritten)
+
+
+def process_defined_names(workbook_path: str, at: int, delta: int, apply: bool = True) -> list[tuple]:
+    """Shift row references inside xl/workbook.xml <definedNames>.
+
+    With apply=False the workbook part is left untouched and only the planned
+    changes are returned (non-mutating preview mode for the pending preview
+    option). Returns a list of (name, old_value, new_value) tuples.
+    """
+    tree = ET.parse(workbook_path)
+    planned = []
+    for dn in tree.getroot().iter(_tag("definedName")):
+        old = dn.text
+        if not old:
+            continue
+        new = shift_defined_name_value(old, at, delta)
+        if new != old:
+            planned.append((dn.get("name", ""), old, new))
+            if apply:
+                dn.text = new
+    if apply and planned:
+        _write_tree(tree, workbook_path)
+    return planned
 
 
 # ---------------------------------------------------------------------------
@@ -380,11 +585,19 @@ def main() -> None:
                     print(f"  Updated pivot source range in xl/pivotCaches/{fname}")
                     total_changes += n
 
+    # Process defined names in the workbook part
+    workbook_path = os.path.join(work_dir, "xl", "workbook.xml")
+    if os.path.isfile(workbook_path):
+        planned = process_defined_names(workbook_path, at, delta, apply=True)
+        if planned:
+            print(f"  Updated {len(planned)} defined name reference(s) in xl/workbook.xml")
+            total_changes += len(planned)
+
     print()
     print(f"Total changes: {total_changes}")
     print()
-    print("IMPORTANT: Review named ranges in xl/workbook.xml <definedNames> manually.")
-    print("           Structured table references (Table[@Col]) are NOT updated.")
+    print("IMPORTANT: Structured table references (Table[@Col]) are NOT updated.")
+    print("           External workbook links in xl/externalLinks/ are NOT updated.")
     print()
     print("Next steps:")
     print("  1. Review the changes above")

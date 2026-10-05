@@ -514,7 +514,7 @@ python3 SKILL_DIR/scripts/xlsx_shift_rows.py /tmp/xlsx_work/ insert 5 1
 python3 SKILL_DIR/scripts/xlsx_shift_rows.py /tmp/xlsx_work/ delete 8 1
 ```
 
-The script updates in one pass: `<row r="...">` attributes, `<c r="...">` cell addresses, all `<f>` formula text across every worksheet, `<mergeCell>` ranges, `<conditionalFormatting sqref="...">`, `<dataValidation sqref="...">`, `<dimension ref="...">`, table `ref` attributes in `xl/tables/`, chart series ranges in `xl/charts/`, and pivot cache source ranges in `xl/pivotCaches/`.
+The script updates in one pass: `<row r="...">` attributes, `<c r="...">` cell addresses, all `<f>` formula text across every worksheet, `<mergeCell>` ranges, `<conditionalFormatting sqref="...">`, `<dataValidation sqref="...">`, `<dimension ref="...">`, table `ref` attributes in `xl/tables/`, chart series ranges in `xl/charts/`, pivot cache source ranges in `xl/pivotCaches/`, and direct definedName references in `xl/workbook.xml` `<definedNames>` (A1 cells/ranges, whole rows/columns and comma unions, including print areas and print titles, with quoted sheet qualifiers preserved exactly).
 
 **After running the shift script, always repack and validate:**
 ```bash
@@ -523,7 +523,7 @@ python3 SKILL_DIR/scripts/formula_check.py output.xlsx
 ```
 
 **What the script does NOT update (review manually):**
-- Named ranges in `xl/workbook.xml` `<definedNames>` — check and update if they reference shifted rows.
+- Defined names whose value is a complex expression (`SUM(...)`, `OFFSET(...)`), an external `[...]` reference, a 3D `Sheet1:Sheet3!` reference, or a malformed/out-of-grid range — the whole value is left untouched, including when only one member of a comma union is unsupported.
 - Structured table references (`Table[@Column]`) inside formulas.
 - External workbook links in `xl/externalLinks/`.
 
