@@ -123,7 +123,7 @@ python3 /home/ecs-user/.copilot-shell/skills/install-openclaw/scripts/install_op
 
 - Checks Node.js/npm and installs them with `dnf`/`yum` when needed.
 - Runs dependency precheck before installing or writing config.
-- Runs a model endpoint pre-flight check before writing config or starting Gateway. It uses the official Alibaba Cloud OpenClaw `anthropic-messages` shape and validates the resolved API key, Base URL, and model ID. Pass `--skip-preflight` only when the endpoint is temporarily unreachable and the user accepts deferring validation to Gateway startup.
+- Runs a model endpoint pre-flight check before writing config or starting Gateway. It uses the official Alibaba Cloud OpenClaw `anthropic-messages` shape and validates the resolved API key, Base URL, and model ID, reading the reply bounded and requiring a valid Anthropic Messages or OpenAI Chat Completions success envelope before any config is written. Pass `--skip-preflight` only when the endpoint is temporarily unreachable and the user accepts deferring validation to Gateway startup.
 - With `--dry-run`, still resolves config and runs the model pre-flight check, but skips local install/config/gateway changes. Combine with `--skip-preflight` only for an offline local-flow preview.
 - With `--precheck-only`, checks only local dependencies and prints the API key source; it does not require or validate an API key.
 - Installs OpenClaw with npm unless `--skip-install-openclaw` is passed.

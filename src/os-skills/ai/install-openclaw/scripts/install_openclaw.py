@@ -8,6 +8,7 @@ and starts the local gateway service.
 """
 
 import argparse
+import http.client
 import json
 import os
 import socket
@@ -458,6 +459,80 @@ def preflight_hint(status, metadata):
     return "Check API key, baseUrl, model id, and network reachability."
 
 
+PREFLIGHT_MAX_REPLY_BYTES = 64 * 1024
+
+
+class PreflightReplyError(Exception):
+    """A model endpoint reply failed bounded reading or protocol validation."""
+
+
+def read_model_reply(response, limit=PREFLIGHT_MAX_REPLY_BYTES):
+    """Read at most ``limit`` bytes plus one overflow-detection byte."""
+    data = response.read(limit + 1)
+    if len(data) > limit:
+        raise PreflightReplyError(f"model reply exceeded the {limit}-byte limit")
+    return data
+
+
+def _is_anthropic_messages_success(parsed):
+    return (
+        parsed.get("type") == "message"
+        and parsed.get("role") == "assistant"
+        and isinstance(parsed.get("content"), list)
+        and isinstance(parsed.get("id"), str)
+    )
+
+
+def _is_openai_completion_success(parsed):
+    return (
+        parsed.get("object") == "chat.completion"
+        and isinstance(parsed.get("choices"), list)
+        and isinstance(parsed.get("id"), str)
+    )
+
+
+def validate_model_reply(data, limit=PREFLIGHT_MAX_REPLY_BYTES):
+    """Require a minimal protocol success envelope in a complete JSON reply.
+
+    Accepts Anthropic Messages and OpenAI Chat Completions success shapes,
+    including empty, token-limited, filtered and tool responses (neither
+    generated text nor optional provider metadata is required). Rejects
+    provider error envelopes, non-object JSON, malformed or non-UTF-8
+    payloads and wrong-protocol objects. No response body is dumped.
+    """
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise PreflightReplyError("model reply is not valid UTF-8") from exc
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PreflightReplyError("model reply is not complete JSON") from exc
+    if not isinstance(parsed, dict):
+        raise PreflightReplyError("model reply is not a JSON object")
+    error = parsed.get("error")
+    if isinstance(error, (dict, str)) and error:
+        message = extract_error_message(text)
+        detail = f" ({message})" if message else ""
+        raise PreflightReplyError(f"endpoint returned a provider error reply{detail}")
+    if _is_anthropic_messages_success(parsed) or _is_openai_completion_success(parsed):
+        return
+    raise PreflightReplyError(
+        "model reply does not match the Anthropic Messages or OpenAI "
+        "Chat Completions success envelope"
+    )
+
+
+def _preflight_reply_exit(url, exc):
+    return SystemExit(
+        "Model pre-flight check failed before writing OpenClaw config.\n"
+        f"  endpoint: {url}\n"
+        f"  reply rejected: {exc}\n"
+        "Fix the values or rerun with --skip-preflight only if you want "
+        "to defer validation to OpenClaw Gateway startup."
+    )
+
+
 def preflight_model_call(args, metadata):
     if args.skip_preflight:
         print("\n--- Skipping model pre-flight check (--skip-preflight) ---\n")
@@ -494,9 +569,14 @@ def preflight_model_call(args, metadata):
     print(f"  model={metadata['model_id']}")
     try:
         with urllib.request.urlopen(request, timeout=args.preflight_timeout) as response:
-            response.read(1024)
+            reply = read_model_reply(response)
+    except PreflightReplyError as exc:
+        raise _preflight_reply_exit(url, exc) from exc
     except urllib.error.HTTPError as exc:
-        error_body = exc.read().decode("utf-8", errors="replace")
+        with exc:
+            error_body = exc.read(PREFLIGHT_MAX_REPLY_BYTES + 1).decode(
+                "utf-8", errors="replace"
+            )
         message = extract_error_message(error_body)
         hint = preflight_hint(exc.code, metadata)
         detail = f"\n  provider message: {message}" if message else ""
@@ -507,7 +587,13 @@ def preflight_model_call(args, metadata):
             "Fix the values or rerun with --skip-preflight only if you want "
             "to defer validation to OpenClaw Gateway startup."
         ) from exc
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        socket.timeout,
+        OSError,
+        http.client.HTTPException,
+    ) as exc:
         reason = getattr(exc, "reason", exc)
         raise SystemExit(
             "Model pre-flight check failed before writing OpenClaw config.\n"
@@ -516,6 +602,11 @@ def preflight_model_call(args, metadata):
             "Check --base-url, DNS/proxy/network access, or rerun with "
             "--skip-preflight to defer validation."
         ) from exc
+
+    try:
+        validate_model_reply(reply)
+    except PreflightReplyError as exc:
+        raise _preflight_reply_exit(url, exc) from exc
 
     print("  [OK] API key, baseUrl, and model id accepted by endpoint")
 
