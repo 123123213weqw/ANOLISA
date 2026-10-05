@@ -308,3 +308,122 @@ fn legacy_background_entry_points_return_the_views_refusal() {
         "no FUSE session may come up for the refused legacy mount"
     );
 }
+
+/// Mount-level companion to the fs.rs snapshot unit test: the reviewer's
+/// synchronized regression, driven through the real entry point.
+///
+/// The unit test hands a pre-parsed snapshot straight to the constructor;
+/// this one reproduces the actual race end to end. The views "file" is a
+/// FIFO, so every reader open blocks until a writer session is offered
+/// and the readers consume sessions strictly in order (the synchronous
+/// preflight in `mount_background_configured`, then the mount-time parse
+/// in `mount_inner`). Sessions 1 and 2 feed both validations the
+/// restrictive config; a would-be third read — the constructor re-read
+/// that existed before the snapshot carry — would consume session 3 and
+/// observe truncated (zero-byte) bytes. The mount must serve exactly the
+/// validated snapshot, never the no-views fallback widened to beta/gamma.
+///
+/// On the pre-carry head this failed deterministically: the constructor
+/// consumed session 3, fell back to no views, and `/skills` listed
+/// alpha, beta and gamma.
+#[test]
+#[cfg(target_os = "linux")]
+fn views_snapshot_survives_a_post_validation_swap() {
+    /// One FIFO writer session: block until the next reader opens, hand
+    /// it `payload`, and report whether a reader rendezvoused within
+    /// `timeout`. Sessions must be offered strictly one at a time —
+    /// FIFO opens pair in arrival order, so sequential offers pin which
+    /// reader sees which bytes.
+    fn fifo_offer(path: &Path, payload: &[u8], timeout: Duration) -> bool {
+        use std::io::Write;
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let path = path.to_path_buf();
+        let payload = payload.to_vec();
+        std::thread::spawn(move || {
+            if let Ok(mut file) = std::fs::OpenOptions::new().write(true).open(&path) {
+                let _ = file.write_all(&payload);
+                let _ = done_tx.send(());
+            }
+        });
+        done_rx.recv_timeout(timeout).is_ok()
+    }
+
+    if !common::fuse_available() {
+        eprintln!("SKIP views_snapshot_survives_a_post_validation_swap: FUSE not available");
+        return;
+    }
+
+    let source = tempfile::tempdir().expect("source tempdir");
+    seed_three_skills(source.path(), None);
+    let views_path = source.path().join("skillfs-views.toml");
+    let fifo = std::process::Command::new("mkfifo")
+        .arg(&views_path)
+        .status()
+        .expect("mkfifo");
+    assert!(fifo.success(), "seed the views FIFO");
+
+    let mut store = SkillStore::new();
+    let load_errors = store.load_from_directory(source.path(), &ParseConfig::default());
+    assert!(load_errors.is_empty(), "fixture skills must all load");
+    let shared: SharedSkillStore = Arc::new(RwLock::new(store));
+
+    // The preflight inside `mount_background_configured` blocks reading
+    // until session 1 arrives, so the mount call runs concurrently with
+    // the writer sessions.
+    let mountpoint = tempfile::tempdir().expect("mount tempdir");
+    let mount_mountpoint = mountpoint.path().to_path_buf();
+    let mount_source = source.path().to_path_buf();
+    let mount_shared = shared.clone();
+    let mount = std::thread::spawn(move || {
+        mount_background_configured(
+            &mount_mountpoint,
+            &mount_source,
+            mount_shared,
+            MountOptions::default(),
+            false,
+            Default::default(),
+        )
+    });
+
+    assert!(
+        fifo_offer(&views_path, VALID_VIEWS.as_bytes(), Duration::from_secs(10)),
+        "the synchronous preflight must read the restrictive config"
+    );
+    assert!(
+        fifo_offer(&views_path, VALID_VIEWS.as_bytes(), Duration::from_secs(10)),
+        "the mount-time validation must read the restrictive config"
+    );
+    // Session 3 is consumed ONLY by a post-validation re-read of the
+    // file — the TOCTOU window. It hands that reader truncated
+    // (zero-byte) bytes. Once the validated snapshot is carried into the
+    // filesystem no third read exists and this session simply times out.
+    let _re_read_after_validation = fifo_offer(&views_path, b"", Duration::from_secs(2));
+
+    let handle = mount
+        .join()
+        .expect("mount thread")
+        .expect("both validations observed the restrictive config; the mount must succeed");
+
+    std::thread::sleep(Duration::from_millis(500));
+    let skills_dir = mountpoint.path().join("skills");
+    if skills_dir.exists() {
+        let listed = std::fs::read_dir(&skills_dir)
+            .expect("readdir /skills")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "skill-discover")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            listed,
+            vec!["alpha".to_string()],
+            "the mount must serve exactly the validated snapshot, never the \
+             no-views fallback widened to beta/gamma"
+        );
+    }
+    drop(handle);
+    unmount_quiet(mountpoint.path());
+    // Bookkeeping for any session-3 writer that never rendezvoused (it
+    // blocks on open; the test process exit reaps it).
+    let _ = std::fs::remove_file(&views_path);
+}
