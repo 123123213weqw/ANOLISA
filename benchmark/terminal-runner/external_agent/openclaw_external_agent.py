@@ -696,7 +696,12 @@ class OpenClawExternalAgent(BaseAgent):
     def _build_followup_instruction(
         self, cmd_outputs: list[str], original_task: str,
     ) -> str:
+        # Re-state the task: when no session id was established (missing
+        # ``meta.agentMeta.sessionId``) each iteration runs against a fresh
+        # OpenClaw session, and command results alone leave it without
+        # any notion of what it is supposed to be doing.
         return (
+            f"Task: {original_task}\n\n"
             f"Results of your commands:\n\n{chr(10).join(cmd_outputs)}\n\n"
             "Continue with more bash commands in ```bash``` code blocks, "
             "or say TASK_COMPLETE if done."
