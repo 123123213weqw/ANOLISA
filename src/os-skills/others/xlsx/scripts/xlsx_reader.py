@@ -8,13 +8,14 @@ Usage:
     python3 xlsx_reader.py <file> --sheet Sales     # analyze one sheet
     python3 xlsx_reader.py <file> --json            # machine-readable output
     python3 xlsx_reader.py <file> --quality         # data quality audit only
+    python3 xlsx_reader.py <file> --max-rows 200    # analyze at most N rows per sheet
 
 Supports: .xlsx, .xlsm, .csv, .tsv
 Does NOT modify the source file in any way.
 
 Exit codes:
     0 — success
-    1 — file not found / unsupported format / encoding failure
+    1 — file not found / unsupported format / encoding failure / invalid arguments
 """
 
 import sys
@@ -27,10 +28,20 @@ from pathlib import Path
 # Format detection and loading
 # ---------------------------------------------------------------------------
 
-def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dict:
+def detect_and_load(
+    file_path: str,
+    sheet_name_filter: str | None = None,
+    max_rows: int | None = None,
+) -> dict:
     """
     Load file into {sheet_name: DataFrame} dict.
     CSV/TSV files are mapped to a single-key dict using the file stem as key.
+
+    When max_rows is given, pandas IO is asked for max_rows+1 rows to bound
+    table materialization and detect whether more rows exist; at most
+    max_rows rows per sheet/record set are then analyzed. Each returned
+    DataFrame carries a `_row_budget` attribute:
+    {"max_rows": N, "loaded_rows": L, "truncated": bool}.
 
     Raises ValueError for unsupported formats or encoding failures.
     """
@@ -46,15 +57,19 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
         raise FileNotFoundError(f"File not found: {file_path}")
 
     suffix = path.suffix.lower()
+    load_nrows = None if max_rows is None else max_rows + 1
 
     if suffix in (".xlsx", ".xlsm"):
         target = sheet_name_filter if sheet_name_filter else None
-        result = pd.read_excel(file_path, sheet_name=target)
+        result = pd.read_excel(file_path, sheet_name=target, nrows=load_nrows)
         # pd.read_excel with sheet_name=None returns dict; with a name, returns DataFrame
         if isinstance(result, dict):
-            return result
+            return {
+                name: _apply_row_budget(df, max_rows)
+                for name, df in result.items()
+            }
         else:
-            return {sheet_name_filter: result}
+            return {sheet_name_filter: _apply_row_budget(result, max_rows)}
 
     elif suffix in (".csv", ".tsv"):
         sep = "\t" if suffix == ".tsv" else ","
@@ -63,7 +78,8 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
         for enc in encodings:
             try:
                 import pandas as pd
-                df = pd.read_csv(file_path, sep=sep, encoding=enc)
+                df = pd.read_csv(file_path, sep=sep, encoding=enc, nrows=load_nrows)
+                df = _apply_row_budget(df, max_rows)
                 df._reader_encoding = enc  # attach metadata (non-standard, for reporting)
                 return {path.stem: df}
             except (UnicodeDecodeError, Exception) as e:
@@ -88,6 +104,49 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Row budget
+# ---------------------------------------------------------------------------
+
+def _apply_row_budget(df, max_rows: int | None):
+    """Trim a loaded frame to the row budget and record its scope metadata.
+
+    The caller requests max_rows+1 rows from pandas IO, so a frame longer
+    than max_rows proves that more rows exist in the source. The extra row
+    is dropped here so analysis sees at most max_rows rows.
+    """
+    if max_rows is None:
+        return df
+    loaded_rows = int(len(df))
+    truncated = loaded_rows > max_rows
+    if truncated:
+        df = df.iloc[:max_rows]
+    # Bypass pandas' __setattr__ (it warns on unknown attribute names).
+    object.__setattr__(
+        df,
+        "_row_budget",
+        {
+            "max_rows": max_rows,
+            "loaded_rows": loaded_rows,
+            "truncated": truncated,
+        },
+    )
+    return df
+
+
+def _sheet_row_scope(df) -> dict | None:
+    """Return the analyzed-row scope for a budgeted frame, else None."""
+    budget = getattr(df, "_row_budget", None)
+    if not isinstance(budget, dict):
+        return None
+    return {
+        "max_rows": budget["max_rows"],
+        "loaded_rows": budget["loaded_rows"],
+        "analyzed_rows": int(df.shape[0]),
+        "truncated": budget["truncated"],
+    }
+
+
+# ---------------------------------------------------------------------------
 # Structure discovery
 # ---------------------------------------------------------------------------
 
@@ -95,6 +154,8 @@ def explore_structure(sheets: dict) -> dict:
     """
     Return a structured dict describing each sheet.
     Keys: sheet_name -> {shape, columns, dtypes, null_counts, preview}
+    Budgeted sheets additionally carry a row_scope dict describing the
+    analyzed-row scope, per-sheet truncation, and loaded row counts.
     """
     result = {}
     for sheet_name, df in sheets.items():
@@ -104,6 +165,7 @@ def explore_structure(sheets: dict) -> dict:
             for col, cnt in null_counts.items()
             if cnt > 0
         }
+        row_scope = _sheet_row_scope(df)
         result[sheet_name] = {
             "shape": {"rows": df.shape[0], "cols": df.shape[1]},
             "columns": list(df.columns),
@@ -111,6 +173,8 @@ def explore_structure(sheets: dict) -> dict:
             "null_columns": null_info,
             "preview": df.head(5).to_dict(orient="records"),
         }
+        if row_scope is not None:
+            result[sheet_name]["row_scope"] = row_scope
     return result
 
 
@@ -248,14 +312,41 @@ def render_report(
     # File overview
     sheet_list = list(structure.keys())
     total_rows = sum(s["shape"]["rows"] for s in structure.values())
+    scopes = {
+        name: info["row_scope"]
+        for name, info in structure.items()
+        if "row_scope" in info
+    }
     p(f"\nSheets ({len(sheet_list)}): {', '.join(sheet_list)}")
-    p(f"Total rows across all sheets: {total_rows:,}")
+    if scopes:
+        max_rows = next(iter(scopes.values()))["max_rows"]
+        analyzed_total = sum(s["analyzed_rows"] for s in scopes.values())
+        loaded_total = sum(s["loaded_rows"] for s in scopes.values())
+        truncated_sheets = [name for name, s in scopes.items() if s["truncated"]]
+        p(f"Row budget: analyzing at most {max_rows:,} row(s) per sheet")
+        p(f"Total analyzed rows across all sheets: {analyzed_total:,} (loaded: {loaded_total:,})")
+        if truncated_sheets:
+            p(f"Sheets truncated at budget: {', '.join(truncated_sheets)}")
+            p("Statistics and quality reflect analyzed rows only, not full-file totals")
+    else:
+        p(f"Total rows across all sheets: {total_rows:,}")
 
     for sheet_name, info in structure.items():
         p(f"\n{'─' * 50}")
         p(f"Sheet: {sheet_name}")
         p(f"{'─' * 50}")
         p(f"  Size: {info['shape']['rows']:,} rows × {info['shape']['cols']} cols")
+        if "row_scope" in info:
+            scope = info["row_scope"]
+            truncation = (
+                " (more rows exist; truncated at budget)"
+                if scope["truncated"]
+                else " (entire sheet within budget)"
+            )
+            p(
+                f"  Row scope: analyzed {scope['analyzed_rows']:,} of "
+                f"{scope['loaded_rows']:,} loaded row(s){truncation}"
+            )
         p(f"  Columns: {info['columns']}")
 
         # Data types
@@ -319,8 +410,32 @@ def render_report(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
+def _positive_int(value: str) -> int:
+    """Argparse type for --max-rows: a strictly positive integer."""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        raise argparse.ArgumentTypeError(
+            f"--max-rows must be a positive integer, got {value!r}"
+        ) from None
+    if n < 1:
+        raise argparse.ArgumentTypeError(
+            f"--max-rows must be a positive integer, got {n}"
+        )
+    return n
+
+
+class _ReaderArgumentParser(argparse.ArgumentParser):
+    """ArgumentParser that exits with the documented code 1 on usage errors."""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        print(f"ERROR: {message}", file=sys.stderr)
+        sys.exit(1)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(
+    parser = _ReaderArgumentParser(
         description="Read and analyze Excel/CSV files without modifying them."
     )
     parser.add_argument("file", help="Path to .xlsx, .xlsm, .csv, or .tsv file")
@@ -332,10 +447,18 @@ def main() -> None:
         "--quality", action="store_true",
         help="Run data quality audit only (skip stats)"
     )
+    parser.add_argument(
+        "--max-rows", type=_positive_int, default=None, metavar="N",
+        help="Analyze at most N rows per sheet/data record set "
+        "(statistics and quality then describe the analyzed rows only, "
+        "not full-file totals)"
+    )
     args = parser.parse_args()
 
     try:
-        sheets = detect_and_load(args.file, sheet_name_filter=args.sheet)
+        sheets = detect_and_load(
+            args.file, sheet_name_filter=args.sheet, max_rows=args.max_rows
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
@@ -351,6 +474,20 @@ def main() -> None:
             "quality": quality,
             "stats": stats,
         }
+        scopes = {
+            name: info["row_scope"]
+            for name, info in structure.items()
+            if "row_scope" in info
+        }
+        if scopes:
+            output["row_scope"] = {
+                "max_rows": args.max_rows,
+                "analyzed_rows_total": sum(s["analyzed_rows"] for s in scopes.values()),
+                "loaded_rows_total": sum(s["loaded_rows"] for s in scopes.values()),
+                "truncated_sheets": [
+                    name for name, s in scopes.items() if s["truncated"]
+                ],
+            }
         # Convert preview records to serializable form (handle non-JSON types)
         print(json.dumps(output, indent=2, ensure_ascii=False, default=str))
     else:
