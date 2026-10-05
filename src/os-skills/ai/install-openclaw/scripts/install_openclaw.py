@@ -843,7 +843,9 @@ def gateway_port_listeners(args):
 
     output = ""
     if result is not None:
-        output = (result.stdout or "") + (result.stderr or "")
+        # fuser writes PIDs to stdout and diagnostics to stderr; only the
+        # PID stream identifies listeners.
+        output = result.stdout or ""
     for token in output.split():
         if token.isdigit() and token not in pids:
             pids.append(token)
@@ -866,7 +868,8 @@ def gateway_port_listeners(args):
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
-    for token in ((result.stdout or "") + (result.stderr or "")).split():
+    # lsof -t prints PIDs on stdout; warnings go to stderr.
+    for token in (result.stdout or "").split():
         if token.isdigit() and token not in pids:
             pids.append(token)
     return pids
