@@ -78,6 +78,23 @@ def prompt_input(label: str, default: str = "", hide_default: bool = False) -> s
     return val if val else default
 
 
+def validate_model_settings(roles):
+    """Reject blank required model settings before any file is updated.
+
+    ``roles`` is an iterable of ``(role, settings)`` pairs. Every required
+    field (api_key, base_url, model_id) must be a nonblank string; otherwise
+    the script exits with a role/field error before touching config files.
+    """
+    for role, settings in roles:
+        for field in ("api_key", "base_url", "model_id"):
+            value = settings.get(field)
+            if not isinstance(value, str) or not value.strip():
+                label = field.replace("_", " ")
+                print(f"Error: {role} {label} must be a nonblank string",
+                      file=sys.stderr)
+                sys.exit(1)
+
+
 def update_config_file(path: Path, model: dict, judge: dict,
                        user_agent_model: dict = None):
     """Update a single YAML config file with new model settings."""
@@ -153,6 +170,12 @@ def run_interactive(config_dir: Path, api_key: str = None):
     ua_base_url = prompt_input("Base URL", _DEFAULT_BASE_URL)
     ua_model = {"api_key": ua_api_key, "base_url": ua_base_url, "model_id": ua_model_id}
 
+    validate_model_settings((
+        ("model", model),
+        ("judge", judge),
+        ("user agent", ua_model),
+    ))
+
     # Apply to all config files
     print(f"\nUpdating config files in {config_dir}...")
     for fname in CONFIG_FILES:
@@ -193,6 +216,12 @@ def run_cli(args):
         "base_url": args.base_url or _DEFAULT_BASE_URL,
         "model_id": args.model_id or _DEFAULT_MODEL_ID,
     }
+
+    validate_model_settings((
+        ("model", model),
+        ("judge", judge),
+        ("user agent", ua_model),
+    ))
 
     # Apply
     updated = 0
