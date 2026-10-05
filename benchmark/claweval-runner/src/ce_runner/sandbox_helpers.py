@@ -106,6 +106,12 @@ def _probe_exec(sandbox_url: str, max_attempts: int = 5):
     After /health returns 200 the HTTP listener is up, but internal processes
     (e.g. the shell executor) may still be initializing. Send a trivial Bash
     command and retry with exponential backoff until it succeeds.
+
+    Readiness requires a regular JSON object without the container-response
+    error flags (``error`` / ``status == "error"``, the same convention as
+    ``mcp_sandbox_tools``) and a string ``stdout`` whose trimmed value is
+    exactly the echoed marker -- a body merely containing the marker does not
+    demonstrate that command execution works.
     """
     endpoint = f"{sandbox_url}/exec"
     payload = {"command": "echo ok", "timeout_seconds": 5}
@@ -116,12 +122,18 @@ def _probe_exec(sandbox_url: str, max_attempts: int = 5):
             r = httpx.post(endpoint, json=payload, timeout=10)
             if r.status_code == 200:
                 body = r.json()
-                if "ok" in body.get("stdout", ""):
+                if (
+                    isinstance(body, dict)
+                    and not body.get("error")
+                    and body.get("status") != "error"
+                    and isinstance(body.get("stdout"), str)
+                    and body["stdout"].strip() == "ok"
+                ):
                     return
         except Exception:
             pass
         if attempt < max_attempts - 1:
-            wait = backoff[attempt]
+            wait = backoff[attempt] if attempt < len(backoff) else backoff[-1]
             log(f"  [sandbox] probe /exec attempt {attempt + 1}/{max_attempts} "
                 f"failed, retrying in {wait}s")
             time.sleep(wait)
