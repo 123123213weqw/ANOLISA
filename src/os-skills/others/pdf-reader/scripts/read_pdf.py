@@ -57,6 +57,7 @@ def main():
     ap.add_argument("--outline",action="store_true",
                     help="include the document bookmark outline in --format json output")
     ap.add_argument("--format",default="text",choices=["text","json"])
+    ap.add_argument("--annotations",action="store_true")
     ap.add_argument("-m","--max-length",type=int,default=0)
     ap.add_argument("--sort",action="store_true",
                     help="extract text in spatial reading order (PyMuPDF >= 1.19.1)")
@@ -66,6 +67,9 @@ def main():
 
     if a.outline and a.format != "json":
         print("ERROR: --outline requires --format json",file=sys.stderr); sys.exit(1)
+    if a.annotations and a.format != "json":
+        print("ERROR: --annotations requires --format json",file=sys.stderr); sys.exit(2)
+
     fitz = _install()
     if a.sort and not _engine_supports_sort(fitz):
         print(f"ERROR: --sort requires PyMuPDF >= 1.19.1, engine is {_engine_version(fitz) or 'unknown'}",
@@ -84,14 +88,22 @@ def main():
 
     pages = []
     for i in idx:
-        t = doc[i].get_text("text", sort=a.sort).strip()
+        page = doc[i]
+        t = page.get_text("text", sort=a.sort).strip()
         if not t:
-            blocks = doc[i].get_text("blocks")
+            blocks = page.get_text("blocks")
             t = "\n".join(b[4] for b in sorted(blocks,key=lambda b:(b[1],b[0])) if b[-1]==0).strip()
-        entry = {"page":i+1,"text":t}
+        rec = {"page":i+1,"text":t}
         if a.tables:
-            entry["tables"] = _page_tables(doc[i])
-        pages.append(entry)
+            rec["tables"] = _page_tables(page)
+        if a.annotations:
+            rec["annotations"] = [
+                {"type":an.type[1],
+                 "author":an.info.get("title",""),
+                 "content":an.info.get("content",""),
+                 "rect":[round(v,2) for v in an.rect]}
+                for an in page.annots()]
+        pages.append(rec)
     doc.close()
 
     if a.format == "json":
