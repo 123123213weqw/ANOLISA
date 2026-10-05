@@ -8,8 +8,15 @@ Usage:
     python3 xlsx_reader.py <file> --sheet Sales     # analyze one sheet
     python3 xlsx_reader.py <file> --json            # machine-readable output
     python3 xlsx_reader.py <file> --quality         # data quality audit only
+    python3 xlsx_reader.py <file> --password-env VAR  # decrypt an encrypted
+                                                      # .xlsx/.xlsm using the
+                                                      # password in env var VAR
 
 Supports: .xlsx, .xlsm, .csv, .tsv
+Password-protected .xlsx/.xlsm workbooks are supported through the optional
+msoffcrypto-tool backend when the password is already known; the password is
+read from a named environment variable so it never appears in CLI arguments
+or reports, and decryption happens fully in memory.
 Does NOT modify the source file in any way.
 
 Exit codes:
@@ -20,17 +27,95 @@ Exit codes:
 import sys
 import json
 import argparse
+import io
+import os
 from pathlib import Path
+
+
+# OLE2 compound file magic — what an encrypted OOXML workbook looks like.
+# Plain OOXML workbooks are ZIP containers and start with the PK\x03\x04
+# local file header instead.
+_OLE2_MAGIC = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
 
 
 # ---------------------------------------------------------------------------
 # Format detection and loading
 # ---------------------------------------------------------------------------
 
-def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dict:
+def _decrypt_to_memory(file_path: str, password_env: str) -> bytes:
+    """
+    Decrypt an encrypted OOXML workbook in memory using a known password.
+
+    The password itself is read from the environment variable named by
+    password_env. Raises ValueError for missing credentials, wrong
+    credentials or damaged encrypted payloads, and RuntimeError when the
+    optional msoffcrypto backend is not installed.
+    """
+    if not password_env:
+        raise ValueError(
+            f"{file_path} is an encrypted Office workbook. Pass the name of "
+            "an environment variable holding the known password via "
+            "--password-env NAME (the password value itself is never passed "
+            "as a CLI argument)."
+        )
+    password = os.environ.get(password_env)
+    if not password:
+        raise ValueError(
+            f"Environment variable {password_env} is not set or is empty; it "
+            "must hold the known password for this encrypted workbook."
+        )
+    try:
+        import msoffcrypto
+    except ImportError:
+        raise RuntimeError(
+            "Reading encrypted Office workbooks requires the optional "
+            "msoffcrypto backend. Run: pip install msoffcrypto-tool"
+        )
+    import olefile
+
+    try:
+        with open(file_path, "rb") as fh:
+            office_file = msoffcrypto.OfficeFile(fh)
+            try:
+                office_file.load_key(password=password)
+            except msoffcrypto.exceptions.InvalidKeyError:
+                raise ValueError(
+                    f"{file_path} could not be decrypted with the password in "
+                    f"environment variable {password_env} (wrong password)."
+                )
+            decrypted = io.BytesIO()
+            office_file.decrypt(decrypted)
+    except ValueError:
+        raise
+    except olefile.olefile.NotOleFileError:
+        raise ValueError(
+            f"{file_path} looks like an encrypted Office workbook but is not "
+            "a readable OLE2 container; the file may be damaged or not an "
+            "encrypted workbook at all."
+        )
+    except msoffcrypto.exceptions.InvalidKeyError:
+        raise ValueError(
+            f"{file_path} could not be decrypted with the password in "
+            f"environment variable {password_env} (wrong password)."
+        )
+    except Exception as e:
+        raise ValueError(
+            f"Cannot decrypt {file_path}: the encrypted payload is damaged "
+            f"or uses an unsupported encryption ({e})"
+        ) from e
+    return decrypted.getvalue()
+
+
+def detect_and_load(
+    file_path: str,
+    sheet_name_filter: str | None = None,
+    password_env: str | None = None,
+) -> dict:
     """
     Load file into {sheet_name: DataFrame} dict.
     CSV/TSV files are mapped to a single-key dict using the file stem as key.
+    Encrypted .xlsx/.xlsm workbooks are decrypted in memory with the password
+    held by the environment variable named in password_env.
 
     Raises ValueError for unsupported formats or encoding failures.
     """
@@ -48,8 +133,16 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
     suffix = path.suffix.lower()
 
     if suffix in (".xlsx", ".xlsm"):
+        with open(file_path, "rb") as fh:
+            magic = fh.read(len(_OLE2_MAGIC))
+        if magic == _OLE2_MAGIC:
+            # Encrypted OOXML: OLE2 container instead of a plain ZIP workbook.
+            decrypted_bytes = _decrypt_to_memory(file_path, password_env)
+            source = io.BytesIO(decrypted_bytes)
+        else:
+            source = file_path
         target = sheet_name_filter if sheet_name_filter else None
-        result = pd.read_excel(file_path, sheet_name=target)
+        result = pd.read_excel(source, sheet_name=target)
         # pd.read_excel with sheet_name=None returns dict; with a name, returns DataFrame
         if isinstance(result, dict):
             return result
@@ -332,10 +425,18 @@ def main() -> None:
         "--quality", action="store_true",
         help="Run data quality audit only (skip stats)"
     )
+    parser.add_argument(
+        "--password-env", dest="password_env", default=None, metavar="VAR",
+        help="Name of an environment variable holding the known password for "
+             "an encrypted .xlsx/.xlsm workbook (the password value is never "
+             "passed on the command line)"
+    )
     args = parser.parse_args()
 
     try:
-        sheets = detect_and_load(args.file, sheet_name_filter=args.sheet)
+        sheets = detect_and_load(
+            args.file, sheet_name_filter=args.sheet, password_env=args.password_env
+        )
     except (FileNotFoundError, ValueError, RuntimeError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         sys.exit(1)
