@@ -130,6 +130,16 @@ class DatasetConfig(BaseModel):
     filter_regex: str | None = Field(default=None, description="Regex filter for instance IDs")
     slice_range: str | None = Field(default=None, description="Slice string (e.g., '0:5')")
     instance_ids: list[str] | None = Field(default=None, description="Specific instance IDs to run")
+    num_shards: int = Field(default=1, description="Number of stable ID-based shards to split the selection into")
+    shard_index: int = Field(default=0, description="Zero-based index of the shard this run should process")
+
+    @model_validator(mode="after")
+    def validate_shard_parameters(self) -> DatasetConfig:
+        if self.num_shards < 1:
+            raise ValueError("num_shards must be at least 1")
+        if not 0 <= self.shard_index < self.num_shards:
+            raise ValueError("shard_index must satisfy 0 <= shard_index < num_shards")
+        return self
 
     def get_slice(self) -> tuple[int, int] | None:
         """Parse slice_range string to (start, end) tuple.

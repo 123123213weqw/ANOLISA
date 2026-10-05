@@ -62,6 +62,10 @@ def run(
     instance_id: str | None = typer.Option(
         None, "--instance-id", "-i", help="Instance ID(s), comma-separated for multiple"
     ),
+    num_shards: int = typer.Option(
+        1, "--num-shards", help="Split filtered instances into N stable ID-based shards (default: 1)"
+    ),
+    shard_index: int = typer.Option(0, "--shard-index", help="Zero-based index of the shard to run (default: 0)"),
     workers: int = typer.Option(1, "--workers", "-w", help="Number of parallel workers (default: 1)"),
     docker_pull_registry: str | None = typer.Option(
         None,
@@ -108,6 +112,8 @@ def run(
             slice_range=slice_range,
             filter_regex=filter_regex,
             instance_id=instance_id,
+            num_shards=num_shards,
+            shard_index=shard_index,
             workers=workers,
             docker_pull_registry=docker_pull_registry,
             use_skill=use_skill,

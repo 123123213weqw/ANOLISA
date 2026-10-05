@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 
@@ -53,7 +54,8 @@ def filter_instances(instances: list[SWEInstance], config: DatasetConfig) -> lis
     Filters are applied in order:
     1. instance_ids — keep only matching IDs
     2. filter_regex — keep only IDs matching the regex
-    3. slice_range — slice the result list
+    3. num_shards/shard_index — keep IDs whose stable shard equals shard_index
+    4. slice_range — slice the result list
 
     Args:
         instances: Unfiltered list of instances.
@@ -81,6 +83,15 @@ def filter_instances(instances: list[SWEInstance], config: DatasetConfig) -> lis
         result = [i for i in result if pattern.search(i.instance_id)]
         logger.info("FILTER_REGEX instance=global remaining=%s pattern=%s", len(result), config.filter_regex)
 
+    if config.num_shards > 1:
+        result = [i for i in result if _shard_of(i.instance_id, config.num_shards) == config.shard_index]
+        logger.info(
+            "FILTER_SHARD instance=global remaining=%s num_shards=%s shard_index=%s",
+            len(result),
+            config.num_shards,
+            config.shard_index,
+        )
+
     slice_tuple = config.get_slice()
     if slice_tuple is not None:
         start, end = slice_tuple
@@ -89,3 +100,14 @@ def filter_instances(instances: list[SWEInstance], config: DatasetConfig) -> lis
 
     logger.info("FILTER_END instance=global remaining=%s", len(result))
     return result
+
+
+def _shard_of(instance_id: str, num_shards: int) -> int:
+    """Return the stable zero-based shard of an instance ID.
+
+    Assignment uses the full SHA-256 digest of the UTF-8 encoded instance ID,
+    so it does not depend on row order, dataset contents or the Python hash
+    seed, and shard membership only changes when num_shards changes.
+    """
+    digest = hashlib.sha256(instance_id.encode("utf-8")).hexdigest()
+    return int(digest, 16) % num_shards
