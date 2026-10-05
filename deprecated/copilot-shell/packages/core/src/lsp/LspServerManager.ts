@@ -262,6 +262,11 @@ export class LspServerManager {
       this.attachRestartHandler(name, handle);
       console.log(`LSP server ${name} started successfully`);
     } catch (error) {
+      // Dispose the partially-started server. Without this, a server whose
+      // initialize handshake fails (e.g. it never answers) keeps running
+      // with open stdio pipes for the rest of the session because nothing
+      // else references the process until a later stop/restart.
+      this.resetHandle(handle);
       handle.status = 'FAILED';
       handle.error = error as Error;
       console.error(`LSP server ${name} failed to start:`, error);
