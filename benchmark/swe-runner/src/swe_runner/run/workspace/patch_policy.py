@@ -120,8 +120,29 @@ PATCH_DIFF_EXCLUDE_PATHSPECS: tuple[str, ...] = (
 
 _BINARY_MARKER_RE = re.compile(r"(?m)^Binary files .+ differ\s*$")
 _DIFF_HEADER_RE = re.compile(r"(?m)^diff --git a/(.*?) b/(.*?)$")
+# Git C-quotes both sides of the header when a path contains non-ASCII bytes
+# (``core.quotePath`` enabled) or control/quote characters, e.g.
+# ``diff --git "a/verify_\345\267\245.py" "b/verify_\345\267\245.py"``.
+_QUOTED_DIFF_HEADER_RE = re.compile(
+    r'(?m)^diff --git "a/((?:[^"\\]|\\.)*)" "b/((?:[^"\\]|\\.)*)"$'
+)
 _HUNK_RE = re.compile(r"(?m)^@@ ")
 _NEW_FILE_RE = re.compile(r"(?m)^new file mode ")
+
+# C-style escapes emitted by Git's path quoting. Unrecognised bytes and every
+# octal escape are raw byte values, so quoted paths are decoded as bytes and
+# only then interpreted as text.
+_GIT_C_ESCAPES = {
+    "a": b"\a",
+    "b": b"\b",
+    "f": b"\f",
+    "n": b"\n",
+    "r": b"\r",
+    "t": b"\t",
+    "v": b"\v",
+    "\\": b"\\",
+    '"': b'"',
+}
 _ROOT_HELPER_NAMES: frozenset[str] = frozenset(
     {
         "debug.py",
@@ -168,6 +189,49 @@ def _is_root_helper_path(path: str) -> bool:
     )
 
 
+def _decode_git_c_quoted(quoted: str) -> str:
+    """Decode one side of a Git C-quoted diff header path."""
+    raw = bytearray()
+    i = 0
+    while i < len(quoted):
+        ch = quoted[i]
+        if ch != "\\":
+            raw.extend(ch.encode("utf-8", "surrogateescape"))
+            i += 1
+            continue
+        i += 1
+        if i >= len(quoted):
+            raw += b"\\"
+            break
+        esc = quoted[i]
+        mapped = _GIT_C_ESCAPES.get(esc)
+        if mapped is not None:
+            raw += mapped
+            i += 1
+            continue
+        digits = ""
+        while i < len(quoted) and len(digits) < 3 and quoted[i] in "01234567":
+            digits += quoted[i]
+            i += 1
+        if digits:
+            raw.append(int(digits, 8) & 0xFF)
+            continue
+        raw.extend(esc.encode("utf-8", "surrogateescape"))
+        i += 1
+    return raw.decode("utf-8", "replace")
+
+
+def _diff_header_destination(part: str) -> str | None:
+    """Return the destination path of a ``diff --git`` section, if readable."""
+    quoted = _QUOTED_DIFF_HEADER_RE.search(part)
+    if quoted:
+        return _decode_git_c_quoted(quoted.group(2))
+    header = _DIFF_HEADER_RE.search(part)
+    if header:
+        return header.group(2)
+    return None
+
+
 def _strip_new_root_helper_sections(diff_text: str) -> str:
     """Drop newly-added root helper scripts while preserving tracked files."""
     parts = re.split(r"(?m)^(?=diff --git )", diff_text)
@@ -175,8 +239,12 @@ def _strip_new_root_helper_sections(diff_text: str) -> str:
     for part in parts:
         if not part.strip():
             continue
-        header = _DIFF_HEADER_RE.search(part)
-        if header and _NEW_FILE_RE.search(part) and _is_root_helper_path(header.group(2)):
+        destination = _diff_header_destination(part)
+        if (
+            destination
+            and _NEW_FILE_RE.search(part)
+            and _is_root_helper_path(destination)
+        ):
             continue
         kept.append(part)
     return "".join(kept)

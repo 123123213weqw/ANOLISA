@@ -82,3 +82,76 @@ def test_clean_model_patch_diff_drops_new_root_helper_scripts_only() -> None:
     assert cleaned is not None
     assert "diff --git a/test_fix.py b/test_fix.py" not in cleaned
     assert "diff --git a/pkg/test_fix.py b/pkg/test_fix.py" in cleaned
+
+
+def test_clean_model_patch_diff_drops_git_c_quoted_new_root_helper_scripts() -> None:
+    """Git quotes non-ASCII and control-character paths in diff headers.
+
+    ``core.quotePath`` (the default) octal-escapes non-ASCII bytes, while a
+    tab always forces C-quoting even with ``core.quotePath`` disabled.
+    """
+    cleaned = clean_model_patch_diff(
+        "diff --git a/pkg/keep.py b/pkg/keep.py\n"
+        "index 111..222 100644\n"
+        "--- a/pkg/keep.py\n"
+        "+++ b/pkg/keep.py\n"
+        "@@ -1 +1 @@\n"
+        "-old\n"
+        "+new\n"
+        'diff --git "a/verify_\\345\\267\\245\\345\\205\\267.py"'
+        ' "b/verify_\\345\\267\\245\\345\\205\\267.py"\n'
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        '+++ "b/verify_\\345\\267\\245\\345\\205\\267.py"\n'
+        "@@ -0,0 +1 @@\n"
+        "+print('verify')\n"
+        'diff --git "a/test_\\303\\251.py" "b/test_\\303\\251.py"\n'
+        "new file mode 100644\n"
+        "index 0000000..2222222\n"
+        "--- /dev/null\n"
+        '+++ "b/test_\\303\\251.py"\n'
+        "@@ -0,0 +1 @@\n"
+        "+print('test')\n"
+        'diff --git "a/verify_a\\tb.py" "b/verify_a\\tb.py"\n'
+        "new file mode 100644\n"
+        "index 0000000..3333333\n"
+        "--- /dev/null\n"
+        '+++ "b/verify_a\\tb.py"\n'
+        "@@ -0,0 +1 @@\n"
+        "+print('tab')\n"
+        "diff --git a/verify_工具.py b/verify_工具.py\n"
+        "new file mode 100644\n"
+        "index 0000000..4444444\n"
+        "--- /dev/null\n"
+        "+++ b/verify_工具.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+print('raw')"
+    )
+
+    assert cleaned is not None
+    assert "diff --git a/pkg/keep.py b/pkg/keep.py" in cleaned
+    assert "+new" in cleaned
+    # Quoted headers (octal-escaped non-ASCII and escaped tab) are dropped.
+    assert "345" not in cleaned
+    assert "303" not in cleaned
+    assert "\\t" not in cleaned
+    # Unquoted non-ASCII headers are dropped exactly as before.
+    assert "verify_工具" not in cleaned
+
+
+def test_clean_model_patch_diff_keeps_git_c_quoted_non_helper_files() -> None:
+    cleaned = clean_model_patch_diff(
+        'diff --git "a/notes_\\345\\267\\245\\345\\205\\267.txt"'
+        ' "b/notes_\\345\\267\\245\\345\\205\\267.txt"\n'
+        "new file mode 100644\n"
+        "index 0000000..1111111\n"
+        "--- /dev/null\n"
+        '+++ "b/notes_\\345\\267\\245\\345\\205\\267.txt"\n'
+        "@@ -0,0 +1 @@\n"
+        "+notes"
+    )
+
+    assert cleaned is not None
+    assert 'diff --git "a/notes_' in cleaned
+    assert "+notes" in cleaned
