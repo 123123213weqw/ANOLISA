@@ -9,7 +9,7 @@ Usage:
     python3 xlsx_reader.py <file> --json            # machine-readable output
     python3 xlsx_reader.py <file> --quality         # data quality audit only
 
-Supports: .xlsx, .xlsm, .csv, .tsv
+Supports: .xlsx, .xlsm, .csv, .tsv, and .csv/.tsv wrapped in .gz/.bz2/.xz
 Does NOT modify the source file in any way.
 
 Exit codes:
@@ -27,10 +27,35 @@ from pathlib import Path
 # Format detection and loading
 # ---------------------------------------------------------------------------
 
+_COMPRESSION_SUFFIXES = {".gz": "gzip", ".bz2": "bz2", ".xz": "xz"}
+_TABLE_SUFFIXES = (".csv", ".tsv")
+_SUPPORTED_FORMATS = (
+    ".xlsx, .xlsm, .csv, .tsv, or .csv/.tsv wrapped in .gz/.bz2/.xz "
+    "(e.g. data.csv.gz)"
+)
+
+
+def _compressed_table_format(path: Path) -> tuple[str, str] | None:
+    """Return (table_suffix, pandas compression) for names like data.csv.gz.
+
+    Only single-stream codecs wrapping an underlying .csv/.tsv name qualify;
+    ZIP archives and compressed non-table files are not this feature.
+    """
+    suffixes = [s.lower() for s in path.suffixes]
+    if (
+        len(suffixes) >= 2
+        and suffixes[-1] in _COMPRESSION_SUFFIXES
+        and suffixes[-2] in _TABLE_SUFFIXES
+    ):
+        return suffixes[-2], _COMPRESSION_SUFFIXES[suffixes[-1]]
+    return None
+
+
 def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dict:
     """
     Load file into {sheet_name: DataFrame} dict.
-    CSV/TSV files are mapped to a single-key dict using the file stem as key.
+    CSV/TSV files (plain or .gz/.bz2/.xz wrapped) are mapped to a single-key
+    dict using the underlying table stem as key.
 
     Raises ValueError for unsupported formats or encoding failures.
     """
@@ -46,6 +71,32 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
         raise FileNotFoundError(f"File not found: {file_path}")
 
     suffix = path.suffix.lower()
+
+    compressed = _compressed_table_format(path)
+    if compressed is not None:
+        table_suffix, compression = compressed
+        sep = "\t" if table_suffix == ".tsv" else ","
+        # Logical pseudo-sheet name: the stem of the underlying table file,
+        # so "data.csv.gz" reports "data" just like "data.csv" does.
+        table_stem = Path(path.stem).stem
+        encodings = ["utf-8-sig", "gbk", "utf-8", "latin-1"]
+        last_error = None
+        for enc in encodings:
+            try:
+                # Explicit compression so uppercase extensions (.CSV.GZ) work.
+                df = pd.read_csv(
+                    file_path, sep=sep, encoding=enc, compression=compression
+                )
+                df._reader_encoding = enc  # attach metadata (non-standard, for reporting)
+                return {table_stem: df}
+            except (UnicodeDecodeError, Exception) as e:
+                last_error = e
+                continue
+        raise ValueError(
+            f"Cannot read compressed file {file_path} as {compression} "
+            f"(tried encodings: {encodings}). The compressed stream may be "
+            f"corrupt or truncated. Last error: {last_error}"
+        )
 
     if suffix in (".xlsx", ".xlsm"):
         target = sheet_name_filter if sheet_name_filter else None
@@ -83,7 +134,7 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
     else:
         raise ValueError(
             f"Unsupported file format: {suffix}. "
-            "Supported formats: .xlsx, .xlsm, .csv, .tsv"
+            f"Supported formats: {_SUPPORTED_FORMATS}"
         )
 
 
@@ -323,7 +374,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Read and analyze Excel/CSV files without modifying them."
     )
-    parser.add_argument("file", help="Path to .xlsx, .xlsm, .csv, or .tsv file")
+    parser.add_argument(
+        "file",
+        help="Path to .xlsx, .xlsm, .csv, or .tsv file "
+             "(.csv/.tsv may be .gz/.bz2/.xz wrapped)",
+    )
     parser.add_argument("--sheet", help="Analyze a specific sheet only", default=None)
     parser.add_argument(
         "--json", action="store_true", help="Output machine-readable JSON"
