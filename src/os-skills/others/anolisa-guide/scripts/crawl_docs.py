@@ -5,6 +5,7 @@ ANOLISA 文档爬取脚本
 """
 import os
 import sys
+import tempfile
 import requests
 from bs4 import BeautifulSoup
 import markdownify
@@ -141,10 +142,48 @@ def post_process_markdown(content):
     
     return content
 
+def _publish_artifact(final_path, write_fn):
+    """通过同目录暂存文件原子发布产物。
+
+    先写入同目录下的临时文件并 fsync，再替换最终文件：中途写失败时，
+    之前完整的缓存文档保持原字节不变；新产物发布失败也不会留下半个
+    文件。与直接 ``open(final_path, 'w')`` 一致，写入会跟随符号链接
+    并保留既有文件权限。
+    """
+    final_path = Path(final_path)
+    # os.replace 会替换符号链接本身；先解析真实目标，保持 open('w')
+    # 跟随符号链接写入目标文件的行为。
+    target = Path(os.path.realpath(final_path))
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, staging_name = tempfile.mkstemp(
+        dir=str(target.parent), prefix=target.name + '.', suffix='.tmp'
+    )
+    staging_path = Path(staging_name)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            write_fn(f)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            mode = os.stat(target).st_mode & 0o7777
+        except FileNotFoundError:
+            mask = os.umask(0)
+            os.umask(mask)
+            mode = 0o666 & ~mask
+        os.chmod(staging_path, mode)
+        os.replace(staging_path, target)
+    except BaseException:
+        try:
+            staging_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def save_markdown_file(data, output_path):
     """保存为 Markdown 文件"""
     crawl_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    
+
     # 构建文件内容
     file_content = f"""# {data['title']}
 
@@ -156,10 +195,9 @@ def save_markdown_file(data, output_path):
 
 {data['content']}
 """
-    
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(file_content)
-    
+
+    _publish_artifact(output_path, lambda f: f.write(file_content))
+
     return file_content
 
 def crawl_all_docs(reference_dir):
@@ -219,8 +257,10 @@ def crawl_all_docs(reference_dir):
     }
     
     summary_path = reference_dir / 'crawl_summary.json'
-    with open(summary_path, 'w', encoding='utf-8') as f:
-        json.dump(summary, f, ensure_ascii=False, indent=2)
+    _publish_artifact(
+        summary_path,
+        lambda f: json.dump(summary, f, ensure_ascii=False, indent=2),
+    )
     
     print("\n" + "=" * 60)
     print(f"爬取完成！成功: {success_count}/{len(DOC_URLS)}")
