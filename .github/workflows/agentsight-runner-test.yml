@@ -3,6 +3,7 @@ name: Infra / AgentSight Kernel Validation
 on:
   push:
     branches:
+      - main
       - chore/test_sight
     paths:
       - 'src/agentsight/**'
