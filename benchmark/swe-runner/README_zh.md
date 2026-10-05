@@ -435,6 +435,15 @@ swe-runner analyze-traces \
 | `--end` | `now` | 补录窗口结束时间 |
 | `--run-metadata` | 无 | `run` 命令生成的 `run_metadata.json` |
 
+### 补录的用量数值
+
+从 OpenClaw 会话 JSONL usage 记录重建的 token 与费用取值，按别名列表选
+第一个可用值：布尔值、负 token 数以及非有限浮点数（NaN/Infinity）视为不
+可用，跳过后继续尝试下一个已记录别名；超出浮点范围的整数视为不可用费
+用。有限的带小数 token 数保持向零截断。不可用取值不会进入归一化指标；
+求和后溢出浮点范围的 trace 总费用上报为不可用（`null`），各 step 仍保留
+自己已记录的有限费用。
+
 ## 输出目录
 
 默认输出根目录是 `./output`。每个命令会写入自己的子目录：

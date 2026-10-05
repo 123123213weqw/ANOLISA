@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 from collections import Counter
 from collections.abc import Iterable
@@ -186,21 +187,36 @@ def _entry_usage(entry: dict[str, Any]) -> dict[str, Any]:
     return usage if isinstance(usage, dict) else {}
 
 
+def _usable_number(value: Any) -> float | None:
+    """Return a recorded usage number as a finite float, or None when unusable.
+
+    Unusable values are booleans, non-numeric types, non-finite floats
+    (NaN/Infinity) and integers too large for the float range.
+    """
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
+
+
 def _usage_int(usage: dict[str, Any], *keys: str) -> int:
     for key in keys:
-        value = usage.get(key)
-        if isinstance(value, int):
-            return value
-        if isinstance(value, float):
-            return int(value)
+        number = _usable_number(usage.get(key))
+        if number is None or number < 0:
+            continue
+        return int(number)
     return 0
 
 
 def _usage_float(usage: dict[str, Any], *keys: str) -> float | None:
     for key in keys:
-        value = usage.get(key)
-        if isinstance(value, int | float):
-            return float(value)
+        number = _usable_number(usage.get(key))
+        if number is None:
+            continue
+        return number
     return None
 
 
@@ -564,7 +580,7 @@ def reconstruct_openclaw_jsonl_session(path: Path) -> dict[str, Any] | None:
         "search_command_count": search_command_count,
         "file_read_tool_count": file_read_tool_count,
         "file_edit_tool_count": file_edit_tool_count,
-        "total_cost": total_cost if has_cost else None,
+        "total_cost": total_cost if has_cost and math.isfinite(total_cost) else None,
         "models": sorted(models),
         "providers": sorted(providers),
         "first_event_at": ns_to_iso(first_ts) if first_ts is not None else None,

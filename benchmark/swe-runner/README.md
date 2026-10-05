@@ -445,6 +445,17 @@ swe-runner analyze-traces \
 | `--end` | `now` | Trace collection window end |
 | `--run-metadata` | none | `run_metadata.json` produced by `run` |
 
+### Recorded Usage Numbers
+
+Token and cost values reconstructed from OpenClaw session JSONL usage records
+are selected per alias list from the first usable value. Booleans, negative
+token counts, and non-finite floats (NaN/Infinity) are unusable and are skipped
+in favor of the next recorded alias; integers outside the float range are
+unusable costs. Finite fractional token counts keep truncation toward zero.
+Unusable values are excluded from normalized metrics, and a trace total cost
+that overflows the float range is reported as unavailable (`null`) while each
+step keeps its recorded finite cost.
+
 ## Output Layout
 
 The default output root is `./output`. Each command writes to its own subdir:
