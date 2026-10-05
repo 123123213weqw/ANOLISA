@@ -77,8 +77,8 @@ cd /root/upstream-kernel
 KERNEL_VER=$(curl -sL https://kernel.org/ | grep -o 'linux-[0-9.]*\.tar\.xz' | head -1 | sed 's/linux-//;s/\.tar\.xz//')
 echo "Latest kernel: $KERNEL_VER"
 
-# 下载源码
-wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${KERNEL_VER}.tar.xz
+# 下载源码（每个主版本在 kernel.org 有独立的 v<major>.x 归档目录）
+wget https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_VER%%.*}.x/linux-${KERNEL_VER}.tar.xz
 tar -xf linux-${KERNEL_VER}.tar.xz
 cd linux-${KERNEL_VER}
 ```

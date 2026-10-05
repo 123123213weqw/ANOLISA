@@ -172,6 +172,8 @@ build_upstream() {
     
     local src_dir="$WORK_DIR/linux-$kernel_ver"
     local tarball="$WORK_DIR/linux-$kernel_ver.tar.xz"
+    # kernel.org publishes each major line in its own archive family (v4.x, v5.x, ...)
+    local archive_dir="v${kernel_ver%%.*}.x"
     
     info "Building kernel: $kernel_ver"
     info "Work directory: $WORK_DIR"
@@ -184,7 +186,7 @@ build_upstream() {
     # Download kernel source if not exists
     if [ ! -f "$tarball" ]; then
         info "Downloading kernel source..."
-        wget -q "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$kernel_ver.tar.xz" || {
+        wget -q "https://cdn.kernel.org/pub/linux/kernel/${archive_dir}/linux-$kernel_ver.tar.xz" || {
             error "Failed to download kernel $kernel_ver"
             exit 1
         }

@@ -669,7 +669,7 @@ git commit -m "Initial kernel module"
 **支持架构**: x86_64, aarch64
 **支持内核**:
   - Alinux4 官方内核（通过 SRPM 编译，如 6.6.102-5.2.alnx4）
-  - 上游最新内核（通过 kernel.org，如 6.12.x、6.13.x）
+  - 上游最新内核（通过 kernel.org，如 6.12.x、6.13.x；源码归档目录 v<major>.x 随解析出的主版本匹配）
 **dist 字段**: alnx4
 **软件仓库 (x86_64)**: https://mirrors.aliyun.com/alinux/4/updates/x86_64/os/Packages/
 **软件仓库 (aarch64)**: https://mirrors.aliyun.com/alinux/4/updates/aarch64/os/Packages/
