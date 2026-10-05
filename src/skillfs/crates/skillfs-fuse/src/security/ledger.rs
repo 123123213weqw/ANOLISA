@@ -54,7 +54,8 @@
 //!   served from the live `<skill_dir>` itself).
 //! * `decision == "hidden"` ignores `target`; `reason` is recommended
 //!   but not required by D1.0.
-//! * `status` must be one of `none|pass|warn|deny|drifted|tampered`.
+//! * `status` must be one of
+//!   `none|pass|warn|deny|drifted|tampered|error`.
 //! * `decision` must be one of `current|fallback|hidden`.
 //!
 //! The strict subset matches the §4.2 schema; relaxations live
@@ -101,6 +102,8 @@ pub enum LedgerStatus {
     Drifted,
     /// Current version failed integrity checks (manifest / signature).
     Tampered,
+    /// The provider could not evaluate the skill state.
+    Error,
 }
 
 impl LedgerStatus {
@@ -112,6 +115,7 @@ impl LedgerStatus {
             LedgerStatus::Deny => "deny",
             LedgerStatus::Drifted => "drifted",
             LedgerStatus::Tampered => "tampered",
+            LedgerStatus::Error => "error",
         }
     }
 
@@ -123,6 +127,7 @@ impl LedgerStatus {
             "deny" => Some(Self::Deny),
             "drifted" => Some(Self::Drifted),
             "tampered" => Some(Self::Tampered),
+            "error" => Some(Self::Error),
             _ => None,
         }
     }
@@ -1165,6 +1170,7 @@ mod tests {
             LedgerStatus::Deny,
             LedgerStatus::Drifted,
             LedgerStatus::Tampered,
+            LedgerStatus::Error,
         ] {
             assert_eq!(LedgerStatus::parse(s.as_str()), Some(s));
         }
@@ -1227,6 +1233,32 @@ mod tests {
         assert!(r.target.is_none());
         assert!(r.target_kind.is_none());
         assert!(r.reason.is_some());
+    }
+
+    /// The External Decision Protocol doc
+    /// (`docs/security/external-decision-protocol.md`) lists `error` in
+    /// its "Allowed `status` values" and ships this exact payload as the
+    /// "`error` mapped to `hidden`" example, so a provider that follows
+    /// the documented enum can send it. The strict validator must
+    /// recognize the documented value instead of discarding the whole
+    /// resolve as malformed.
+    #[test]
+    fn accepts_documented_error_status() {
+        let json = r#"{
+            "schemaVersion": 1,
+            "skillName": "demo-weather",
+            "status": "error",
+            "decision": "hidden",
+            "reason": "provider failed to evaluate skill state",
+            "currentVersion": null,
+            "trustedVersion": null,
+            "target": null,
+            "targetKind": null
+        }"#;
+        let r = LedgerResolveResult::from_json_str(json)
+            .expect("the documented error-status payload must parse");
+        assert_eq!(r.status.as_str(), "error");
+        assert_eq!(r.decision, LedgerDecision::Hidden);
     }
 
     #[test]
