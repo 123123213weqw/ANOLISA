@@ -181,7 +181,13 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
         sheet_names = get_sheet_names(z)
         sheet_files = get_sheet_files(z)
         valid_sheet_names = set(sheet_names.values())
+        # Excel resolves worksheet and defined-name references
+        # case-insensitively, so membership is tested on a casefolded
+        # copy of the declared spellings while diagnostics keep the
+        # original case everywhere.
+        valid_sheet_keys = {name.casefold() for name in valid_sheet_names}
         defined_names = get_defined_names(z)
+        defined_name_keys = {name.casefold() for name in defined_names}
 
         for rid, sheet_name in sheet_names.items():
             # Apply sheet filter if requested
@@ -260,9 +266,9 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
                 if formula:
                     results["formula_count"] += 1
 
-                    # Check 2: cross-sheet references
+                    # Check 2: cross-sheet references (case-insensitive identity)
                     for ref_sheet in extract_sheet_refs(formula):
-                        if ref_sheet not in valid_sheet_names:
+                        if ref_sheet.casefold() not in valid_sheet_keys:
                             results["errors"].append(
                                 {
                                     "type": "broken_sheet_ref",
@@ -275,10 +281,10 @@ def check(xlsx_path: str, sheet_filter: str | None = None) -> dict:
                             )
                             results["error_count"] += 1
 
-                    # Check 3: named range references
+                    # Check 3: named range references (case-insensitive identity)
                     # Only flag if the name is not a built-in and not a sheet-prefixed ref
                     for name_ref in extract_name_refs(formula):
-                        if name_ref not in defined_names:
+                        if name_ref.casefold() not in defined_name_keys:
                             results["errors"].append(
                                 {
                                     "type": "unknown_name_ref",
