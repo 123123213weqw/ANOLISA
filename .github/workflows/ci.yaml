@@ -66,6 +66,16 @@ on:
 permissions:
   contents: read
 
+# Coalesce only PR runs: a newer push to the same PR cancels its superseded
+# 20-job suite on the shared ARC runner pool (the aw-ci.yml shape). Push and
+# manual-dispatch runs get per-run groups (github.run_id) and are never
+# canceled: combined with the push diff base (github.event.before) in
+# detect-changes, a replacement run can no longer discard the component
+# coverage of the commits it supersedes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   RUSTUP_DIST_SERVER: https://static.rust-lang.org
   RUSTUP_UPDATE_ROOT: https://static.rust-lang.org/rustup
@@ -96,13 +106,36 @@ jobs:
 
       - name: Check which components changed
         id: changes
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PUSH_BEFORE: ${{ github.event.before }}
         run: |
           set -e
           echo "=== Detect Changes ==="
 
+          # Diff base. For push events prefer the previous ref tip
+          # (github.event.before) over HEAD~1: a single push can carry
+          # several commits, and superseded push runs now complete
+          # instead of being canceled, so every run must cover the whole
+          # range it supersedes. Fetch the base commit itself when the
+          # depth-2 checkout does not already include it (git diff only
+          # needs the two endpoint snapshots). Fall back to HEAD~1 (the
+          # pull_request merge ref) and then to the full tree, matching
+          # the previous behavior for first commits and new branches.
+          BASE="HEAD~1"
+          if [ "$EVENT_NAME" = "push" ] && [ ${#PUSH_BEFORE} -eq 40 ] \
+             && [ "$PUSH_BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            if ! git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "$PUSH_BEFORE" || true
+            fi
+            if git cat-file -e "$PUSH_BEFORE^{commit}" 2>/dev/null; then
+              BASE="$PUSH_BEFORE"
+            fi
+          fi
+
           # Get changed files
-          if git rev-parse HEAD~1 >/dev/null 2>&1; then
-            CHANGED=$(git diff --name-only HEAD~1 HEAD || true)
+          if git rev-parse --verify -q "$BASE" >/dev/null 2>&1; then
+            CHANGED=$(git diff --name-only "$BASE" HEAD || true)
           else
             CHANGED=$(git diff --name-only --diff-filter=ACMRT HEAD || true)
           fi
