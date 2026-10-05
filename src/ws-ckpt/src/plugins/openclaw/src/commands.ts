@@ -313,9 +313,10 @@ export async function runCrontab(
   const timeout = opts?.timeout ?? 10_000;
 
   if (opts?.input !== undefined) {
-    const tmpDir = mkdtempSync(join(tmpdir(), "ws-ckpt-cron-"));
-    const tmpFile = join(tmpDir, "crontab");
+    let tmpDir: string | undefined;
     try {
+      tmpDir = mkdtempSync(join(tmpdir(), "ws-ckpt-cron-"));
+      const tmpFile = join(tmpDir, "crontab");
       writeFileSync(tmpFile, opts.input, "utf-8");
       const { stdout, stderr } = await execFileAsync("crontab", [tmpFile], {
         timeout,
@@ -335,7 +336,12 @@ export async function runCrontab(
         stderr: err.stderr ?? err.message ?? "Unknown command error",
       };
     } finally {
-      try { unlinkSync(tmpFile); rmdirSync(tmpDir); } catch { /* cleanup best-effort */ }
+      // Clean up only successfully created resources, each step best-effort
+      // so a failed unlink (e.g. file never written) still removes the dir.
+      if (tmpDir !== undefined) {
+        try { unlinkSync(join(tmpDir, "crontab")); } catch { /* not written */ }
+        try { rmdirSync(tmpDir); } catch { /* already removed */ }
+      }
     }
   }
 
