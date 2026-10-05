@@ -717,7 +717,9 @@ class OpenClawExternalAgent(BaseAgent):
         if not self._task_name:
             return ""
 
-        dataset_dir = os.environ.get("DATASET_DIR", self._DEFAULT_DATASET_DIR)
+        dataset_dir = os.path.expanduser(
+            os.environ.get("DATASET_DIR", self._DEFAULT_DATASET_DIR)
+        )
         task_dir = os.path.join(dataset_dir, self._task_name)
 
         # 1. Try manual skill.md first.
