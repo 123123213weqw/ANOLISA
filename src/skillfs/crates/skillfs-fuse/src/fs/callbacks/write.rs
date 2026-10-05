@@ -100,6 +100,64 @@ impl SkillFs {
             return;
         }
 
+        // I4/H3: hidden-skill write gate. An fd opened while the skill
+        // resolved `current` keeps its inode -> path mapping after the
+        // ledger flips the skill to `hidden`, so the write dispatches
+        // with a live mapping and must be refused here exactly like
+        // every other mutating callback — and like the #5183 xattr
+        // gate, which rejects `fsetxattr` on the very same stale fd
+        // with ENOENT. Without this arm the fd kept a mutation channel
+        // into the hidden skill's live source. The open-after-unlink
+        // branch above deliberately skips this gate: POSIX keeps a raw
+        // fd writable until last close, and the unlink already passed
+        // the protection gates when it dropped the mapping.
+        {
+            let reject = match &path_type {
+                PathType::Passthrough {
+                    skill_name,
+                    relative_path,
+                } => self.should_reject_hidden_write(skill_name, Some(relative_path)),
+                PathType::SkillMd { skill_name } => {
+                    self.should_reject_hidden_write(skill_name, Some(Path::new("SKILL.md")))
+                }
+                PathType::NestedPassthrough {
+                    category,
+                    skill_name,
+                    relative_path,
+                } => self.should_reject_hermes_nested_hidden_write(
+                    category,
+                    skill_name,
+                    Some(relative_path),
+                ),
+                PathType::NestedSkillMd {
+                    category,
+                    skill_name,
+                } => self.should_reject_hermes_nested_hidden_write(
+                    category,
+                    skill_name,
+                    Some(Path::new("SKILL.md")),
+                ),
+                _ => false,
+            };
+            if reject {
+                // Audit the rejection with the `hidden_skill` class the
+                // xattr gate established (#5183): a stale-fd write probe
+                // against a hidden skill must leave the same
+                // `Rejected` trace as `fsetxattr` on the same fd.
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Write,
+                    SkillEventAction::Rejected,
+                    Some(libc::ENOENT),
+                    None,
+                    Some("class=hidden_skill".to_string()),
+                );
+                reply.error(libc::ENOENT);
+                return;
+            }
+        }
+
         debug!(ino, offset, len = data.len(), "write");
 
         // Must go through fh lookup
