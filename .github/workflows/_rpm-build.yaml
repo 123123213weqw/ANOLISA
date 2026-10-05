@@ -36,6 +36,7 @@ env:
 
 jobs:
   build-rpm:
+    timeout-minutes: 120
     name: "Build"
     runs-on: ${{ inputs.arch == 'arm64' && 'anolisa-k8s-arm2204-nightly' || 'anolisa-k8s-amd-nightly' }}
     container:
