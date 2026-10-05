@@ -2999,17 +2999,22 @@ async fn cmd_classify(
 
     // If a views config already exists, report its status instead of overwriting.
     if let Some(existing) = ViewsConfig::load(&source) {
+        // The report echoes tree-controlled content: skill names come
+        // verbatim from directory names and the view fields from the views
+        // file, so both get the same escape as the load-error diagnostics —
+        // a raw newline would forge listing lines and an ESC/OSC sequence is
+        // a live terminal command.
         println!("skillfs-views.toml already exists in {}", source.display());
         println!();
         for view in &existing.views {
             let marker = if view.default { " [default]" } else { "" };
-            println!("View: {}{}", view.name, marker);
+            println!("View: {}{}", escape_ctl_stderr(&view.name), marker);
             if !view.description.is_empty() {
-                println!("  Description: {}", view.description);
+                println!("  Description: {}", escape_ctl_stderr(&view.description));
             }
             println!("  Skills ({}):", view.skills.len());
             for s in &view.skills {
-                println!("    - {}", s);
+                println!("    - {}", escape_ctl_stderr(s));
             }
             println!();
         }
@@ -3021,7 +3026,7 @@ async fn cmd_classify(
         if !unassigned.is_empty() {
             println!("Unassigned skills (will be added to default view on next mount):");
             for s in &unassigned {
-                println!("  - {}", s);
+                println!("  - {}", escape_ctl_stderr(s));
             }
         }
         return Ok(());
@@ -3070,12 +3075,12 @@ async fn cmd_classify(
         println!();
         println!("Primary view 'major' ({} skills):", primary.len());
         for s in &primary {
-            println!("  - {}", s);
+            println!("  - {}", escape_ctl_stderr(s));
         }
         println!();
         println!("Secondary view 'other' ({} skills):", secondary.len());
         for s in &secondary {
-            println!("  - {}", s);
+            println!("  - {}", escape_ctl_stderr(s));
         }
     } else {
         // The absence check above is a point-in-time observation: another
@@ -3097,12 +3102,12 @@ async fn cmd_classify(
         println!();
         println!("Primary view 'major' ({} skills):", primary.len());
         for s in &primary {
-            println!("  - {}", s);
+            println!("  - {}", escape_ctl_stderr(s));
         }
         println!();
         println!("Secondary view 'other' ({} skills):", secondary.len());
         for s in &secondary {
-            println!("  - {}", s);
+            println!("  - {}", escape_ctl_stderr(s));
         }
         println!();
         println!("Edit skillfs-views.toml to move skills between views as needed.");
