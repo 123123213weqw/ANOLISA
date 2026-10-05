@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """DashScope image generation (wanx models)."""
-import argparse, base64, json, os, sys, time, urllib.request, urllib.error
+import argparse, base64, json, os, socket, sys, time, urllib.request, urllib.error
 
 def _key():
     # 1. 环境变量
@@ -37,14 +37,19 @@ def _wanx(prompt, model, size, key):
     for i in range(120):
         time.sleep(2)
         req = urllib.request.Request(f"https://dashscope.aliyuncs.com/api/v1/tasks/{tid}",headers=ph)
-        with urllib.request.urlopen(req,timeout=30) as r: st = json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req,timeout=30) as r: st = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            print(f"ERROR: HTTP {e.code} {e.read().decode() if e.readable() else ''}",file=sys.stderr); sys.exit(1)
+        except (urllib.error.URLError, socket.timeout) as e:
+            print(f"ERROR: poll request failed: {e}",file=sys.stderr); sys.exit(1)
         s = st.get("output",{}).get("task_status","")
         if s == "SUCCEEDED":
             rs = st["output"].get("results",[])
             if rs and rs[0].get("url"): return rs[0]["url"]
             if rs and rs[0].get("b64_image"): return "b64:"+rs[0]["b64_image"]
-        elif s == "FAILED":
-            print(f"ERROR: {st['output'].get('message','')}",file=sys.stderr); sys.exit(1)
+        elif s in ("FAILED","CANCELED"):
+            print(f"ERROR: task {s}: {st['output'].get('message','')}",file=sys.stderr); sys.exit(1)
     print("ERROR: Timeout",file=sys.stderr); sys.exit(1)
 
 def _compat(prompt, model, size, key, base):
