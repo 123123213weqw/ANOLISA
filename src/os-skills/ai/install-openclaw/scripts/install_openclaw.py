@@ -1068,6 +1068,8 @@ def cached_operator_has_write_scope(args):
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return False
+    if not isinstance(data, dict):
+        return False
 
     scopes = []
     if isinstance(data.get("tokens"), dict):
@@ -1086,6 +1088,11 @@ def clear_cached_operator_device_auth(args):
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
+        data = None
+    if not isinstance(data, dict):
+        # A syntactically valid but non-object root is just as unusable as
+        # malformed JSON: recover through the byte-preserving
+        # backup-before-delete path instead of crashing on data.get().
         backup = path.with_name(path.name + ".bak")
         backup.write_bytes(path.read_bytes())
         path.unlink()
