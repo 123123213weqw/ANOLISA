@@ -602,7 +602,12 @@ class OpenClawExternalAgent(BaseAgent):
     # ==================================================================
 
     def _collect_session_tokens(self, profile_dir: str, agent_id: str) -> dict[str, Any] | None:
-        """Read OpenClaw session JSONL and extract per-round token usage."""
+        """Read OpenClaw session JSONL and extract per-round token usage.
+
+        Damaged lines — invalid UTF-8 (container output echoed into the
+        conversation) or non-object JSON — are skipped so one bad line
+        costs one line, not the whole token report.
+        """
         sessions_dir = os.path.join(profile_dir, "agents", agent_id, "sessions")
         jsonl_files = sorted(glob.glob(os.path.join(sessions_dir, "*.jsonl")))
         if not jsonl_files:
@@ -617,10 +622,16 @@ class OpenClawExternalAgent(BaseAgent):
         prev_input = 0
 
         try:
-            with open(jsonl_path) as f:
-                for line in f:
+            with open(jsonl_path, "rb") as f:
+                for raw_line in f:
+                    try:
+                        line = raw_line.decode("utf-8")
+                    except UnicodeDecodeError:
+                        continue
                     try:
                         d = json.loads(line.strip())
+                        if not isinstance(d, dict):
+                            continue
                         if d.get("type") != "message":
                             continue
                         usage = (d.get("message") or {}).get("usage") or {}
