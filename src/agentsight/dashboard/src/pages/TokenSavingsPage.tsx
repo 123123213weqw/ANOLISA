@@ -530,6 +530,11 @@ export const TokenSavingsPage: React.FC = () => {
   const [error, setError] = useState<string | null>(null);
   const [agentNames, setAgentNames] = useState<string[]>([]);
 
+  // A newer request must invalidate an older in-flight one: the time range
+  // and agent filter are read from state when the request is issued, so a
+  // late response would otherwise render data for the previous filters.
+  const loadRequestIdRef = useRef(0);
+
   // Ref for scrolling to the target session row
   const targetRowRef = useRef<HTMLTableRowElement>(null);
 
@@ -541,6 +546,7 @@ export const TokenSavingsPage: React.FC = () => {
   }, []);
 
   const handleQuery = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current;
     setLoading(true);
     setError(null);
     setHasQueried(true);
@@ -548,14 +554,29 @@ export const TokenSavingsPage: React.FC = () => {
       const startNs = startMs * 1_000_000;
       const endNs = endMs * 1_000_000;
       const resp = await fetchTokenSavings(startNs, endNs, selectedAgent || undefined);
+      if (requestId !== loadRequestIdRef.current) return;
       setSessions(resp.sessions);
       setSummary(resp.summary);
       setStatsAvailable(resp.stats_available);
       setTips(resp.optimization_tips ?? []);
     } catch (e: any) {
-      setError(e.message || t('ts.fetchFailed'));
+      // The failed query updated nothing: the summary cards, both pies, the
+      // optimization tips and the session table kept the previous range's
+      // payload under a lone error banner. Clear them (only for the newest
+      // request — a superseded failure must not wipe newer data), the same
+      // treatment the conversation list got in #5537 and the security
+      // overview cards in #5313.
+      if (requestId === loadRequestIdRef.current) {
+        setSessions([]);
+        setSummary(null);
+        setStatsAvailable(true);
+        setTips([]);
+        setError(e.message || t('ts.fetchFailed'));
+      }
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestIdRef.current) {
+        setLoading(false);
+      }
     }
   }, [startMs, endMs, selectedAgent, t]);
 
