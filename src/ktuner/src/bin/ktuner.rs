@@ -289,17 +289,23 @@ fn normalize_param(param: &str) -> String {
         return param.to_string();
     }
     for proto in ["ipv4", "ipv6"] {
-        let prefix = format!("net.{proto}.conf.");
-        if param
-            .get(..prefix.len())
-            .is_some_and(|p| p.replace('/', ".").eq_ignore_ascii_case(&prefix))
-        {
-            let rest = &param[prefix.len()..];
-            if let Some((iface, property)) = rest.rsplit_once('/').or_else(|| rest.rsplit_once('.'))
+        for family in ["conf", "neigh"] {
+            let prefix = format!("net.{proto}.{family}.");
+            if param
+                .get(..prefix.len())
+                .is_some_and(|p| p.replace('/', ".").eq_ignore_ascii_case(&prefix))
             {
-                return format!("net.{proto}.conf.{iface}.{}", property.to_ascii_lowercase());
+                let rest = &param[prefix.len()..];
+                if let Some((iface, property)) =
+                    rest.rsplit_once('/').or_else(|| rest.rsplit_once('.'))
+                {
+                    return format!(
+                        "net.{proto}.{family}.{iface}.{}",
+                        property.to_ascii_lowercase()
+                    );
+                }
+                return format!("net.{proto}.{family}.{rest}");
             }
-            return format!("net.{proto}.conf.{rest}");
         }
     }
     param.replace('/', ".").to_lowercase()
@@ -544,6 +550,53 @@ mod tests {
                 .unwrap();
                 assert_eq!(code, 0);
                 assert_eq!(output["current"], "1");
+            }
+        }
+    }
+
+    #[test]
+    fn neighbour_normalization_preserves_interface_identity() {
+        // The neighbour family has the same literal-dot interfaces as conf,
+        // so the same identity rule applies: the interface segment keeps its
+        // case and dots, the property is lower-cased.
+        for proto in ["ipv4", "ipv6"] {
+            for iface in ["Br0", "Br0.100", "br0.100", "lo"] {
+                for input in [
+                    format!("net/{proto}/neigh/{iface}/gc_thresh3"),
+                    format!("net.{proto}.neigh.{iface}.gc_thresh3"),
+                    format!("NET/{proto}/NEIGH/{iface}/GC_THRESH3"),
+                    format!("net/{proto}.neigh/{iface}/gc_thresh3"),
+                ] {
+                    assert_eq!(
+                        normalize_param(&input),
+                        format!("net.{proto}.neigh.{iface}.gc_thresh3")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn neighbour_why_reads_the_requested_interface_path() {
+        let eval = rules::EvalResult {
+            recommendations: vec![],
+            total_checked: 0,
+        };
+        for proto in ["ipv4", "ipv6"] {
+            for input in [
+                format!("net/{proto}/neigh/Br0.100/gc_thresh3"),
+                format!("net.{proto}.neigh.Br0.100.gc_thresh3"),
+            ] {
+                let (output, code) = why_with(&input, &eval, |path| {
+                    assert_eq!(
+                        path,
+                        format!("/proc/sys/net/{proto}/neigh/Br0.100/gc_thresh3")
+                    );
+                    Ok(Some("8192\n".into()))
+                })
+                .unwrap();
+                assert_eq!(code, 0);
+                assert_eq!(output["current"], "8192");
             }
         }
     }

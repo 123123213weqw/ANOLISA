@@ -360,7 +360,7 @@ pub fn param_to_path(param: &str) -> String {
         }
     } else if let Some(rest) = param.strip_prefix("transparent_hugepage/") {
         format!("/sys/kernel/mm/transparent_hugepage/{}", sanitize_rel(rest))
-    } else if let Some(path) = net_conf_path(param) {
+    } else if let Some(path) = net_iface_path(param) {
         path
     } else {
         // sysctl: dots become slashes, so any ".." is turned into "//" and
@@ -369,40 +369,43 @@ pub fn param_to_path(param: &str) -> String {
     }
 }
 
-/// Resolve `net.<proto>.conf.<interface>.<property>` (dotted or slashed
-/// spelling) with the INTERFACE segment kept verbatim. Under
-/// /proc/sys/net/{ipv4,ipv6}/conf/ every interface is a directory whose name
-/// may itself contain dots — a VLAN subinterface is `eth0.100`, so the real
-/// file is conf/eth0.100/forwarding (a literal-dot directory). The blanket
-/// dot->slash translation instead produced conf/eth0/100/forwarding, which
-/// never exists, so `ktuner why` answered "parameter not found" for BOTH
-/// spellings even though the file was right there. Property names under
-/// conf/ never contain dots or slashes, so the last separator splits
+/// Resolve `net.<proto>.{conf,neigh}.<interface>.<property>` (dotted or
+/// slashed spelling) with the INTERFACE segment kept verbatim. Under
+/// /proc/sys/net/{ipv4,ipv6}/{conf,neigh}/ every interface is a directory
+/// whose name may itself contain dots — a VLAN subinterface is `eth0.100`, so
+/// the real file is conf/eth0.100/forwarding (a literal-dot directory). The
+/// blanket dot->slash translation instead produced conf/eth0/100/forwarding,
+/// which never exists, so `ktuner why` answered "parameter not found" for
+/// BOTH spellings even though the file was right there. Property names under
+/// these families never contain dots or slashes, so the last separator splits
 /// interface from property and everything before it stays verbatim; for
 /// dot-free interfaces (all, default, eth0) the result is byte-identical to
 /// the blanket translation. Returns None for every other sysctl.
-fn net_conf_path(param: &str) -> Option<String> {
+fn net_iface_path(param: &str) -> Option<String> {
     for proto in ["ipv4", "ipv6"] {
-        for sep in ['.', '/'] {
-            let prefix = format!("net{sep}{proto}{sep}conf{sep}");
-            if let Some(rest) = param.strip_prefix(&prefix) {
-                return Some(match split_conf_tail(rest) {
-                    Some((iface, prop)) => {
-                        format!("/proc/sys/net/{proto}/conf/{iface}/{prop}")
-                    }
-                    None => format!("/proc/sys/net/{proto}/conf/{rest}"),
-                });
+        for family in ["conf", "neigh"] {
+            for sep in ['.', '/'] {
+                let prefix = format!("net{sep}{proto}{sep}{family}{sep}");
+                if let Some(rest) = param.strip_prefix(&prefix) {
+                    return Some(match split_iface_tail(rest) {
+                        Some((iface, prop)) => {
+                            format!("/proc/sys/net/{proto}/{family}/{iface}/{prop}")
+                        }
+                        None => format!("/proc/sys/net/{proto}/{family}/{rest}"),
+                    });
+                }
             }
         }
     }
     None
 }
 
-/// Split a conf-family tail into (interface, property): the LAST separator
-/// is the boundary, because properties are plain names while interfaces may
-/// contain dots (VLAN `eth0.100`). None when the tail has no separator — an
-/// interface named without a property, a directory rather than a tunable.
-fn split_conf_tail(rest: &str) -> Option<(&str, &str)> {
+/// Split a per-interface family tail into (interface, property): the LAST
+/// separator is the boundary, because properties are plain names while
+/// interfaces may contain dots (VLAN `eth0.100`). None when the tail has no
+/// separator — an interface named without a property, a directory rather than
+/// a tunable.
+fn split_iface_tail(rest: &str) -> Option<(&str, &str)> {
     rest.rsplit_once('/').or_else(|| rest.rsplit_once('.'))
 }
 
@@ -783,7 +786,7 @@ fn render_persistence(
             let key = entry
                 .path
                 .strip_prefix("/proc/sys/")
-                .filter(|path| net_conf_path(param).is_some() && path.contains('.'))
+                .filter(|path| net_iface_path(param).is_some() && path.contains('.'))
                 .map(str::to_string)
                 .unwrap_or_else(|| param.replace('/', "."));
             sysctl_content.push_str(&format!("{key} = {}\n", entry.applied));
@@ -1218,6 +1221,35 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persistence_preserves_neighbour_interface_dots() {
+        // sysctl.d needs a slash-first key to keep a literal-dot interface
+        // together (systemd would split net.ipv4.neigh.Br0.100 into two path
+        // components), so the neigh key must be derived from the recorded
+        // proc path exactly as the conf one is.
+        for proto in ["ipv4", "ipv6"] {
+            for param in [
+                format!("net/{proto}/neigh/Br0.100/gc_thresh3"),
+                format!("net.{proto}.neigh.Br0.100.gc_thresh3"),
+            ] {
+                let path = format!("/proc/sys/net/{proto}/neigh/Br0.100/gc_thresh3");
+                let entries = BTreeMap::from([(
+                    param,
+                    RollbackEntry {
+                        previous: "4096".into(),
+                        applied: "8192".into(),
+                        path,
+                    },
+                )]);
+                let (config, script) = render_persistence(&entries);
+                assert!(config
+                    .unwrap()
+                    .contains(&format!("net/{proto}/neigh/Br0.100/gc_thresh3 = 8192")));
+                assert!(script.is_none());
+            }
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -1478,6 +1510,36 @@ mod tests {
     }
 
     #[test]
+    fn test_param_to_path_neigh_vlan_interface() {
+        // The neighbour family repeats conf's literal-dot layout
+        // (neigh/eth0.100/gc_thresh3), so the same blanket dot->slash
+        // translation resolved both spellings to neigh/eth0/100/gc_thresh3 —
+        // a path that never exists, making `ktuner why` answer
+        // "parameter not found" although the file was present.
+        assert_eq!(
+            param_to_path("net.ipv4.neigh.eth0.100.gc_thresh3"),
+            "/proc/sys/net/ipv4/neigh/eth0.100/gc_thresh3"
+        );
+        assert_eq!(
+            param_to_path("net/ipv4/neigh/eth0.100/gc_thresh3"),
+            "/proc/sys/net/ipv4/neigh/eth0.100/gc_thresh3"
+        );
+        assert_eq!(
+            param_to_path("net.ipv6.neigh.Br0.100.proxy_qlen"),
+            "/proc/sys/net/ipv6/neigh/Br0.100/proxy_qlen"
+        );
+        // Dot-free interfaces keep the blanket translation's exact result.
+        assert_eq!(
+            param_to_path("net.ipv4.neigh.default.gc_thresh1"),
+            "/proc/sys/net/ipv4/neigh/default/gc_thresh1"
+        );
+        assert_eq!(
+            param_to_path("net.ipv4.neigh.eth0.proxy_delay"),
+            "/proc/sys/net/ipv4/neigh/eth0/proxy_delay"
+        );
+    }
+
+    #[test]
     fn test_conf_vlan_spellings_share_a_ledger_entry() {
         // Equivalent dotted/slashed spellings must resolve to the same real
         // file so merge_entries keeps ONE rollback entry pointing at it
@@ -1507,6 +1569,37 @@ mod tests {
         let entry = data.entries.values().next().unwrap();
         assert_eq!(entry.path, "/proc/sys/net/ipv4/conf/eth0.100/forwarding");
         assert_eq!(entry.previous, "0", "pristine value survives the alias");
+    }
+
+    #[test]
+    fn test_neigh_vlan_spellings_share_a_ledger_entry() {
+        // Same alias-dedup contract one namespace over: both neighbour
+        // spellings must resolve to the real literal-dot file so the ledger
+        // keeps one entry with the pristine value.
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [(
+                "net.ipv4.neigh.eth0.100.gc_thresh3".to_string(),
+                "1024".to_string(),
+                "4096".to_string(),
+            )],
+        );
+        let data = merge_entries(
+            data,
+            [(
+                "net/ipv4/neigh/eth0.100/gc_thresh3".to_string(),
+                "4096".to_string(),
+                "4096".to_string(),
+            )],
+        );
+        assert_eq!(data.entries.len(), 1, "aliases must share one entry");
+        let entry = data.entries.values().next().unwrap();
+        assert_eq!(entry.path, "/proc/sys/net/ipv4/neigh/eth0.100/gc_thresh3");
+        assert_eq!(entry.previous, "1024", "pristine value survives the alias");
     }
 
     #[test]
