@@ -14,6 +14,31 @@ import os
 FORBIDDEN_FIELDS = {"type", "transport", "disabled", "alwaysAllow", "scope"}
 
 
+def option_shape_errors(name, cfg):
+    """Validate args/env/headers option shapes for one server entry.
+
+    args must be an array of strings; env and headers must be mappings with
+    string values. Valid empty collections, omitted fields and arbitrary
+    string values (including whitespace) are accepted. Diagnostics name the
+    server and field only — option values may hold credentials and are never
+    echoed.
+    """
+    errors = []
+    args = cfg.get("args")
+    if args is not None:
+        if not isinstance(args, list) or any(not isinstance(a, str) for a in args):
+            errors.append(f"ERROR: [{name}] args must be an array of strings")
+    for field in ("env", "headers"):
+        value = cfg.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, dict):
+            errors.append(f"ERROR: [{name}] {field} must be a string mapping")
+        elif any(not isinstance(v, str) for v in value.values()):
+            errors.append(f"ERROR: [{name}] {field} values must be strings")
+    return errors
+
+
 def merge(json_str, config_path):
     """Parse input JSON, merge mcpServers into existing config, write back."""
     try:
@@ -25,6 +50,17 @@ def merge(json_str, config_path):
     servers = new.get("mcpServers", {})
     if not servers:
         print("ERROR: No mcpServers found in input", file=sys.stderr)
+        sys.exit(1)
+
+    # Refuse malformed options before touching the destination at all
+    # (no read, no write, no directory creation).
+    shape_errors = []
+    for name, cfg in servers.items():
+        if isinstance(cfg, dict):
+            shape_errors.extend(option_shape_errors(name, cfg))
+    if shape_errors:
+        for err in shape_errors:
+            print(err, file=sys.stderr)
         sys.exit(1)
 
     # Read existing config
@@ -94,6 +130,11 @@ def check(config_path):
         bad = FORBIDDEN_FIELDS & cfg.keys()
         if bad:
             print(f"WARNING: [{name}] has unsupported fields: {bad}", file=sys.stderr)
+
+        # Option shapes: args array of strings, env/headers string mappings
+        for err in option_shape_errors(name, cfg):
+            print(err, file=sys.stderr)
+            ok = False
 
     if ok:
         print(f"OK: {len(servers)} server(s) in {config_path}")
