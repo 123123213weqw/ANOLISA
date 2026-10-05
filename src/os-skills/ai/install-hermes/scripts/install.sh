@@ -98,6 +98,13 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Child processes (the bundled-skill sync, the setup wizard and the Hermes
+# gateway) resolve their data home from $HERMES_HOME in the environment
+# before falling back to the platform default. Export the resolved value so
+# a home selected with --hermes-home reaches them even when the calling
+# environment did not already carry it.
+export HERMES_HOME
+
 # ============================================================================
 # Helper functions
 # ============================================================================
