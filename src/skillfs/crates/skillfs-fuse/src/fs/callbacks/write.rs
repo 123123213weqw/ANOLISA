@@ -498,9 +498,21 @@ impl SkillFs {
 
         debug!(parent, name = %name.to_string_lossy(), ?physical, "create");
 
-        // skill-discover namespace is read-only
+        // skill-discover namespace is read-only. Emit the
+        // `Rejected`/`EROFS` record the `symlink`/`link` gates
+        // (link.rs) already leave for the same namespace so `create`
+        // probes against the read-only tree are audited too.
         if let PathType::Passthrough { ref skill_name, .. } = path_type {
             if is_skill_discover_path(skill_name) {
+                self.emit_op_event_with_detail(
+                    req,
+                    &path_type,
+                    SkillEventKind::Create,
+                    SkillEventAction::Rejected,
+                    Some(libc::EROFS),
+                    None,
+                    Some("class=skill_discover".to_string()),
+                );
                 reply.error(libc::EROFS);
                 return;
             }
