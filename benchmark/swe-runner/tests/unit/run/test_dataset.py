@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
+import pytest
+
 from swe_runner.common.dataset_registry import DATASET_MAPPING, get_dataset_name
 from swe_runner.common.models import DatasetConfig, SWEInstance
 from swe_runner.run.dataset import (
@@ -142,6 +144,24 @@ class TestFilterInstances:
         result = filter_instances(instances, config)
         assert len(result) == 1
         assert result[0].instance_id == "django__django-11179"
+
+    def test_filter_rejects_empty_instance_ids_snapshot(self):
+        instances = _mock_instances()
+        config = DatasetConfig(instance_ids=[])
+        with pytest.raises(ValueError, match="instance_ids"):
+            filter_instances(instances, config)
+
+    def test_filter_without_instance_ids_selects_all(self):
+        instances = _mock_instances()
+        config = DatasetConfig()
+        result = filter_instances(instances, config)
+        assert len(result) == 3
+
+    def test_filter_by_unknown_instance_ids_selects_none(self):
+        instances = _mock_instances()
+        config = DatasetConfig(instance_ids=["unknown__repo-0000"])
+        result = filter_instances(instances, config)
+        assert result == []
 
 
 class TestGetDockerImageName:

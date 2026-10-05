@@ -96,3 +96,84 @@ def test_build_run_settings_rejects_unsupported_tokenless_agent(tmp_path: Path) 
             tokenless=True,
             per_case_prompt=False,
         )
+
+
+def test_build_run_settings_rejects_empty_instance_id(tmp_path: Path) -> None:
+    with pytest.raises(CommandUsageError, match="--instance-id"):
+        build_run_settings(
+            agent="openclaw",
+            subset="lite",
+            split="test",
+            output=tmp_path,
+            timeout=120,
+            step_limit=0,
+            slice_range=None,
+            filter_regex=None,
+            instance_id="",
+            workers=1,
+            docker_pull_registry=None,
+            use_skill=False,
+            tokenless=False,
+            per_case_prompt=False,
+        )
+
+
+def test_build_run_settings_rejects_whitespace_only_instance_id(tmp_path: Path) -> None:
+    with pytest.raises(CommandUsageError, match="--instance-id"):
+        build_run_settings(
+            agent="openclaw",
+            subset="lite",
+            split="test",
+            output=tmp_path,
+            timeout=120,
+            step_limit=0,
+            slice_range=None,
+            filter_regex=None,
+            instance_id="   ",
+            workers=1,
+            docker_pull_registry=None,
+            use_skill=False,
+            tokenless=False,
+            per_case_prompt=False,
+        )
+
+
+def test_build_run_settings_rejects_comma_only_instance_id(tmp_path: Path) -> None:
+    with pytest.raises(CommandUsageError, match="--instance-id"):
+        build_run_settings(
+            agent="openclaw",
+            subset="lite",
+            split="test",
+            output=tmp_path,
+            timeout=120,
+            step_limit=0,
+            slice_range=None,
+            filter_regex=None,
+            instance_id=",,",
+            workers=1,
+            docker_pull_registry=None,
+            use_skill=False,
+            tokenless=False,
+            per_case_prompt=False,
+        )
+
+
+def test_build_run_settings_preserves_blank_separators_in_mixed_instance_id(tmp_path: Path) -> None:
+    settings = build_run_settings(
+        agent="openclaw",
+        subset="lite",
+        split="test",
+        output=tmp_path,
+        timeout=120,
+        step_limit=0,
+        slice_range=None,
+        filter_regex=None,
+        instance_id="a,, b",
+        workers=1,
+        docker_pull_registry=None,
+        use_skill=False,
+        tokenless=False,
+        per_case_prompt=False,
+    )
+
+    assert settings.dataset.instance_ids == ["a", "", "b"]

@@ -125,7 +125,14 @@ def build_run_settings(
     if tokenless and not agent_supports_run_option(agent, TOKENLESS_RUN_OPTION):
         raise CommandUsageError(f"--tokenless is not supported by agent '{agent}'")
 
-    instance_ids = [item.strip() for item in instance_id.split(",")] if instance_id else None
+    instance_ids: list[str] | None = None
+    if instance_id is not None:
+        instance_ids = [item.strip() for item in instance_id.split(",")]
+        if not any(instance_ids):
+            raise CommandUsageError(
+                "--instance-id requires at least one non-empty instance ID; "
+                "omit the option to select the full dataset"
+            )
     return Settings(
         agent=AgentConfig(
             name=agent,

@@ -71,6 +71,29 @@ def test_run_rejects_skill_and_per_case_prompt_together():
     assert "--use-skill and --per-case-prompt are mutually exclusive" in result.output
 
 
+def test_run_rejects_empty_instance_id_selection(tmp_path):
+    with patch("swe_runner.cli_commands.RunSession") as mock_session_cls:
+        result = runner.invoke(
+            app,
+            ["run", "--agent", "openclaw", "--instance-id", "", "--output", str(tmp_path)],
+        )
+
+    assert result.exit_code == 1
+    assert "--instance-id" in result.output
+    mock_session_cls.assert_not_called()
+
+
+def test_run_rejects_comma_only_instance_id_selection(tmp_path):
+    with patch("swe_runner.cli_commands.RunSession") as mock_session_cls:
+        result = runner.invoke(
+            app,
+            ["run", "--agent", "openclaw", "--instance-id", ",", "--output", str(tmp_path)],
+        )
+
+    assert result.exit_code == 1
+    mock_session_cls.assert_not_called()
+
+
 def test_run_does_not_pass_openclaw_config_to_agent():
     with patch("swe_runner.cli_commands.RunSession") as mock_session_cls:
         mock_session_cls.return_value.execute.return_value = RunReport(succeeded=0, failed=0, total=0, instance_ids=[])

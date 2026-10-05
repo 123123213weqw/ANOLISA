@@ -66,12 +66,16 @@ def filter_instances(instances: list[SWEInstance], config: DatasetConfig) -> lis
     logger.info(
         "FILTER_START instance=global total=%s instance_ids=%s filter_regex=%s slice_range=%s",
         len(result),
-        len(config.instance_ids) if config.instance_ids else 0,
+        len(config.instance_ids) if config.instance_ids is not None else 0,
         config.filter_regex,
         config.slice_range,
     )
 
-    if config.instance_ids:
+    if config.instance_ids is not None:
+        if not config.instance_ids:
+            raise ValueError(
+                "instance_ids must contain at least one ID; set it to None to select the full dataset"
+            )
         id_set = set(config.instance_ids)
         result = [i for i in result if i.instance_id in id_set]
         logger.info("FILTER_INSTANCE_IDS instance=global remaining=%s requested=%s", len(result), len(id_set))
