@@ -52,24 +52,63 @@ _DOCTOR_TIMEOUT = 30
 _DOCKER_TIMEOUT = 15
 
 
+def _decode_probe_output(data: bytes | str | None) -> str:
+    """Decode captured probe output as UTF-8 with universal newlines.
+
+    ``text=True`` would raise ``UnicodeDecodeError`` from inside
+    ``communicate()`` (or corrupt text-reader threads), so probes capture
+    bytes and decode explicitly; undecodable output becomes an actionable
+    error instead of an aborted preflight.
+    """
+    if data is None:
+        return ""
+    text = data.decode("utf-8") if isinstance(data, bytes) else data
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _run_required_probe(
+    command: list[str],
+    timeout: int,
+    missing_hint: str,
+) -> tuple[subprocess.CompletedProcess[str] | None, list[str]]:
+    """Run one required probe, capturing bytes and decoding as UTF-8.
+
+    Returns ``(completed, [])`` when the command ran and its output decoded,
+    or ``(None, errors)`` with an actionable message when it could not be
+    launched, timed out, or emitted undecodable output.
+    """
+    label = " ".join(command)
+    try:
+        proc = subprocess.run(command, capture_output=True, timeout=timeout)
+    except FileNotFoundError:
+        return None, [missing_hint]
+    except subprocess.TimeoutExpired:
+        return None, [f"'{label}' timed out after {timeout}s"]
+    except OSError as exc:
+        return None, [f"'{label}' failed to launch: {exc}"]
+
+    try:
+        stdout = _decode_probe_output(proc.stdout)
+        stderr = _decode_probe_output(proc.stderr)
+    except UnicodeDecodeError:
+        return None, [f"'{label}' output was not valid UTF-8"]
+    return subprocess.CompletedProcess(command, proc.returncode, stdout, stderr), []
+
+
 def check_openclaw_plugins() -> list[str]:
     """Run ``openclaw plugins doctor`` and report plugin load failures.
 
     Returns a list of human-readable error strings (empty when healthy).
     """
-    try:
-        proc = subprocess.run(
-            ["openclaw", "plugins", "doctor"],
-            capture_output=True,
-            text=True,
-            timeout=_DOCTOR_TIMEOUT,
-        )
-    except FileNotFoundError:
-        return ["'openclaw' command not found (is openclaw installed?)"]
-    except subprocess.TimeoutExpired:
-        return [f"'openclaw plugins doctor' timed out after {_DOCTOR_TIMEOUT}s"]
+    proc, launch_errors = _run_required_probe(
+        ["openclaw", "plugins", "doctor"],
+        _DOCTOR_TIMEOUT,
+        "'openclaw' command not found (is openclaw installed?)",
+    )
+    if proc is None:
+        return launch_errors
 
-    output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+    output = proc.stdout + "\n" + proc.stderr
 
     errors: list[str] = []
     for plugin, phase, msg in _PLUGIN_ERROR_RE.findall(output):
@@ -91,17 +130,13 @@ def check_docker() -> list[str]:
 
     Returns a list of human-readable error strings (empty when healthy).
     """
-    try:
-        proc = subprocess.run(
-            ["docker", "info"],
-            capture_output=True,
-            text=True,
-            timeout=_DOCKER_TIMEOUT,
-        )
-    except FileNotFoundError:
-        return ["'docker' command not found (is Docker installed?)"]
-    except subprocess.TimeoutExpired:
-        return [f"'docker info' timed out after {_DOCKER_TIMEOUT}s"]
+    proc, launch_errors = _run_required_probe(
+        ["docker", "info"],
+        _DOCKER_TIMEOUT,
+        "'docker' command not found (is Docker installed?)",
+    )
+    if proc is None:
+        return launch_errors
 
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()

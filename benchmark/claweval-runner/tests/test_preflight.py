@@ -23,6 +23,7 @@ Covers:
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -38,6 +39,12 @@ from ce_runner import preflight  # noqa: E402
 
 
 def _completed(stdout="", stderr="", returncode=0):
+    return subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _completed_bytes(stdout=b"", stderr=b"", returncode=0):
     return subprocess.CompletedProcess(
         args=[], returncode=returncode, stdout=stdout, stderr=stderr
     )
@@ -101,6 +108,22 @@ class TestCheckOpenclawPlugins:
         assert len(errs) == 1
         assert "timed out" in errs[0]
 
+    def test_undecodable_output_reported(self):
+        with patch.object(preflight.subprocess, "run",
+                          return_value=_completed_bytes(stdout=b"\xff\xfe")):
+            errs = preflight.check_openclaw_plugins()
+        assert len(errs) == 1
+        assert "not valid UTF-8" in errs[0]
+        assert "openclaw plugins doctor" in errs[0]
+
+    def test_launch_failure_reported(self):
+        with patch.object(preflight.subprocess, "run",
+                          side_effect=PermissionError(13, "Permission denied")):
+            errs = preflight.check_openclaw_plugins()
+        assert len(errs) == 1
+        assert "failed to launch" in errs[0]
+        assert "openclaw plugins doctor" in errs[0]
+
 
 class TestCheckDocker:
     def test_healthy(self):
@@ -130,6 +153,15 @@ class TestCheckDocker:
         assert len(errs) == 1
         assert "timed out" in errs[0]
 
+    def test_undecodable_docker_output_reported(self):
+        with patch.object(preflight.subprocess, "run",
+                          return_value=_completed_bytes(stderr=b"\xff\xfe",
+                                                        returncode=1)):
+            errs = preflight.check_docker()
+        assert len(errs) == 1
+        assert "not valid UTF-8" in errs[0]
+        assert "docker info" in errs[0]
+
 
 class TestRunPreflightChecks:
     def test_all_healthy(self):
@@ -145,6 +177,62 @@ class TestRunPreflightChecks:
             ok, errs = preflight.run_preflight_checks()
         assert ok is False
         assert errs == ["a", "b"]
+
+
+class TestRequiredProbeRealSubprocess:
+    """Real local probes: unusable evidence must be reported, never raised.
+
+    ``text=True`` decoding of invalid UTF-8 and non-``FileNotFoundError``
+    launch errors (e.g. ``PermissionError``) used to escape the aggregated
+    preflight instead of failing the affected probe.
+    """
+
+    def _fake_probe_dir(self, tmp_path, openclaw_body, docker_body="raise SystemExit(0)"):
+        fake = tmp_path / "fake-bin"
+        fake.mkdir()
+        for name, body in (("openclaw", openclaw_body), ("docker", docker_body)):
+            script = fake / name
+            script.write_text("#!/usr/bin/env python3\n" + body + "\n")
+            script.chmod(0o755)
+        return fake
+
+    def _prepend_path(self, monkeypatch, fake):
+        monkeypatch.setenv("PATH", str(fake) + os.pathsep + os.environ["PATH"])
+
+    def test_invalid_utf8_output_is_reported_not_raised(self, tmp_path, monkeypatch):
+        fake = self._fake_probe_dir(
+            tmp_path,
+            openclaw_body='import sys; sys.stdout.buffer.write(b"- x [load]: \\xff\\xfe boom\\n")',
+        )
+        self._prepend_path(monkeypatch, fake)
+
+        ok, errs = preflight.run_preflight_checks()
+
+        assert ok is False
+        assert len(errs) == 1
+        assert "not valid UTF-8" in errs[0]
+        assert "openclaw plugins doctor" in errs[0]
+
+    def test_unlaunchable_probe_is_reported_not_raised(self, tmp_path, monkeypatch):
+        fake = self._fake_probe_dir(tmp_path, openclaw_body="raise SystemExit(0)")
+        (fake / "openclaw").chmod(0o644)
+        self._prepend_path(monkeypatch, fake)
+
+        ok, errs = preflight.run_preflight_checks()
+
+        assert ok is False
+        assert len(errs) == 1
+        assert "failed to launch" in errs[0]
+        assert "openclaw plugins doctor" in errs[0]
+
+    def test_healthy_fake_probes_pass(self, tmp_path, monkeypatch):
+        fake = self._fake_probe_dir(tmp_path, openclaw_body="print('No plugin issues detected.')")
+        self._prepend_path(monkeypatch, fake)
+
+        ok, errs = preflight.run_preflight_checks()
+
+        assert ok is True
+        assert errs == []
 
 
 def _write_task(task_dir: Path, content: dict) -> str:
