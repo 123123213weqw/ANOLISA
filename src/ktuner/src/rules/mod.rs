@@ -740,11 +740,24 @@ fn eval_accept_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
 }
 
 fn eval_sysrq(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/sysrq";
+    eval_sysrq_at(info, recs, "/proc/sys/kernel/sysrq")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the signed read is
+/// unit-testable against a temp file. `drivers/tty/sysrq.c` registers
+/// kernel.sysrq through `sysrq_sysctl_handler`, which copies the table
+/// with no min/max and reads back through `sysrq_mask()` — and -1 is the
+/// mask with every function enabled, a legal, maximally-open setting. The
+/// unsigned reader parses "-1" to Err and falls back to 0, which here is
+/// the *disabled* value, so the `current != 0 && current != 176` gate
+/// skipped the hardening rule on exactly the most exposed hosts.
+fn eval_sysrq_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // sysrq is a mask; -1 enables every function, so it must be read signed
+    // or the unsigned fallback maps it to 0 (disabled) and skips the rule.
+    let current = read_sysctl_i64(path);
     // sysrq=1 means all functions enabled; high values also enable all
     if current != 0 && current != 176 {
         // 176 = safe subset (sync + remount-ro + reboot)
@@ -8886,6 +8899,81 @@ mod tests {
         let mut recs = Vec::new();
         let checked =
             eval_perf_event_paranoid_at(&info, &mut recs, "/proc/sys/kernel/ktuner_absent_pep");
+        assert_eq!(checked, 1);
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn test_sysrq_minus_one_reads_signed() {
+        // -1 is the kernel's "every sysrq function enabled" mask (sysrq_mask()
+        // with all bits set). The unsigned reader parsed "-1" to Err, fell
+        // back to 0 — the *disabled* value — so the gate skipped the
+        // hardening recommendation on exactly the maximally-open host, and
+        // current_value lied about what a rollback would restore.
+        let path = std::env::temp_dir().join(format!(
+            "ktuner_sysrq_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, b"-1\n").unwrap();
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        let checked = eval_sysrq_at(&info, &mut recs, path.to_str().unwrap());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(checked, 1);
+        assert_eq!(recs.len(), 1, "-1 is fully open, so it must be flagged");
+        assert_eq!(recs[0].param, "kernel.sysrq");
+        assert_eq!(recs[0].current_value, "-1", "current must be faithful");
+        assert_eq!(recs[0].recommended_value, "176");
+    }
+
+    #[test]
+    fn test_sysrq_boundaries() {
+        // 0 (sysrq fully disabled) and 176 (the safe subset itself:
+        // sync + remount-ro + reboot) are already hardened and must NOT be
+        // flagged; every other value — including the signed -1 mask and the
+        // common 1/16/438 masks — must recommend 176.
+        let info = make_test_info();
+        for (value, expects_rec) in [
+            (-1, true),
+            (0, false),
+            (1, true),
+            (16, true),
+            (176, false),
+            (438, true),
+        ] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_sysrq_bound_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            eval_sysrq_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 (disabled) and 176 (safe subset) are hardened"
+            );
+            if expects_rec {
+                assert_eq!(
+                    recs[0].current_value,
+                    value.to_string(),
+                    "current_value must echo the signed value verbatim"
+                );
+                assert_eq!(recs[0].recommended_value, "176");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sysrq_absent_counts_as_checked() {
+        // A path that never exists exercises the absent branch: 1 checked,
+        // 0 recommendations, no filesystem dependency in CI.
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        let checked = eval_sysrq_at(&info, &mut recs, "/proc/sys/kernel/ktuner_absent_sysrq");
         assert_eq!(checked, 1);
         assert!(recs.is_empty());
     }
