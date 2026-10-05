@@ -15,6 +15,7 @@
 """Public API for trace extraction and analysis."""
 
 from swe_runner.trace_extraction.analysis import analyze_trace_files
+from swe_runner.trace_extraction.comparison import TraceComparisonResult, compare_trace_summaries
 from swe_runner.trace_extraction.export import write_trace_analysis_csvs
 from swe_runner.trace_extraction.helpers import ExtractionError
 from swe_runner.trace_extraction.plan import TraceCollectionPlan
@@ -23,7 +24,9 @@ from swe_runner.trace_extraction.recording import record_openclaw_jsonl_traces_i
 __all__ = [
     "ExtractionError",
     "TraceCollectionPlan",
+    "TraceComparisonResult",
     "analyze_trace_files",
+    "compare_trace_summaries",
     "write_trace_analysis_csvs",
     "record_openclaw_jsonl_traces_in_window",
 ]

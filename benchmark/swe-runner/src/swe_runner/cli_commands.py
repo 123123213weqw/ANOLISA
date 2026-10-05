@@ -27,13 +27,18 @@ from swe_runner.common.models import AgentConfig, DatasetConfig, OutputConfig, S
 from swe_runner.evaluation import run_evaluation as run_patch_evaluation
 from swe_runner.run.io.report import RunReport
 from swe_runner.run.session import RunSession
-from swe_runner.trace_extraction import TraceCollectionPlan, write_trace_analysis_csvs
+from swe_runner.trace_extraction import (
+    TraceCollectionPlan,
+    compare_trace_summaries,
+    write_trace_analysis_csvs,
+)
 
 logger = logging.getLogger(__name__)
 
 RUN_OUTPUT_SUBDIR = "run"
 EVALUATE_OUTPUT_SUBDIR = "evaluate"
 ANALYZE_TRACES_OUTPUT_SUBDIR = "analyze-traces"
+COMPARE_TRACES_OUTPUT_SUBDIR = "compare-traces"
 TOKENLESS_RUN_OPTION = "tokenless"
 
 
@@ -49,6 +54,16 @@ class TraceAnalysisCommandResult:
     detail_dir: Path
     summary_csv: Path
     trace_metrics_csv: Path
+
+
+@dataclass(frozen=True)
+class TraceComparisonCommandResult:
+    """Files and counts produced by the trace summary comparison command."""
+
+    output_csv: Path
+    matched_count: int
+    baseline_only_count: int
+    candidate_only_count: int
 
 
 def command_output_dir(output_root: Path, command_name: str) -> Path:
@@ -227,4 +242,27 @@ def analyze_traces_command(
         detail_dir=detail_dir,
         summary_csv=summary_csv,
         trace_metrics_csv=analyze_output / "trace_metrics" / "trace_metrics.csv",
+    )
+
+
+def compare_traces_command(
+    *,
+    baseline: Path,
+    candidate: Path,
+    output: Path,
+) -> TraceComparisonCommandResult:
+    """Compare two exported trace summary CSVs and write the alignment report."""
+    if not baseline.exists():
+        raise CommandUsageError(f"Baseline trace summary not found: {baseline}")
+    if not candidate.exists():
+        raise CommandUsageError(f"Candidate trace summary not found: {candidate}")
+
+    compare_output = command_output_dir(output, COMPARE_TRACES_OUTPUT_SUBDIR)
+    setup_logging(compare_output, suffix=COMPARE_TRACES_OUTPUT_SUBDIR)
+    result = compare_trace_summaries(baseline, candidate, compare_output / "trace_comparison.csv")
+    return TraceComparisonCommandResult(
+        output_csv=result.output_csv,
+        matched_count=result.matched_count,
+        baseline_only_count=result.baseline_only_count,
+        candidate_only_count=result.candidate_only_count,
     )

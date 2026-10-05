@@ -394,3 +394,129 @@ def test_evaluate_none_namespace_uses_local_build_mode(mocker: MockerFixture) ->
     assert result.exit_code == 0
     mock_run_evaluation.assert_called_once()
     assert mock_run_evaluation.call_args.kwargs["namespace"] is None
+
+
+def _write_compare_summary(path, rows):
+    import csv
+
+    headers = ["用例ID", "执行次数", "平均执行步骤数", "平均输入Token数", "平均输出Token数", "平均总Token数"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=headers)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({header: row.get(header, "") for header in headers})
+    return path
+
+
+def test_compare_traces_registered():
+    result = runner.invoke(app, ["--help"])
+    assert result.exit_code == 0
+    assert "compare-traces" in result.output
+
+
+def test_compare_traces_help():
+    result = runner.invoke(app, ["compare-traces", "--help"])
+    assert result.exit_code == 0
+    assert "--baseline" in result.output
+    assert "--candidate" in result.output
+    assert "--output" in result.output
+
+
+def test_compare_traces_dispatch_writes_alignment_report(tmp_path):
+    baseline = _write_compare_summary(
+        tmp_path / "base.csv",
+        [
+            {"用例ID": "inst-a", "执行次数": 2, "平均执行步骤数": "12.00", "平均输入Token数": "110.00", "平均输出Token数": "40.00", "平均总Token数": "150.00"},
+            {"用例ID": "inst-b", "执行次数": 1, "平均执行步骤数": "5.00", "平均输入Token数": "200.00", "平均输出Token数": "100.00", "平均总Token数": "300.00"},
+        ],
+    )
+    candidate = _write_compare_summary(
+        tmp_path / "cand.csv",
+        [
+            {"用例ID": "inst-a", "执行次数": 1, "平均执行步骤数": "6.00", "平均输入Token数": "55.00", "平均输出Token数": "25.00", "平均总Token数": "80.00"},
+            {"用例ID": "inst-c", "执行次数": 1, "平均执行步骤数": "2.00", "平均输入Token数": "10.00", "平均输出Token数": "5.00", "平均总Token数": "15.00"},
+        ],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "compare-traces",
+            "--baseline",
+            str(baseline),
+            "--candidate",
+            str(candidate),
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert "Matched cases: 1" in result.output
+    assert "Baseline-only cases: 1" in result.output
+    assert "Candidate-only cases: 1" in result.output
+
+    output_csv = tmp_path / "out" / "compare-traces" / "trace_comparison.csv"
+    assert output_csv.is_file()
+
+    import csv
+
+    with open(output_csv, encoding="utf-8", newline="") as f:
+        rows = {row["用例ID"]: row for row in csv.DictReader(f)}
+    assert rows["inst-a"]["匹配状态"] == "matched"
+    assert rows["inst-a"]["平均总Token数差异"] == "-70.00"
+    assert rows["inst-b"]["匹配状态"] == "baseline-only"
+    assert rows["inst-b"]["平均总Token数差异"] == ""
+    assert rows["inst-c"]["匹配状态"] == "candidate-only"
+
+
+def test_compare_traces_missing_baseline_exits_with_error(tmp_path):
+    candidate = _write_compare_summary(tmp_path / "cand.csv", [{"用例ID": "inst-a", "执行次数": 1}])
+
+    result = runner.invoke(
+        app,
+        [
+            "compare-traces",
+            "--baseline",
+            str(tmp_path / "missing.csv"),
+            "--candidate",
+            str(candidate),
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "Baseline trace summary not found" in result.output
+
+
+def test_compare_traces_invalid_rows_exit_before_output(tmp_path):
+    baseline = _write_compare_summary(
+        tmp_path / "base.csv",
+        [{"用例ID": "inst-a", "执行次数": 1, "平均执行步骤数": "10.00", "平均输入Token数": "100.00", "平均输出Token数": "50.00", "平均总Token数": "150.00"}],
+    )
+    candidate = _write_compare_summary(
+        tmp_path / "cand.csv",
+        [
+            {"用例ID": "inst-a", "执行次数": 1, "平均执行步骤数": "10.00", "平均输入Token数": "100.00", "平均输出Token数": "50.00", "平均总Token数": "150.00"},
+            {"用例ID": "inst-a", "执行次数": 2, "平均执行步骤数": "8.00", "平均输入Token数": "60.00", "平均输出Token数": "30.00", "平均总Token数": "90.00"},
+        ],
+    )
+
+    result = runner.invoke(
+        app,
+        [
+            "compare-traces",
+            "--baseline",
+            str(baseline),
+            "--candidate",
+            str(candidate),
+            "--output",
+            str(tmp_path / "out"),
+        ],
+    )
+
+    assert result.exit_code == 1
+    assert "repeats case ID 'inst-a'" in result.output
+    assert not (tmp_path / "out" / "compare-traces" / "trace_comparison.csv").exists()

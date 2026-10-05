@@ -23,6 +23,7 @@ from swe_runner.agents import AgentEnvironmentError, list_available_agent_names
 from swe_runner.cli_commands import (
     CommandUsageError,
     analyze_traces_command,
+    compare_traces_command,
     evaluate_patches_command,
     run_instances_command,
 )
@@ -210,6 +211,37 @@ def analyze_traces(
     console.print(f"[green]Per-trace CSV dir:[/green] {result.detail_dir}")
     console.print(f"[green]Per-case summary CSV:[/green] {result.summary_csv}")
     console.print(f"[green]Trace metrics CSV:[/green] {result.trace_metrics_csv}")
+
+
+@app.command("compare-traces")
+def compare_traces(
+    baseline: Path = typer.Option(
+        ...,
+        "--baseline",
+        help="Baseline trace_summary.csv exported by analyze-traces",
+    ),
+    candidate: Path = typer.Option(
+        ...,
+        "--candidate",
+        help="Candidate trace_summary.csv exported by analyze-traces",
+    ),
+    output: Path = typer.Option(Path("./output"), "--output", "-o", help="Output root directory"),
+) -> None:
+    """Compare two exported trace summary CSVs and report per-case budget differences."""
+    try:
+        result = compare_traces_command(
+            baseline=baseline,
+            candidate=candidate,
+            output=output,
+        )
+    except (CommandUsageError, ExtractionError) as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1) from None
+
+    console.print(f"[green]Comparison CSV:[/green] {result.output_csv}")
+    console.print(f"[green]Matched cases:[/green] {result.matched_count}")
+    console.print(f"[green]Baseline-only cases:[/green] {result.baseline_only_count}")
+    console.print(f"[green]Candidate-only cases:[/green] {result.candidate_only_count}")
 
 
 if __name__ == "__main__":

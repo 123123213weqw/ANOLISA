@@ -118,13 +118,22 @@ swe-runner analyze-traces \
   --run-metadata ./output/run/run_metadata.json
 ```
 
+对比两次运行的 trace 汇总：
+
+```bash
+swe-runner compare-traces \
+  --baseline ./runs/base/analyze-traces/trace_summary.csv \
+  --candidate ./runs/new/analyze-traces/trace_summary.csv
+```
+
 ## 命令概览
 
 ```text
 swe-runner
 ├── run             运行实例并生成 patch
 ├── evaluate        调用 SWE-bench 官方 evaluator
-└── analyze-traces  补录 trace 并导出 CSV
+├── analyze-traces  补录 trace 并导出 CSV
+└── compare-traces  对比两份已导出的 trace 汇总 CSV
 ```
 
 ## `swe-runner run`
@@ -435,6 +444,40 @@ swe-runner analyze-traces \
 | `--end` | `now` | 补录窗口结束时间 |
 | `--run-metadata` | 无 | `run` 命令生成的 `run_metadata.json` |
 
+## `swe-runner compare-traces`
+
+`compare-traces` 会按用例对齐两份由 `analyze-traces` 导出的
+`trace_summary.csv`，并输出一份对比 CSV。它完全离线：只消费已导出的
+汇总，不重新补录 trace、不调用 agent、不重跑 evaluation。
+`analyze-traces` 及其 CSV 格式保持不变。
+
+对比两次已记录的运行：
+
+```bash
+swe-runner compare-traces \
+  --baseline ./runs/base/analyze-traces/trace_summary.csv \
+  --candidate ./runs/new/analyze-traces/trace_summary.csv \
+  --output ./output
+```
+
+### Compare 参数速查
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--baseline` | 必填 | 基线 `trace_summary.csv`（`analyze-traces` 导出） |
+| `--candidate` | 必填 | 候选 `trace_summary.csv`（`analyze-traces` 导出） |
+| `--output, -o` | `./output` | 输出根目录；对比结果写入 `compare-traces/trace_comparison.csv` |
+
+### 对比输出
+
+用例按精确用例 ID 对齐并按排序输出。每行报告匹配状态
+（`matched`、`baseline-only` 或 `candidate-only`）、两侧执行次数、
+两次运行的平均执行步骤数和平均输入、输出、总 Token 数、候选减基线的
+绝对差异，以及各均值相对基线的百分比变化。没有对应用例的差异保持
+空白，不会被当作零消耗。当基线均值为零且候选消耗为正时百分比留空。
+畸形行（缺失或非数值、负数指标、非整数执行次数）、重复用例 ID 和
+非有限值（`NaN`、`inf`）会在写出任何输出之前被拒绝并报错。
+
 ## 输出目录
 
 默认输出根目录是 `./output`。每个命令会写入自己的子目录：
@@ -459,15 +502,18 @@ output/
 │   ├── swe-runner.evaluate.log
 │   ├── <model>.<run_id>.json
 │   └── logs/run_evaluation/<run_id>/<model>/<instance_id>/
-└── analyze-traces/
-    ├── swe-runner.analyze-traces.log
-    ├── traces/
-    │   └── <instance_id>/trace*.json
-    ├── trace_details/
-    │   └── <instance_id>.csv
-    ├── trace_metrics/
-    │   └── trace_metrics.csv
-    └── trace_summary.csv
+├── analyze-traces/
+│   ├── swe-runner.analyze-traces.log
+│   ├── traces/
+│   │   └── <instance_id>/trace*.json
+│   ├── trace_details/
+│   │   └── <instance_id>.csv
+│   ├── trace_metrics/
+│   │   └── trace_metrics.csv
+│   └── trace_summary.csv
+└── compare-traces/
+    ├── swe-runner.compare-traces.log
+    └── trace_comparison.csv
 ```
 
 重要文件：
@@ -485,6 +531,7 @@ output/
 | `analyze-traces/trace_details/*.csv` | 每条 trace 的基础指标 |
 | `analyze-traces/trace_summary.csv` | 每个实例的汇总指标 |
 | `analyze-traces/trace_metrics/trace_metrics.csv` | 更细的 trace、工具调用和 token 指标 |
+| `compare-traces/trace_comparison.csv` | 两份 `trace_summary.csv` 导出的跨运行对齐结果 |
 
 ## 项目结构
 
