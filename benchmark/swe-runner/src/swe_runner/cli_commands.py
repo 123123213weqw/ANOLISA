@@ -26,6 +26,7 @@ from swe_runner.common.logging_config import setup_logging
 from swe_runner.common.models import AgentConfig, DatasetConfig, OutputConfig, Settings
 from swe_runner.evaluation import run_evaluation as run_patch_evaluation
 from swe_runner.run.io.report import RunReport
+from swe_runner.run.io.run_summary_export import RunSummaryExportResult, export_run_summary
 from swe_runner.run.session import RunSession
 from swe_runner.trace_extraction import (
     TraceCollectionPlan,
@@ -39,6 +40,7 @@ RUN_OUTPUT_SUBDIR = "run"
 EVALUATE_OUTPUT_SUBDIR = "evaluate"
 ANALYZE_TRACES_OUTPUT_SUBDIR = "analyze-traces"
 COMPARE_TRACES_OUTPUT_SUBDIR = "compare-traces"
+SUMMARIZE_RUN_OUTPUT_SUBDIR = "summarize-run"
 TOKENLESS_RUN_OPTION = "tokenless"
 
 
@@ -266,3 +268,9 @@ def compare_traces_command(
         baseline_only_count=result.baseline_only_count,
         candidate_only_count=result.candidate_only_count,
     )
+
+
+def summarize_run_command(*, run_dir: Path, output: Path) -> RunSummaryExportResult:
+    """Export the recorded run outcome inventory to a deterministic CSV."""
+    setup_logging(command_output_dir(output, SUMMARIZE_RUN_OUTPUT_SUBDIR), suffix=SUMMARIZE_RUN_OUTPUT_SUBDIR)
+    return export_run_summary(run_dir, output)

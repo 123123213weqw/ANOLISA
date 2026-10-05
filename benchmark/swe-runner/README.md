@@ -137,7 +137,8 @@ swe-runner
 ├── run             Run instances and generate patches
 ├── evaluate        Run the official SWE-bench evaluator
 ├── analyze-traces  Collect traces and export CSV reports
-└── compare-traces  Compare two exported trace summary CSVs
+├── compare-traces  Compare two exported trace summary CSVs
+└── summarize-run   Export the recorded run outcome inventory as CSV
 ```
 
 ## `swe-runner run`
@@ -493,6 +494,27 @@ non-numeric values, negative metrics, non-integer execution counts),
 duplicate case IDs, and nonfinite values (`NaN`, `inf`) are rejected with an
 error before any output is written.
 
+## `swe-runner summarize-run`
+
+`summarize-run` exports the recorded run outcome inventory to a deterministic
+UTF-8 CSV. It reads `results/<instance_id>.json` files written by `run`
+(including failed attempts that produced no `preds.json` entry), validates
+them, and atomically publishes `<output>/summarize-run/run_summary.csv` with
+one row per attempt: `instance_id`, `success`, `patch_produced`,
+`duration_seconds`, `agent_name`, and `error`. These are runner outcomes, not
+SWE-bench evaluator pass results.
+
+```bash
+swe-runner summarize-run \
+  --run-dir ./output/run \
+  --output ./output
+```
+
+| Option | Default | Description |
+|---|---:|---|
+| `--run-dir` | required | Recorded run directory containing `results/*.json` |
+| `--output, -o` | `./output` | Output root; the CSV lands in `summarize-run/run_summary.csv` |
+
 ## Output Layout
 
 The default output root is `./output`. Each command writes to its own subdir:
@@ -523,12 +545,12 @@ output/
 │   │   └── <instance_id>/trace*.json
 │   ├── trace_details/
 │   │   └── <instance_id>.csv
-│   ├── trace_metrics/
-│   │   └── trace_metrics.csv
-│   └── trace_summary.csv
-└── compare-traces/
-    ├── swe-runner.compare-traces.log
-    └── trace_comparison.csv
+├── compare-traces/
+│   ├── swe-runner.compare-traces.log
+│   └── trace_comparison.csv
+└── summarize-run/
+    ├── swe-runner.summarize-run.log
+    └── run_summary.csv
 ```
 
 Important files:
@@ -547,6 +569,7 @@ Important files:
 | `analyze-traces/trace_summary.csv` | Per-instance summary metrics |
 | `analyze-traces/trace_metrics/trace_metrics.csv` | Detailed trace, tool-call, and token metrics |
 | `compare-traces/trace_comparison.csv` | Cross-run alignment of two `trace_summary.csv` exports |
+| `summarize-run/run_summary.csv` | Per-attempt run outcome inventory CSV |
 
 ## Project Structure
 

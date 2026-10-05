@@ -133,7 +133,8 @@ swe-runner
 ├── run             运行实例并生成 patch
 ├── evaluate        调用 SWE-bench 官方 evaluator
 ├── analyze-traces  补录 trace 并导出 CSV
-└── compare-traces  对比两份已导出的 trace 汇总 CSV
+├── compare-traces  对比两份已导出的 trace 汇总 CSV
+└── summarize-run   导出已记录运行结果清单 CSV
 ```
 
 ## `swe-runner run`
@@ -478,6 +479,25 @@ swe-runner compare-traces \
 畸形行（缺失或非数值、负数指标、非整数执行次数）、重复用例 ID 和
 非有限值（`NaN`、`inf`）会在写出任何输出之前被拒绝并报错。
 
+## `swe-runner summarize-run`
+
+`summarize-run` 将已记录的运行结果清单导出为确定性 UTF-8 CSV。它读取 `run`
+写入的 `results/<instance_id>.json`（包括没有 `preds.json` 条目的失败尝试），
+先校验再原子发布 `<output>/summarize-run/run_summary.csv`，每次尝试一行：
+`instance_id`、`success`、`patch_produced`、`duration_seconds`、`agent_name`
+和 `error`。这些是 runner 层的运行结果，不是 SWE-bench evaluator 的判定结果。
+
+```bash
+swe-runner summarize-run \
+  --run-dir ./output/run \
+  --output ./output
+```
+
+| 参数 | 默认值 | 说明 |
+|---|---:|---|
+| `--run-dir` | 必填 | 包含 `results/*.json` 的已记录 run 目录 |
+| `--output, -o` | `./output` | 输出根目录；CSV 写入 `summarize-run/run_summary.csv` |
+
 ## 输出目录
 
 默认输出根目录是 `./output`。每个命令会写入自己的子目录：
@@ -508,12 +528,12 @@ output/
 │   │   └── <instance_id>/trace*.json
 │   ├── trace_details/
 │   │   └── <instance_id>.csv
-│   ├── trace_metrics/
-│   │   └── trace_metrics.csv
-│   └── trace_summary.csv
-└── compare-traces/
-    ├── swe-runner.compare-traces.log
-    └── trace_comparison.csv
+├── compare-traces/
+│   ├── swe-runner.compare-traces.log
+│   └── trace_comparison.csv
+└── summarize-run/
+    ├── swe-runner.summarize-run.log
+    └── run_summary.csv
 ```
 
 重要文件：
@@ -532,6 +552,7 @@ output/
 | `analyze-traces/trace_summary.csv` | 每个实例的汇总指标 |
 | `analyze-traces/trace_metrics/trace_metrics.csv` | 更细的 trace、工具调用和 token 指标 |
 | `compare-traces/trace_comparison.csv` | 两份 `trace_summary.csv` 导出的跨运行对齐结果 |
+| `summarize-run/run_summary.csv` | 每次尝试的运行结果清单 CSV |
 
 ## 项目结构
 

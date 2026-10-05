@@ -26,7 +26,9 @@ from swe_runner.cli_commands import (
     compare_traces_command,
     evaluate_patches_command,
     run_instances_command,
+    summarize_run_command,
 )
+from swe_runner.run.io.run_summary_export import RunSummaryExportError
 from swe_runner.trace_extraction import ExtractionError
 
 app = typer.Typer(
@@ -242,6 +244,26 @@ def compare_traces(
     console.print(f"[green]Matched cases:[/green] {result.matched_count}")
     console.print(f"[green]Baseline-only cases:[/green] {result.baseline_only_count}")
     console.print(f"[green]Candidate-only cases:[/green] {result.candidate_only_count}")
+
+
+@app.command("summarize-run")
+def summarize_run(
+    run_dir: Path = typer.Option(
+        ...,
+        "--run-dir",
+        help="Recorded run output directory containing results/<instance_id>.json files",
+    ),
+    output: Path = typer.Option(Path("./output"), "--output", "-o", help="Output root directory"),
+) -> None:
+    """Export the recorded run outcome inventory to a deterministic CSV."""
+    try:
+        result = summarize_run_command(run_dir=run_dir, output=output)
+    except RunSummaryExportError as e:
+        console.print(f"[red]Error:[/red] {e}")
+        raise typer.Exit(code=1) from None
+
+    console.print(f"[green]Attempts:[/green] {result.attempt_count}")
+    console.print(f"[green]Run summary CSV:[/green] {result.summary_csv}")
 
 
 if __name__ == "__main__":
