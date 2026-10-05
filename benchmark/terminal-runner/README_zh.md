@@ -155,7 +155,7 @@ harbor run \
 3. 从 OpenClaw 响应中提取 bash 命令（toolCall 或 `bash` 代码块）
 4. 通过 `environment.exec()` 在 harbor 容器中执行每条命令
 5. 将结果反馈给 OpenClaw 进入下一轮迭代
-6. 当 OpenClaw 输出 `TASK_COMPLETE` 或达到 `OPENCLAW_MAX_ITERATIONS` 时停止
+6. 当 OpenClaw 在代码块之外单独一行输出 `TASK_COMPLETE`（大小写不敏感；正文、引述或代码块内的提及会被忽略，且此前必须已执行过至少一条命令），或达到 `OPENCLAW_MAX_ITERATIONS` 时停止
 
 ### 每次试验隔离
 

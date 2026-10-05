@@ -160,7 +160,7 @@ harbor run \
 3. Extracts bash commands from OpenClaw's response (toolCall or fenced `bash` code blocks)
 4. Executes each command in the harbor container via `environment.exec()`
 5. Feeds the results back to OpenClaw for the next iteration
-6. Stops when OpenClaw outputs `TASK_COMPLETE` or `OPENCLAW_MAX_ITERATIONS` is hit
+6. Stops when OpenClaw outputs `TASK_COMPLETE` as a standalone case-insensitive line outside code fences (prose/quoted/fenced mentions are ignored; at least one command must have been executed), or `OPENCLAW_MAX_ITERATIONS` is hit
 
 ### Per-trial isolation
 

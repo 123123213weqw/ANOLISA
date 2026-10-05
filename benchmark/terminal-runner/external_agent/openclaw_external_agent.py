@@ -161,8 +161,11 @@ class OpenClawExternalAgent(BaseAgent):
         "- Do NOT use `cd /app && command` — use absolute paths instead.\n"
         "- Each command must be a single simple command, not chained with `&&` "
         "or `;`.\n"
-        "- You MUST execute ALL commands in the Approach section before saying "
-        "TASK_COMPLETE. Do NOT claim completion without executing commands.\n"
+        "- You MUST execute ALL commands in the Approach section before "
+        "signalling completion. To finish, put TASK_COMPLETE alone on its "
+        "own line outside any code block; mentions inside code blocks or "
+        "quoted examples are ignored. Do NOT claim completion without "
+        "executing commands.\n"
     )
 
     # ------------------------------------------------------------------
@@ -539,7 +542,7 @@ class OpenClawExternalAgent(BaseAgent):
 
             # No commands extracted – check if task is complete.
             oc_text = self._extract_final_text(parsed) or ""
-            if "TASK_COMPLETE" in oc_text.upper() and all_executions:
+            if self._has_completion_signal(oc_text) and all_executions:
                 self.logger.info(
                     "%s: iteration %d | TASK_COMPLETE received",
                     _LOG_PREFIX, iteration,
@@ -549,7 +552,7 @@ class OpenClawExternalAgent(BaseAgent):
                     parsed, container_id, iteration, all_executions,
                 )
                 break
-            elif "TASK_COMPLETE" in oc_text.upper() and not all_executions:
+            elif self._has_completion_signal(oc_text) and not all_executions:
                 self.logger.warning(
                     "%s: iteration %d | TASK_COMPLETE but NO commands yet, "
                     "re-prompting", _LOG_PREFIX, iteration,
@@ -572,7 +575,8 @@ class OpenClawExternalAgent(BaseAgent):
                 "```bash``` code blocks. You MUST output bash commands to "
                 "be executed in the container. Do NOT just analyze – "
                 "directly provide the commands. Output bash commands, or "
-                "say TASK_COMPLETE if the task is truly finished."
+                "end your reply with TASK_COMPLETE on its own line "
+                "(outside any code block) if the task is truly finished."
             )
 
         if not final_result:
@@ -689,7 +693,8 @@ class OpenClawExternalAgent(BaseAgent):
             "Docker container via docker exec.\n\n"
             "RULES: Keep reasoning under 2 sentences. Use absolute paths, "
             "NOT `cd && command`. Each bash block = one simple command. "
-            "Say TASK_COMPLETE when done."
+            "When the task is truly finished, end your reply with "
+            "TASK_COMPLETE alone on its own line outside any code block."
         )
         return "".join(parts)
 
@@ -699,7 +704,8 @@ class OpenClawExternalAgent(BaseAgent):
         return (
             f"Results of your commands:\n\n{chr(10).join(cmd_outputs)}\n\n"
             "Continue with more bash commands in ```bash``` code blocks, "
-            "or say TASK_COMPLETE if done."
+            "or end your reply with TASK_COMPLETE alone on its own line "
+            "outside any code block when done."
         )
 
     # ==================================================================
@@ -1201,6 +1207,28 @@ class OpenClawExternalAgent(BaseAgent):
     # ==================================================================
     # OpenClaw output parsing
     # ==================================================================
+
+    @staticmethod
+    def _has_completion_signal(text: str) -> bool:
+        """Return whether *text* carries the task-completion signal.
+
+        The signal is the token ``TASK_COMPLETE`` as a standalone,
+        case-insensitive line outside any fenced code block. Ordinary
+        prose mentions ("I am not TASK_COMPLETE yet"), quoted protocol
+        examples and tokens inside code fences are NOT signals — the
+        routing loop must not end a task from them.
+        """
+        if not text:
+            return False
+        in_fence = False
+        for raw_line in text.splitlines():
+            stripped = raw_line.strip()
+            if stripped.startswith("```"):
+                in_fence = not in_fence
+                continue
+            if not in_fence and stripped.upper() == "TASK_COMPLETE":
+                return True
+        return False
 
     def _extract_commands(self, parsed: dict[str, Any] | None) -> list[str]:
         if not parsed:
