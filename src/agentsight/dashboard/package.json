@@ -13,6 +13,7 @@
     "test:round-model": "node tests/run-round-model-regression.cjs",
     "test:stale-load": "node tests/run-stale-load-regression.cjs",
     "test:agent-sessions-subagent-count": "node tests/run-agent-sessions-subagent-count-regression.cjs",
+    "test:conversation-failed-query": "node tests/run-conversation-failed-query-regression.cjs",
     "test:product-branding": "node --test tests/product-branding-regression.test.cjs",
     "test:agent-health-notifier": "node --test tests/agent-health-notifier-regression.test.cjs"
   },

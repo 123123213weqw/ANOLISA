@@ -881,6 +881,21 @@ export const ConversationList: React.FC<ConversationListProps> = () => {
       ));
       return { ok: true, requestId };
     } catch (error) {
+      // The batch is all-or-nothing, so a failed query updated nothing: the
+      // table, charts, interruption card and savings column kept the previous
+      // range's payload under a lone error banner. Clear them (only for the
+      // newest request — a superseded failure must not wipe newer data), the
+      // same treatment the security overview cards got in #5313.
+      if (requestId === loadRequestIdRef.current) {
+        setSessions([]);
+        setTokenSeries([]);
+        setModelSeries([]);
+        setInterruptionCount(null);
+        setInterruptionStats([]);
+        setSessionInterruptionCounts(new Map());
+        setConversationInterruptionCounts(new Map());
+        setSavingsMap(new Map());
+      }
       return { ok: false, error, requestId };
     } finally {
       if (requestId === loadRequestIdRef.current) {
