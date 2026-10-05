@@ -185,13 +185,16 @@ fn classify_warning_escapes_control_characters_in_paths() {
             .any(|l| l.trim_start().starts_with("Injected:")),
         "the hostile name must not fabricate new diagnostic lines: {stderr:?}"
     );
-    // The hostile names are still reported, in escaped form.
+    // The hostile names are still reported, in escaped form. Control
+    // bytes render through the one shared diagnostic escaper
+    // (`\u{NN}`, the list/validate format); the classify-local `\xNN`
+    // twin no longer exists.
     assert!(
         stderr.contains("evil\\n"),
         "the newline-named skill must be reported with an escaped newline: {stderr:?}"
     );
     assert!(
-        stderr.contains("\\x1b]777;id\\x07"),
+        stderr.contains("\\u{1b}]777;id\\u{7}"),
         "the OSC-named skill must be reported with an escaped ESC: {stderr:?}"
     );
     // The healthy skill's generated views config is unaffected.

@@ -42,6 +42,18 @@ fn create_skill_dir(parent: &Path, name: &str, content: &str) {
     std::fs::write(dir.join("SKILL.md"), content).expect("write SKILL.md");
 }
 
+/// A SKILL.md past the 1 MiB parse limit cannot be loaded at all: the skill
+/// lands in `load_errors`, which text-mode validate prints on stdout.
+fn create_unloadable_skill(parent: &Path, name: &str) {
+    let dir = parent.join(name);
+    std::fs::create_dir_all(&dir).expect("create skill dir");
+    let oversized = format!(
+        "---\nname: {name}\ndescription: too big\n---\n{}\n",
+        "a".repeat(1_100_000)
+    );
+    std::fs::write(dir.join("SKILL.md"), oversized).expect("write oversized SKILL.md");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 1. invalid-only text
 // ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +305,47 @@ fn json_skill_status_fields_are_clean_names() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 7. non-UTF-8 source path
+// 7. text diagnostics escape attacker-controlled bytes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Text-mode validate prints load-error paths and parse-error names and
+/// messages on stdout. A directory name carrying ESC[2J plus a newline would
+/// clear the terminal and forge a second diagnostic line if those prints
+/// bypassed the shared diagnostic escaper.
+#[test]
+fn validate_escapes_terminal_control_bytes_in_text_diagnostics() {
+    let source = tempfile::tempdir().expect("source tempdir");
+    create_skill_dir(source.path(), "good-skill", VALID_SKILL);
+    let evil_name = "evil\u{1b}[2J-name\nline2";
+    create_unloadable_skill(source.path(), evil_name);
+
+    let out = Command::new(bin_path())
+        .args(["validate", source.path().to_str().unwrap()])
+        .output()
+        .expect("invoke skillfs validate");
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !out.status.success(),
+        "an unloadable skill is a validation failure, stdout={stdout}"
+    );
+    assert!(
+        stdout.bytes().all(|b| b == b'\n' || !b.is_ascii_control()),
+        "no raw control byte may reach validate stdout, stdout={stdout:?}"
+    );
+    assert!(
+        !stdout.lines().any(|line| line.starts_with("line2")),
+        "the newline in the skill name must not forge a diagnostic line, \
+         stdout={stdout:?}"
+    );
+    assert!(
+        stdout.contains("evil\\u{1b}[2J-name\\nline2"),
+        "the escaped name must still be reported, stdout={stdout}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. non-UTF-8 source path
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

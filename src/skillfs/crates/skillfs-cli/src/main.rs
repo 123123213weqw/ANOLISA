@@ -778,6 +778,12 @@ fn err_reason<T>(result: &Result<T, Box<dyn std::error::Error>>) -> Option<Strin
 /// additional diagnostic lines. Control characters become visible escapes
 /// (`\n`, `\u{1b}`, …) and a literal backslash is doubled so the rendering is
 /// unambiguous; ordinary text, including non-ASCII names, stays readable.
+///
+/// Every command's diagnostics render through this one helper. A
+/// classify-local twin (dd07cfc91) omitted the backslash doubling and used a
+/// different control format than the list/validate helper (9ddfeef2c), so a
+/// literal `\` + `n` in a skill name could render exactly like an escaped
+/// newline and identical bytes rendered differently per command.
 fn escape_for_diagnostics(text: &str) -> String {
     use std::fmt::Write as _;
 
@@ -2879,30 +2885,15 @@ async fn cmd_mount(
 // Classify Command
 // ---------------------------------------------------------------------------
 
-/// Render diagnostic free text safe for terminal output.
-///
-/// `LoadError` paths and messages carry attacker-influenceable bytes from
-/// directory names and SKILL.md content. Printed raw, an embedded newline
-/// forges diagnostic lines and ESC/OSC sequences are live terminal
-/// commands — and the classify diagnostics print in the default
-/// configuration (the structured warn! fields and the stderr summary
-/// alike). Same escaping as the list/validate text-output fix (kept as a
-/// separate helper so the two audit fixes land independently).
-fn escape_ctl_stderr(s: &str) -> String {
-    let mut escaped = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\n' => escaped.push_str("\\n"),
-            '\r' => escaped.push_str("\\r"),
-            '\t' => escaped.push_str("\\t"),
-            c if (c as u32) < 0x20 || c as u32 == 0x7f => {
-                escaped.push_str(&format!("\\x{:02x}", c as u32));
-            }
-            c => escaped.push(c),
-        }
-    }
-    escaped
-}
+// `LoadError` diagnostics below render through `escape_for_diagnostics`
+// (the list/validate helper): attacker-influenceable bytes from directory
+// names and SKILL.md content must not forge diagnostic lines or run
+// ESC/OSC terminal commands, and a literal backslash must be doubled so
+// `\` + `n` in a skill name cannot masquerade as an escaped newline.
+// The classify-local escaper that lived here omitted the backslash
+// doubling and escaped controls in a different format (`\xNN` vs
+// `\u{..}`), so identical input rendered differently per command — one
+// helper now pins one format for every command.
 
 async fn cmd_classify(
     source: PathBuf,
@@ -2941,8 +2932,8 @@ async fn cmd_classify(
         );
         for err in &load_errors {
             warn!(
-                path = %escape_ctl_stderr(&err.path.display().to_string()),
-                error = %escape_ctl_stderr(&err.error),
+                path = %escape_for_diagnostics(&err.path.display().to_string()),
+                error = %escape_for_diagnostics(&err.error),
                 "load error"
             );
         }
@@ -2958,8 +2949,8 @@ async fn cmd_classify(
         for err in &load_errors {
             eprintln!(
                 "  - {}: {}",
-                escape_ctl_stderr(&err.path.display().to_string()),
-                escape_ctl_stderr(&err.error)
+                escape_for_diagnostics(&err.path.display().to_string()),
+                escape_for_diagnostics(&err.error)
             );
         }
     }
@@ -3146,13 +3137,27 @@ async fn cmd_validate(
             } else {
                 if failed > 0 {
                     println!("✗ {} skill(s) failed:", failed);
+                    // Attacker-influenceable bytes: load-error paths embed
+                    // directory names, and the nearby names and messages come
+                    // from those names and SKILL.md content. All flow through
+                    // the shared diagnostic escaper — a raw newline in a name
+                    // would forge diagnostic lines and an ESC/OSC sequence is
+                    // a live terminal command.
                     for err in &load_errors {
-                        println!("  - {}: {}", err.path.display(), err.error);
+                        println!(
+                            "  - {}: {}",
+                            escape_for_diagnostics(&err.path.display().to_string()),
+                            escape_for_diagnostics(&err.error)
+                        );
                     }
                     for name in &names {
                         if let Some(entry) = store.get(name) {
                             if entry.parse_status.is_error() {
-                                println!("  - {}: {}", name, entry.parse_status.message());
+                                println!(
+                                    "  - {}: {}",
+                                    escape_for_diagnostics(name),
+                                    escape_for_diagnostics(entry.parse_status.message())
+                                );
                             }
                         }
                     }
@@ -3162,7 +3167,11 @@ async fn cmd_validate(
                     for name in &names {
                         if let Some(entry) = store.get(name) {
                             if entry.parse_status.is_degraded() {
-                                println!("  - {}: {}", name, entry.parse_status.message());
+                                println!(
+                                    "  - {}: {}",
+                                    escape_for_diagnostics(name),
+                                    escape_for_diagnostics(entry.parse_status.message())
+                                );
                             }
                         }
                     }
@@ -3384,31 +3393,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn escape_ctl_stderr_neutralizes_terminal_control_bytes() {
-        // Newline/CR/tab become visible mnemonics, not line breaks.
-        assert_eq!(escape_ctl_stderr("evil\ninjected"), "evil\\ninjected");
-        assert_eq!(escape_ctl_stderr("a\rb"), "a\\rb");
-        assert_eq!(escape_ctl_stderr("a\tb"), "a\\tb");
-        // ESC (CSI/OSC introducer) and BEL become \xNN; DEL likewise.
+    fn escape_for_diagnostics_is_the_single_diagnostic_escaper() {
+        // Newline/CR/tab become visible mnemonics, not line breaks — the
+        // shape classify's local escaper used to pin. Every command now
+        // renders through this one helper, in this one format.
+        assert_eq!(escape_for_diagnostics("evil\ninjected"), "evil\\ninjected");
+        assert_eq!(escape_for_diagnostics("a\rb"), "a\\rb");
+        assert_eq!(escape_for_diagnostics("a\tb"), "a\\tb");
+        // ESC (CSI/OSC introducer) and BEL become \u{NN}; DEL likewise.
         assert_eq!(
-            escape_ctl_stderr("ansi\u{1b}]777;id\u{7}"),
-            "ansi\\x1b]777;id\\x07"
+            escape_for_diagnostics("ansi\u{1b}]777;id\u{7}"),
+            "ansi\\u{1b}]777;id\\u{7}"
         );
-        assert_eq!(escape_ctl_stderr("\u{7f}"), "\\x7f");
-        assert_eq!(escape_ctl_stderr("a\u{0}b"), "a\\x00b");
+        assert_eq!(escape_for_diagnostics("\u{7f}"), "\\u{7f}");
+        assert_eq!(escape_for_diagnostics("a\u{0}b"), "a\\u{0}b");
         // No raw control byte survives.
         assert!(
-            !escape_ctl_stderr("\u{1}\u{2}\n\u{1b}\u{7f}")
+            !escape_for_diagnostics("\u{1}\u{2}\n\u{1b}\u{7f}")
                 .chars()
                 .any(|c| (c as u32) < 0x20 || c as u32 == 0x7f)
         );
+        // A literal backslash is doubled, so `\` + `n` in attacker-chosen
+        // text can never render like an escaped newline (the forgery the
+        // classify-local escaper permitted).
+        assert_eq!(
+            escape_for_diagnostics("forge\\nline"),
+            "forge\\\\nline",
+            "a literal backslash must render differently from a real newline"
+        );
+        assert_ne!(
+            escape_for_diagnostics("forge\\nline"),
+            escape_for_diagnostics("forge\nline")
+        );
         // Visible text — including multi-byte characters — passes through.
         assert_eq!(
-            escape_ctl_stderr("big-skill/SKILL.md"),
+            escape_for_diagnostics("big-skill/SKILL.md"),
             "big-skill/SKILL.md"
         );
-        assert_eq!(escape_ctl_stderr("技能 v1.2"), "技能 v1.2");
-        assert_eq!(escape_ctl_stderr(""), "");
+        assert_eq!(escape_for_diagnostics("技能 v1.2"), "技能 v1.2");
+        assert_eq!(escape_for_diagnostics(""), "");
     }
 
     #[derive(Debug, Clone)]
