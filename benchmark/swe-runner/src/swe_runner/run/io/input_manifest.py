@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -119,12 +121,39 @@ def build_input_manifest(*, agent_name: str, prepared: PreparedAgentRun, manifes
     return manifest
 
 
+def _publish_manifest(path: Path, data: bytes) -> None:
+    """Publish complete bytes at ``path`` without truncating prior evidence.
+
+    ``data`` must already be fully encoded. It is written to an exclusively
+    owned temporary file beside the target and published with a single
+    same-filesystem replacement only after the complete data is closed.
+    Pre-publication errors preserve the previous target and clean only the
+    temporary owned by this call; no cross-writer locking or crash
+    durability is attempted.
+    """
+    handle, temp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(data)
+        os.replace(temp_path, path)
+    except BaseException:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
 def write_input_manifest(output_dir: Path, *, agent_name: str, prepared: PreparedAgentRun) -> Path:
     """Write ``input-manifests/<instance_id>.json`` and return its path."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = _manifest_path(output_dir, prepared.instance.instance_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = build_input_manifest(agent_name=agent_name, prepared=prepared, manifest_path=path)
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    # Serialize and validate UTF-8 before opening any destination, so an
+    # encoding failure never truncates the previous provenance file.
+    data = (json.dumps(payload, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+    _publish_manifest(path, data)
     logger.info("INPUT_MANIFEST_WRITE instance=%s file=%s", prepared.instance.instance_id, path)
     return path
