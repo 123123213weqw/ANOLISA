@@ -12,6 +12,8 @@ use crate::RuntimeError;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(1);
+const SPAWN_BUSY_BACKOFF: Duration = Duration::from_millis(2);
+const SPAWN_BUSY_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Collects UTF-8 stdout and exit status under the same operation deadline.
 pub(super) fn run(
@@ -19,13 +21,7 @@ pub(super) fn run(
     path: &Path,
     timeout: Duration,
 ) -> Result<(ExitStatus, String), RuntimeError> {
-    let child = command
-        .process_group(0)
-        .spawn()
-        .map_err(|source| RuntimeError::RtkSpawn {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let child = spawn(&mut command, path)?;
     let mut owned = OwnedChild {
         child,
         reaped: false,
@@ -43,6 +39,32 @@ pub(super) fn run(
         RuntimeError::RtkOutput(io::Error::new(io::ErrorKind::InvalidData, error))
     })?;
     Ok((status, stdout))
+}
+
+/// Spawns the process-group leader, retrying while the executable rejects
+/// execve with ETXTBSY. The kernel keeps accounting a just-closed writer for
+/// a freshly (re)written executable for a few milliseconds, so a spawn that
+/// immediately follows a write of the same path can fail transiently; this
+/// is routine under parallel test execution.
+fn spawn(command: &mut Command, path: &Path) -> Result<Child, RuntimeError> {
+    command.process_group(0);
+    let started = Instant::now();
+    loop {
+        match command.spawn() {
+            Ok(child) => return Ok(child),
+            Err(source) => {
+                if source.kind() != io::ErrorKind::ExecutableFileBusy
+                    || started.elapsed() >= SPAWN_BUSY_TIMEOUT
+                {
+                    return Err(RuntimeError::RtkSpawn {
+                        path: path.to_path_buf(),
+                        source,
+                    });
+                }
+                thread::sleep(SPAWN_BUSY_BACKOFF);
+            }
+        }
+    }
 }
 
 fn collect_output(owned: &mut OwnedChild, timeout: Duration) -> Result<Vec<u8>, RuntimeError> {

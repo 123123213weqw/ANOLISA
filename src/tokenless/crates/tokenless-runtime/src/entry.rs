@@ -992,11 +992,20 @@ mod tests {
     }
 
     fn write_executable(path: &Path, script: &str) {
-        fs::write(path, script).unwrap();
-        let mut permissions = fs::metadata(path).unwrap().permissions();
+        use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
+
+        // Stage the script beside its destination and swap it in with an
+        // atomic rename instead of writing the destination in place: an
+        // in-place write can observe ETXTBSY while a leftover process from a
+        // previous spawn still executes that path, and it can expose a torn
+        // file to the spawn that immediately follows.
+        let mut staged = tempfile::NamedTempFile::new_in(path.parent().unwrap()).unwrap();
+        staged.write_all(script.as_bytes()).unwrap();
+        let mut permissions = staged.as_file().metadata().unwrap().permissions();
         permissions.set_mode(0o700);
-        fs::set_permissions(path, permissions).unwrap();
+        staged.as_file().set_permissions(permissions).unwrap();
+        staged.persist(path).map_err(|error| error.error).unwrap();
     }
 
     #[derive(Default)]
