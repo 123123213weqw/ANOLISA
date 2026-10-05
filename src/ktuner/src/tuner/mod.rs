@@ -629,6 +629,19 @@ struct LedgerLock {
 /// `previous` — was silently dropped: rollback then restored the wrong
 /// value or none, and the regenerated sysctl.d omitted the line.
 fn lock_ledger_at(path: &str) -> Result<LedgerLock> {
+    lock_ledger_with(path, libc::LOCK_EX)
+}
+
+/// Shared-acquisition twin of `lock_ledger_at` for read-only ledger access
+/// (`rollback --list`): the preview's exists -> read pair must be atomic
+/// against every LOCK_EX holder — a rollback finalize deletes the ledger
+/// under that lock — but concurrent readers cost nothing, so LOCK_SH
+/// excludes the writers without serializing parallel listings.
+fn lock_ledger_shared_at(path: &str) -> Result<LedgerLock> {
+    lock_ledger_with(path, libc::LOCK_SH)
+}
+
+fn lock_ledger_with(path: &str, operation: i32) -> Result<LedgerLock> {
     let dir = Path::new(path)
         .parent()
         .context("rollback path has no parent")?;
@@ -643,7 +656,7 @@ fn lock_ledger_at(path: &str) -> Result<LedgerLock> {
         .mode(0o600)
         .open(&lock_path)
         .with_context(|| format!("打开 rollback 锁文件 {lock_path} 失败"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
         return Err(anyhow::anyhow!(
             "锁定 rollback 锁文件 {lock_path} 失败: {}",
             std::io::Error::last_os_error()
@@ -841,12 +854,29 @@ fn systemctl_quiet(args: &[&str]) {
 }
 
 pub fn rollback_preview() -> Result<Vec<(String, String, String)>> {
+    rollback_preview_at(ROLLBACK_PATH)
+}
+
+/// Read the pending rollback set for `--list` from the ledger at `path`.
+///
+/// The whole exists -> read pair runs under the ledger's lock, matching
+/// rollback_inner's transaction shape: a concurrent rollback finalize holds
+/// LOCK_EX while it deletes the ledger, so an unlocked preview could pass
+/// exists() and then lose the file to that delete before read_to_string —
+/// "empty pending" turned into a hard 读取 rollback 文件失败 error and a
+/// `--list` exit 2. A shared lock is enough: preview never writes, and every
+/// writer/finalizer takes LOCK_EX on the same `<ledger>.lock`, so LOCK_SH
+/// keeps them out of the window without serializing parallel listings.
+fn rollback_preview_at(path: &str) -> Result<Vec<(String, String, String)>> {
+    let _guard = lock_ledger_shared_at(path)?;
     // No ledger = nothing pending, which is not an error (a fresh install, or
     // a completed rollback): --list reports an empty pending set.
-    if !Path::new(ROLLBACK_PATH).exists() {
+    if !Path::new(path).exists() {
         return Ok(Vec::new());
     }
-    let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
+    #[cfg(test)]
+    tests::finalize_race_probe(path);
+    let json = fs::read_to_string(path).context("读取 rollback 文件失败")?;
     parse_rollback_entries(&json)
 }
 
@@ -1930,6 +1960,111 @@ mod tests {
         unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_UN) };
         drop(second);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Arm switch for `finalize_race_probe`, set only by the preview race
+    /// test so every other `rollback_preview_at` caller stays unaffected.
+    pub(super) static ARM_FINALIZE_RACE_PROBE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Test-only injection point inside `rollback_preview_at`'s exists ->
+    /// read_to_string window (the TOCTOU gap). Deterministic stand-in for a
+    /// concurrent `ktuner rollback` finalize racing the preview: the real
+    /// finalize may delete the ledger only while holding the exclusive
+    /// ledger lock (#5447's discipline), so this probe grabs LOCK_EX
+    /// non-blocking and deletes only if the grab succeeds. Against an
+    /// unlocked preview the grab succeeds and the delete lands inside the
+    /// window — the historical race; against the shared-locked preview the
+    /// grab fails and the finalize defers, exactly as a real blocking LOCK_EX
+    /// waiter would behind the preview's LOCK_SH.
+    pub(super) fn finalize_race_probe(path: &str) {
+        use std::sync::atomic::Ordering;
+        if !ARM_FINALIZE_RACE_PROBE.load(Ordering::SeqCst) {
+            return;
+        }
+        let lock_path = format!("{path}.lock");
+        let file = match fs::OpenOptions::new().write(true).open(&lock_path) {
+            Ok(file) => file,
+            Err(_) => return,
+        };
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            // Exclusive holder present (the preview's shared lock): a real
+            // finalize blocks here instead of deleting mid-window.
+            return;
+        }
+        let _ = fs::remove_file(path);
+        drop(file);
+    }
+
+    #[test]
+    fn test_rollback_preview_reports_pending_set() {
+        // Control: a normal preview is unchanged by the locking — the pending
+        // triples come back in (param, applied, previous) shape, BTreeMap order.
+        let dir = AtomicTestDir::new("preview-normal");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        merge_rollback_at(
+            path,
+            [
+                ("vm.swappiness".into(), "60".into(), "10".into()),
+                ("net.core.somaxconn".into(), "128".into(), "256".into()),
+            ],
+        )
+        .unwrap();
+        let entries = rollback_preview_at(path).unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                (
+                    "net.core.somaxconn".to_string(),
+                    "256".to_string(),
+                    "128".to_string()
+                ),
+                (
+                    "vm.swappiness".to_string(),
+                    "10".to_string(),
+                    "60".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_rollback_preview_empty_when_ledger_absent() {
+        // Control: the exit-0 empty case stays empty — no ledger is not an
+        // error, `--list` still reports an empty pending set.
+        let dir = AtomicTestDir::new("preview-absent");
+        let ledger = dir.0.join("rollback.json");
+        assert!(rollback_preview_at(ledger.to_str().unwrap())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn test_rollback_preview_survives_concurrent_finalize_delete() {
+        // A rollback finalize deletes the ledger under the exclusive lock; the
+        // preview's exists -> read pair must not straddle that delete. Unlocked
+        // (pre-fix), the probe's delete lands inside the window and the
+        // preview died with 读取 rollback 文件失败 (--list exit 2) instead of
+        // reporting the pending set.
+        use std::sync::atomic::Ordering;
+        let dir = AtomicTestDir::new("preview-race");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        ARM_FINALIZE_RACE_PROBE.store(true, Ordering::SeqCst);
+        let entries = rollback_preview_at(path)
+            .expect("preview must survive a concurrent finalize's delete window");
+        ARM_FINALIZE_RACE_PROBE.store(false, Ordering::SeqCst);
+        assert_eq!(
+            entries,
+            vec![(
+                "vm.swappiness".to_string(),
+                "10".to_string(),
+                "60".to_string()
+            )]
+        );
     }
 
     #[test]
