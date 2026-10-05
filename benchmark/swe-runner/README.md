@@ -496,6 +496,16 @@ Important files:
 | `analyze-traces/trace_summary.csv` | Per-instance summary metrics |
 | `analyze-traces/trace_metrics/trace_metrics.csv` | Detailed trace, tool-call, and token metrics |
 
+### Runner Provenance
+
+Each `run/input-manifests/*/input_manifest.json` records the runner's Git
+provenance under `runner`. `repo_root` is the actual Git worktree containing
+the swe-runner source, and `commit`, `dirty`, and `status_porcelain_sha256`
+are sampled when that manifest is generated, so later source edits or commits
+are reflected in later manifests. When the runner source is not inside a Git
+worktree (for example an installed copy), every `runner` field is `null`:
+provenance is unavailable rather than clean.
+
 ## Project Structure
 
 ```text

@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import logging
-from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +33,7 @@ from swe_runner.run.io.manifest_records import (
 )
 from swe_runner.run.prompting.prompt_resources import resolve_builtin_skill_path, resolve_custom_prompt_path
 from swe_runner.run.workspace.docker_refs import get_docker_image_name
-from swe_runner.run.workspace.git import get_git_revision, get_git_status_porcelain
+from swe_runner.run.workspace.git import get_git_revision, get_git_status_porcelain, git_worktree_root
 
 logger = logging.getLogger(__name__)
 
@@ -48,15 +47,29 @@ def _safe_manifest_component(value: str) -> str:
     return safe or "instance"
 
 
-@lru_cache(maxsize=1)
-def _runner_git_info() -> dict[str, Any]:
-    repo_root = Path(__file__).resolve().parents[3]
+def _runner_git_info(source_dir: Path | None = None) -> dict[str, Any]:
+    """Sample the runner's current Git provenance for one input manifest.
+
+    ``repo_root`` is the actual Git worktree containing the runner source
+    (``source_dir`` defaults to this module's directory), and every field is
+    sampled per call so later edits or commits are reflected. Outside a Git
+    worktree, for example an installed copy, all runner provenance fields are
+    reported as ``None`` because the current state is unavailable.
+    """
+    repo_root = git_worktree_root(source_dir or Path(__file__).resolve().parent, timeout=5)
+    if repo_root is None:
+        return {
+            "repo_root": None,
+            "commit": None,
+            "dirty": None,
+            "status_porcelain_sha256": None,
+        }
     status = get_git_status_porcelain(repo_root, timeout=5)
     return {
         "repo_root": str(repo_root),
         "commit": get_git_revision(repo_root, timeout=5),
-        "dirty": bool(status),
-        "status_porcelain_sha256": sha256_text(status or ""),
+        "dirty": bool(status) if status is not None else None,
+        "status_porcelain_sha256": sha256_text(status) if status is not None else None,
     }
 
 

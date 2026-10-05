@@ -96,6 +96,14 @@ def get_git_revision(work_dir: Path | None, *, timeout: float | None = None) -> 
     return _successful_stdout(["rev-parse", "HEAD"], work_dir=work_dir, timeout=timeout)
 
 
+def git_worktree_root(work_dir: Path | None, *, timeout: float | None = 5) -> Path | None:
+    """Return the Git worktree root containing *work_dir*, or ``None`` outside any worktree."""
+    if work_dir is None:
+        return None
+    output = _successful_stdout(["rev-parse", "--show-toplevel"], work_dir=work_dir, timeout=timeout)
+    return Path(output) if output else None
+
+
 def get_git_status_porcelain(work_dir: Path, *, timeout: float | None = 5) -> str | None:
     """Return ``git status --porcelain`` output, or ``None`` when git is unavailable."""
     return _successful_stdout(["status", "--porcelain"], work_dir=work_dir, timeout=timeout, empty_as_none=False)

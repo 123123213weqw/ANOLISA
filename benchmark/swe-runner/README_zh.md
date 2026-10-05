@@ -486,6 +486,15 @@ output/
 | `analyze-traces/trace_summary.csv` | 每个实例的汇总指标 |
 | `analyze-traces/trace_metrics/trace_metrics.csv` | 更细的 trace、工具调用和 token 指标 |
 
+### Runner 溯源信息
+
+每个 `run/input-manifests/*/input_manifest.json` 的 `runner` 字段记录
+swe-runner 源码的 Git 溯源信息。`repo_root` 是包含 swe-runner 源码的实际
+Git worktree 根目录；`commit`、`dirty` 和 `status_porcelain_sha256` 在生成
+该 manifest 时实时采样，因此后续的源码修改或提交会反映到之后的 manifest。
+当 runner 源码不在任何 Git worktree 内（例如安装后的副本）时，所有
+`runner` 字段均为 `null`：表示溯源信息不可用，而不是工作区干净。
+
 ## 项目结构
 
 ```text
