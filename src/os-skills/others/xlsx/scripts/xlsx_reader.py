@@ -75,10 +75,36 @@ def detect_and_load(file_path: str, sheet_name_filter: str | None = None) -> dic
         )
 
     elif suffix == ".xls":
-        raise ValueError(
-            ".xls is a legacy binary format not supported by this tool. "
-            "Please open the file in Excel and save as .xlsx, then retry."
+        # Optional legacy BIFF backend: xlrd is imported only on this path so
+        # modern OOXML and delimited inputs stay independent of it.
+        try:
+            import xlrd
+        except ImportError:
+            raise RuntimeError(
+                ".xls reading requires the optional xlrd backend. "
+                "Run: pip install 'xlrd>=2.0.1'"
+            )
+        version = tuple(
+            int(part) for part in xlrd.__version__.split(".")[:3]
         )
+        if version < (2, 0, 1):
+            raise RuntimeError(
+                f"Installed xlrd {xlrd.__version__} is outdated for legacy "
+                ".xls workbooks. Run: pip install --upgrade 'xlrd>=2.0.1'"
+            )
+        target = sheet_name_filter if sheet_name_filter else None
+        try:
+            result = pd.read_excel(file_path, sheet_name=target, engine="xlrd")
+        except ValueError:
+            # e.g. unknown worksheet name — already an actionable message.
+            raise
+        except Exception as e:
+            raise ValueError(
+                f"Cannot read legacy .xls workbook {file_path}: {e}"
+            ) from e
+        if isinstance(result, dict):
+            return result
+        return {sheet_name_filter: result}
 
     else:
         raise ValueError(
