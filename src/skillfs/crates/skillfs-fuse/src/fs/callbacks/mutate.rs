@@ -81,7 +81,9 @@ impl SkillFs {
         // write/open/setattr/symlink/link guards (write.rs) so `mkdir`
         // cannot create (or inject a store placeholder for) the reserved
         // virtual name or mutate its physical backing tree.
-        if let Some(errno) = enforce_skill_discover_readonly(&path_type) {
+        if let Some(errno) =
+            self.enforce_skill_discover_readonly(req, &path_type, SkillEventKind::Create)
+        {
             reply.error(errno);
             return;
         }
@@ -322,7 +324,9 @@ impl SkillFs {
         // write/open/setattr/symlink/link guards (write.rs) so `unlink`
         // cannot delete the physical backing tree through the virtual
         // view.
-        if let Some(errno) = enforce_skill_discover_readonly(&path_type) {
+        if let Some(errno) =
+            self.enforce_skill_discover_readonly(req, &path_type, SkillEventKind::Delete)
+        {
             reply.error(errno);
             return;
         }
@@ -526,7 +530,9 @@ impl SkillFs {
         // write/open/setattr/symlink/link guards (write.rs) so `rmdir`
         // cannot delete the physical backing tree through the virtual
         // view.
-        if let Some(errno) = enforce_skill_discover_readonly(&path_type) {
+        if let Some(errno) =
+            self.enforce_skill_discover_readonly(req, &path_type, SkillEventKind::Delete)
+        {
             reply.error(errno);
             return;
         }
@@ -760,11 +766,15 @@ impl SkillFs {
         // read-only namespace, and answering it with EXDEV would make
         // `mv` fall back to copy+unlink against the read-only side,
         // leaving a partial target behind.
-        if let Some(errno) = enforce_skill_discover_readonly(&old_path_type) {
+        if let Some(errno) =
+            self.enforce_skill_discover_readonly(req, &old_path_type, SkillEventKind::Rename)
+        {
             reply.error(errno);
             return;
         }
-        if let Some(errno) = enforce_skill_discover_readonly(&new_path_type) {
+        if let Some(errno) =
+            self.enforce_skill_discover_readonly(req, &new_path_type, SkillEventKind::Rename)
+        {
             reply.error(errno);
             return;
         }
@@ -1588,25 +1598,44 @@ impl SkillFs {
                 .unwrap_or(false)
         })
     }
-}
-
-/// `EROFS` gate for the always-read-only `skill-discover` virtual
-/// namespace on the namespace-mutation callbacks, mirroring the guard
-/// `write.rs` already applies to `write`/`create`/`setattr` and
-/// `link.rs` to `symlink`/`link`. `resolve_physical_path` maps every
-/// skill-discover FUSE path onto `source/skill-discover/...`, so an
-/// unguarded mkdir/unlink/rmdir/rename would mutate that physical tree
-/// through the read-only virtual view.
-fn enforce_skill_discover_readonly(path_type: &PathType) -> Option<i32> {
-    match path_type {
-        PathType::SkillMd { skill_name }
-        | PathType::SkillDir { skill_name }
-        | PathType::Passthrough { skill_name, .. }
-            if is_skill_discover_path(skill_name) =>
-        {
-            Some(libc::EROFS)
+    /// `EROFS` gate for the always-read-only `skill-discover` virtual
+    /// namespace on the namespace-mutation callbacks, mirroring the guard
+    /// `write.rs` already applies to `write`/`create`/`setattr` and
+    /// `link.rs` to `symlink`/`link`. `resolve_physical_path` maps every
+    /// skill-discover FUSE path onto `source/skill-discover/...`, so an
+    /// unguarded mkdir/unlink/rmdir/rename would mutate that physical tree
+    /// through the read-only virtual view.
+    ///
+    /// Every rejection leaves a `Rejected`/`EROFS` audit record tagged
+    /// `class=skill_discover` — the label the `symlink`/`link` gates in
+    /// `link.rs` already emit for the same namespace — so
+    /// mkdir/unlink/rmdir/rename probes against the read-only tree are
+    /// visible to audit consumers instead of failing silently.
+    fn enforce_skill_discover_readonly(
+        &self,
+        req: &Request,
+        path_type: &PathType,
+        kind: SkillEventKind,
+    ) -> Option<i32> {
+        match path_type {
+            PathType::SkillMd { skill_name }
+            | PathType::SkillDir { skill_name }
+            | PathType::Passthrough { skill_name, .. }
+                if is_skill_discover_path(skill_name) =>
+            {
+                self.emit_op_event_with_detail(
+                    req,
+                    path_type,
+                    kind,
+                    SkillEventAction::Rejected,
+                    Some(libc::EROFS),
+                    None,
+                    Some("class=skill_discover".to_string()),
+                );
+                Some(libc::EROFS)
+            }
+            _ => None,
         }
-        _ => None,
     }
 }
 
