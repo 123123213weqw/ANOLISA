@@ -7,6 +7,16 @@ on:
       - 'release/agent-sec-core/**'
     paths:
       - 'src/agent-sec-core/**'
+      - 'scripts/rpm-build.sh'
+      - '.github/actions/package-source/**'
+      - '.github/actions/package-vendor/**'
+      - '.github/workflows/sec-core-rpmbuild.yaml'
+  push:
+    branches:
+      - main
+    paths:
+      - 'src/agent-sec-core/**'
+      - 'scripts/rpm-build.sh'
       - '.github/actions/package-source/**'
       - '.github/actions/package-vendor/**'
       - '.github/workflows/sec-core-rpmbuild.yaml'
