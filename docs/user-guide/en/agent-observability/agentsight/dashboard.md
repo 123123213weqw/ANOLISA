@@ -146,6 +146,14 @@ The export omits tool content and uses UTF-8 with a BOM for spreadsheet compatib
 Text beginning with a spreadsheet formula prefix is prefixed with an apostrophe.
 Export is disabled while querying, after a query error, or when there are no sessions.
 
+To compare a subset, check the box on each session row (or the box in the table header
+to select or clear every session) and press **Export Selected (N)**. The download uses
+the same columns, escaping, units and file lifecycle as the full export, keeps the
+displayed row order, and reads only the already loaded results — it never issues another
+request. Checking a box does not expand or collapse the row; the selection is keyed by
+session ID, and it is cleared whenever a new successful query replaces the snapshot.
+The button stays disabled while querying, after a query error, or while nothing is selected.
+
 ## Optimization
 
 Runs LLM-assisted analysis over one session in six dimensions: `perf`, `perf-issues`, `cost`,
