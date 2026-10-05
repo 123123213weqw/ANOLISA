@@ -90,10 +90,19 @@ impl std::fmt::Display for RuntimeEnv {
 }
 
 pub fn detect_runtime_env() -> RuntimeEnv {
-    if Path::new("/.dockerenv").exists() || Path::new("/run/.containerenv").exists() {
+    runtime_env_from(Path::new("/"))
+}
+
+/// Classify the runtime from the filesystem rooted at `root` (`/` in
+/// production; a temp dir in tests).
+fn runtime_env_from(root: &Path) -> RuntimeEnv {
+    if root.join(".dockerenv").exists() || root.join("run/.containerenv").exists() {
         return RuntimeEnv::Container;
     }
-    if let Ok(cgroup) = fs::read_to_string("/proc/1/cgroup") {
+    // Both files are read lossily: cgroup paths and PID 1's comm (the first
+    // token of /proc/1/sched) may hold non-UTF-8 bytes, which made
+    // `read_to_string` skip the check and report a container as `BareHost`.
+    if let Some(cgroup) = read_text_lossy(&root.join("proc/1/cgroup")) {
         if cgroup.contains("docker")
             || cgroup.contains("kubepods")
             || cgroup.contains("containerd")
@@ -107,7 +116,7 @@ pub fn detect_runtime_env() -> RuntimeEnv {
     // OpenRC, ...), so whitelist those to avoid misclassifying them as
     // containers (which would wrongly mark params read-only and steer the user
     // to the host-export workflow).
-    if let Ok(sched) = fs::read_to_string("/proc/1/sched") {
+    if let Some(sched) = read_text_lossy(&root.join("proc/1/sched")) {
         const KNOWN_INIT: &[&str] = &[
             "systemd",
             "init",
@@ -126,6 +135,11 @@ pub fn detect_runtime_env() -> RuntimeEnv {
         }
     }
     RuntimeEnv::BareHost
+}
+
+fn read_text_lossy(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 pub fn is_param_writable(path: &str) -> bool {
@@ -1195,6 +1209,32 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `/proc/1/sched` starts with PID 1's comm, which may hold non-UTF-8
+    /// bytes (set via prctl), and a cgroup path may too; `read_to_string`
+    /// rejected such a file, so a container fell through to `BareHost`.
+    #[test]
+    fn runtime_env_survives_non_utf8_pid1_files() {
+        let root = std::env::temp_dir().join(format!("ktuner_runtime_{}", std::process::id()));
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+
+        // Unknown init whose comm carries a raw byte, plain cgroup v2 path.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"app\xff (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Known init, but the container marker sits in a non-UTF-8 cgroup path.
+        fs::write(proc1.join("cgroup"), b"0::/kubepods/pod\xff\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Guard: a known init with a plain cgroup is still a bare host.
+        fs::write(proc1.join("cgroup"), b"0::/init.scope\n").expect("write cgroup");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// Wait until a freshly spawned child's `/proc/<pid>/cmdline` carries
