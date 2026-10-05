@@ -723,7 +723,7 @@ def _download_fixtures_archive() -> bool:
 
 
 _FIXTURE_DOWNLOAD_SCRIPT = '''\
-import os, sys
+import os, re, sys
 import httpx
 from pathlib import Path
 
@@ -749,7 +749,26 @@ try:
     with httpx.stream("GET", url, headers=headers,
                       follow_redirects=True, timeout=60.0) as resp:
         if resp.status_code == 416:
-            pass  # .part is already complete
+            # Unsatisfied range (RFC 9110 section 14.4/15.5.17): the partial
+            # counts as complete only when a syntactically valid
+            # "Content-Range: <unit> */<complete-length>" header (unit name
+            # case-insensitive) declares a byte length the nonempty partial
+            # already matches exactly. Promote the existing partial without
+            # reading the 416 error body; otherwise fail and keep the partial
+            # for resume. This is a byte-length check, not a content checksum.
+            m = re.match(r"^\\s*([A-Za-z]+)\\s+\\*/([0-9]+)\\s*$",
+                         resp.headers.get("content-range", ""))
+            if resume_from > 0 and m and m.group(1).lower() == "bytes" \\
+                    and int(m.group(2)) == resume_from:
+                part.replace(archive)
+                print(f"  \\u2705 downloaded: {{archive}} "
+                      f"({{archive.stat().st_size / 1e9:.2f}} GB)", flush=True)
+                sys.exit(0)
+            print("  \\u274c download failed: HTTP 416 without a matching "
+                  "unsatisfied-range length", flush=True)
+            print(f"     URL: {{url}}", flush=True)
+            print("     Partial file kept for resume; re-run to continue.", flush=True)
+            sys.exit(1)
         elif resp.status_code not in (200, 206):
             print(f"  \\u274c download failed: HTTP {{resp.status_code}}", flush=True)
             print(f"     URL: {{url}}", flush=True)
