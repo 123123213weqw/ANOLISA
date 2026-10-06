@@ -562,7 +562,7 @@ fn write_atomic_with(
 fn save_rollback(guard: &LedgerLock, recommendations: &[Recommendation]) -> Result<()> {
     merge_rollback_locked(
         guard,
-        ROLLBACK_PATH,
+        &guard.path,
         recommendations.iter().map(|r| {
             (
                 r.param.clone(),
@@ -619,6 +619,11 @@ where
 /// released when the descriptor closes on drop; the file itself stays on
 /// disk (flock state belongs to the open descriptor, not the file).
 struct LedgerLock {
+    /// The ledger path this guard was taken for. Writers derive the file
+    /// they mutate from the lock they hold, so a guard taken over a private
+    /// fixture ledger (the unit tests) steers every write back to that
+    /// fixture instead of the production `ROLLBACK_PATH` constant.
+    path: String,
     _file: fs::File,
 }
 
@@ -665,7 +670,10 @@ fn lock_ledger_with(path: &str, operation: i32) -> Result<LedgerLock> {
             std::io::Error::last_os_error()
         ));
     }
-    Ok(LedgerLock { _file: file })
+    Ok(LedgerLock {
+        path: path.to_string(),
+        _file: file,
+    })
 }
 
 #[cfg(test)]
@@ -803,9 +811,11 @@ fn render_persistence(
 /// which is the single source of truth for everything ktuner has applied. This
 /// keeps persistence cumulative across runs (previously each run overwrote the
 /// files with only its own batch, silently dropping earlier params) and never
-/// persists a param that failed to apply (those are not in the record).
-fn persist_from_rollback(_guard: &LedgerLock) -> Result<()> {
-    let data = load_rollback()?;
+/// persists a param that failed to apply (those are not in the record). The
+/// record is read from the ledger the transaction's lock guards, so a fixture
+/// lock renders its own ledger and never the production one.
+fn persist_from_rollback(guard: &LedgerLock) -> Result<()> {
+    let data = load_rollback_from(&guard.path)?;
     let (sysctl_content, nonsysctl_script) = render_persistence(&data.entries);
 
     if let Some(sysctl_content) = sysctl_content {
@@ -2053,6 +2063,86 @@ mod tests {
         unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_UN) };
         drop(second);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    fn fixture_guard_body() {
+        // The guard points at a private ledger OUTSIDE the mounted fixtures;
+        // the production constant is bind-mounted to an empty fixture here.
+        let guard_dir =
+            std::env::temp_dir().join(format!("ktuner-fixture-guard-{}", std::process::id()));
+        let guard_ledger = guard_dir.join("rollback.json");
+        let guard = lock_ledger_at(guard_ledger.to_str().unwrap()).unwrap();
+        let recs = [Recommendation {
+            param: "net.core.somaxconn".to_string(),
+            current_value: "stale gathered value".to_string(),
+            recommended_value: "65535".to_string(),
+            writable: true,
+            ..Default::default()
+        }];
+        let outcome = apply_locked(&recs, true, &guard).expect("fixture-guarded apply");
+        assert_eq!(outcome.applied, 1);
+        assert!(outcome.clamped.is_empty());
+        // The entry followed the LOCK, not the production constant: a
+        // fixture-guarded transaction publishes its ledger beside its own
+        // lockfile, which is the whole point of f56776d7c's fixture locks —
+        // otherwise a successful apply in a test would silently write
+        // /var/lib/ktuner/rollback.json.
+        let data = load_rollback_from(guard_ledger.to_str().unwrap()).unwrap();
+        let entry = &data.entries["net.core.somaxconn"];
+        assert_eq!(entry.previous, "1024");
+        assert_eq!(entry.applied, "65535");
+        assert!(
+            !Path::new(ROLLBACK_PATH).exists(),
+            "a fixture guard must not write the production ledger"
+        );
+        // Persistence rendered from the guard's own ledger into /etc (also a
+        // fixture under the mount namespace).
+        assert!(fs::read_to_string(SYSCTL_PERSIST_PATH)
+            .unwrap()
+            .contains("65535"));
+        let _ = fs::remove_dir_all(&guard_dir);
+    }
+
+    #[test]
+    #[ignore = "requires root and private mount namespaces; only fixture files are written"]
+    fn fixture_guard_keeps_the_ledger_private() {
+        if std::env::var_os("KTUNER_FIXTURE_CHILD").is_some() {
+            fixture_guard_body();
+            return;
+        }
+        assert_eq!(unsafe { libc::geteuid() }, 0);
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner-fixture-guard-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(dir.join("varlib")).unwrap();
+        fs::create_dir_all(dir.join("etc/sysctl.d")).unwrap();
+        fs::write(dir.join("somaxconn"), "1024").unwrap();
+        let before = fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap();
+        let out = std::process::Command::new("unshare")
+            .env("KTUNER_FIXTURE_CHILD", "1")
+            .args(["--mount", "--propagation", "private", "sh", "-ec",
+                "mount --bind \"$1/varlib\" /var/lib; mount --bind \"$1/etc\" /etc; mount --bind \"$1/somaxconn\" /proc/sys/net/core/somaxconn; exec \"$2\" --exact tuner::tests::fixture_guard_keeps_the_ledger_private --ignored --nocapture",
+                "fixture-guard-test"])
+            .arg(&dir)
+            .arg(std::env::current_exe().unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string("/proc/sys/net/core/somaxconn").unwrap(),
+            before
+        );
+        let _ = fs::remove_dir_all(&dir);
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 
     /// Arm switch for `finalize_race_probe`, set only by the preview race
