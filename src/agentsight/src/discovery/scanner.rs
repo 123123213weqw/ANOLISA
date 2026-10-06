@@ -223,8 +223,14 @@ impl AgentScanner {
 
     /// Attempt to match a process against known agents
     pub fn try_match_process(&self, pid: u32) -> Option<DiscoveredAgent> {
-        // Read process name from <procfs root>/[pid]/comm
-        let comm = read_comm_from(&proc_pid_entry(pid, "comm"))?;
+        // Read process name from <procfs root>/[pid]/comm. The kernel allows
+        // non-NUL non-UTF-8 bytes in a comm (fb944ddb), and it also allows an
+        // empty one (`prctl(PR_SET_NAME, "")`): the `read_to_string` this
+        // replaced read such a file back as `Ok("")` and discovery still fell
+        // through to the cmdline rules, while `read_comm_from` collapses
+        // "empty" into "unreadable" and the `?` then dropped the pid before
+        // the cmdline rules ever ran. Keep the two cases distinct.
+        let comm = read_comm_text(&proc_pid_entry(pid, "comm"))?;
         let process_name = comm.trim().to_string();
 
         // Read full command line from <procfs root>/[pid]/cmdline
@@ -297,6 +303,21 @@ fn read_comm_from(path: &Path) -> Option<String> {
 /// the *process* name (main-thread comm), not a per-event worker-thread name.
 pub fn read_comm(pid: u32) -> Option<String> {
     read_comm_from(&proc_pid_entry(pid, "comm"))
+}
+
+/// Read the raw comm text of a `<procfs root>/<pid>/comm` path, untrimmed.
+///
+/// The same non-UTF-8 argument as [`read_comm_from`] applies (the kernel
+/// allows almost any non-NUL bytes in a comm, so `read_to_string` rejects the
+/// whole file), but [`try_match_process`] historically distinguishes "file
+/// unreadable" (give up on the pid) from "file readable but empty" (continue
+/// with an empty comm and let the cmdline rules decide), so this variant keeps
+/// both: `None` only when the file cannot be read, the untrimmed lossy text
+/// otherwise.
+fn read_comm_text(path: &Path) -> Option<String> {
+    fs::read(path)
+        .ok()
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Read and parse a process's cmdline
@@ -521,6 +542,58 @@ mod tests {
         assert!(read_comm_from(&comm_path).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `try_match_process` must not give up on a pid whose comm carries
+    /// non-UTF-8 bytes, and it must keep the "readable but empty" meaning:
+    /// the raw read survives the invalid byte (the strict `read_to_string`
+    /// returned None and dropped the pid), while an empty comm stays
+    /// `Some("")` so the cmdline rules still get their chance -- the
+    /// distinction `read_comm_from` collapses into a single `None`.
+    #[test]
+    fn read_comm_text_survives_non_utf8_bytes_and_keeps_empty_means_continue() {
+        let dir = std::env::temp_dir().join(format!("agentsight_comm_text_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let comm_path = dir.join("comm");
+
+        // "qoder" followed by an invalid UTF-8 byte and the trailing newline
+        // the kernel writes.
+        fs::write(&comm_path, b"qoder\xa0\n").expect("write non-UTF-8 comm");
+        let comm = read_comm_text(&comm_path).expect("a non-UTF-8 comm must still be readable");
+        assert_eq!(comm.trim(), "qoder\u{fffd}");
+
+        // An empty comm file keeps the "continue with an empty name" meaning:
+        // the cmdline rules must still get their chance.
+        fs::write(&comm_path, b"").expect("write empty comm");
+        assert_eq!(read_comm_text(&comm_path).as_deref(), Some(""));
+
+        // An unreadable file (pid gone) is still None.
+        assert!(read_comm_text(&dir.join("missing")).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_match_still_uses_cmdline_rules_when_the_comm_is_lossy() {
+        // Downstream of the lossy read: a comm carrying U+FFFD -- or the empty
+        // name an empty comm file leaves behind -- does not look like any
+        // exact name, but the cmdline rules are the scan path's other
+        // strategy, so the pid must not be dropped before they run.
+        let rules = vec![crate::config::CmdlineRule {
+            patterns: vec!["node*".to_string(), "*agent*".to_string()],
+            agent_name: Some("Agent".to_string()),
+            allow: true,
+        }];
+        let scanner = AgentScanner::from_rules(&rules, &[]);
+        let ctx = ProcessContext {
+            comm: "qoder\u{fffd}".to_string(),
+            cmdline_args: vec!["node".to_string(), "/usr/lib/agent/cli.js".to_string()],
+            exe_path: String::new(),
+        };
+        assert_eq!(
+            scanner.find_match(&ctx).map(|i| i.name),
+            Some("Agent".to_string())
+        );
     }
 
     #[test]
