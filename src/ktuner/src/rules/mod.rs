@@ -580,19 +580,45 @@ fn eval_tcp_fastopen(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     if !info.param_exists("/proc/sys/net/ipv4/tcp_fastopen") {
         return 1;
     }
-
-    if info.has_listen_sockets() && info.sysctl.tcp_fastopen < 3 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_fastopen".to_string(),
-            current_value: info.sysctl.tcp_fastopen.to_string(),
-            recommended_value: "3".to_string(),
-            reason: "启用 TCP Fast Open（客户端+服务端）减少连接建立延迟".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if !info.has_listen_sockets() {
+        return 1;
+    }
+    if let Some(rec) = tcp_fastopen_recommendation(info.sysctl.tcp_fastopen) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the `net.ipv4.tcp_fastopen` rule, split from the live
+/// probe so every branch is assertable on any host (the sysctl is read from
+/// the real `/proc`).
+///
+/// The sysctl is a bitmask (`include/net/tcp.h`): 0x1 enables the client,
+/// 0x2 the server, and 0x400 forces TFO on all listeners, "i.e., not
+/// requiring the TCP_FASTOPEN socket option". Passive TFO needs 0x2 AND
+/// 0x400 together: `__inet_listen_sk` only fills a listener's
+/// `fastopenq.max_qlen` when both are set, and `tcp_fastopen_queue_check`
+/// then refuses every SYN that carries data while that length is still 0.
+/// The rule used to recommend 3 and treat any value >= 3 as done, so on the
+/// host it had just tuned, a listener that never called the TCP_FASTOPEN
+/// socket option got no passive TFO at all — the opposite of what the reason
+/// promised. The value is written as a whole word, so flags the
+/// administrator set (0x4 `TFO_CLIENT_NO_COOKIE`, 0x200
+/// `TFO_SERVER_COOKIE_NOT_REQD`, ...) are kept rather than cleared.
+fn tcp_fastopen_recommendation(current: u64) -> Option<Recommendation> {
+    const REQUIRED: u64 = 0x1 | 0x2 | 0x400;
+    if current & REQUIRED == REQUIRED {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_fastopen".to_string(),
+        current_value: current.to_string(),
+        recommended_value: (current | REQUIRED).to_string(),
+        reason: "启用 TCP Fast Open 的客户端与服务端，并让未调用 TCP_FASTOPEN socket 选项的监听套接字也生效（内核要求 0x400，仅写 3 时服务端 TFO 实际不生效）".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_min_free_kbytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -5859,6 +5885,50 @@ mod tests {
     use crate::detect::*;
 
     #[test]
+    fn tcp_fastopen_requires_the_all_listeners_flag() {
+        // 0x1|0x2 is the value this rule used to write. Passive (server-side)
+        // TFO needs 0x400 as well: __inet_listen_sk only fills a listener's
+        // fastopenq.max_qlen when 0x2 AND 0x400 are both set, and
+        // tcp_fastopen_queue_check refuses every SYN with data while that
+        // length is 0 — so a listener that never called the TCP_FASTOPEN
+        // socket option got no passive TFO from a host at 3.
+        let rec = tcp_fastopen_recommendation(3).expect("3 does not enable server TFO");
+        assert_eq!(rec.current_value, "3");
+        assert_eq!(rec.recommended_value, "1027");
+        assert_eq!(rec.param, "net.ipv4.tcp_fastopen");
+    }
+
+    #[test]
+    fn tcp_fastopen_completes_the_kernel_default() {
+        // Default 0x1 (client only): both the server flag and the
+        // all-listeners flag are missing.
+        let rec = tcp_fastopen_recommendation(1).expect("the kernel default is incomplete");
+        assert_eq!(rec.recommended_value, "1027");
+        // Server only.
+        let rec = tcp_fastopen_recommendation(2).expect("server without 0x400 is incomplete");
+        assert_eq!(rec.recommended_value, "1027");
+    }
+
+    #[test]
+    fn tcp_fastopen_keeps_the_flags_the_host_set() {
+        // 0x4 is TFO_CLIENT_NO_COOKIE and 0x200 is
+        // TFO_SERVER_COOKIE_NOT_REQD; the sysctl is written as one word, so a
+        // recommendation must not clear a flag the administrator chose.
+        let rec = tcp_fastopen_recommendation(0x4).expect("0x4 alone is incomplete");
+        assert_eq!(rec.recommended_value, "1031");
+        // 0x201 | 0x1|0x2|0x400 = 0x603: the 0x200 flag survives too.
+        let rec = tcp_fastopen_recommendation(0x200 | 0x1).expect("0x200|0x1 is incomplete");
+        assert_eq!(rec.recommended_value, "1539");
+    }
+
+    #[test]
+    fn tcp_fastopen_is_silent_once_every_required_flag_is_set() {
+        assert!(tcp_fastopen_recommendation(0x1 | 0x2 | 0x400).is_none());
+        // Extra flags on top of the required set stay complete.
+        assert!(tcp_fastopen_recommendation(0x1 | 0x2 | 0x4 | 0x200 | 0x400).is_none());
+    }
+
+    #[test]
     fn sem_recommendation_only_raises_fields() {
         // Everything at or above the floors: no recommendation.
         assert_eq!(sem_recommendation(&[32000, 1024000000, 500, 32000]), None);
@@ -6272,7 +6342,11 @@ mod tests {
         info.sysctl.dirty_ratio = 10;
         info.sysctl.dirty_background_ratio = 5;
         info.sysctl.somaxconn = 65535;
-        info.sysctl.tcp_fastopen = 3;
+        // 0x1|0x2|0x400: client, server, and TFO on every listener without
+        // the TCP_FASTOPEN socket option. 3 (0x1|0x2) is NOT optimal — the
+        // kernel only pre-fills a listener's fastopenq.max_qlen when 0x400 is
+        // set too, so passive TFO silently stays off.
+        info.sysctl.tcp_fastopen = 0x403;
         info.processes = vec![];
         info.network = vec![];
 
