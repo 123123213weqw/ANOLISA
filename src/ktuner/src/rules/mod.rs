@@ -838,22 +838,64 @@ fn eval_tcp_max_syn_backlog(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
     if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
-        return 1;
-    }
-    let current = read_sysctl_u64(path);
-    if current < 8192 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_max_syn_backlog".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "65536".to_string(),
-            reason: "增大半连接队列，避免突发连接请求时 SYN 被丢弃".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = syn_backlog_recommendation(
+        read_sysctl_u64(path),
+        read_sysctl_u64("/proc/sys/net/ipv4/tcp_syncookies"),
+        info.has_listen_sockets(),
+    ) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the syn-backlog rule (the `*_recommendation` idiom):
+/// every input the branch needs is a parameter, so the gate is assertable on
+/// any host instead of only on one that happens to have a listener and
+/// disabled syncookies.
+///
+/// The knob has exactly one reader in v6.6: the last-quarter reservation in
+/// `tcp_conn_request()` (net/ipv4/tcp_input.c):
+///
+/// ```text
+///    if (!want_cookie && !isn) {
+///        int max_syn_backlog = READ_ONCE(net->ipv4.sysctl_max_syn_backlog);
+///
+///        /* Kill the following clause, if you dislike this way. */
+///        if (!syncookies &&
+///            (max_syn_backlog - inet_csk_reqsk_queue_len(sk) <
+///             (max_syn_backlog >> 2)) &&
+///            !tcp_peer_is_proven(req, dst)) {
+///            ... goto drop_and_release;
+///        }
+/// ```
+///
+/// and the clause is skipped entirely while syncookies are enabled — the
+/// kernel default (tcp_ipv4.c: `net->ipv4.sysctl_tcp_syncookies = 1`) and what
+/// this engine's own `net.ipv4.tcp_syncookies` rule asks for. The request queue
+/// itself is bounded by `sk_max_ack_backlog`
+/// (`inet_csk_reqsk_queue_is_full`), i.e. the listener backlog capped by
+/// `net.core.somaxconn`, so on a syncookie host this knob sizes nothing and the
+/// reason's promise ("避免突发连接请求时 SYN 被丢弃") cannot be delivered by
+/// writing it. A host that turned syncookies off still reads it — including a
+/// kernel built without CONFIG_SYN_COOKIES, where the file is absent and the
+/// read falls back to 0 — so only the enabled case is skipped.
+fn syn_backlog_recommendation(
+    current: u64,
+    syncookies: u64,
+    has_listen_sockets: bool,
+) -> Option<Recommendation> {
+    if !has_listen_sockets || syncookies != 0 || current >= 8192 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_max_syn_backlog".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "65536".to_string(),
+        reason: "增大半连接队列，避免突发连接请求时 SYN 被丢弃".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_rmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -8023,6 +8065,40 @@ mod tests {
         {
             assert_eq!(rec.recommended_value, "3");
         }
+    }
+
+    #[test]
+    fn syn_backlog_is_only_worth_sizing_where_the_kernel_reads_it() {
+        // tcp_input.c reads sysctl_max_syn_backlog in exactly one place: the
+        // last-quarter reservation inside tcp_conn_request(), guarded by
+        // `!syncookies`. Syncookies are on by default (tcp_ipv4.c sets 1) and
+        // are what this engine's own tcp_syncookies rule asks for, so the
+        // shape the rule used to fire on — a listener host with the default
+        // 1024 — cannot read the value at all; the request queue is bounded by
+        // sk_max_ack_backlog / net.core.somaxconn instead.
+        assert!(
+            syn_backlog_recommendation(1024, 0, true).is_some(),
+            "a syncookie-less listener host still reads the knob"
+        );
+        for syncookies in [1, 2] {
+            assert!(
+                syn_backlog_recommendation(1024, syncookies, true).is_none(),
+                "syncookies={syncookies} skips the only reader of the knob"
+            );
+        }
+        assert!(
+            syn_backlog_recommendation(1024, 0, false).is_none(),
+            "no listener means no request queue to size"
+        );
+        assert!(
+            syn_backlog_recommendation(8192, 0, true).is_none(),
+            "an adequate backlog stays untouched"
+        );
+
+        let rec = syn_backlog_recommendation(1024, 0, true).expect("recommendation");
+        assert_eq!(rec.param, "net.ipv4.tcp_max_syn_backlog");
+        assert_eq!(rec.current_value, "1024");
+        assert_eq!(rec.recommended_value, "65536");
     }
 
     #[test]
