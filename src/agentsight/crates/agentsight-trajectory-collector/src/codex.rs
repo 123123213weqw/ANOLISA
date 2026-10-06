@@ -309,6 +309,14 @@ pub fn extract_private_metadata(
         .iter()
         .any(|e| envelope_type(e) == "event_msg" && payload_type(e) == "user_message");
 
+    // The converter merges every assistant event of one LLM turn (reasoning,
+    // tool calls, several messages) into a single agent step, so the count
+    // must count TURNS, not message items — the same contract
+    // `qoder::extract_private_metadata` upholds since 9df75a971. A turn ends
+    // exactly where the converter flushes: at a `user_message` event, or at a
+    // legacy role=user response_item (message-less ones flush too).
+    let mut in_assistant_turn = false;
+
     for e in events {
         let payload = e.get("payload").unwrap_or(&serde_json::Value::Null);
         match envelope_type(e) {
@@ -324,6 +332,7 @@ pub fn extract_private_metadata(
             // agree with the steps it contains, so an event that produces no
             // step must not be counted either (see `convert_codex_events`).
             "event_msg" if payload_type(e) == "user_message" => {
+                in_assistant_turn = false;
                 let text = payload
                     .get("message")
                     .and_then(|v| v.as_str())
@@ -335,18 +344,21 @@ pub fn extract_private_metadata(
             "response_item" if payload_type(e) == "message" => {
                 let role = payload.get("role").and_then(|v| v.as_str());
                 if role == Some("assistant") && !joined_text(payload.get("content")).is_empty() {
-                    assistant_count += 1;
+                    if !in_assistant_turn {
+                        assistant_count += 1;
+                        in_assistant_turn = true;
+                    }
                 }
                 // Legacy fallback (no event_msg/user_message in the whole
                 // rollout): the converter derives the user steps from
                 // role=user response_items, so the count must follow the same
                 // fallback; message-less items produce no step and are not
-                // counted.
-                if !has_user_event_msg
-                    && role == Some("user")
-                    && !joined_text(payload.get("content")).is_empty()
-                {
-                    user_count += 1;
+                // counted. Either way the converter flushed the agent turn.
+                if !has_user_event_msg && role == Some("user") {
+                    in_assistant_turn = false;
+                    if !joined_text(payload.get("content")).is_empty() {
+                        user_count += 1;
+                    }
                 }
             }
             _ => {}
@@ -763,6 +775,35 @@ mod tests {
             (counted_user, counted_assistant),
             (user_steps as u64, assistant_messages as u64),
             "the counts must describe the trajectory they ride on"
+        );
+    }
+
+    /// One LLM turn can carry several assistant message items (text split
+    /// across response_items, reasoning between them, tool outputs). The
+    /// converter merges them into ONE agent step, and the count that rides
+    /// in `extra` must describe that trajectory — the same contract
+    /// `qoder::extract_private_metadata` upholds.
+    #[test]
+    fn test_extract_private_metadata_counts_assistant_turns_like_the_trajectory() {
+        let content = concat!(
+            "{\"timestamp\":\"2026-08-03T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"s-5\",\"cwd\":\"/w/app\",\"cli_version\":\"0.1.0\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"hello\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"part one\"}]}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"thinking\"}]}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"part two\"}]}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let traj = convert_codex_events(&events, "codex").unwrap();
+        let agent_steps = traj
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::Agent)
+            .count();
+        assert_eq!(agent_steps, 1, "both messages are one LLM turn");
+        let extra = extract_private_metadata(&events, "app");
+        assert_eq!(
+            extra["assistant_message_count"], agent_steps as i64,
+            "the count must describe the trajectory it rides on"
         );
     }
 
