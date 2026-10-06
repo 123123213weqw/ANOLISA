@@ -2834,21 +2834,37 @@ fn eval_tcp_challenge_ack_limit(_info: &SystemInfo, recs: &mut Vec<Recommendatio
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current <= 100 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_challenge_ack_limit".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "999999999".to_string(),
-            reason:
-                "默认值 100 存在 CVE-2016-5696 边信道攻击风险，攻击者可推断 TCP 连接状态并注入数据"
-                    .to_string(),
-            confidence: Confidence::High,
-            category: Category::Security,
-            writable: true,
-        });
+    if let Some(rec) = challenge_ack_limit_recommendation(read_sysctl_u64(path)) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the challenge-ACK rule, split from the live probe so
+/// the boundary and the value the kernel special-cases are assertable on any
+/// host.
+///
+/// `tcp_send_challenge_ack` (`net/ipv4/tcp_input.c`) reads this sysctl into a
+/// u32 and takes the unlimited path only at `INT_MAX`
+/// (`if (ack_limit == INT_MAX) goto send_ack;`); every other value installs
+/// the randomized per-second budget that the CVE-2016-5696 side channel
+/// measures, and `tcp_ipv4.c` initializes the sysctl to `INT_MAX`. The reason
+/// used to warn about a default of 100, which no kernel sets; the
+/// recommendation was 999999999, which still installs the limiter.
+fn challenge_ack_limit_recommendation(current: u64) -> Option<Recommendation> {
+    if current > 100 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_challenge_ack_limit".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "2147483647".to_string(),
+        reason: "该上限被设得很低：内核只把 INT_MAX 当作不限速，更小的值会启用每秒随机预算的 RFC 5961 限速，攻击者可据此推断 TCP 连接状态（CVE-2016-5696）；内核默认本就是 INT_MAX"
+            .to_string(),
+        confidence: Confidence::High,
+        category: Category::Security,
+        writable: true,
+    })
 }
 
 fn eval_rp_filter_all(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -3186,20 +3202,32 @@ fn eval_unix_max_dgram_qlen(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current < 1024 {
-        recs.push(Recommendation {
-            param: "net.unix.max_dgram_qlen".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "1024".to_string(),
-            reason: "Unix socket 数据报队列默认 512 太小，systemd/journald 等高负载下可能丢失消息"
-                .to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = max_dgram_qlen_recommendation(read_sysctl_u64(path)) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the unix datagram queue rule, split from the live
+/// probe so the recommendation is assertable on any host.
+///
+/// The kernel default is 10, not the 512 the reason used to cite:
+/// `unix_net_init` (`net/unix/af_unix.c`) sets `sysctl_max_dgram_qlen = 10`
+/// for every net namespace.
+fn max_dgram_qlen_recommendation(current: u64) -> Option<Recommendation> {
+    if current >= 1024 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.unix.max_dgram_qlen".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "1024".to_string(),
+        reason: "Unix socket 数据报队列上限默认只有 10，systemd/journald 等高负载下可能丢失消息"
+            .to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_rps_sock_flow_entries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7809,10 +7837,49 @@ mod tests {
             .iter()
             .find(|r| r.param == "net.ipv4.tcp_challenge_ack_limit")
         {
-            assert_eq!(rec.recommended_value, "999999999");
+            assert_eq!(rec.recommended_value, "2147483647");
             assert_eq!(rec.confidence, Confidence::High);
             assert_eq!(rec.category, Category::Security);
         }
+    }
+
+    #[test]
+    fn challenge_ack_limit_recommends_the_unlimited_sentinel() {
+        // tcp_send_challenge_ack (net/ipv4/tcp_input.c) takes the unlimited
+        // path only at INT_MAX (`if (ack_limit == INT_MAX) goto send_ack;`);
+        // every other value installs the randomized per-second budget the
+        // side channel measures. 999999999 still installs it, so the
+        // recommendation is the value the kernel checks.
+        let rec = challenge_ack_limit_recommendation(100).expect("a 100/second cap is a finding");
+        assert_eq!(rec.current_value, "100");
+        assert_eq!(rec.recommended_value, "2147483647");
+        // The reason used to warn about a default of 100; tcp_ipv4.c
+        // initializes the sysctl to INT_MAX, so no such default exists.
+        assert!(
+            !rec.reason.contains("默认值 100"),
+            "reason must not cite a default the kernel does not have: {}",
+            rec.reason
+        );
+        // The kernel default is already the recommendation.
+        assert!(challenge_ack_limit_recommendation(2147483647).is_none());
+        // The boundary itself is unchanged.
+        assert!(challenge_ack_limit_recommendation(101).is_none());
+        assert!(challenge_ack_limit_recommendation(0).is_some());
+    }
+
+    #[test]
+    fn max_dgram_qlen_quotes_the_kernel_default() {
+        // unix_net_init (net/unix/af_unix.c) sets sysctl_max_dgram_qlen = 10,
+        // not the 512 the reason used to cite.
+        let rec = max_dgram_qlen_recommendation(10).expect("the kernel default is a finding");
+        assert_eq!(rec.recommended_value, "1024");
+        assert!(
+            !rec.reason.contains("默认 512"),
+            "reason must not cite a default the kernel does not have: {}",
+            rec.reason
+        );
+        assert!(max_dgram_qlen_recommendation(1024).is_none());
+        assert!(max_dgram_qlen_recommendation(1023).is_some());
     }
 
     #[test]
