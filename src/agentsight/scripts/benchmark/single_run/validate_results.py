@@ -41,20 +41,39 @@ def _coerce_optional_status(status: Any) -> int | None:
         return None
 
 
+def read_only_uri(db_path: Path) -> str:
+    """Return an escaped absolute read-only file URI for the database.
+
+    Interpolating the raw path into ``file:{path}?mode=ro`` lets literal ``#``,
+    ``?`` and percent-encoded-looking path segments be reinterpreted as URI
+    syntax, so the readers open the wrong file (or none at all) for existing
+    capture databases. ``Path.as_uri`` percent-escapes those characters while
+    SQLite's URI parser decodes them back, keeping the path literal.
+    """
+    return f"{db_path.resolve().as_uri()}?mode=ro"
+
+
 def load_expected(path: Path) -> tuple[set[str], set[str]]:
     """Return request IDs from legacy k6 output containing per-request tags."""
     expected: set[str] = set()
     successful: set[str] = set()
     for item in json_lines(path):
-        tags = item.get("data", {}).get("tags", {})
+        data = item.get("data", {})
+        if not isinstance(data, dict):
+            # Null/list/scalar point payloads carry no tags, value or status;
+            # skip the malformed shape and keep later valid evidence.
+            continue
+        tags = data.get("tags", {})
+        if not isinstance(tags, dict):
+            continue
         request_id = item.get("request_id") or tags.get("request_id")
         if not request_id:
             continue
         request_id = str(request_id)
         expected.add(request_id)
         metric = item.get("metric")
-        value = item.get("data", {}).get("value")
-        status = item.get("data", {}).get("status")
+        value = data.get("value")
+        status = data.get("status")
         if metric == "benchmark_http_success" and value:
             successful.add(request_id)
         status_code = _coerce_optional_status(status)
@@ -96,7 +115,7 @@ def load_captured(
 ) -> Captured:
     """Find captured IDs, narrowing indexed queries to the current run."""
     captured: dict[str, list[tuple[str, int | None]]] = {}
-    uri = f"file:{db_path}?mode=ro"
+    uri = read_only_uri(db_path)
     with sqlite3.connect(uri, uri=True, timeout=0.5) as connection:
         tables = {
             row[0]
@@ -194,7 +213,7 @@ def load_captured_incremental(
     next_genai_id = genai_after_id
     next_token_rowid = token_after_rowid
     next_pending_ids = set(pending_genai_ids)
-    uri = f"file:{db_path}?mode=ro"
+    uri = read_only_uri(db_path)
     with sqlite3.connect(uri, uri=True, timeout=0.5) as connection:
         tables = {
             row[0]
