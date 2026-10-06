@@ -1081,12 +1081,25 @@ pub fn rollback_quiet() -> Result<RollbackOutcome> {
 }
 
 fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
+    restore_entries_with(data, quiet, &mut |path, value| fs::write(path, value))
+}
+
+/// `restore_entries` with the parameter write injectable. The kernel write is
+/// a parameter because a single write can move a DIFFERENT knob than the one
+/// addressed (the dirty pair's mutual clear), and that side effect has to be
+/// reproducible on plain files for the re-check below to be testable without
+/// a writable /proc/sys.
+fn restore_entries_with(
+    data: &RollbackData,
+    quiet: bool,
+    write_value: &mut dyn FnMut(&str, &str) -> std::io::Result<()>,
+) -> RollbackOutcome {
     // Heal first: a legacy ledger may hold two spellings of one kernel path,
     // and restoring both in key order would overwrite the pristine original
     // with the intermediate value the second spelling recorded.
     let mut data = data.clone();
     heal_alias_duplicates(&mut data);
-    let mut restored = 0;
+    let mut verified: Vec<&String> = Vec::new();
     let mut failed = 0;
     let mut skipped = 0;
     for (param, entry) in &data.entries {
@@ -1098,7 +1111,7 @@ fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
             continue;
         }
         if Path::new(&entry.path).exists() {
-            match fs::write(&entry.path, &entry.previous) {
+            match write_value(&entry.path, &entry.previous) {
                 Ok(()) => {
                     // Confirm the write with the same read-back the tune path
                     // uses (#5717): fs::write returning Ok only means the
@@ -1117,7 +1130,7 @@ fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
                                     entry.previous
                                 );
                             }
-                            restored += 1;
+                            verified.push(param);
                         }
                         ReadbackVerdict::Clamped { effective } => {
                             if !quiet {
@@ -1145,6 +1158,35 @@ fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
                 println!("  {} {} : 路径不存在，跳过", "⊘".yellow(), param);
             }
             skipped += 1;
+        }
+    }
+
+    // Re-check every verified restore AFTER all writes ran. A per-write
+    // read-back only proves its own file held `previous` at that moment; a
+    // later write can move an earlier-restored knob behind its back — the
+    // kernel zeroes the vm.dirty_ratio <-> vm.dirty_bytes sibling on every
+    // changing write (mm/page-writeback.c dirty_ratio_handler /
+    // dirty_bytes_handler), and BTreeMap order restores the bytes knob of
+    // each pair first. A diverging re-read is a failure so rollback never
+    // reports Full (and deletes the ledger) while a recorded original is not
+    // the live value. Write-only tunables (read fails) stay verified: their
+    // read-back never held anything to diverge from.
+    let mut restored = verified.len();
+    for param in &verified {
+        let entry = &data.entries[*param];
+        if let ReadbackVerdict::Clamped { effective } =
+            readback_verdict(&entry.path, &entry.previous)
+        {
+            if !quiet {
+                println!(
+                    "  {} {} : 最终回读为 {effective}（期望 {}），已被后续写入覆盖，未恢复",
+                    "✗".red(),
+                    param,
+                    entry.previous
+                );
+            }
+            restored -= 1;
+            failed += 1;
         }
     }
 
@@ -2384,6 +2426,118 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.skipped, 0);
         assert!(!rollback_should_finalize(outcome.failed, outcome.skipped));
+    }
+
+    #[test]
+    fn restore_rechecks_every_param_after_all_writes_ran() {
+        // One restore write can move a DIFFERENT knob than the one addressed:
+        // the kernel zeroes the sibling of the dirty pair on every changing
+        // write (v6.6 mm/page-writeback.c dirty_ratio_handler /
+        // dirty_bytes_handler set the other to 0). BTreeMap order restores
+        // vm.dirty_bytes before vm.dirty_ratio, so the ratio write clears the
+        // bytes value that was already restored and verified — the per-write
+        // read-back cannot see it because each one runs before the next
+        // write. Scenario: ratio mode (20) tuned to 30, the operator then set
+        // vm.dirty_bytes manually and ktuner applied a new bytes value, so
+        // the ledger holds both knobs with non-zero originals. Only a
+        // re-check after ALL writes ran catches the cleared sibling and keeps
+        // the ledger instead of reporting Full and deleting it.
+        let dir = AtomicTestDir::new("restore_recheck_after_writes");
+        let ratio = dir.0.join("dirty_ratio");
+        let bytes = dir.0.join("dirty_bytes");
+        let ratio_path = ratio.to_str().unwrap().to_string();
+        let bytes_path = bytes.to_str().unwrap().to_string();
+        // Live state at rollback time: both knobs were tuned (30, 512MB).
+        fs::write(&ratio, "30").unwrap();
+        fs::write(&bytes, "536870912").unwrap();
+        let mut entries = BTreeMap::new();
+        for (param, previous, applied, path) in [
+            (
+                "vm.dirty_bytes",
+                "268435456",
+                "536870912",
+                bytes_path.clone(),
+            ),
+            ("vm.dirty_ratio", "20", "30", ratio_path.clone()),
+        ] {
+            entries.insert(
+                param.to_string(),
+                RollbackEntry {
+                    previous: previous.to_string(),
+                    applied: applied.to_string(),
+                    path,
+                },
+            );
+        }
+        // The kernel write, simulated on plain files: every changing write to
+        // one knob of the pair zeroes its sibling.
+        let mut kernel = |path: &str, value: &str| -> std::io::Result<()> {
+            fs::write(path, value)?;
+            if path == ratio_path {
+                fs::write(&bytes, "0")
+            } else if path == bytes_path {
+                fs::write(&ratio, "0")
+            } else {
+                Ok(())
+            }
+        };
+        let outcome = restore_entries_with(
+            &RollbackData {
+                version: 1,
+                entries,
+            },
+            true,
+            &mut kernel,
+        );
+        assert_eq!(
+            fs::read_to_string(&ratio).unwrap(),
+            "20",
+            "the ratio side of the pair is restored"
+        );
+        assert_eq!(outcome.restored, 1, "only the ratio write holds");
+        assert_eq!(
+            outcome.failed, 1,
+            "the bytes knob was cleared by the ratio write and must count as failed"
+        );
+        assert_eq!(outcome.skipped, 0);
+        assert!(
+            !rollback_should_finalize(outcome.failed, outcome.skipped),
+            "a cleared sibling must keep the ledger for inspection"
+        );
+    }
+
+    #[test]
+    fn restore_recheck_passes_when_no_write_clobbers_a_sibling() {
+        // The re-check must not turn a healthy restore into a failure: two
+        // independent params, plain writes, both read back their previous.
+        let dir = AtomicTestDir::new("restore_recheck_healthy");
+        let mut entries = BTreeMap::new();
+        for (param, name) in [
+            ("vm.swappiness", "swappiness"),
+            ("net.core.somaxconn", "somaxconn"),
+        ] {
+            let path = dir.0.join(name);
+            fs::write(&path, "10").unwrap();
+            entries.insert(
+                param.to_string(),
+                RollbackEntry {
+                    previous: "10".to_string(),
+                    applied: "30".to_string(),
+                    path: path.to_str().unwrap().to_string(),
+                },
+            );
+        }
+        let outcome = restore_entries(
+            &RollbackData {
+                version: 1,
+                entries,
+            },
+            true,
+        );
+        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.failed, 0);
+        assert_eq!(outcome.skipped, 0);
+        assert!(rollback_should_finalize(outcome.failed, outcome.skipped));
     }
 
     #[test]
