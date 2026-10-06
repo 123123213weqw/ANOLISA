@@ -589,7 +589,24 @@ impl GenAIBuilder {
         // The old hand-built `[{"Text": …}]` externally-tagged payload failed
         // `Vec<OutputMessage>` parsing ("missing field `type`"), silently
         // losing the row in skill metrics and ATIF export.
-        let (parts, finish_reason) = Self::merge_sse_chunks(&chunks);
+        let (parts, finish_reason) = {
+            let merged = Self::merge_sse_chunks(&chunks);
+            if merged.0.is_empty() {
+                // A drained DashScope/Bailian native stream carries its
+                // output under a top-level `output` envelope with neither a
+                // `choices` array nor an event `type`, so every merger above
+                // yields nothing. The live path falls back to the native
+                // envelope extractor; the drain path must too, or a drained
+                // native stream loses its entire output while the same
+                // stream captured live keeps it.
+                match Self::extract_dashscope_native_parts(&chunks) {
+                    Some(native) => native,
+                    None => merged,
+                }
+            } else {
+                merged
+            }
+        };
         let output_messages = if parts.is_empty() {
             None
         } else {
@@ -791,6 +808,34 @@ mod tests {
         assert!(
             matches!(&parsed[0].parts[1], MessagePart::Text { content } if content == "answer")
         );
+    }
+
+    /// A DashScope/Bailian native stream (`output.…` envelope, no top-level
+    /// `choices` and no event `type`) merged to nothing in the drain path —
+    /// every merger only understands the OpenAI/Responses/Anthropic shapes —
+    /// so a drained native stream persisted `output_messages = None` and
+    /// lost its entire output while the live capture kept it.
+    #[test]
+    fn test_extract_sse_enrichment_captures_dashscope_native_output() {
+        let events = vec![
+            make_sse_event(
+                r#"{"output":{"text":"Hel","finish_reason":"null"},"request_id":"req_1"}"#,
+            ),
+            make_sse_event(
+                r#"{"output":{"text":"Hello","finish_reason":"stop"},"request_id":"req_1"}"#,
+            ),
+        ];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&events).expect("enrichment");
+        let json = enrichment
+            .output_messages
+            .expect("native output must be persisted");
+        let parsed: Vec<OutputMessage> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].finish_reason.as_deref(), Some("stop"));
+        match &parsed[0].parts[0] {
+            MessagePart::Text { content } => assert_eq!(content, "Hello"),
+            other => panic!("expected Text part, got {other:?}"),
+        }
     }
 
     #[test]
