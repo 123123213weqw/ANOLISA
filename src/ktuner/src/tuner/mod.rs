@@ -626,9 +626,20 @@ where
             entry.applied = applied;
             continue;
         }
+        // The key may already exist under a path an older `param_to_path`
+        // resolved differently (a dotted interface written before 5448, e.g.
+        // `.../conf/Br0/100/forwarding`). `heal_alias_duplicates` compares
+        // canonicalized paths and cannot merge that pair, so the stale path
+        // would survive: the file does not exist, every restore skips the
+        // entry, and the ledger never clears. Re-point it at what this
+        // parameter resolves to now; `previous` stays the original.
+        let current_path = path.clone();
         data.entries
             .entry(param)
-            .and_modify(|e| e.applied = applied.clone())
+            .and_modify(|e| {
+                e.applied = applied.clone();
+                e.path = current_path.clone();
+            })
             .or_insert_with(|| RollbackEntry {
                 previous: previous.clone(),
                 applied: applied.clone(),
@@ -2100,6 +2111,43 @@ mod tests {
         assert_eq!(entry.previous, "10");
         assert_eq!(entry.applied, "30");
         assert_eq!(entry.path, "/proc/sys/vm/swappiness");
+    }
+
+    /// A ledger entry whose recorded `path` predates the dotted-interface
+    /// fix (`5448`) must be re-pointed when the same parameter is merged
+    /// again, not just refreshed in `applied`.
+    ///
+    /// `heal_alias_duplicates` cannot do it: it compares canonicalized paths,
+    /// and `/proc/sys/net/ipv4/conf/Br0/100/forwarding` differs from the path
+    /// this parameter now resolves to. Left stale, the entry's file does not
+    /// exist, so every restore skips it — the original value never comes back
+    /// and the ledger entry never clears — while the write this merge records
+    /// has no usable rollback record at all.
+    #[test]
+    fn test_merge_refreshes_a_stale_path_for_the_same_param() {
+        let data: RollbackData = serde_json::from_str(
+            r#"{"version":1,"entries":{
+                "net.ipv4.conf.Br0.100.forwarding":{
+                    "previous":"0","applied":"1",
+                    "path":"/proc/sys/net/ipv4/conf/Br0/100/forwarding"
+                }}}"#,
+        )
+        .unwrap();
+        let data = merge_entries(
+            data,
+            [(
+                "net.ipv4.conf.Br0.100.forwarding".to_string(),
+                "0".to_string(),
+                "1".to_string(),
+            )],
+        );
+        assert_eq!(data.entries.len(), 1);
+        let entry = &data.entries["net.ipv4.conf.Br0.100.forwarding"];
+        assert_eq!(entry.previous, "0");
+        assert_eq!(
+            entry.path, "/proc/sys/net/ipv4/conf/Br0.100/forwarding",
+            "the recorded path must be the one this parameter resolves to now"
+        );
     }
 
     #[test]
