@@ -5514,11 +5514,28 @@ fn eval_bpf_jit_enable(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
 }
 
 fn eval_bpf_jit_harden(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/bpf_jit_harden";
-    if !std::path::Path::new(path).exists() {
+    eval_bpf_jit_harden_at("/proc/sys/net/core/bpf_jit_harden", recs)
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the unreadable branch is
+/// assertable on any host, without root.
+///
+/// `net.core.bpf_jit_harden` is created 0600 root-owned and its handler
+/// (`proc_dointvec_minmax_bpf_restricted`, net/core/sysctl_net_core.c)
+/// returns -EPERM unless the caller holds CAP_SYS_ADMIN, so the read fails
+/// for every unprivileged `ktuner check`. `read_sysctl_u64` maps a failed
+/// read to 0, which is this rule's firing value: the report claimed "BPF JIT
+/// 加固未启用" for a host whose value was never read, and the same run marks
+/// the parameter `"writable": false`. `why` already refuses to present a
+/// failed read as a value ("A failed read is an error, never a value"); the
+/// rule must not invent one either. A readable 0 is still a finding.
+fn eval_bpf_jit_harden_at(path: &str, recs: &mut Vec<Recommendation>) -> usize {
+    let Ok(raw) = std::fs::read_to_string(path) else {
         return 1;
-    }
-    let current = read_sysctl_u64(path);
+    };
+    let Ok(current) = raw.trim().parse::<u64>() else {
+        return 1;
+    };
     if current == 0 {
         recs.push(Recommendation {
             param: "net.core.bpf_jit_harden".to_string(),
@@ -8973,15 +8990,65 @@ mod tests {
         let info = make_test_info();
         let mut recs = Vec::new();
         let checked = eval_bpf_jit_harden(&info, &mut recs);
-        if std::path::Path::new("/proc/sys/net/core/bpf_jit_harden").exists() {
-            assert_eq!(checked, 1);
-            let val = read_sysctl_u64("/proc/sys/net/core/bpf_jit_harden");
-            let triggered = recs.iter().any(|r| r.param == "net.core.bpf_jit_harden");
-            if val == 0 {
-                assert!(triggered, "Should trigger when bpf_jit_harden=0");
-                assert_eq!(recs.last().unwrap().category, Category::Security);
+        assert_eq!(checked, 1);
+        let triggered = recs.iter().any(|r| r.param == "net.core.bpf_jit_harden");
+        // The sysctl is 0600 root-owned and its handler needs CAP_SYS_ADMIN,
+        // so an unprivileged run cannot read it at all. Distinguish a
+        // readable 0 (a finding) from a failed read (no value, no finding) —
+        // read_sysctl_u64 maps the failure to 0 and cannot tell them apart.
+        match std::fs::read_to_string("/proc/sys/net/core/bpf_jit_harden") {
+            Ok(raw) => {
+                assert_eq!(triggered, raw.trim() == "0", "readable value {raw:?}");
+                if triggered {
+                    assert_eq!(recs.last().unwrap().category, Category::Security);
+                }
             }
+            Err(_) => assert!(
+                !triggered,
+                "an unreadable sysctl is not the value 0: {recs:?}"
+            ),
         }
+    }
+
+    #[test]
+    fn bpf_jit_harden_skips_an_unreadable_sysctl() {
+        // A directory is the portable stand-in for "exists but cannot be
+        // read" (EISDIR), which works for root and unprivileged runs alike.
+        let mut recs = Vec::new();
+        assert_eq!(eval_bpf_jit_harden_at("/", &mut recs), 1);
+        assert!(
+            recs.is_empty(),
+            "a failed read must not report a hardening gap: {recs:?}"
+        );
+    }
+
+    #[test]
+    fn bpf_jit_harden_reads_real_values() {
+        let dir = std::env::temp_dir().join(format!("ktuner-bpf-harden-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("bpf_jit_harden");
+        let path = path.to_str().expect("utf-8 temp path");
+
+        std::fs::write(path, "0\n").expect("write fixture");
+        let mut recs = Vec::new();
+        eval_bpf_jit_harden_at(path, &mut recs);
+        assert_eq!(recs.len(), 1, "a readable 0 is still a finding");
+        assert_eq!(recs[0].param, "net.core.bpf_jit_harden");
+        assert_eq!(recs[0].current_value, "0");
+        assert_eq!(recs[0].recommended_value, "1");
+
+        std::fs::write(path, "1\n").expect("write fixture");
+        let mut recs = Vec::new();
+        eval_bpf_jit_harden_at(path, &mut recs);
+        assert!(recs.is_empty(), "a hardened host has no finding");
+
+        // Garbage is a failed parse, not a value either.
+        std::fs::write(path, "not-a-number\n").expect("write fixture");
+        let mut recs = Vec::new();
+        eval_bpf_jit_harden_at(path, &mut recs);
+        assert!(recs.is_empty(), "unparseable content is not the value 0");
+        std::fs::remove_file(path).ok();
+        std::fs::remove_dir(&dir).ok();
     }
 
     #[test]
