@@ -83,11 +83,12 @@ fn apply_locked(
 ) -> Result<ApplyOutcome> {
     let total = recommendations.len();
     let mut applied_recs: Vec<Recommendation> = Vec::new();
+    let mut applied = 0usize;
     let mut failed: Vec<ApplyFailure> = Vec::new();
     let mut clamped: Vec<ClampNote> = Vec::new();
     for (i, rec) in recommendations.iter().enumerate() {
         match apply_recordable(rec) {
-            Ok((applied, outcome)) => {
+            Ok((previous, outcome)) => {
                 if !quiet {
                     println!(
                         "    {} [{}/{}] {} → {}",
@@ -116,9 +117,17 @@ fn apply_locked(
                         effective: outcome.effective.clone(),
                     });
                 }
-                // The ledger and sysctl.d must describe live reality: record
-                // the value the kernel actually took, not the request (#4160).
-                applied_recs.push(applied);
+                // The write landed whether or not a pristine value exists.
+                applied += 1;
+                if let Some(previous) = previous {
+                    // The ledger and sysctl.d must describe live reality:
+                    // record the value the kernel actually took, not the
+                    // request (#4160). A param whose original could not be
+                    // read is applied but unrecordable — see apply_recordable.
+                    let mut applied_rec = rec_with_effective(rec, &outcome);
+                    applied_rec.current_value = previous;
+                    applied_recs.push(applied_rec);
+                }
             }
             Err(e) => {
                 failed.push(ApplyFailure {
@@ -149,12 +158,12 @@ fn apply_locked(
                 applied_recs.len()
             );
         }
-    } else if !quiet {
+    } else if applied == 0 && !quiet {
         println!();
         println!("  没有配置被成功应用");
     }
     Ok(ApplyOutcome {
-        applied: applied_recs.len(),
+        applied,
         failed,
         clamped,
     })
@@ -163,13 +172,19 @@ fn apply_locked(
 /// Apply a single recommendation with rollback recording and persistence, but
 /// without apply()'s progress output — used by `ktuner fix` so a single fix is
 /// just as reversible (and survives reboot) as `tune`. Returns the write
-/// outcome so `fix` can report the value the kernel actually took.
+/// outcome so `fix` can report the value the kernel actually took. A param
+/// whose original cannot be read (write-only tunable) applies without a
+/// rollback record, mirroring apply_import.
 pub fn apply_one(rec: &Recommendation) -> Result<WriteOutcome> {
     let guard = lock_ledger_at(ROLLBACK_PATH)?;
     load_rollback()?;
-    let (applied, outcome) = apply_recordable(rec)?;
-    save_rollback(&guard, std::slice::from_ref(&applied))?;
-    persist_from_rollback(&guard)?;
+    let (previous, outcome) = apply_recordable(rec)?;
+    if let Some(previous) = previous {
+        let mut applied = rec_with_effective(rec, &outcome);
+        applied.current_value = previous;
+        save_rollback(&guard, std::slice::from_ref(&applied))?;
+        persist_from_rollback(&guard)?;
+    }
     Ok(outcome)
 }
 
@@ -187,12 +202,19 @@ fn read_previous(param: &str) -> Result<String> {
         .to_string())
 }
 
-fn apply_recordable(rec: &Recommendation) -> Result<(Recommendation, WriteOutcome)> {
-    let previous = read_previous(&rec.param)?;
+// Write-only tunables (mode 0200, e.g. vm.drop_caches / vm.compact_memory)
+// deny the read but accept the write — write_and_verify documents that arm
+// and records the request as the effective value. A failed read therefore
+// means "no pristine value to restore", not "do not apply": failing here put
+// the read before the write and made every such param dead on arrival, while
+// apply_import kept an escape. Mirror apply_import instead: apply, report the
+// effective value, and keep the param out of the rollback ledger and
+// persistence — a previous that was never read must never be invented, or
+// rollback would write it back over the kernel.
+fn apply_recordable(rec: &Recommendation) -> Result<(Option<String>, WriteOutcome)> {
+    let previous = read_previous(&rec.param).ok();
     let outcome = write_and_verify(&rec.param, &rec.recommended_value)?;
-    let mut applied = rec_with_effective(rec, &outcome);
-    applied.current_value = previous;
-    Ok((applied, outcome))
+    Ok((previous, outcome))
 }
 
 /// The result of a verified write: the value now live in the kernel.
