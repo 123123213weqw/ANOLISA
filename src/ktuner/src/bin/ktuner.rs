@@ -550,8 +550,13 @@ fn gather() -> Result<(detect::SystemInfo, rules::EvalResult)> {
 /// used to exist in two shapes — rec_json dropped `subcategory` and
 /// `writable`, leaving dry-run entries with 6 keys where check emits 8 — so
 /// an agent diffing the two views saw the same `param` under two schemas.
+///
+/// An entry no write path will take carries the same `skip_reason` the plan
+/// publishes (`unwritable` or `runtime_dangerous`, from the shared helper
+/// behind `would_skip`), so `check` — like `why` — never contradicts the
+/// plan it is reconciled against.
 fn rec_json(r: &Recommendation) -> serde_json::Value {
-    json!({
+    let mut value = json!({
         "param": r.param,
         "current": r.current_value,
         "recommended": r.recommended_value,
@@ -560,7 +565,11 @@ fn rec_json(r: &Recommendation) -> serde_json::Value {
         "category": format!("{:?}", r.category).to_lowercase(),
         "subcategory": category::param_subcategory(&r.param),
         "writable": r.writable,
-    })
+    });
+    if let Some(reason) = skip_reason(r) {
+        value["skip_reason"] = json!(reason);
+    }
+    value
 }
 
 #[cfg(test)]
@@ -1009,9 +1018,11 @@ mod tests {
         // must serialize identically: rec_json used to drop subcategory and
         // writable from the preview, so an agent reconciling the plan
         // against the diagnosis saw the same param under two schemas
-        // (6 keys vs the documented 8). This test is about that entry shape,
-        // not the skip classification, so in_scope mirrors would_apply.
-        let recs = vec![rec("vm.swappiness", true), rec("net.core.somaxconn", false)];
+        // (6 keys vs the documented 8). The fixture is plan-consistent —
+        // would_apply only ever lists applicable entries, so none of them
+        // carries a skip_reason; the skipped-entry shape is covered by
+        // check_entries_carry_the_reason_the_plan_skips_them.
+        let recs = vec![rec("vm.swappiness", true), rec("net.core.somaxconn", true)];
         let output = dry_run_output(&recs, &recs);
         let entries = output["would_apply"].as_array().unwrap();
         assert_eq!(entries.len(), 2);
@@ -1019,7 +1030,7 @@ mod tests {
         assert_eq!(entries[0].get("subcategory"), Some(&json!("memory")));
         assert_eq!(entries[0].get("writable"), Some(&json!(true)));
         assert_eq!(entries[1].get("subcategory"), Some(&json!("network")));
-        assert_eq!(entries[1].get("writable"), Some(&json!(false)));
+        assert_eq!(entries[1].get("writable"), Some(&json!(true)));
         // cmd_check builds its recommendations array with the same rec_json,
         // so the key set below is exactly check's entry shape, not a subset.
         for entry in entries {
@@ -1044,6 +1055,32 @@ mod tests {
                 ]
             );
         }
+    }
+
+    #[test]
+    fn check_entries_carry_the_reason_the_plan_skips_them() {
+        // check's recommendations are the diagnosis the plan is reconciled
+        // against — #6288's rationale applies here word for word:
+        // `writable: true` on vm.nr_hugepages with no reason told the agent
+        // the opposite of what every apply path does (tune skips it, fix
+        // refuses it). The reason must ride the shared entry shape, not
+        // `why`'s bespoke output alone.
+        let recs = vec![
+            rec("vm.nr_hugepages", true), // writable, runtime-dangerous
+            rec("vm.swappiness", false),  // unwritable in this environment
+            rec("fs.file-max", true),     // applicable: no reason to carry
+        ];
+        let entries: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
+        assert_eq!(
+            entries[0]["skip_reason"],
+            json!("runtime_dangerous"),
+            "a writable runtime-dangerous entry names why the plan drops it"
+        );
+        assert_eq!(entries[1]["skip_reason"], json!("unwritable"));
+        assert!(
+            entries[2].get("skip_reason").is_none(),
+            "an entry the plan writes carries no skip reason"
+        );
     }
 
     #[test]

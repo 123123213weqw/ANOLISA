@@ -118,7 +118,9 @@ count:
 
 `ktuner why` carries the same reason on a recommendation no write path will
 take (`skip_reason`: `unwritable` or `runtime_dangerous`; absent when the
-plan would write it), so the explanation never contradicts the plan.
+plan would write it), so the explanation never contradicts the plan. `check`
+publishes the same classification on its recommendations, so the diagnosis
+carries the reason without a dry run.
 
 ### rollback output
 

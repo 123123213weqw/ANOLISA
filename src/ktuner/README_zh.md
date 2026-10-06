@@ -113,7 +113,8 @@ sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 
 `ktuner why` 对没有任何写路径会采纳的推荐同样携带该原因
 （`skip_reason`：`unwritable` 或 `runtime_dangerous`；计划会写入的项无此
-字段），使解释输出与计划不矛盾。
+字段），使解释输出与计划不矛盾。`check` 的推荐项也发布同一分类，
+使诊断输出无需 dry run 就携带该原因。
 
 ### rollback 输出
 
