@@ -3653,11 +3653,39 @@ fn eval_watchdog_thresh(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 }
 
 fn eval_admin_reserve_kbytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/admin_reserve_kbytes";
-    if !std::path::Path::new(path).exists() {
+    eval_admin_reserve_kbytes_at(
+        info,
+        recs,
+        "/proc/sys/vm/admin_reserve_kbytes",
+        "/proc/sys/vm/overcommit_memory",
+    )
+}
+
+/// Path-injectable form of [`eval_admin_reserve_kbytes`] (the `eval_*_at`
+/// idiom) so the overcommit-mode precondition is assertable against synthetic
+/// files.
+///
+/// The reserve is only subtracted on the `OVERCOMMIT_NEVER` path of
+/// `__vm_enough_memory()` (mm/util.c): `vm.overcommit_memory == 0` (the
+/// default "guess" mode) returns from that function before either
+/// `sysctl_admin_reserve_kbytes` or `sysctl_user_reserve_kbytes` is read, and
+/// mode 1 returns even earlier. On such a host the reason's promised recovery
+/// headroom does not exist, so the write cannot change any allocation —
+/// the sibling [`overcommit_ratio_recommendation`] gate already keys on the
+/// same `oc_mode == 2` condition.
+fn eval_admin_reserve_kbytes_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    overcommit_path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if info.memory_total_gb < 64 {
+        return 1;
+    }
+    if !overcommit_reserves_are_live(overcommit_path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3673,6 +3701,17 @@ fn eval_admin_reserve_kbytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) 
         });
     }
     1
+}
+
+/// Whether the kernel reads the commit reserves at all: in
+/// `__vm_enough_memory()` (mm/util.c) both `sysctl_admin_reserve_kbytes` and
+/// `sysctl_user_reserve_kbytes` are subtracted *after* the
+/// `sysctl_overcommit_memory == OVERCOMMIT_GUESS` early return, so only a host
+/// running `vm.overcommit_memory == 2` ("never overcommit") consults them.
+/// An unreadable mode file counts as "not consulted", so the rules stay quiet
+/// instead of promising recovery headroom nothing reads.
+fn overcommit_reserves_are_live(overcommit_path: &str) -> bool {
+    read_sysctl_u64(overcommit_path) == 2
 }
 
 fn eval_nr_open(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -4579,11 +4618,38 @@ fn eval_msgmnb(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 // hardening set it themselves; an auto-tuner aimed at beginners must not.
 
 fn eval_user_reserve_kbytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/user_reserve_kbytes";
-    if !std::path::Path::new(path).exists() {
+    eval_user_reserve_kbytes_at(
+        info,
+        recs,
+        "/proc/sys/vm/user_reserve_kbytes",
+        "/proc/sys/vm/overcommit_memory",
+    )
+}
+
+/// Path-injectable form of [`eval_user_reserve_kbytes`] (the `eval_*_at`
+/// idiom) so the overcommit-mode precondition is assertable against synthetic
+/// files.
+///
+/// Same condition as its sibling, and the documented one: `user_reserve_kbytes`
+/// is only consulted under overcommit "never" — the kernel documentation opens
+/// with "When overcommit_memory is set to 2, 'never overcommit' mode, reserve
+/// min(3% of current process size, user_reserve_kbytes) of free memory"
+/// (sysctl/vm.rst) — and `__vm_enough_memory()` (mm/util.c) returns before the
+/// reserve under the default guess mode. The reason's promise of a usable
+/// login path therefore only holds where the kernel reads the value.
+fn eval_user_reserve_kbytes_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    overcommit_path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if info.memory_total_gb < 64 {
+        return 1;
+    }
+    if !overcommit_reserves_are_live(overcommit_path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -9001,6 +9067,106 @@ mod tests {
             rec.is_none(),
             "Should not recommend user_reserve_kbytes for small memory"
         );
+    }
+
+    #[test]
+    fn commit_reserves_need_overcommit_never_to_be_read() {
+        // `__vm_enough_memory()` (mm/util.c) returns inside the
+        // OVERCOMMIT_GUESS branch before either reserve is subtracted:
+        //
+        //	if (sysctl_overcommit_memory == OVERCOMMIT_GUESS) { ...; return 0; }
+        //	allowed = vm_commit_limit();
+        //	if (!cap_sys_admin)
+        //		allowed -= sysctl_admin_reserve_kbytes >> ...;
+        //	if (mm) { ... sysctl_user_reserve_kbytes ... }
+        //
+        // So only vm.overcommit_memory == 2 reads them, which is why the
+        // sibling overcommit_ratio rule already gates on oc_mode == 2. On any
+        // other host the promised recovery headroom cannot exist.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_commit_reserves_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let admin = write("admin_reserve_kbytes", "8192\n");
+        let user = write("user_reserve_kbytes", "16384\n");
+        let mode_never = write("overcommit_memory.never", "2\n");
+        let mode_guess = write("overcommit_memory.guess", "0\n");
+        let mode_always = write("overcommit_memory.always", "1\n");
+        let mode_missing = dir.join("overcommit_memory.missing");
+
+        let mut info = make_test_info();
+        info.memory_total_gb = 128;
+
+        for mode in [&mode_guess, &mode_always, &mode_missing] {
+            let mut recs = Vec::new();
+            eval_admin_reserve_kbytes_at(
+                &info,
+                &mut recs,
+                admin.to_str().unwrap(),
+                mode.to_str().unwrap(),
+            );
+            eval_user_reserve_kbytes_at(
+                &info,
+                &mut recs,
+                user.to_str().unwrap(),
+                mode.to_str().unwrap(),
+            );
+            assert!(
+                recs.is_empty(),
+                "{}: the kernel never reads either reserve",
+                mode.display()
+            );
+        }
+
+        let mut recs = Vec::new();
+        eval_admin_reserve_kbytes_at(
+            &info,
+            &mut recs,
+            admin.to_str().unwrap(),
+            mode_never.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.admin_reserve_kbytes"),
+            "overcommit never reads the admin reserve"
+        );
+        eval_user_reserve_kbytes_at(
+            &info,
+            &mut recs,
+            user.to_str().unwrap(),
+            mode_never.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.user_reserve_kbytes"),
+            "overcommit never reads the user reserve"
+        );
+
+        // Adequate reserves stay untouched, still under the mode that reads
+        // them.
+        let admin_ok = write("admin_reserve_kbytes_ok", "131072\n");
+        let user_ok = write("user_reserve_kbytes_ok", "262144\n");
+        let mut recs = Vec::new();
+        eval_admin_reserve_kbytes_at(
+            &info,
+            &mut recs,
+            admin_ok.to_str().unwrap(),
+            mode_never.to_str().unwrap(),
+        );
+        eval_user_reserve_kbytes_at(
+            &info,
+            &mut recs,
+            user_ok.to_str().unwrap(),
+            mode_never.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "an adequate reserve stays untouched");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
