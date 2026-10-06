@@ -3103,19 +3103,37 @@ fn eval_sched_child_runs_first(info: &SystemInfo, recs: &mut Vec<Recommendation>
     if !fork_server_present(info) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current != 0 {
-        recs.push(Recommendation {
-            param: "kernel.sched_child_runs_first".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "服务器场景下 fork 后父进程先运行更优，避免 COW 页面不必要的复制".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) =
+        sched_child_runs_first_recommendation(read_sysctl_u64(path), &info.kernel_version)
+    {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `kernel.sched_child_runs_first` recommendation for an already-read
+/// value; split from the file probe so the version gate is testable anywhere.
+fn sched_child_runs_first_recommendation(
+    current: u64,
+    kernel_version: &str,
+) -> Option<Recommendation> {
+    // Linux 6.6 merged EEVDF: commit e8f331bcc2 ("sched/smp: Use lag to
+    // simplify cross-runqueue placement") removed the only reader of this
+    // knob from task_fork_fair(). The sysctl node still exists and accepts
+    // writes, but nothing consumes the value, so telling an administrator to
+    // set it back to 0 promises COW-copy savings that can no longer happen.
+    if kernel_at_least(kernel_version, 6, 6) || current == 0 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "kernel.sched_child_runs_first".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: "服务器场景下 fork 后父进程先运行更优，避免 COW 页面不必要的复制".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_page_cluster(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -7951,6 +7969,22 @@ mod tests {
         let mut info = make_test_info();
         info.processes = vec![];
         assert!(!fork_server_present(&info));
+    }
+
+    #[test]
+    fn sched_child_runs_first_recommendation_gates_on_kernel_version() {
+        // Pre-6.6 kernels still consume the knob: task_fork_fair() reads it.
+        let rec = sched_child_runs_first_recommendation(1, "5.15.0-91-generic")
+            .expect("pre-6.6 kernels still honor sched_child_runs_first");
+        assert_eq!(rec.recommended_value, "0");
+        assert_eq!(rec.current_value, "1");
+        assert!(sched_child_runs_first_recommendation(2, "6.5.0").is_some());
+        // 6.6+ merged EEVDF and task_fork_fair() no longer reads the knob:
+        // the recommendation can never change any behavior.
+        assert!(sched_child_runs_first_recommendation(1, "6.6.0").is_none());
+        assert!(sched_child_runs_first_recommendation(1, "6.8.0-40-generic").is_none());
+        // Already at the target on any version.
+        assert!(sched_child_runs_first_recommendation(0, "4.19.0").is_none());
     }
 
     #[test]
