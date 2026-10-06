@@ -718,6 +718,11 @@ const RUNTIME_SERVICE_MARKERS: &[(&str, &str)] = &[
     ("elasticsearch", "elasticsearch"),
     ("org.opensearch", "opensearch"),
     ("opensearch", "opensearch"),
+    // Kafka's daemon main classes all live under the connect package (the
+    // Connect workers and MirrorMaker 2); the bare org.apache.kafka root is
+    // deliberately NOT mapped — clients and tools (org.apache.kafka.clients,
+    // .tools) are consumers of the service, not the service itself.
+    ("org.apache.kafka.connect", "kafka"),
     ("kafka.kafka", "kafka"),
     ("kafka", "kafka"),
     ("org.apache.zookeeper", "zookeeper"),
@@ -1476,6 +1481,52 @@ mod tests {
         // Kafka's own broker class still decides, through its class name.
         let cmdline = "java\u{0}kafka.Kafka";
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
+    }
+
+    #[test]
+    fn test_runtime_service_matches_kafka_daemon_main_classes() {
+        // Kafka Connect workers and MirrorMaker 2 are daemons whose main
+        // class lives under the org.apache.kafka.connect package: the
+        // package run owns the program from the root, exactly like
+        // org.apache.zookeeper for QuorumPeerMain. With no kafka root
+        // mapped, the boundary rules left every one of them unclassified
+        // even though the pre-boundary scan reported Some("kafka").
+        for class in [
+            "org.apache.kafka.connect.runtime.ConnectDistributed",
+            "org.apache.kafka.connect.cli.ConnectStandalone",
+            "org.apache.kafka.connect.mirror.MirrorMaker",
+        ] {
+            let cmdline = format!("java\u{0}-Xmx1g\u{0}{class}");
+            assert_eq!(
+                runtime_service_from_cmdline(&cmdline),
+                Some("kafka"),
+                "{class}"
+            );
+        }
+
+        // Client and tool packages under org.apache.kafka are consumers of
+        // the service, not the service itself — the same contract that keeps
+        // com.example.kafka.ConsumerApp unclassified.
+        for class in [
+            "org.apache.kafka.clients.consumer.KafkaConsumer",
+            "org.apache.kafka.tools.consumer.ConsoleConsumer",
+            "org.apache.kafka.tools.ProducerPerformance",
+        ] {
+            let cmdline = format!("java\u{0}{class}");
+            assert_eq!(runtime_service_from_cmdline(&cmdline), None, "{class}");
+        }
+
+        // The legacy MirrorMaker main class and the broker still decide via
+        // their own names, and neighbouring services are untouched.
+        let cmdline = "java\0kafka.tools.MirrorMaker";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("kafka"));
+        let cmdline = "java\0org.apache.zookeeper.server.quorum.QuorumPeerMain";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("zookeeper"));
+        let cmdline = "java\0org.apache.catalina.startup.Bootstrap\0start";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("tomcat"));
+        let cmdline =
+            "java\u{0}-cp\u{0}/opt/kafka/libs/kafka_2.13-3.7.0.jar\u{0}com.example.kafka.ConsumerApp";
+        assert_eq!(runtime_service_from_cmdline(cmdline), None);
     }
 
     #[test]
