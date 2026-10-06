@@ -1087,22 +1087,47 @@ fn eval_tcp_slow_start_after_idle(info: &SystemInfo, recs: &mut Vec<Recommendati
     if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
-        return 1;
-    }
-    let current = read_sysctl_u64(path);
-    if current == 1 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_slow_start_after_idle".to_string(),
-            current_value: "1".to_string(),
-            recommended_value: "0".to_string(),
-            reason: "长连接空闲后重新慢启动会造成突发延迟，禁用后保持已探测的拥塞窗口".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = slow_start_after_idle_recommendation(
+        read_sysctl_u64(path),
+        &read_sysctl_string("/proc/sys/net/ipv4/tcp_congestion_control"),
+        info.has_listen_sockets(),
+    ) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the slow-start-after-idle rule (the `*_recommendation`
+/// idiom): the value, the congestion control and the listener flag are all
+/// parameters, so the gate is assertable on any host instead of only on one
+/// that listens on TCP and runs a control without `cong_control`.
+///
+/// Both readers of the knob skip congestion controls that define
+/// `cong_control` — `tcp_output.c`'s starvation branch ends
+/// `... && !ca_ops->cong_control`, and the `include/net/tcp.h` helper returns
+/// early on `ca_ops->cong_control` — and BBR is the in-tree algorithm that
+/// defines it (`net/ipv4/tcp_bbr.c`: `.cong_control = bbr_main`). BBR is also
+/// what this engine's own `net.ipv4.tcp_congestion_control` rule asks for, so
+/// on a BBR host the write cannot change any cwnd behavior and the reason's
+/// promise ("禁用后保持已探测的拥塞窗口") already describes what BBR does by
+/// design: it never restarts slow start after an idle period.
+fn slow_start_after_idle_recommendation(
+    current: u64,
+    congestion_control: &str,
+    has_listen_sockets: bool,
+) -> Option<Recommendation> {
+    if !has_listen_sockets || congestion_control == "bbr" || current != 1 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_slow_start_after_idle".to_string(),
+        current_value: "1".to_string(),
+        recommended_value: "0".to_string(),
+        reason: "长连接空闲后重新慢启动会造成突发延迟，禁用后保持已探测的拥塞窗口".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_ip_local_port_range(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -8363,6 +8388,42 @@ mod tests {
         assert_eq!(rec.param, "net.ipv4.tcp_max_syn_backlog");
         assert_eq!(rec.current_value, "1024");
         assert_eq!(rec.recommended_value, "65536");
+    }
+
+    #[test]
+    fn slow_start_after_idle_is_not_read_by_bbr() {
+        // Both readers of the knob skip congestion controls that define
+        // `cong_control`: tcp_output.c's starvation branch ends
+        // "... && !ca_ops->cong_control", and the include/net/tcp.h helper
+        // returns early on `ca_ops->cong_control`. BBR defines it
+        // (net/ipv4/tcp_bbr.c: `.cong_control = bbr_main`) and is exactly the
+        // control this engine's own tcp_congestion_control rule asks for, so
+        // on a BBR host the write cannot change any cwnd behavior.
+        assert!(
+            slow_start_after_idle_recommendation(1, "cubic", true).is_some(),
+            "a control without cong_control still reads the knob"
+        );
+        assert!(
+            slow_start_after_idle_recommendation(1, "bbr", true).is_none(),
+            "BBR defines cong_control, so neither reader consults the knob"
+        );
+        assert!(
+            slow_start_after_idle_recommendation(1, "", true).is_some(),
+            "an unreadable congestion-control file keeps today's behavior"
+        );
+        assert!(
+            slow_start_after_idle_recommendation(0, "cubic", true).is_none(),
+            "an already-disabled knob stays untouched"
+        );
+        assert!(
+            slow_start_after_idle_recommendation(1, "cubic", false).is_none(),
+            "no listener means no connection to keep warm"
+        );
+
+        let rec = slow_start_after_idle_recommendation(1, "cubic", true).expect("recommendation");
+        assert_eq!(rec.param, "net.ipv4.tcp_slow_start_after_idle");
+        assert_eq!(rec.current_value, "1");
+        assert_eq!(rec.recommended_value, "0");
     }
 
     #[test]
