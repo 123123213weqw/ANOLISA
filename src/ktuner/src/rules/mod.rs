@@ -2163,11 +2163,24 @@ fn eval_yama_ptrace_scope(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> 
 }
 
 fn eval_log_martians(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/all/log_martians";
+    eval_log_martians_at(info, recs, "/proc/sys/net/ipv4/conf/all/log_martians")
+}
+
+/// Path-injectable form of [`eval_log_martians`] (the `eval_*_at` idiom).
+/// `net/ipv4/devinet.c`'s `devinet_conf_proc` routes every `conf/<iface>/…`
+/// entry through a plain `proc_dointvec` on an `int` slot of
+/// `struct ipv4_devconf` (include/linux/inetdevice.h), with no min/max, so -1
+/// is a legal value; `IN_DEV_LOG_MARTIANS` (inetdevice.h) reads it through
+/// `IN_DEV_ORCONF` — a truthiness test — and `net/ipv4/route.c` consumes it as
+/// `if (IN_DEV_LOG_MARTIANS(in_dev))`. The unsigned reader parses "-1" to Err
+/// and falls back to 0, the *disabled* value, so the `== 0` gate invented the
+/// recommendation on a host that already logs martians.
+fn eval_log_martians_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.log_martians".to_string(),
@@ -2747,12 +2760,28 @@ fn eval_tcp_rfc1337(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     1
 }
 
-fn eval_secure_redirects(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/all/secure_redirects";
-    if !std::path::Path::new(path).exists() {
+fn eval_secure_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_secure_redirects_at(info, recs, "/proc/sys/net/ipv4/conf/all/secure_redirects")
+}
+
+/// Path-injectable form of [`eval_secure_redirects`] (the `eval_*_at` idiom).
+/// The `conf/all/secure_redirects` entry is a plain `proc_dointvec` int slot
+/// (`devinet_conf_proc` in net/ipv4/devinet.c, no min/max), and
+/// `IN_DEV_SEC_REDIRECTS` (include/linux/inetdevice.h) reads it through
+/// `IN_DEV_ORCONF`, a truthiness test consumed by `net/ipv4/route.c` as
+/// `if (IN_DEV_SEC_REDIRECTS(in_dev) && ...)`. -1 is therefore enabled and
+/// must be flagged, but the unsigned reader parsed "-1" to Err — its fallback
+/// 0 skipped the rule on exactly the host whose secure redirects are on.
+fn eval_secure_redirects_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current != 0 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.secure_redirects".to_string(),
@@ -3557,12 +3586,27 @@ fn eval_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     1
 }
 
-fn eval_default_log_martians(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/default/log_martians";
-    if !std::path::Path::new(path).exists() {
+fn eval_default_log_martians(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_default_log_martians_at(info, recs, "/proc/sys/net/ipv4/conf/default/log_martians")
+}
+
+/// Path-injectable form of [`eval_default_log_martians`] (the `eval_*_at`
+/// idiom). `conf/default/*` is the same `devinet_conf_proc` plain
+/// `proc_dointvec` int slot as `conf/all/*` (net/ipv4/devinet.c, no
+/// min/max), inherited by every new interface, and `IN_DEV_LOG_MARTIANS`
+/// (include/linux/inetdevice.h) is an `IN_DEV_ORCONF` truthiness test — -1
+/// is legal and enabled. The unsigned reader's fallback 0 made the `== 0`
+/// gate report new interfaces as blind to martians.
+fn eval_default_log_martians_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.default.log_martians".to_string(),
@@ -4116,14 +4160,26 @@ fn eval_icmp_ignore_bogus(_info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
 }
 
 fn eval_arp_filter(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/all/arp_filter";
-    if !std::path::Path::new(path).exists() {
+    eval_arp_filter_at(info, recs, "/proc/sys/net/ipv4/conf/all/arp_filter")
+}
+
+/// Path-injectable form of [`eval_arp_filter`] (the `eval_*_at` idiom).
+/// `conf/all/arp_filter` is a plain `proc_dointvec` int slot
+/// (`devinet_conf_proc` in net/ipv4/devinet.c, no min/max) read through
+/// `IN_DEV_ARPFILTER` (include/linux/inetdevice.h), an `IN_DEV_ORCONF`
+/// truthiness test consumed by `net/ipv4/arp.c` as
+/// `if (!dont_send && IN_DEV_ARPFILTER(in_dev))`. -1 is legal and enabled,
+/// so the unsigned reader's fallback 0 made the `== 0` gate report a
+/// multi-NIC host as unfiltered.
+fn eval_arp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.arp_filter".to_string(),
@@ -5651,12 +5707,32 @@ fn eval_somaxconn_large(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
     1
 }
 
-fn eval_promote_secondaries(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/default/promote_secondaries";
-    if !std::path::Path::new(path).exists() {
+fn eval_promote_secondaries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_promote_secondaries_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/promote_secondaries",
+    )
+}
+
+/// Path-injectable form of [`eval_promote_secondaries`] (the `eval_*_at`
+/// idiom). `conf/default/promote_secondaries` is a plain `proc_dointvec` int
+/// slot (`devinet_conf_proc` in net/ipv4/devinet.c, no min/max) read through
+/// `IN_DEV_PROMOTE_SECONDARIES` (include/linux/inetdevice.h), an
+/// `IN_DEV_ORCONF` truthiness test that `net/ipv4/devinet.c` consumes as
+/// `int do_promote = IN_DEV_PROMOTE_SECONDARIES(in_dev)`. -1 is legal and
+/// enabled, so the unsigned reader's fallback 0 made the `== 0` gate claim
+/// secondary addresses are dropped on primary removal.
+fn eval_promote_secondaries_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.default.promote_secondaries".to_string(),
@@ -9563,6 +9639,172 @@ mod tests {
             );
             if expects_rec {
                 assert_eq!(recs[0].param, "vm.oom_dump_tasks");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_log_martians_reads_truthiness_signed() {
+        // net/ipv4/devinet.c's devinet_conf_proc routes this entry through a
+        // plain proc_dointvec on an int slot (no min/max), and
+        // IN_DEV_LOG_MARTIANS (include/linux/inetdevice.h) reads it through
+        // IN_DEV_ORCONF, a truthiness test consumed by net/ipv4/route.c. Any
+        // nonzero value is enabled, so -1 must not read as the value 0.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_log_martians_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_log_martians_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 leaves martians unlogged"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "net.ipv4.conf.all.log_martians");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_default_log_martians_reads_truthiness_signed() {
+        // Same devinet_conf_proc slot as conf/all, inherited by new
+        // interfaces; -1 is legal and enabled.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_default_log_martians_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_default_log_martians_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 leaves new interfaces blind to martians"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "net.ipv4.conf.default.log_martians");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_promote_secondaries_reads_truthiness_signed() {
+        // devinet_conf_proc int slot; IN_DEV_PROMOTE_SECONDARIES is an
+        // IN_DEV_ORCONF truthiness test used as `int do_promote = ...`.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_promote_secondaries_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 drops secondary addresses"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "net.ipv4.conf.default.promote_secondaries");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_secure_redirects_reads_truthiness_signed() {
+        // The gate is `!= 0`, so the unsigned reader's collapse of -1 to 0
+        // silently skipped the rule on a host whose secure redirects are on
+        // (IN_DEV_SEC_REDIRECTS is an ORCONF truthiness test).
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, true), (0, false), (1, true)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_secure_redirects_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_secure_redirects_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: any nonzero value accepts secure redirects"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "net.ipv4.conf.all.secure_redirects");
+                assert_eq!(
+                    recs[0].current_value,
+                    value.to_string(),
+                    "current_value must echo the signed value verbatim"
+                );
+                assert_eq!(recs[0].recommended_value, "0");
+            }
+        }
+    }
+
+    #[test]
+    fn test_arp_filter_reads_truthiness_signed() {
+        // devinet_conf_proc int slot; IN_DEV_ARPFILTER is an ORCONF
+        // truthiness test consumed by net/ipv4/arp.c. The multi-NIC gate
+        // needs two interfaces and no bond on the host, so the 0 case is
+        // asserted only when that gate lets the rule run.
+        let mut info = make_test_info();
+        info.network = vec![
+            NetInfo {
+                name: "eth0".to_string(),
+                speed_mbps: 10000,
+            },
+            NetInfo {
+                name: "eth1".to_string(),
+                speed_mbps: 10000,
+            },
+        ];
+        let bonded = has_bond();
+        for (value, expects_rec) in [(-1, false), (0, !bonded), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_arp_filter_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_arp_filter_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 leaves multi-NIC ARP unfiltered"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "net.ipv4.conf.all.arp_filter");
                 assert_eq!(recs[0].current_value, "0");
                 assert_eq!(recs[0].recommended_value, "1");
             }
