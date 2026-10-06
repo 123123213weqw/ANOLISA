@@ -232,33 +232,34 @@ pub fn write_and_verify(param: &str, value: &str) -> Result<WriteOutcome> {
         }
     })?;
 
-    // Verify by reading back. Some tunables are write-only (mode 0200, e.g.
-    // vm.drop_caches / vm.compact_memory): the write is accepted but the read
-    // fails — treat that as success with the request as the record, since the
-    // kernel took the write and no read-back exists to diverge from.
-    let readback = match fs::read_to_string(&path) {
-        Ok(s) => s,
-        Err(_) => {
-            return Ok(WriteOutcome {
-                effective: value.to_string(),
-                clamped: false,
-            })
-        }
-    };
-
-    // A mismatch is NOT a failure (#4160): fs::write already succeeded, so
-    // the live value changed. Return what the kernel actually took so every
-    // caller records it instead of leaving an untracked live change that the
-    // rollback ledger cannot undo and sysctl.d does not persist.
-    match classify_readback(value, readback.trim()) {
-        ReadbackVerdict::Verified { effective } => Ok(WriteOutcome {
+    // Verify by reading back. A mismatch is NOT a failure (#4160): fs::write
+    // already succeeded, so the live value changed. Return what the kernel
+    // actually took so every caller records it instead of leaving an untracked
+    // live change that the rollback ledger cannot undo and sysctl.d does not
+    // persist.
+    Ok(match readback_verdict(&path, value) {
+        ReadbackVerdict::Verified { effective } => WriteOutcome {
             effective,
             clamped: false,
-        }),
-        ReadbackVerdict::Clamped { effective } => Ok(WriteOutcome {
+        },
+        ReadbackVerdict::Clamped { effective } => WriteOutcome {
             effective,
             clamped: true,
-        }),
+        },
+    })
+}
+
+/// Read `path` back and classify it against the value just written. Some
+/// tunables are write-only (mode 0200, e.g. vm.drop_caches /
+/// vm.compact_memory): the write is accepted but the read fails — that is
+/// `Verified` with the request as the record, since the kernel took the write
+/// and no read-back exists to diverge from.
+fn readback_verdict(path: &str, value: &str) -> ReadbackVerdict {
+    match fs::read_to_string(path) {
+        Ok(s) => classify_readback(value, s.trim()),
+        Err(_) => ReadbackVerdict::Verified {
+            effective: value.to_string(),
+        },
     }
 }
 
@@ -1037,10 +1038,38 @@ fn restore_entries(data: &RollbackData, quiet: bool) -> RollbackOutcome {
         if Path::new(&entry.path).exists() {
             match fs::write(&entry.path, &entry.previous) {
                 Ok(()) => {
-                    if !quiet {
-                        println!("  {} {} → {} (已恢复)", "✓".green(), param, entry.previous);
+                    // Confirm the write with the same read-back the tune path
+                    // uses (#5717): fs::write returning Ok only means the
+                    // kernel accepted the value, not that it took it. A
+                    // clamped read-back (the kernel kept another value) must
+                    // not count as restored, or rollback reports Full and
+                    // deletes the ledger while the system is still tuned. It
+                    // is a failure, which keeps the ledger for a retry.
+                    match readback_verdict(&entry.path, &entry.previous) {
+                        ReadbackVerdict::Verified { .. } => {
+                            if !quiet {
+                                println!(
+                                    "  {} {} → {} (已恢复)",
+                                    "✓".green(),
+                                    param,
+                                    entry.previous
+                                );
+                            }
+                            restored += 1;
+                        }
+                        ReadbackVerdict::Clamped { effective } => {
+                            if !quiet {
+                                println!(
+                                    "  {} {} : 回读为 {}（期望 {}），未恢复",
+                                    "✗".red(),
+                                    param,
+                                    effective,
+                                    entry.previous
+                                );
+                            }
+                            failed += 1;
+                        }
                     }
-                    restored += 1;
                 }
                 Err(e) => {
                     if !quiet {
@@ -2123,6 +2152,48 @@ mod tests {
         assert_eq!(outcome.restored, 1);
         assert_eq!(outcome.failed, 2);
         assert_eq!(outcome.skipped, 1);
+    }
+
+    #[test]
+    fn test_restore_entries_counts_readback_mismatch_as_failed() {
+        // fs::write returning Ok does not prove the kernel took the value: a
+        // write can be clamped, and the vm.dirty_ratio <-> vm.dirty_bytes
+        // pair silently clears its sibling. A restore whose write is not
+        // confirmed must NOT count as restored — counting it lets rollback
+        // report Full and delete the ledger while the live value is still the
+        // tuned one, so `previous` is never re-applied. A symlink to /dev/null
+        // has the same shape: the write is accepted and the read-back does not
+        // hold `previous`.
+        let dir = AtomicTestDir::new("rollback_readback_mismatch");
+        let discarded = dir.0.join("discarded");
+        std::os::unix::fs::symlink("/dev/null", &discarded).unwrap();
+        let restored = dir.0.join("restored");
+        fs::write(&restored, "30").unwrap();
+        let mut entries = BTreeMap::new();
+        for (param, path) in [("vm.dirty_bytes", &discarded), ("vm.swappiness", &restored)] {
+            entries.insert(
+                param.to_string(),
+                RollbackEntry {
+                    previous: "10".to_string(),
+                    applied: "30".to_string(),
+                    path: path.to_str().unwrap().to_string(),
+                },
+            );
+        }
+        let outcome = restore_entries(
+            &RollbackData {
+                version: 1,
+                entries,
+            },
+            true,
+        );
+        // The confirmed restore is restored; the unconfirmed one is a failure
+        // so the ledger is kept for a retry.
+        assert_eq!(fs::read_to_string(&restored).unwrap(), "10");
+        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.failed, 1);
+        assert_eq!(outcome.skipped, 0);
+        assert!(!rollback_should_finalize(outcome.failed, outcome.skipped));
     }
 
     #[test]
