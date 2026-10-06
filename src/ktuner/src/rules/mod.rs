@@ -4770,13 +4770,27 @@ fn eval_percpu_pagelist_high_fraction(info: &SystemInfo, recs: &mut Vec<Recommen
     1
 }
 
-fn eval_accept_ra(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv6/conf/default/accept_ra";
-    if !std::path::Path::new(path).exists() {
+fn eval_accept_ra(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_accept_ra_at(info, recs, "/proc/sys/net/ipv6/conf/default/accept_ra")
+}
+
+/// Path-injectable form of [`eval_accept_ra`] (the `eval_*_at` idiom).
+///
+/// `accept_ra` is an `__s32` slot of `struct ipv6_devconf`
+/// (`include/linux/ipv6.h`) registered through a plain `proc_dointvec` with no
+/// min/max (`net/ipv6/addrconf.c`), so -1 is a legal value; `ipv6_accept_ra()`
+/// (`include/net/ipv6.h`) reads the slot as a truthiness test when forwarding
+/// is off, so -1 means Router Advertisements are accepted. The unsigned reader
+/// parses "-1" to Err and falls back to 0 — the *disabled* value — so the old
+/// `> 0` gate stayed silent on a host that accepts RAs. This is the IPv6
+/// counterpart of the ipv4 devconf booleans read signed in f57a3c81a.
+fn eval_accept_ra_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current > 0 {
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
+    if current != 0 {
         recs.push(Recommendation {
             param: "net.ipv6.conf.default.accept_ra".to_string(),
             current_value: current.to_string(),
@@ -9020,6 +9034,48 @@ mod tests {
             assert_eq!(rec.category, Category::Security);
             assert_eq!(rec.confidence, Confidence::High);
         }
+    }
+
+    #[test]
+    fn accept_ra_reads_the_signed_devconf_value() {
+        // accept_ra is an __s32 slot of struct ipv6_devconf behind a plain
+        // proc_dointvec (net/ipv6/addrconf.c), and ipv6_accept_ra()
+        // (include/net/ipv6.h) reads it as a truthiness test when forwarding
+        // is off — so -1 means enabled. The unsigned reader parsed "-1" to
+        // the disabled value 0, and the rule then stayed silent on a host
+        // that accepts Router Advertisements.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_accept_ra_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("accept_ra");
+        let info = make_test_info();
+
+        for (content, expected) in [
+            ("-1\n", Some("-1")),
+            ("1\n", Some("1")),
+            ("2\n", Some("2")),
+            ("0\n", None),
+        ] {
+            std::fs::write(&path, content).unwrap();
+            let mut recs = Vec::new();
+            eval_accept_ra_at(&info, &mut recs, path.to_str().unwrap());
+            let rec = recs
+                .iter()
+                .find(|r| r.param == "net.ipv6.conf.default.accept_ra");
+            assert_eq!(
+                rec.map(|r| r.current_value.as_str()),
+                expected,
+                "accept_ra={content}"
+            );
+            if let Some(rec) = rec {
+                assert_eq!(rec.recommended_value, "0");
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
