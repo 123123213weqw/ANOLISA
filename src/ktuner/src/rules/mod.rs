@@ -2111,11 +2111,22 @@ fn recommend_unprivileged_bpf(current: u64, recs: &mut Vec<Recommendation>) {
 }
 
 fn eval_core_uses_pid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/core_uses_pid";
+    eval_core_uses_pid_at(info, recs, "/proc/sys/kernel/core_uses_pid")
+}
+
+/// Path-injectable form of [`eval_core_uses_pid`] (the `eval_*_at` idiom).
+/// `fs/coredump.c` registers kernel.core_uses_pid through plain
+/// `proc_dointvec` with no min/max, and the same file consumes it as a
+/// boolean (`if (!ispipe && !pid_in_pattern && core_uses_pid)`), so -1 is a
+/// legal, already-enabled value. The unsigned reader turns "-1" into the
+/// fallback 0 — the *not-enabled* value — so the `== 0` gate invented the
+/// recommendation on a host that already appends the PID.
+fn eval_core_uses_pid_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "kernel.core_uses_pid".to_string(),
@@ -2522,12 +2533,28 @@ fn eval_optmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     1
 }
 
-fn eval_oom_kill_allocating_task(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/oom_kill_allocating_task";
-    if !std::path::Path::new(path).exists() {
+fn eval_oom_kill_allocating_task(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_oom_kill_allocating_task_at(info, recs, "/proc/sys/vm/oom_kill_allocating_task")
+}
+
+/// Path-injectable form of [`eval_oom_kill_allocating_task`] (the
+/// `eval_*_at` idiom). `mm/oom_kill.c` registers vm.oom_kill_allocating_task
+/// through plain `proc_dointvec` with no min/max, and the same file consumes
+/// it as a boolean (`if (!is_memcg_oom(oc) && sysctl_oom_kill_allocating_task
+/// && ...)`), so -1 is a legal, already-enabled value. The unsigned reader
+/// turns "-1" into the fallback 0 — the *disabled* value — so the `== 0` gate
+/// invented the recommendation on a host that already kills the allocating
+/// task.
+fn eval_oom_kill_allocating_task_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "vm.oom_kill_allocating_task".to_string(),
@@ -3626,12 +3653,24 @@ fn eval_sched_tunable_scaling(info: &SystemInfo, recs: &mut Vec<Recommendation>)
     1
 }
 
-fn eval_panic_on_oops(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/panic_on_oops";
-    if !std::path::Path::new(path).exists() {
+fn eval_panic_on_oops(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_panic_on_oops_at(info, recs, "/proc/sys/kernel/panic_on_oops")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the signed read is
+/// unit-testable against a temp file. `kernel/sysctl.c` registers
+/// kernel.panic_on_oops through plain `proc_dointvec`, which copies the table
+/// with no min/max, so -1 is a legal value; `arch/x86/kernel/dumpstack.c`
+/// consumes it as a boolean (`if (panic_on_oops) panic(...)`), and -1 is
+/// already enabled. The unsigned reader parses "-1" to Err and falls back to
+/// 0, the *not-enabled* value, so the `== 0` gate invented the recommendation
+/// on a host that already panics on oops.
+fn eval_panic_on_oops_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "kernel.panic_on_oops".to_string(),
@@ -3646,12 +3685,23 @@ fn eval_panic_on_oops(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
     1
 }
 
-fn eval_oom_dump_tasks(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/oom_dump_tasks";
-    if !std::path::Path::new(path).exists() {
+fn eval_oom_dump_tasks(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_oom_dump_tasks_at(info, recs, "/proc/sys/vm/oom_dump_tasks")
+}
+
+/// Path-injectable form of [`eval_oom_dump_tasks`] (the `eval_*_at` idiom).
+/// `mm/oom_kill.c` registers vm.oom_dump_tasks through plain `proc_dointvec`
+/// with no min/max, and its consumer is a boolean (`if (sysctl_oom_dump_tasks)`
+/// in the same file), so -1 is a legal, already-enabled value. The unsigned
+/// reader turns "-1" into the fallback 0 — the *disabled* value — so the
+/// `== 0` gate invented the recommendation on a host that already dumps the
+/// task list.
+fn eval_oom_dump_tasks_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // Any nonzero value is enabled, so -1 must not read as the value 0.
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "vm.oom_dump_tasks".to_string(),
@@ -9351,6 +9401,137 @@ mod tests {
                 usize::from(expects_rec),
                 "value {value}: only 0 (never reboot) is unhardened"
             );
+        }
+    }
+
+    #[test]
+    fn test_panic_on_oops_reads_truthiness_signed() {
+        // kernel.panic_on_oops is a plain proc_dointvec int with no min/max
+        // (kernel/sysctl.c), consumed as a boolean by
+        // arch/x86/kernel/dumpstack.c ("if (panic_on_oops) panic(...)"): any
+        // nonzero value, -1 included, is enabled. The unsigned reader parsed
+        // "-1" to Err, fell back to 0 — the *not-enabled* value — so the
+        // `== 0` gate invented the recommendation on a host that already
+        // panics on oops.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_panic_on_oops_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_panic_on_oops_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 is unhardened; any nonzero value is enabled"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "kernel.panic_on_oops");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_core_uses_pid_reads_truthiness_signed() {
+        // kernel.core_uses_pid is a plain proc_dointvec int with no min/max
+        // (fs/coredump.c), consumed by the same file as
+        // "if (!ispipe && !pid_in_pattern && core_uses_pid)". -1 is legal and
+        // enabled, so the unsigned reader's fallback 0 made the `== 0` gate
+        // report a PID-less core pattern on a host that appends the PID.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_core_uses_pid_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_core_uses_pid_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 leaves core files unnamed"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "kernel.core_uses_pid");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_oom_kill_allocating_task_reads_truthiness_signed() {
+        // vm.oom_kill_allocating_task is a plain proc_dointvec int with no
+        // min/max (mm/oom_kill.c), consumed by the same file as
+        // "if (!is_memcg_oom(oc) && sysctl_oom_kill_allocating_task && ...)".
+        // -1 is legal and enabled, so the unsigned reader's fallback 0 made
+        // the `== 0` gate report the opposite OOM policy.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_oom_kill_allocating_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked =
+                eval_oom_kill_allocating_task_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 selects a victim from the task list"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "vm.oom_kill_allocating_task");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
+        }
+    }
+
+    #[test]
+    fn test_oom_dump_tasks_reads_truthiness_signed() {
+        // vm.oom_dump_tasks is a plain proc_dointvec int with no min/max
+        // (mm/oom_kill.c), consumed by the same file as
+        // "if (sysctl_oom_dump_tasks)". -1 is legal and enabled, so the
+        // unsigned reader's fallback 0 made the `== 0` gate claim the OOM
+        // report is missing on a host that dumps it.
+        let info = make_test_info();
+        for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_oom_dump_tasks_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked = eval_oom_dump_tasks_at(&info, &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_rec),
+                "value {value}: only 0 suppresses the OOM task dump"
+            );
+            if expects_rec {
+                assert_eq!(recs[0].param, "vm.oom_dump_tasks");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
         }
     }
 
