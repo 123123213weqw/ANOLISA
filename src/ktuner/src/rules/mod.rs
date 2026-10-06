@@ -3495,12 +3495,46 @@ fn max_dgram_qlen_recommendation(current: u64) -> Option<Recommendation> {
 }
 
 fn eval_rps_sock_flow_entries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/rps_sock_flow_entries";
+    eval_rps_sock_flow_entries_at(
+        info,
+        recs,
+        "/proc/sys/net/core/rps_sock_flow_entries",
+        std::path::Path::new("/sys/class/net"),
+    )
+}
+
+/// Path-injectable form of [`eval_rps_sock_flow_entries`] (the `eval_*_at`
+/// idiom) so the RPS precondition is assertable against a synthetic sysfs
+/// tree instead of the live `/sys/class/net`.
+///
+/// The kernel only picks a receive CPU for RPS/RFS while `rps_needed` is set
+/// (net/core/dev.c: `if (static_branch_unlikely(&rps_needed)) { ...
+/// cpu = get_rps_cpu(skb->dev, skb, &rflow); ... }`), and that key is raised
+/// per receive queue by `store_rps_map()` (net/core/net-sysfs.c: `if (map)
+/// static_branch_inc(&rps_needed);`) — i.e. only once a queue has a non-empty
+/// `rps_cpus` mask. The global flow table this rule sizes is read inside
+/// `get_rps_cpu()`, so on a host whose queues never had `rps_cpus` written
+/// (the default: every `/sys/class/net/*/queues/rx-*/rps_cpus` is 0) the table
+/// is never consulted and the reason's promise ("启用 RFS 流分发表可将网络
+/// 处理分散到多核，减少 CPU 热点提升吞吐") cannot be delivered by this write.
+/// The kernel documentation states the matching requirement: "The
+/// functionality remains disabled until explicitly configured" and "Both of
+/// these need to be set before RFS is enabled for a receive queue"
+/// (Documentation/networking/scaling.rst).
+fn eval_rps_sock_flow_entries_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    net_root: &std::path::Path,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     let max_speed = info.network.iter().map(|n| n.speed_mbps).max().unwrap_or(0);
     if max_speed < 10000 {
+        return 1;
+    }
+    if !rps_configured(net_root) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3517,6 +3551,34 @@ fn eval_rps_sock_flow_entries(info: &SystemInfo, recs: &mut Vec<Recommendation>)
         });
     }
     1
+}
+
+/// Whether any receive queue has RPS configured — a non-zero `rps_cpus` mask —
+/// which is what makes the kernel enter its RPS/RFS steering path at all (see
+/// [`eval_rps_sock_flow_entries_at`]). `rps_cpus` holds a hex CPU bitmap that
+/// may carry comma-separated 64-bit words, so "configured" means any hex digit
+/// other than 0; a queue without the file, or with `0`, steers nothing.
+fn rps_configured(net_root: &std::path::Path) -> bool {
+    let Ok(interfaces) = std::fs::read_dir(net_root) else {
+        return false;
+    };
+    for interface in interfaces.filter_map(|entry| entry.ok()) {
+        let Ok(queues) = std::fs::read_dir(interface.path().join("queues")) else {
+            continue;
+        };
+        for queue in queues.filter_map(|entry| entry.ok()) {
+            if !queue.file_name().to_string_lossy().starts_with("rx-") {
+                continue;
+            }
+            let Ok(mask) = std::fs::read_to_string(queue.path().join("rps_cpus")) else {
+                continue;
+            };
+            if mask.chars().any(|c| c.is_ascii_hexdigit() && c != '0') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn eval_neigh_gc_thresh3(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -8293,6 +8355,78 @@ mod tests {
         {
             assert_eq!(rec.recommended_value, "2");
         }
+    }
+
+    #[test]
+    fn rps_flow_table_is_only_sized_where_rps_is_configured() {
+        // dev.c only picks a receive CPU for RPS/RFS while `rps_needed` is
+        // set, and net-sysfs.c raises that key per receive queue when
+        // `rps_cpus` becomes non-empty. With every mask left at 0 the global
+        // flow table is never read, so raising it cannot spread any traffic —
+        // the shape the rule used to fire on (a 10-GbE host with the default
+        // rps_sock_flow_entries).
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_rps_cpus_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+        };
+        let param = dir.join("rps_sock_flow_entries");
+        std::fs::write(&param, "4096\n").unwrap();
+
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        // A transmit queue that carries a mask must not count, and neither
+        // must any receive mask that is entirely zero.
+        write("eth0/queues/tx-0/rps_cpus", "0000000f\n");
+        for mask in ["0\n", "00000000\n", "00000000,00000000\n"] {
+            write("eth0/queues/rx-0/rps_cpus", mask);
+            let mut recs = Vec::new();
+            eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
+            assert!(recs.is_empty(), "rps_cpus={mask:?} steers no traffic");
+        }
+
+        // A configured receive queue keeps the rule, including masks that
+        // span comma-separated 64-bit words.
+        write("eth0/queues/rx-0/rps_cpus", "00000000,00000030\n");
+        let mut recs = Vec::new();
+        eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
+        assert!(
+            recs.iter()
+                .any(|r| r.param == "net.core.rps_sock_flow_entries"),
+            "a configured RPS queue makes the global table matter"
+        );
+
+        // An unreadable tree counts as unconfigured instead of panicking.
+        let mut recs = Vec::new();
+        eval_rps_sock_flow_entries_at(
+            &info,
+            &mut recs,
+            param.to_str().unwrap(),
+            &dir.join("missing"),
+        );
+        assert!(recs.is_empty(), "no sysfs tree means nothing is steered");
+
+        // The 10-GbE gate is unchanged.
+        let mut slow = make_test_info();
+        slow.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 1000,
+        }];
+        let mut recs = Vec::new();
+        eval_rps_sock_flow_entries_at(&slow, &mut recs, param.to_str().unwrap(), &dir);
+        assert!(recs.is_empty(), "a slow NIC keeps the rule silent");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
