@@ -99,6 +99,24 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
     if root.join(".dockerenv").exists() || root.join("run/.containerenv").exists() {
         return RuntimeEnv::Container;
     }
+    // systemd's container interface: when systemd runs as PID 1 inside a
+    // container it records the manager's name here, taken from the
+    // `container=` variable the manager puts in its environment. In a cgroup
+    // v2 container this is the only signal that is left — /proc/1/cgroup is
+    // then the namespace root `0::/` and PID 1 is a known init, so both checks
+    // below report a bare host.
+    //
+    // `wsl` is the one value that is not a container here: WSL2's own init
+    // exports it (systemd documents WSL as "categorized as a container for
+    // practical purposes"), but /proc/sys in WSL2 is the WSL kernel the
+    // workload itself runs on — not a host kernel shared with other machines —
+    // so the bare-host verdict the scope already gets must not change.
+    if let Some(manager) = read_text_lossy(&root.join("run/systemd/container")) {
+        let manager = manager.trim();
+        if !manager.is_empty() && manager != "wsl" {
+            return RuntimeEnv::Container;
+        }
+    }
     // Both files are read lossily: cgroup paths and PID 1's comm (the first
     // token of /proc/1/sched) may hold non-UTF-8 bytes, which made
     // `read_to_string` skip the check and report a container as `BareHost`.
@@ -1602,6 +1620,49 @@ mod tests {
 
         // Guard: a known init with a plain cgroup is still a bare host.
         fs::write(proc1.join("cgroup"), b"0::/init.scope\n").expect("write cgroup");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// systemd's container interface: when systemd runs as PID 1 inside a
+    /// container it records the manager's name in `/run/systemd/container`
+    /// (from the `container=` variable the manager puts in its environment).
+    /// In a cgroup-v2 container that is the only signal left — `/proc/1/cgroup`
+    /// is the namespace root `0::/` and PID 1 is a known init, so every other
+    /// check reports a bare host.
+    #[test]
+    fn runtime_env_reads_the_systemd_container_marker() {
+        let root =
+            std::env::temp_dir().join(format!("ktuner_container_marker_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+        // An LXC container with systemd as PID 1 and a private cgroup namespace.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        let marker = root.join("run/systemd/container");
+        fs::create_dir_all(marker.parent().expect("marker parent")).expect("create run/systemd");
+
+        fs::write(&marker, b"lxc\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // A manager systemd does not know is still a container.
+        fs::write(&marker, b"some-unknown-manager\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // `wsl` is not a container manager here: WSL2's init exports it, but
+        // /proc/sys in WSL2 is the WSL kernel the workload runs on, so the
+        // bare-host verdict it already reports must not change.
+        fs::write(&marker, b"wsl\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        // An empty marker file names no manager.
+        fs::write(&marker, b"\n").expect("write container marker");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        // Guard: no marker file at all is still a bare host.
+        fs::remove_file(&marker).ok();
         assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
 
         fs::remove_dir_all(&root).ok();
