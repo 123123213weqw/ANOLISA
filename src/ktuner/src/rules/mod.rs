@@ -3191,7 +3191,25 @@ fn sched_child_runs_first_recommendation(
 }
 
 fn eval_page_cluster(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/page-cluster";
+    eval_page_cluster_at(info, recs, "/proc/sys/vm/page-cluster", "/proc/swaps")
+}
+
+/// Path-injectable form of [`eval_page_cluster`] (the `eval_*_at` idiom) so the
+/// swap gate is assertable against a synthetic /proc/swaps.
+///
+/// The knob only sizes the swap-in readahead window: v6.6 reads `page_cluster`
+/// solely in `mm/swap_state.c` (`swapin_nr_pages`, `swapin_readahead` and the
+/// swap VMA readahead), and the kernel documentation calls it "the swap
+/// counterpart to page cache readahead" (`sysctl/vm.rst`). A host with no swap
+/// area has nothing to read in, so the recommendation's promised saving cannot
+/// happen there — the same "never recommend a no-op" rule the hardlockup_panic
+/// gate already follows for a disabled NMI watchdog.
+fn eval_page_cluster_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    swaps_path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -3200,6 +3218,9 @@ fn eval_page_cluster(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
         .iter()
         .any(|d| matches!(d.disk_type, DiskType::NVMe | DiskType::SSD));
     if !has_ssd {
+        return 1;
+    }
+    if !swap_configured(swaps_path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3216,6 +3237,16 @@ fn eval_page_cluster(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
         });
     }
     1
+}
+
+/// Whether `/proc/swaps` lists at least one swap area. The table always carries
+/// its header line, so a configured area means a following non-empty line
+/// (zram and file-backed areas are listed the same way). An unreadable table
+/// counts as "no swap", so the rule stays quiet instead of promising a swap
+/// saving it cannot verify.
+fn swap_configured(path: &str) -> bool {
+    std::fs::read_to_string(path)
+        .is_ok_and(|content| content.lines().skip(1).any(|line| !line.trim().is_empty()))
 }
 
 fn eval_rmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -8409,6 +8440,70 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "vm.page-cluster") {
             assert_eq!(rec.recommended_value, "0");
         }
+    }
+
+    #[test]
+    fn page_cluster_needs_a_swap_area_to_be_worth_setting() {
+        // vm.page-cluster sizes the swap-in readahead window: v6.6 reads it
+        // only from mm/swap_state.c (swapin_nr_pages / swapin_readahead / the
+        // swap VMA readahead). On an SSD host with no swap area the
+        // recommendation's promised IO saving cannot happen, so the rule must
+        // stay quiet — the same "don't recommend a no-op" rule the
+        // hardlockup_panic gate follows for a disabled NMI watchdog.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_page_cluster_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let param = dir.join("page-cluster");
+        std::fs::write(&param, b"3\n").unwrap();
+        // /proc/swaps always carries its header, so a header-only table means
+        // no configured area.
+        let header_only = dir.join("swaps-header-only");
+        std::fs::write(
+            &header_only,
+            b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n",
+        )
+        .unwrap();
+        let with_swap = dir.join("swaps-active");
+        std::fs::write(
+            &with_swap,
+            b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/dev/sda2                               partition\t16776188\t0\t\t-2\n",
+        )
+        .unwrap();
+        let missing = dir.join("swaps-missing");
+
+        let info = make_test_info();
+
+        for swaps in [&header_only, &missing] {
+            let mut recs = Vec::new();
+            eval_page_cluster_at(
+                &info,
+                &mut recs,
+                param.to_str().unwrap(),
+                swaps.to_str().unwrap(),
+            );
+            assert!(
+                recs.is_empty(),
+                "{}: no swap area means nothing to read in",
+                swaps.display()
+            );
+        }
+
+        let mut recs = Vec::new();
+        eval_page_cluster_at(
+            &info,
+            &mut recs,
+            param.to_str().unwrap(),
+            with_swap.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.page-cluster"),
+            "an active swap area keeps the rule"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
