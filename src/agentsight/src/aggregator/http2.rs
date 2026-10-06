@@ -1043,17 +1043,33 @@ impl Http2StreamAggregator {
             StreamDirection::Response => &mut state.resp_decoder,
         };
 
-        match decoder.decode(fragment) {
-            Ok(headers) => {
-                let result: Vec<(String, String)> = headers
-                    .into_iter()
-                    .map(|(name, value)| {
-                        (
-                            String::from_utf8_lossy(&name).into_owned(),
-                            String::from_utf8_lossy(&value).into_owned(),
-                        )
-                    })
-                    .collect();
+        // The third-party hpack 0.3 decoder panics on malformed
+        // dynamic-table-size updates: `update_max_dynamic_size` unwraps the
+        // integer decode, so a `0x3F`-prefixed update that is truncated or
+        // runs past the octet limit kills the calling thread instead of
+        // returning an error. Both are trivially crafted by any TLS peer of
+        // a monitored process. The workspace builds with the default unwind
+        // panic strategy (no `panic = "abort"` in any profile), so catch the
+        // unwind and degrade exactly like a decode error below: reset the
+        // connection's decoder for this direction and skip the block.
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            decoder
+                .decode(fragment)
+                .map(|headers| -> Vec<(String, String)> {
+                    headers
+                        .into_iter()
+                        .map(|(name, value)| {
+                            (
+                                String::from_utf8_lossy(&name).into_owned(),
+                                String::from_utf8_lossy(&value).into_owned(),
+                            )
+                        })
+                        .collect()
+                })
+        }));
+
+        match outcome {
+            Ok(Ok(headers)) => {
                 // A block may carry a dynamic-table size update, which the
                 // hpack 0.3 decoder applies verbatim with no ceiling of its
                 // own — re-assert the clamped cap after every block.
@@ -1063,7 +1079,7 @@ impl Http2StreamAggregator {
                 // over-advertised update as a decode error; degrading to
                 // the clamp instead keeps the connection observable.)
                 decoder.set_max_table_size(cap);
-                let block_addition: usize = result
+                let block_addition: usize = headers
                     .iter()
                     .map(|(name, value)| name.len() + value.len() + 32)
                     .fold(0usize, usize::saturating_add);
@@ -1084,31 +1100,43 @@ impl Http2StreamAggregator {
                             .min(cap);
                     }
                 }
-                Some(result)
+                Some(headers)
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::warn!(
                     "HPACK decode error for conn={conn_id:?} dir={direction:?}: {e:?}, resetting decoder"
                 );
-                // Reset decoder for this direction. The fresh table is
-                // empty and re-pinned to the connection's effective cap;
-                // the retained-bytes estimate starts over from zero.
-                let state = self
-                    .hpack_states
-                    .get_or_insert_mut(conn_id, HpackConnectionState::new);
-                match direction {
-                    StreamDirection::Request => {
-                        state.req_decoder = Decoder::new();
-                        state.req_decoder.set_max_table_size(state.req_table_cap);
-                        state.req_table_bytes = 0;
-                    }
-                    StreamDirection::Response => {
-                        state.resp_decoder = Decoder::new();
-                        state.resp_decoder.set_max_table_size(state.resp_table_cap);
-                        state.resp_table_bytes = 0;
-                    }
-                }
+                self.reset_hpack_decoder(conn_id, direction);
                 None
+            }
+            Err(panic) => {
+                log::warn!(
+                    "HPACK decoder panicked for conn={conn_id:?} dir={direction:?}: {panic:?}, resetting decoder"
+                );
+                self.reset_hpack_decoder(conn_id, direction);
+                None
+            }
+        }
+    }
+
+    /// Reset the per-direction HPACK decoder for a connection after a decode
+    /// error or panic, so later header blocks start from a clean dynamic
+    /// table. The fresh table is empty and re-pinned to the connection's
+    /// effective cap; the retained-bytes estimate starts over from zero.
+    fn reset_hpack_decoder(&mut self, conn_id: ConnectionId, direction: StreamDirection) {
+        let state = self
+            .hpack_states
+            .get_or_insert_mut(conn_id, HpackConnectionState::new);
+        match direction {
+            StreamDirection::Request => {
+                state.req_decoder = Decoder::new();
+                state.req_decoder.set_max_table_size(state.req_table_cap);
+                state.req_table_bytes = 0;
+            }
+            StreamDirection::Response => {
+                state.resp_decoder = Decoder::new();
+                state.resp_decoder.set_max_table_size(state.resp_table_cap);
+                state.resp_table_bytes = 0;
             }
         }
     }
@@ -2432,6 +2460,116 @@ mod tests {
         assert!(decoded.is_some());
         let hdrs = decoded.unwrap();
         assert_eq!(hdrs.iter().find(|(n, _)| n == ":method").unwrap().1, "GET");
+    }
+
+    #[test]
+    fn hostile_hpack_size_update_panics_are_contained() {
+        // Regression: a dynamic-table-size update whose 5-bit prefix is all
+        // ones (0x3f) must be terminated by a low continuation byte within
+        // the octet limit. A block that ends first (NotEnoughOctets) or runs
+        // >= 4 high-bit continuation bytes (TooManyOctets) makes hpack 0.3's
+        // `update_max_dynamic_size` unwrap a None — panicking the observer's
+        // event thread on any monitored TLS connection. The aggregator must
+        // skip the block instead and keep decoding later traffic.
+        let mut aggregator = Http2StreamAggregator::new();
+
+        let shapes: [(ConnectionId, &[u8], &str); 3] = [
+            // Truncated update: the block ends before any continuation byte.
+            (
+                ConnectionId {
+                    pid: 510,
+                    ssl_ptr: 0xA100,
+                },
+                &[0x3F],
+                "truncated size update",
+            ),
+            // Octet limit: four all-ones continuation bytes.
+            (
+                ConnectionId {
+                    pid: 511,
+                    ssl_ptr: 0xA200,
+                },
+                &[0x3F, 0xFF, 0xFF, 0xFF, 0xFF],
+                "octet-limit size update",
+            ),
+            // An indexed field decoded before the truncated update.
+            (
+                ConnectionId {
+                    pid: 512,
+                    ssl_ptr: 0xA300,
+                },
+                &[0x82, 0x3F],
+                "indexed field + truncated size update",
+            ),
+        ];
+
+        for (conn_id, fragment, label) in shapes {
+            let decoded =
+                aggregator.decode_header_block(conn_id, StreamDirection::Request, fragment);
+            assert!(decoded.is_none(), "{label} must be skipped, not panic");
+        }
+
+        // The PADDED framing variant reaching the same decoder through
+        // process_frames: pad length 1 strips down to the bare 0x3f update.
+        let mut padded_agg = Http2StreamAggregator::new();
+        let pad_event = create_test_event(513, 0xA400, 1, 6100);
+        let padded = create_test_frame(1, 1, 0x08 | 0x04, vec![0x01, 0x3F, 0x00], pad_event);
+        assert!(padded_agg.process_frames(vec![padded]).is_empty());
+
+        // Recovery: after the contained panic the decoder was reset, so a
+        // valid block on the same connection decodes again.
+        let conn_id = ConnectionId {
+            pid: 510,
+            ssl_ptr: 0xA100,
+        };
+        let mut encoder = Encoder::new();
+        let headers = [
+            (b":method".to_vec(), b"GET".to_vec()),
+            (b":path".to_vec(), b"/health".to_vec()),
+        ];
+        let encoded = encoder.encode(headers.iter().map(|(n, v)| (&n[..], &v[..])));
+        let decoded = aggregator.decode_header_block(conn_id, StreamDirection::Request, &encoded);
+        let hdrs = decoded.expect("decoder must recover after the reset");
+        assert_eq!(hdrs.iter().find(|(n, _)| n == ":method").unwrap().1, "GET");
+    }
+
+    #[test]
+    fn hostile_hpack_size_update_via_continuation_is_contained() {
+        // Same defect through the CONTINUATION reassembly path: HEADERS
+        // without END_HEADERS seeds the buffer, a CONTINUATION frame with
+        // END_HEADERS appends the truncated update and triggers the decode
+        // of the reassembled block.
+        let mut aggregator = Http2StreamAggregator::new();
+        let event = create_test_event(520, 0xB000, 1, 6200);
+        let headers = create_test_frame(1, 1, 0x00, vec![0x82], event.clone());
+        let continuation = create_test_frame(1, 9, 0x04, vec![0x3F], event);
+        assert!(
+            aggregator
+                .process_frames(vec![headers, continuation])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn terminated_hpack_size_update_still_decodes() {
+        // Control: a 0x3f-prefixed update terminated by a low continuation
+        // byte is a legal (empty-valued) table-size update and must keep
+        // decoding, alone or ahead of real headers.
+        let mut aggregator = Http2StreamAggregator::new();
+        let conn_id = ConnectionId {
+            pid: 530,
+            ssl_ptr: 0xC000,
+        };
+        let decoded =
+            aggregator.decode_header_block(conn_id, StreamDirection::Request, &[0x3F, 0x00]);
+        assert_eq!(decoded, Some(Vec::new()));
+
+        let decoded =
+            aggregator.decode_header_block(conn_id, StreamDirection::Request, &[0x3F, 0x00, 0x82]);
+        assert_eq!(
+            decoded,
+            Some(vec![(":method".to_string(), "GET".to_string())])
+        );
     }
 
     #[test]
