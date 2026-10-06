@@ -201,7 +201,10 @@ pub fn gather_system_info() -> Result<SystemInfo> {
         kernel_version: read_kernel_version()?,
         os_distro: read_os_distro(),
         cpu_model,
-        cpu_cores,
+        // The same scaling input memory_total_gb already is: inside a cgroup
+        // CPU limit, every cpu-scaled rule would size its recommendation for
+        // processors the workload can never run on.
+        cpu_cores: effective_cpu_cores(cpu_cores, read_cgroup_cpu_limit_cores()),
         numa_nodes: read_numa_nodes(),
         memory_total_gb: read_memory_total_gb()?,
         disks: read_disk_info()?,
@@ -376,6 +379,71 @@ fn cgroup_v1_limit_kb(bytes: u64) -> u64 {
         bytes / 1024
     } else {
         0
+    }
+}
+
+fn read_cgroup_cpu_limit_cores() -> u64 {
+    // cgroup v2: cpu.max holds "<quota> <period>", quota "max" = no limit.
+    if let Ok(s) = fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        return cgroup_v2_cpu_max_cores(&s);
+    }
+    // cgroup v1: the quota and the period live in two files.
+    let quota = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us");
+    let period = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us");
+    if let (Ok(quota), Ok(period)) = (quota, period) {
+        return cgroup_v1_cfs_cores(&quota, &period);
+    }
+    0
+}
+
+/// cgroup v2 cpu.max content → whole cores, 0 for the "max" (no-limit)
+/// sentinel or unparseable content. A fractional quota rounds up: a
+/// 150000/100000 limit is one and a half CPUs, and scaling by 1 would
+/// under-size rules relative to what the workload can actually run.
+fn cgroup_v2_cpu_max_cores(raw: &str) -> u64 {
+    let mut fields = raw.split_whitespace();
+    let quota: u64 = match fields.next() {
+        Some(q) if q != "max" => match q.parse() {
+            Ok(quota) => quota,
+            Err(_) => return 0,
+        },
+        _ => return 0,
+    };
+    let period: u64 = fields.next().and_then(|p| p.parse().ok()).unwrap_or(0);
+    cores_from_quota_period(quota, period)
+}
+
+/// cgroup v1 cfs quota/period pair → whole cores, 0 when the quota is the -1
+/// "unlimited" sentinel or either value is unparseable.
+fn cgroup_v1_cfs_cores(quota_raw: &str, period_raw: &str) -> u64 {
+    let quota: i64 = quota_raw.trim().parse().unwrap_or(-1);
+    if quota < 0 {
+        return 0;
+    }
+    let period: u64 = period_raw.trim().parse().unwrap_or(0);
+    cores_from_quota_period(quota as u64, period)
+}
+
+/// Quota per period → whole cores (ceiling), 0 when there is no real limit.
+fn cores_from_quota_period(quota: u64, period: u64) -> u64 {
+    if quota == 0 || period == 0 {
+        return 0;
+    }
+    quota.div_ceil(period)
+}
+
+/// Effective CPU cores: the cgroup limit only when it is a real limit below
+/// the host count; never 0 (a 0 here would mis-scale every cpu-scaled rule,
+/// which is why every cpu-scaled rule consumes this one number). Mirrors
+/// [`effective_memory_gb`]: /proc/cpuinfo counts the host's processors, and a
+/// container with a cpu.max / cfs_quota limit can only run a fraction of
+/// them, so rules scaled by `cpu_cores` sized recommendations for processors
+/// the workload can never run on.
+fn effective_cpu_cores(host_cores: usize, cgroup_cores: u64) -> usize {
+    if cgroup_cores > 0 && (cgroup_cores as usize) < host_cores {
+        cgroup_cores as usize
+    } else {
+        host_cores
     }
 }
 
@@ -1104,6 +1172,43 @@ mod tests {
             cgroup_v1_limit_kb((1u64 << 62) - 1024),
             (1u64 << 62) / 1024 - 1
         );
+    }
+
+    #[test]
+    fn effective_cpu_cores_clamps_to_the_cgroup_limit() {
+        // A 2-CPU quota on a 128-core host scales by 2, not 128.
+        assert_eq!(effective_cpu_cores(128, 2), 2);
+        // A single-core quota never floors to 0 — every cpu-scaled rule
+        // consumes this number, and a 0 would mis-scale all of them.
+        assert_eq!(effective_cpu_cores(128, 1), 1);
+        // No limit (0) and a limit at/above the host count keep the host.
+        assert_eq!(effective_cpu_cores(8, 0), 8);
+        assert_eq!(effective_cpu_cores(2, 64), 2);
+    }
+
+    #[test]
+    fn cgroup_v2_cpu_max_handles_max_sentinel_and_ceil() {
+        // "max" is the no-limit sentinel, not a value.
+        assert_eq!(cgroup_v2_cpu_max_cores("max 100000\n"), 0);
+        // 200000 per 100000 period is exactly 2 CPUs.
+        assert_eq!(cgroup_v2_cpu_max_cores("200000 100000\n"), 2);
+        // 150000 per 100000 is one and a half CPUs, rounded up to 2.
+        assert_eq!(cgroup_v2_cpu_max_cores("150000 100000\n"), 2);
+        // A missing period is not a parseable limit.
+        assert_eq!(cgroup_v2_cpu_max_cores("200000\n"), 0);
+        assert_eq!(cgroup_v2_cpu_max_cores("garbage"), 0);
+        assert_eq!(cgroup_v2_cpu_max_cores(""), 0);
+    }
+
+    #[test]
+    fn cgroup_v1_cfs_cores_rejects_unlimited_sentinel() {
+        // -1 is v1's no-limit sentinel for the quota.
+        assert_eq!(cgroup_v1_cfs_cores("-1\n", "100000\n"), 0);
+        // A real 200000/100000 quota converts to 2 cores.
+        assert_eq!(cgroup_v1_cfs_cores("200000\n", "100000\n"), 2);
+        // Garbage on either side is not a limit.
+        assert_eq!(cgroup_v1_cfs_cores("garbage", "100000\n"), 0);
+        assert_eq!(cgroup_v1_cfs_cores("200000\n", "garbage"), 0);
     }
 
     #[test]
