@@ -43,7 +43,24 @@ enum Commands {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    // README's JSON output contract: "Errors go to stderr as JSON." A usage
+    // error fires before any command runs, so parsing must not exit through
+    // clap's own plain-text renderer — an agent reading stderr JSON (the
+    // documented shape) has to be able to read this one too. `--help` and
+    // `--version` are not errors: clap keeps rendering them on stdout with
+    // exit 0.
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) if e.use_stderr() => {
+            let out = json!({ "error": e.to_string().trim_end() });
+            eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+            std::process::exit(e.exit_code());
+        }
+        Err(e) => {
+            print!("{e}");
+            std::process::exit(e.exit_code());
+        }
+    };
     let result = match cli.command {
         Commands::Check {
             category: cat,
