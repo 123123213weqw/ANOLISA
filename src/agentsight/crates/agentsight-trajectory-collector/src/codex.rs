@@ -302,6 +302,14 @@ pub fn extract_private_metadata(
         .iter()
         .any(|e| envelope_type(e) == "event_msg" && payload_type(e) == "user_message");
 
+    // The converter accumulates one AgentTurn between user events and
+    // flushes it as a single step, so the count has to describe those turns
+    // rather than the individual assistant response_items -- the same
+    // contract the qoder side has since 408f701bd. A turn opens on any
+    // event the converter buffers into it: assistant text, a reasoning
+    // summary, a tool call or output, or a token_count usage report.
+    let mut turn_open = false;
+
     for e in events {
         let payload = e.get("payload").unwrap_or(&serde_json::Value::Null);
         match envelope_type(e) {
@@ -316,34 +324,70 @@ pub fn extract_private_metadata(
             // The counts ride on the same events as the trajectory and have to
             // agree with the steps it contains, so an event that produces no
             // step must not be counted either (see `convert_codex_events`).
-            "event_msg" if payload_type(e) == "user_message" => {
-                let text = payload
-                    .get("message")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                if !text.is_empty() {
-                    user_count += 1;
+            "event_msg" => match payload_type(e) {
+                "user_message" => {
+                    // The converter flushes the turn on every user_message,
+                    // even a message-less one.
+                    if turn_open {
+                        assistant_count += 1;
+                        turn_open = false;
+                    }
+                    let text = payload
+                        .get("message")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !text.is_empty() {
+                        user_count += 1;
+                    }
                 }
-            }
-            "response_item" if payload_type(e) == "message" => {
-                let role = payload.get("role").and_then(|v| v.as_str());
-                if role == Some("assistant") && !joined_text(payload.get("content")).is_empty() {
-                    assistant_count += 1;
+                "token_count" => {
+                    if let Some(info) = payload.get("info") {
+                        if usage_triple(info.get("last_token_usage")).is_some() {
+                            turn_open = true;
+                        }
+                    }
                 }
-                // Legacy fallback (no event_msg/user_message in the whole
-                // rollout): the converter derives the user steps from
-                // role=user response_items, so the count must follow the same
-                // fallback; message-less items produce no step and are not
-                // counted.
-                if !has_user_event_msg
-                    && role == Some("user")
-                    && !joined_text(payload.get("content")).is_empty()
+                _ => {}
+            },
+            "response_item" => match payload_type(e) {
+                // Fallback user source for older rollouts: flushes the turn
+                // and produces a step whenever it carries text.
+                "message"
+                    if !has_user_event_msg
+                        && payload.get("role").and_then(|v| v.as_str()) == Some("user") =>
                 {
-                    user_count += 1;
+                    if turn_open {
+                        assistant_count += 1;
+                        turn_open = false;
+                    }
+                    if !joined_text(payload.get("content")).is_empty() {
+                        user_count += 1;
+                    }
                 }
-            }
+                "message" => {
+                    if payload.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                        && !joined_text(payload.get("content")).is_empty()
+                    {
+                        turn_open = true;
+                    }
+                }
+                "reasoning" => {
+                    if !joined_text(payload.get("summary")).is_empty() {
+                        turn_open = true;
+                    }
+                }
+                "custom_tool_call" | "function_call" | "local_shell_call"
+                | "custom_tool_call_output" | "function_call_output"
+                | "local_shell_call_output" => {
+                    turn_open = true;
+                }
+                _ => {}
+            },
             _ => {}
         }
+    }
+    if turn_open {
+        assistant_count += 1;
     }
 
     let project = cwd
@@ -763,6 +807,40 @@ mod tests {
             extra["user_message_count"].as_u64().unwrap(),
             user_steps as u64,
             "legacy sessions without event_msg must still count their users"
+        );
+    }
+
+    #[test]
+    fn test_extract_private_metadata_counts_turns_not_assistant_events() {
+        // The converter merges consecutive assistant messages into one Agent
+        // turn and also flushes turns that only carry reasoning, tool calls or
+        // usage -- the count must describe those turns rather than counting
+        // each assistant response_item (the same contract the qoder side has
+        // since 408f701bd), or it claims more assistant messages than the
+        // trajectory it rides on has agent steps.
+        let content = concat!(
+            "{\"timestamp\":\"2026-08-03T09:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"session_id\":\"s-5\",\"cwd\":\"/w/app\",\"cli_version\":\"0.1.0\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:01Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"go\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:02Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"part one\"}]}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:03Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"part two\"}]}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:04Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"part three\"}]}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:05Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"user_message\",\"message\":\"again\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:06Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call\",\"call_id\":\"fc_1\",\"name\":\"read_file\",\"arguments\":\"{}\"}}\n",
+            "{\"timestamp\":\"2026-08-03T09:00:07Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"function_call_output\",\"call_id\":\"fc_1\",\"output\":\"ok\"}}\n",
+        );
+        let events = load_jsonl_events(content);
+        let traj = convert_codex_events(&events, "codex").unwrap();
+        let extra = extract_private_metadata(&events, "codex");
+        let agent_steps = traj
+            .steps
+            .iter()
+            .filter(|s| s.source == StepSource::Agent)
+            .count();
+        assert_eq!(agent_steps, 2, "one merged turn plus one tool-only turn");
+        assert_eq!(
+            extra["assistant_message_count"].as_u64().unwrap(),
+            agent_steps as u64,
+            "the count must describe the turns the trajectory contains"
         );
     }
 
