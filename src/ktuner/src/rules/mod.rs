@@ -2969,10 +2969,18 @@ fn eval_tcp_rfc1337(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 }
 
 fn eval_secure_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_secure_redirects_at(info, recs, "/proc/sys/net/ipv4/conf/all/secure_redirects")
+    eval_secure_redirects_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/all/secure_redirects",
+        std::path::Path::new("/proc/sys/net/ipv4/conf"),
+    )
 }
 
-/// Path-injectable form of [`eval_secure_redirects`] (the `eval_*_at` idiom).
+/// Path-injectable form of [`eval_secure_redirects`] (the `eval_*_at` idiom)
+/// so the shared-media precondition is assertable against a synthetic conf
+/// tree.
+///
 /// The `conf/all/secure_redirects` entry is a plain `proc_dointvec` int slot
 /// (`devinet_conf_proc` in net/ipv4/devinet.c, no min/max), and
 /// `IN_DEV_SEC_REDIRECTS` (include/linux/inetdevice.h) reads it through
@@ -2980,12 +2988,39 @@ fn eval_secure_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
 /// `if (IN_DEV_SEC_REDIRECTS(in_dev) && ...)`. -1 is therefore enabled and
 /// must be flagged, but the unsigned reader parsed "-1" to Err — its fallback
 /// 0 skipped the rule on exactly the host whose secure redirects are on.
+///
+/// That consumer sits in the branch `__ip_do_redirect()` reaches only when
+/// shared-media redirects are disabled:
+///
+/// ```text
+///    if (!IN_DEV_SHARED_MEDIA(in_dev)) {
+///        if (!inet_addr_onlink(in_dev, new_gw, old_gw))
+///            goto reject_redirect;
+///        if (IN_DEV_SEC_REDIRECTS(in_dev) && ip_fib_check_default(new_gw, dev))
+///            goto reject_redirect;
+///    } else {
+///        if (inet_addr_type(net, new_gw) != RTN_UNICAST)
+///            goto reject_redirect;
+///    }
+/// ```
+///
+/// The sysctl documentation states the override outright — "shared_media ...
+/// Overrides secure_redirects" and "Overridden by shared_media"
+/// (Documentation/networking/ip-sysctl.rst) — and `IN_DEV_SHARED_MEDIA` is an
+/// OR of the `all` template with the device's own value, so while every
+/// interface runs the default (shared media on) the assignment cannot change
+/// how a redirect is judged. The rule stays quiet then, and only a host that
+/// already proved the knob reachable keeps the recommendation.
 fn eval_secure_redirects_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    conf_root: &std::path::Path,
 ) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    if !shared_media_disabled_somewhere(conf_root) {
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
@@ -3003,6 +3038,32 @@ fn eval_secure_redirects_at(
         });
     }
     1
+}
+
+/// Whether any interface has shared-media redirects off, the only state in
+/// which `net/ipv4/route.c` reads `IN_DEV_SEC_REDIRECTS` at all (see
+/// [`eval_secure_redirects_at`]). `IN_DEV_SHARED_MEDIA` is an
+/// `IN_DEV_ORCONF` of the `all` template and the device's own value
+/// (include/linux/inetdevice.h), so a nonzero `all` settles every interface
+/// at once, and only a device — or the `default` template that new devices
+/// inherit — carrying an explicit zero makes the per-interface half
+/// reachable. A value that is missing or unreadable does not count as off, so
+/// an unprovable tree keeps the rule quiet.
+fn shared_media_disabled_somewhere(conf_root: &std::path::Path) -> bool {
+    let zero = |path: &std::path::Path| {
+        std::fs::read_to_string(path)
+            .map(|value| value.trim().parse::<i64>().unwrap_or(1) == 0)
+            .unwrap_or(false)
+    };
+    if !zero(&conf_root.join("all").join("shared_media")) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(conf_root) else {
+        return false;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .any(|entry| entry.file_name() != "all" && zero(&entry.path().join("shared_media")))
 }
 
 fn eval_mmap_min_addr(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -10969,6 +11030,19 @@ mod tests {
         // silently skipped the rule on a host whose secure redirects are on
         // (IN_DEV_SEC_REDIRECTS is an ORCONF truthiness test).
         let info = make_test_info();
+        let conf = std::env::temp_dir().join(format!(
+            "ktuner_secure_redirects_conf_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&conf);
+        for relative in ["all/shared_media", "eth0/shared_media"] {
+            let path = conf.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            // Shared media off so the shared_media gate keeps the knob
+            // reachable and this test still observes the signed read.
+            std::fs::write(&path, "0\n").unwrap();
+        }
         for (value, expects_rec) in [(-1, true), (0, false), (1, true)] {
             let path = std::env::temp_dir().join(format!(
                 "ktuner_secure_redirects_{}_{:?}_{value}",
@@ -10977,7 +11051,7 @@ mod tests {
             ));
             std::fs::write(&path, format!("{value}\n")).unwrap();
             let mut recs = Vec::new();
-            let checked = eval_secure_redirects_at(&info, &mut recs, path.to_str().unwrap());
+            let checked = eval_secure_redirects_at(&info, &mut recs, path.to_str().unwrap(), &conf);
             std::fs::remove_file(&path).ok();
             assert_eq!(checked, 1);
             assert_eq!(
@@ -10995,6 +11069,68 @@ mod tests {
                 assert_eq!(recs[0].recommended_value, "0");
             }
         }
+    }
+
+    #[test]
+    fn secure_redirects_advice_needs_shared_media_off() {
+        // __ip_do_redirect() (net/ipv4/route.c) reads IN_DEV_SEC_REDIRECTS only
+        // inside its `if (!IN_DEV_SHARED_MEDIA(in_dev))` branch, and the sysctl
+        // documentation states the override outright — "shared_media ...
+        // Overrides secure_redirects" / "Overridden by shared_media". Shared
+        // media defaults to on and IN_DEV_SHARED_MEDIA is an OR of conf/all
+        // and the device value, so the default host never reaches the branch
+        // and writing secure_redirects cannot change how a redirect is judged.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_secure_redirects_media_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let knob = write("all/secure_redirects", "1\n");
+        for interface in ["default", "lo", "eth0"] {
+            write(&format!("{interface}/shared_media"), "0\n");
+        }
+
+        // conf/all keeps shared media on for every interface (ORCONF), so the
+        // per-device zero cannot make secure_redirects reachable.
+        write("all/shared_media", "1\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert!(
+            recs.is_empty(),
+            "no redirect is judged by secure_redirects while shared media is on"
+        );
+
+        // Both halves off on one interface: the kernel reads the knob again.
+        write("all/shared_media", "0\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert_eq!(
+            recs.len(),
+            1,
+            "one interface with shared media off makes the write reachable"
+        );
+        assert_eq!(recs[0].param, "net.ipv4.conf.all.secure_redirects");
+
+        // Every device back on the default leaves nothing reading the knob,
+        // even with conf/all off.
+        for interface in ["default", "lo", "eth0"] {
+            write(&format!("{interface}/shared_media"), "1\n");
+        }
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert!(
+            recs.is_empty(),
+            "no interface reads secure_redirects once shared media is back on"
+        );
     }
 
     #[test]
