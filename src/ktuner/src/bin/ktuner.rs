@@ -464,6 +464,23 @@ fn cmd_why(param: &str) -> Result<i32> {
     Ok(code)
 }
 
+/// The value a parameter currently holds, read the way every other consumer
+/// reads it. sysfs option lists (`block/*/scheduler`, `transparent_hugepage/*`)
+/// render every choice and bracket the ACTIVE one, so the value is that
+/// token — the same reading the rules store as a recommendation's `current`,
+/// the ledger records as an original, and `classify_readback` verifies a
+/// write against. Publishing the whole line here flipped the format of
+/// `current` exactly when the recommendation disappeared (the system became
+/// optimal), so an agent polling `why` saw `"madvise"` turn into
+/// `"always [madvise] never"`.
+fn active_value(value: &str) -> &str {
+    let trimmed = value.trim();
+    trimmed
+        .split_whitespace()
+        .find_map(|token| token.strip_prefix('[').and_then(|t| t.strip_suffix(']')))
+        .unwrap_or(trimmed)
+}
+
 fn why_with(
     param: &str,
     eval: &rules::EvalResult,
@@ -496,7 +513,8 @@ fn why_with(
     let path = tuner::param_to_path(&normalized);
     match read_current(&path) {
         Ok(Some(val)) => {
-            let output = json!({ "param": normalized, "current": val.trim(), "status": "optimal" });
+            let output =
+                json!({ "param": normalized, "current": active_value(&val), "status": "optimal" });
             Ok((output, 0))
         }
         Ok(None) => anyhow::bail!("parameter not found: {param}"),
@@ -1231,21 +1249,29 @@ mod tests {
     #[test]
     fn why_reads_sysfs_fallback_without_rewriting_identity() {
         let eval = evaluation(Vec::new());
-        for (param, path, value) in [
+        // The fallback reports the VALUE, not the file's rendering: the
+        // parameter is bracketed option lists, and `current` must be the
+        // active option — the format `check`, a recommendation's `current`
+        // and the ledger's recorded original all use, so the field does not
+        // flip when the recommendation disappears.
+        for (param, path, value, active) in [
             (
                 "transparent_hugepage/enabled",
                 "/sys/kernel/mm/transparent_hugepage/enabled",
                 "always [madvise] never\n",
+                "madvise",
             ),
             (
                 "transparent_hugepage/defrag",
                 "/sys/kernel/mm/transparent_hugepage/defrag",
                 "always defer defer+madvise [madvise] never\n",
+                "madvise",
             ),
             (
                 "block/Disk.0/scheduler",
                 "/sys/block/Disk.0/queue/scheduler",
                 "[none] mq-deadline\n",
+                "none",
             ),
         ] {
             let current = CurrentFile::new(value);
@@ -1255,7 +1281,7 @@ mod tests {
             assert_eq!(code, 0);
             assert_eq!(
                 output,
-                json!({ "param": param, "current": value.trim(), "status": "optimal" })
+                json!({ "param": param, "current": active, "status": "optimal" })
             );
         }
     }
