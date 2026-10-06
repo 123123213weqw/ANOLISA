@@ -2126,7 +2126,12 @@ fn recommend_unprivileged_bpf(current: u64, recs: &mut Vec<Recommendation>) {
 }
 
 fn eval_core_uses_pid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_core_uses_pid_at(info, recs, "/proc/sys/kernel/core_uses_pid")
+    eval_core_uses_pid_at(
+        info,
+        recs,
+        "/proc/sys/kernel/core_uses_pid",
+        "/proc/sys/kernel/core_pattern",
+    )
 }
 
 /// Path-injectable form of [`eval_core_uses_pid`] (the `eval_*_at` idiom).
@@ -2136,9 +2141,31 @@ fn eval_core_uses_pid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
 /// legal, already-enabled value. The unsigned reader turns "-1" into the
 /// fallback 0 — the *not-enabled* value — so the `== 0` gate invented the
 /// recommendation on a host that already appends the PID.
-fn eval_core_uses_pid_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+///
+/// That same condition also says when there is nothing left to recommend:
+/// `core_uses_pid` is only the backward-compatibility half of the core-file
+/// name, and `pid_in_pattern` is set by a literal `%p` — the very specifier
+/// whose absence the reason complains about. A piped pattern
+/// (systemd-coredump ships `|/usr/lib/systemd/systemd-coredump %P %u ...`)
+/// never reaches the filename logic at all. Where either holds, the write
+/// cannot add a PID the kernel already records, so the reason's promise is
+/// already met — the "never recommend a no-op" rule the hardlockup_panic and
+/// page-cluster gates follow. An unreadable pattern keeps the recommendation:
+/// the kernel's default "core", which does use the knob, is what a failed
+/// read leaves behind.
+fn eval_core_uses_pid_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    pattern_path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
+    }
+    if let Ok(pattern) = std::fs::read_to_string(pattern_path) {
+        if core_pattern_records_the_pid(&pattern) {
+            return 1;
+        }
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
     let current = read_sysctl_i64(path);
@@ -2155,6 +2182,33 @@ fn eval_core_uses_pid_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path
         });
     }
     1
+}
+
+/// Whether `core_pattern` already records the crashing pid, so that
+/// `core_uses_pid` has nothing to add. Mirrors `format_corename()`
+/// (fs/coredump.c): a piped pattern bypasses the filename logic, and
+/// `pid_in_pattern` is set by a literal `%p` specifier. `%P` (global pid) and
+/// an escaped `%%` do not set it, so the scan walks the `%` escapes instead of
+/// string-matching the raw text — `core.%%p` names the file with a literal
+/// `%p` and still gets the `.PID` compatibility suffix.
+fn core_pattern_records_the_pid(pattern: &str) -> bool {
+    let pattern = pattern.trim();
+    if pattern.starts_with('|') {
+        return true;
+    }
+    let mut chars = pattern.chars();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some('p') => return true,
+                // `%%` emits one literal percent; every other specifier
+                // consumes its own character and none of them marks the pid.
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+    false
 }
 
 fn eval_yama_ptrace_scope(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -10116,6 +10170,14 @@ mod tests {
         // enabled, so the unsigned reader's fallback 0 made the `== 0` gate
         // report a PID-less core pattern on a host that appends the PID.
         let info = make_test_info();
+        // A file pattern with no %p of its own is where the knob still acts,
+        // so the truthiness cases keep deciding here.
+        let pattern = std::env::temp_dir().join(format!(
+            "ktuner_core_pattern_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&pattern, "core\n").unwrap();
         for (value, expects_rec) in [(-1, false), (0, true), (1, false)] {
             let path = std::env::temp_dir().join(format!(
                 "ktuner_core_uses_pid_{}_{:?}_{value}",
@@ -10124,7 +10186,12 @@ mod tests {
             ));
             std::fs::write(&path, format!("{value}\n")).unwrap();
             let mut recs = Vec::new();
-            let checked = eval_core_uses_pid_at(&info, &mut recs, path.to_str().unwrap());
+            let checked = eval_core_uses_pid_at(
+                &info,
+                &mut recs,
+                path.to_str().unwrap(),
+                pattern.to_str().unwrap(),
+            );
             std::fs::remove_file(&path).ok();
             assert_eq!(checked, 1);
             assert_eq!(
@@ -10138,6 +10205,72 @@ mod tests {
                 assert_eq!(recs[0].recommended_value, "1");
             }
         }
+        std::fs::remove_file(&pattern).ok();
+    }
+
+    #[test]
+    fn core_uses_pid_needs_a_core_pattern_that_leaves_it_something_to_do() {
+        // fs/coredump.c appends the compatibility `.PID` only under
+        // "if (!ispipe && !pid_in_pattern && core_uses_pid)": a piped pattern
+        // (systemd-coredump) never reaches the filename logic, and a pattern
+        // carrying its own %p already records the pid. On those hosts the
+        // reason's promise is already met, so the rule must stay quiet.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_core_uses_pid_pattern_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let param = write("core_uses_pid", "0\n");
+        let plain = write("pattern-plain", "core\n");
+        // A literal %p written with an escape: the kernel emits "%p" as text
+        // and still appends .PID, so the knob keeps its job.
+        let escaped = write("pattern-escaped", "core.%%p\n");
+        let with_pid = write("pattern-pid", "core.%p\n");
+        let piped = write(
+            "pattern-pipe",
+            "|/usr/lib/systemd/systemd-coredump %P %u %g %s %t %c %h\n",
+        );
+        let missing = dir.join("pattern-missing");
+
+        let info = make_test_info();
+
+        for pattern in [&with_pid, &piped] {
+            let mut recs = Vec::new();
+            eval_core_uses_pid_at(
+                &info,
+                &mut recs,
+                param.to_str().unwrap(),
+                pattern.to_str().unwrap(),
+            );
+            assert!(
+                recs.is_empty(),
+                "{}: the kernel already records the pid",
+                pattern.display()
+            );
+        }
+
+        for pattern in [&plain, &escaped, &missing] {
+            let mut recs = Vec::new();
+            eval_core_uses_pid_at(
+                &info,
+                &mut recs,
+                param.to_str().unwrap(),
+                pattern.to_str().unwrap(),
+            );
+            assert!(
+                recs.iter().any(|r| r.param == "kernel.core_uses_pid"),
+                "{}: the knob still names the core file",
+                pattern.display()
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
