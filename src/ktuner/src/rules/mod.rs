@@ -442,6 +442,8 @@ fn eval_swappiness(
 ) -> usize {
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse")
         || info.has_process("redis-server");
@@ -482,6 +484,8 @@ fn eval_thp(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
         || info.has_process("memcached")
         || info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
         || info.has_process("clickhouse");
 
     if is_latency_sensitive && info.sysctl.thp_enabled == "always" {
@@ -505,6 +509,8 @@ fn eval_dirty_ratio(
 ) -> usize {
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse");
     let is_latency_sensitive = is_db || *workload == WorkloadType::IoLatency;
@@ -1539,6 +1545,8 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
 
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse");
 
@@ -1620,7 +1628,12 @@ fn eval_rq_affinity(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
 // ─── CPU/Scheduler Rules ─────────────────────────────────────────────────────
 
 fn eval_numa_balancing(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/numa_balancing";
+    eval_numa_balancing_at(info, recs, "/proc/sys/kernel/numa_balancing")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the database gate is
+/// unit-testable against a temp file instead of the live /proc.
+fn eval_numa_balancing_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -1629,6 +1642,8 @@ fn eval_numa_balancing(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
     }
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
         || info.has_process("mongod")
         || info.has_process("clickhouse");
     if !is_db {
@@ -2267,19 +2282,37 @@ fn quarter_memory_hugepages(memory_gb: u64, hugepage_kb: u64) -> u64 {
 }
 
 fn eval_nr_hugepages(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/nr_hugepages";
+    eval_nr_hugepages_at(
+        info,
+        recs,
+        "/proc/sys/vm/nr_hugepages",
+        crate::detect::read_default_hugepage_kb(),
+    )
+}
+
+/// Path- and page-size-injectable form (the `eval_*_at` idiom): the live probe
+/// reads the count from /proc and the default huge-page size from
+/// /proc/meminfo, so injecting both is the only way to assert either branch on
+/// any host.
+///
+/// The gate is the shared boundary-aware database predicate, not the
+/// hand-rolled `postgres || mysqld` list: MariaDB 10.4+ runs as `mariadbd`
+/// (the daemon comm Debian and Ubuntu ship), so a MariaDB-only host missed
+/// the rule while the sibling SysV IPC sizing rules already counted it.
+fn eval_nr_hugepages_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    hugepage_kb: u64,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let needs_hugepages = info.has_process("postgres") || info.has_process("mysqld");
-    if !needs_hugepages {
+    if !is_database_present(info) {
         return 1;
     }
     let current = read_sysctl_u64(path);
-    let recommended = quarter_memory_hugepages(
-        info.memory_total_gb,
-        crate::detect::read_default_hugepage_kb(),
-    );
+    let recommended = quarter_memory_hugepages(info.memory_total_gb, hugepage_kb);
     if current == 0 && info.memory_total_gb >= 16 && recommended > 0 {
         recs.push(Recommendation {
             param: "vm.nr_hugepages".to_string(),
@@ -2297,12 +2330,21 @@ fn eval_nr_hugepages(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 }
 
 fn eval_shmmax(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/shmmax";
+    eval_shmmax_at(info, recs, "/proc/sys/kernel/shmmax")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the database gate is
+/// unit-testable against a temp file instead of the live /proc.
+///
+/// The gate is the shared boundary-aware database predicate, like the sibling
+/// SysV IPC rules: `kernel.shmmax` sizes the very shared-memory segment MariaDB
+/// and PostgreSQL keep their buffer pools in, and the hand-rolled
+/// `postgres || mysqld` list skipped the MariaDB 10.4+ `mariadbd` daemon comm.
+fn eval_shmmax_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let needs_shm = info.has_process("postgres") || info.has_process("mysqld");
-    if !needs_shm {
+    if !is_database_present(info) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -2630,7 +2672,17 @@ fn eval_dirty_background_ratio(
     workload: &WorkloadType,
     recs: &mut Vec<Recommendation>,
 ) -> usize {
-    let path = "/proc/sys/vm/dirty_background_ratio";
+    eval_dirty_background_ratio_at(info, workload, recs, "/proc/sys/vm/dirty_background_ratio")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the database gate is
+/// unit-testable against a temp file instead of the live /proc.
+fn eval_dirty_background_ratio_at(
+    info: &SystemInfo,
+    workload: &WorkloadType,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -2647,6 +2699,8 @@ fn eval_dirty_background_ratio(
     if current > target as u64 {
         let has_db = info.has_process("postgres")
             || info.has_process("mysqld")
+            // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+            || info.has_process("mariadbd")
             || info.has_process("mongod")
             || info.has_process("clickhouse");
         if has_db || matches!(workload, WorkloadType::IoLatency) || current > 10 {
@@ -6274,6 +6328,143 @@ mod tests {
             eval_shmmni_at(&info, &mut recs, shmmni_path.to_str().unwrap());
             assert!(recs.is_empty(), "{name} must not gate the IPC rules in");
         }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A process list holding exactly `names`, otherwise the standard fixture.
+    fn info_with_processes(names: &[&str]) -> SystemInfo {
+        let mut info = make_test_info();
+        info.processes = names
+            .iter()
+            .map(|n| ProcessInfo {
+                name: n.to_string(),
+            })
+            .collect();
+        info
+    }
+
+    #[test]
+    fn mariadb_daemon_gates_the_database_tuning_rules() {
+        // MariaDB 10.4+ runs as mariadbd — the comm Debian and Ubuntu ship for
+        // the same OLTP database `mysqld` names. The canonical predicate counts
+        // it (73c675865), but these rules still hand-roll the list around
+        // mysqld, so a MariaDB-only host got none of this advice.
+        let mut info = info_with_processes(&["mariadbd"]);
+        // Below the >=64GB branch of the swappiness and dirty rules, so only
+        // the database gate can produce a recommendation here.
+        info.memory_total_gb = 32;
+        info.sysctl.swappiness = 60;
+        info.sysctl.thp_enabled = "always".to_string();
+        info.sysctl.dirty_ratio = 20;
+        info.disks[0].disk_type = DiskType::NVMe;
+        info.disks[0].read_ahead_kb = 512;
+
+        let mut recs = Vec::new();
+        eval_swappiness(&info, &WorkloadType::Mixed, &mut recs);
+        assert!(
+            recs.iter().any(|r| r.param == "vm.swappiness"),
+            "mariadbd must gate the swappiness rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_thp(&info, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.param == "transparent_hugepage/enabled"),
+            "mariadbd must gate the THP rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_dirty_ratio(&info, &WorkloadType::Mixed, &mut recs);
+        assert!(
+            recs.iter().any(|r| r.param == "vm.dirty_ratio"),
+            "mariadbd must gate the dirty_ratio rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_read_ahead_kb(&info, &mut recs);
+        assert!(
+            recs.iter()
+                .any(|r| r.param == "block/nvme0n1/read_ahead_kb"),
+            "mariadbd must gate the read-ahead rule in"
+        );
+    }
+
+    #[test]
+    fn mariadb_daemon_gates_the_shared_memory_rules() {
+        // The SysV/shared-memory sizing gates are on the canonical predicate
+        // since 5c878f7ea: kernel.shmmax and vm.nr_hugepages belong to the same
+        // family as kernel.sem / kernel.shmmni, and the hand-rolled
+        // `postgres || mysqld` list kept a MariaDB-only host out of both.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_mariadb_gates_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let shmmax = write("shmmax", "65536\n");
+        let nr_hugepages = write("nr_hugepages", "0\n");
+        let numa_balancing = write("numa_balancing", "1\n");
+        let dirty_background_ratio = write("dirty_background_ratio", "10\n");
+
+        let mut info = info_with_processes(&["mariadbd"]);
+        info.memory_total_gb = 32;
+        info.numa_nodes = 2;
+
+        let mut recs = Vec::new();
+        eval_shmmax_at(&info, &mut recs, shmmax.to_str().unwrap());
+        assert!(
+            recs.iter().any(|r| r.param == "kernel.shmmax"),
+            "mariadbd must gate the shmmax rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_nr_hugepages_at(&info, &mut recs, nr_hugepages.to_str().unwrap(), 2048);
+        assert!(
+            recs.iter().any(|r| r.param == "vm.nr_hugepages"),
+            "mariadbd must gate the huge-page rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_numa_balancing_at(&info, &mut recs, numa_balancing.to_str().unwrap());
+        assert!(
+            recs.iter().any(|r| r.param == "kernel.numa_balancing"),
+            "mariadbd must gate the numa_balancing rule in"
+        );
+
+        let mut recs = Vec::new();
+        eval_dirty_background_ratio_at(
+            &info,
+            &WorkloadType::Mixed,
+            &mut recs,
+            dirty_background_ratio.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.dirty_background_ratio"),
+            "mariadbd must gate the dirty_background_ratio rule in"
+        );
+
+        // Boundary guard: the client tools are not the database.
+        let mut client = info_with_processes(&["mariadb-dump"]);
+        client.memory_total_gb = 32;
+        client.numa_nodes = 2;
+        let mut recs = Vec::new();
+        eval_shmmax_at(&client, &mut recs, shmmax.to_str().unwrap());
+        eval_nr_hugepages_at(&client, &mut recs, nr_hugepages.to_str().unwrap(), 2048);
+        eval_numa_balancing_at(&client, &mut recs, numa_balancing.to_str().unwrap());
+        eval_dirty_background_ratio_at(
+            &client,
+            &WorkloadType::Mixed,
+            &mut recs,
+            dirty_background_ratio.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "mariadb-dump is not the database");
 
         std::fs::remove_dir_all(&dir).ok();
     }
