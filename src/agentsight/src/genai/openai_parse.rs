@@ -801,6 +801,12 @@ impl GenAIBuilder {
         chunks: &[serde_json::Value],
     ) -> Option<(Vec<MessagePart>, Option<String>)> {
         let mut text_buf = String::new();
+        // Reasoning models stream their thinking as text deltas on the same
+        // event channel (qwen3-coder via dashscope sends reasoning_text, the
+        // o-series summary_text); the live aggregator keeps them as
+        // reasoning_content, so the drain path must too or a drained
+        // Responses stream loses its entire thinking.
+        let mut reasoning_buf = String::new();
         let mut calls = ResponsesToolCalls::default();
         let mut saw_responses_event = false;
         // Done payloads the item router cannot attribute: the router matches a
@@ -824,6 +830,14 @@ impl GenAIBuilder {
                     saw_responses_event = true;
                     if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
                         text_buf.push_str(delta);
+                    }
+                }
+                // Same events and same destination as the live aggregator's
+                // reasoning_content (see aggregate_responses_sse_chunks).
+                "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                    saw_responses_event = true;
+                    if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                        reasoning_buf.push_str(delta);
                     }
                 }
                 "response.output_item.added" => {
@@ -905,6 +919,11 @@ impl GenAIBuilder {
         }
 
         let mut parts = Vec::new();
+        if !reasoning_buf.is_empty() {
+            parts.push(MessagePart::Reasoning {
+                content: reasoning_buf,
+            });
+        }
         if !text_buf.is_empty() {
             parts.push(MessagePart::Text { content: text_buf });
         }
@@ -1517,6 +1536,33 @@ mod tests {
             other => panic!("expected ToolCall part, got {other:?}"),
         }
         assert_eq!(finish.as_deref(), Some("tool_calls"));
+    }
+
+    /// Reasoning models on the Responses protocol stream their thinking as
+    /// `response.reasoning_text.delta` (dashscope) or
+    /// `response.reasoning_summary_text.delta` (o-series). The live
+    /// aggregator keeps those as reasoning_content, but the drain path's
+    /// Responses merger never read them, so a drained stream lost its entire
+    /// thinking while the same stream captured live kept it.
+    #[test]
+    fn test_merge_sse_chunks_responses_reasoning_deltas() {
+        let chunks: Vec<serde_json::Value> = vec![
+            serde_json::json!({"type":"response.created","response":{"id":"resp_1","model":"qwen3-coder-plus"}}),
+            serde_json::json!({"type":"response.reasoning_text.delta","delta":"think "}),
+            serde_json::json!({"type":"response.reasoning_summary_text.delta","delta":"hard"}),
+            serde_json::json!({"type":"response.output_text.delta","delta":"Answer"}),
+        ];
+        let (parts, finish) = GenAIBuilder::merge_sse_chunks(&chunks);
+        assert_eq!(parts.len(), 2, "reasoning + text: {parts:?}");
+        assert!(matches!(
+            &parts[0],
+            MessagePart::Reasoning { content } if content == "think hard"
+        ));
+        assert!(matches!(
+            &parts[1],
+            MessagePart::Text { content } if content == "Answer"
+        ));
+        assert_eq!(finish.as_deref(), Some("stop"));
     }
 
     #[test]
