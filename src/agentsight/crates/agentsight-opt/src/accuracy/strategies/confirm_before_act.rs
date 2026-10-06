@@ -16,19 +16,34 @@ use crate::accuracy::detector::{AnalysisCtx, Detector, RawIssue};
 const SYSTEM_PROMPT: &str = include_str!("../../../prompts/confirm_before_act.md");
 
 /// Sensitive write-operation keywords (matched against lowercase cmd).
+///
+/// `rm` is intentionally absent: it must be matched as its own shell word
+/// (see [`contains_rm_word`]), not as a substring.
 const SENSITIVE_KEYWORDS: &[&str] = &[
     "git push",
     "git merge",
     "git reset",
     "git revert",
-    "rm ",
-    "rm -",
     "delete",
     "drop table",
     "force",
     "--hard",
     "sudo",
 ];
+
+/// Whether the command contains `rm` as its own shell word.
+///
+/// The keyword list used to carry `"rm "` / `"rm -"`, and `contains("rm ")`
+/// matches the tail of any word ending in "rm": `git commit -m 'fix form
+/// data'` or `echo "confirm before delete"` surfaced as a sensitive write op
+/// and fed the authorization LLM a fabricated candidate (which also kept the
+/// call from being skipped when nothing sensitive happened).
+fn contains_rm_word(lc: &str) -> bool {
+    lc.split_whitespace().any(|tok| {
+        let t = tok.trim_start_matches(|c: char| !c.is_ascii_alphanumeric());
+        t == "rm"
+    })
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct UnauthorizedOp {
@@ -69,7 +84,7 @@ impl ConfirmBeforeActStrategy {
             .iter()
             .filter(|c| {
                 let lc = c.cmd.to_lowercase();
-                SENSITIVE_KEYWORDS.iter().any(|k| lc.contains(k))
+                SENSITIVE_KEYWORDS.iter().any(|k| lc.contains(k)) || contains_rm_word(&lc)
             })
             .collect()
     }
@@ -222,5 +237,47 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert!(hits[0].cmd.contains("git push"));
         assert!(hits[1].cmd.contains("sudo"));
+    }
+
+    /// `contains("rm ")` matched the tail of any word ending in "rm", so a
+    /// harmless `git commit -m 'fix form data'` or `echo "confirm the
+    /// deletion"` was listed as a sensitive write op — an LLM-feeding false
+    /// candidate that also kept the detector from skipping when nothing
+    /// sensitive happened.
+    #[test]
+    fn words_containing_rm_are_not_sensitive_ops() {
+        let calls = vec![
+            make_call("Bash", "git commit -m 'fix form data'"),
+            make_call("Bash", r#"{"command":"echo confirm the deletion"}"#),
+            make_call("Bash", "cargo build --release"),
+        ];
+        let hits = ConfirmBeforeActStrategy::find_sensitive_ops(&calls);
+        assert!(
+            hits.is_empty(),
+            "words merely ending in 'rm' must not be flagged: {:?}",
+            hits.iter().map(|c| &c.cmd).collect::<Vec<_>>()
+        );
+    }
+
+    /// `rm` as its own shell word — including behind a command separator or
+    /// inside a subshell — must stay flagged, while `rmdir` stays out (it
+    /// only removes empty directories, matching the original `"rm "` list's
+    /// deliberate exclusion).
+    #[test]
+    fn rm_as_its_own_word_is_still_sensitive() {
+        let rm_calls = vec![
+            make_call("Bash", "rm -rf /tmp/build"),
+            make_call("Bash", "cd /tmp && rm -rf build"),
+            make_call("Bash", "sh -c 'rm -rf build'"),
+        ];
+        let hits = ConfirmBeforeActStrategy::find_sensitive_ops(&rm_calls);
+        assert_eq!(hits.len(), 3, "rm as a shell word must stay flagged");
+
+        let rmdir_calls = vec![make_call("Bash", "rmdir /tmp/empty")];
+        let hits = ConfirmBeforeActStrategy::find_sensitive_ops(&rmdir_calls);
+        assert!(
+            hits.is_empty(),
+            "rmdir was deliberately excluded by the original 'rm ' keywords"
+        );
     }
 }
