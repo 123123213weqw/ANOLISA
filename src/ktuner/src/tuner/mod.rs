@@ -467,29 +467,42 @@ pub fn is_safe_param(param: &str) -> bool {
 /// value is "safe". ktuner's own rules never recommend these, so guarding the
 /// write choke point (write_and_verify) with this list is defense-in-depth
 /// with zero legitimate-use regression.
-pub fn is_forbidden_param(param: &str) -> bool {
-    // Match on the RESOLVED filesystem path, not on the parameter's spelling, so
-    // every equivalent spelling that lands on the same file is rejected: dotted
-    // `kernel.core_pattern`, slashed `kernel/core_pattern`, doubled separators
-    // `kernel//core_pattern`, or a `..`-laden name. A dotted-name-only deny-list
-    // was fully bypassable because param_to_path's `.replace('.', "/")` is a
-    // no-op on an already-slashed name, so `kernel/core_pattern` dodged the list
-    // yet still resolved to /proc/sys/kernel/core_pattern.
-    const FORBIDDEN_PATHS: &[&str] = &[
-        "/proc/sys/kernel/core_pattern",
-        "/proc/sys/kernel/modprobe",
-        "/proc/sys/kernel/hotplug",
-        "/proc/sys/kernel/poweroff_cmd",
-        "/proc/sys/kernel/modules_disabled",
-        "/proc/sys/kernel/kexec_load_disabled",
-        "/proc/sys/kernel/usermodehelper", // + /bset, /inheritable ...
-        "/proc/sys/fs/binfmt_misc",        // + /register ...
-    ];
+///
+/// Matching is on the RESOLVED filesystem path, not on a parameter's spelling,
+/// so every equivalent spelling that lands on the same file is rejected:
+/// dotted `kernel.core_pattern`, slashed `kernel/core_pattern`, doubled
+/// separators `kernel//core_pattern`, or a `..`-laden name. A
+/// dotted-name-only deny-list was fully bypassable because param_to_path's
+/// `.replace('.', "/")` is a no-op on an already-slashed name, so
+/// `kernel/core_pattern` dodged the list yet still resolved to
+/// /proc/sys/kernel/core_pattern.
+const FORBIDDEN_PATHS: &[&str] = &[
+    "/proc/sys/kernel/core_pattern",
+    "/proc/sys/kernel/modprobe",
+    "/proc/sys/kernel/hotplug",
+    "/proc/sys/kernel/poweroff_cmd",
+    "/proc/sys/kernel/modules_disabled",
+    "/proc/sys/kernel/kexec_load_disabled",
+    "/proc/sys/kernel/usermodehelper", // + /bset, /inheritable ...
+    "/proc/sys/fs/binfmt_misc",        // + /register ...
+];
 
-    let resolved = canonicalize_path(&param_to_path(param));
+/// Whether a *filesystem path* (already resolved, as written) is deny-listed.
+///
+/// Both enforcement points go through here so they cannot drift: the write
+/// choke point resolves a parameter into its path, while `restore` writes the
+/// path the ledger recorded — and the recorded path, not the parameter next
+/// to it, is what the kernel receives.
+fn is_forbidden_resolved_path(path: &str) -> bool {
+    let resolved = canonicalize_path(path);
     FORBIDDEN_PATHS
         .iter()
         .any(|p| resolved == *p || resolved.starts_with(&format!("{p}/")))
+}
+
+/// Whether a parameter name resolves to a deny-listed path.
+pub fn is_forbidden_param(param: &str) -> bool {
+    is_forbidden_resolved_path(&param_to_path(param))
 }
 
 /// Collapse empty/`.` segments and resolve `..` in a slash path so equivalent
@@ -914,6 +927,27 @@ fn render_persistence(
     (sysctl, nonsysctl)
 }
 
+/// The ledger entries persistence may render.
+///
+/// The rendered sysctl.d file (and the generated script) is applied by
+/// systemd-sysctl at boot with root privileges, so an entry the deny-list
+/// refuses must not reach it just because it sits in the ledger: rollback
+/// refuses to restore it, and persistence would otherwise hand the same write
+/// to the boot path instead — the root code-execution write the list exists to
+/// prevent, deferred to the next reboot. Both fields are checked, since the
+/// recorded path is what the script writes.
+fn persistable_entries(
+    entries: &BTreeMap<String, RollbackEntry>,
+) -> BTreeMap<String, RollbackEntry> {
+    entries
+        .iter()
+        .filter(|(param, entry)| {
+            !is_forbidden_param(param) && !is_forbidden_resolved_path(&entry.path)
+        })
+        .map(|(param, entry)| (param.clone(), entry.clone()))
+        .collect()
+}
+
 /// Regenerate the persisted config files from the cumulative rollback record,
 /// which is the single source of truth for everything ktuner has applied. This
 /// keeps persistence cumulative across runs (previously each run overwrote the
@@ -923,7 +957,8 @@ fn render_persistence(
 /// lock renders its own ledger and never the production one.
 fn persist_from_rollback(guard: &LedgerLock) -> Result<()> {
     let data = load_rollback_from(&guard.path)?;
-    let (sysctl_content, nonsysctl_script) = render_persistence(&data.entries);
+    let entries = persistable_entries(&data.entries);
+    let (sysctl_content, nonsysctl_script) = render_persistence(&entries);
 
     if let Some(sysctl_content) = sysctl_content {
         // sysctl.d convention: world-readable, same as the systemd service
@@ -1114,7 +1149,13 @@ fn restore_entries_with(
     let mut failed = 0;
     let mut skipped = 0;
     for (param, entry) in &data.entries {
-        if is_forbidden_param(param) {
+        // The deny-list is enforced on BOTH fields: the parameter name (what a
+        // ktuner-written ledger records) and the recorded path, which is the
+        // file the kernel actually receives. Every ledger ktuner writes has the
+        // two in agreement, but a ledger that was edited or written by another
+        // version can point an innocent parameter at `kernel.core_pattern` —
+        // and restore runs as root.
+        if is_forbidden_param(param) || is_forbidden_resolved_path(&entry.path) {
             if !quiet {
                 println!("  {} {} : 拒绝恢复（代码执行参数）", "✗".red(), param);
             }
@@ -1496,6 +1537,57 @@ mod tests {
         let (sysctl, nonsysctl) = render_persistence(&entries);
         assert!(sysctl.is_none());
         assert!(nonsysctl.is_none());
+    }
+
+    #[test]
+    fn persistence_drops_entries_the_deny_list_refuses() {
+        // The rendered sysctl.d file is applied by systemd-sysctl at boot with
+        // root privileges, so a deny-listed entry must not be re-emitted just
+        // because it sits in the ledger: rollback refuses to restore it, and
+        // persistence would otherwise hand the same root write to the boot
+        // path instead.
+        let entries = BTreeMap::from([
+            (
+                "vm.swappiness".to_string(),
+                RollbackEntry {
+                    previous: "60".to_string(),
+                    applied: "1".to_string(),
+                    path: "/proc/sys/vm/swappiness".to_string(),
+                },
+            ),
+            (
+                "kernel.core_pattern".to_string(),
+                RollbackEntry {
+                    previous: "core".to_string(),
+                    applied: "|/tmp/evil".to_string(),
+                    path: "/proc/sys/kernel/core_pattern".to_string(),
+                },
+            ),
+            (
+                "vm.dirty_ratio".to_string(),
+                RollbackEntry {
+                    previous: "20".to_string(),
+                    applied: "10".to_string(),
+                    // Innocent name, deny-listed recorded path.
+                    path: "/proc/sys/kernel/modprobe".to_string(),
+                },
+            ),
+        ]);
+
+        let kept = persistable_entries(&entries);
+        assert!(kept.contains_key("vm.swappiness"), "ordinary params stay");
+        assert!(
+            !kept.contains_key("kernel.core_pattern") && !kept.contains_key("vm.dirty_ratio"),
+            "a deny-listed param and a deny-listed path must both be dropped: {:?}",
+            kept.keys().collect::<Vec<_>>()
+        );
+        let (config, script) = render_persistence(&kept);
+        let config = config.unwrap_or_default();
+        assert!(
+            !config.contains("core_pattern") && !config.contains("modprobe"),
+            "nothing deny-listed may reach the rendered file: {config}"
+        );
+        assert!(script.is_none());
     }
 
     #[test]
@@ -1977,6 +2069,25 @@ mod tests {
     }
 
     #[test]
+    fn forbidden_paths_match_the_recorded_write_target() {
+        // The same list, applied to a *path*: this is the form `restore`
+        // checks, because the ledger's recorded path is what the kernel
+        // receives. Equivalent spellings of a deny-listed file must all match.
+        for path in [
+            "/proc/sys/kernel/core_pattern",
+            "/proc/sys//kernel/core_pattern",
+            "/proc/sys/kernel/../kernel/core_pattern",
+            "/proc/sys/kernel/modprobe",
+            "/proc/sys/fs/binfmt_misc/register",
+        ] {
+            assert!(is_forbidden_resolved_path(path), "{path} must be forbidden");
+        }
+        for path in ["/proc/sys/vm/swappiness", "/proc/sys/kernel/core_uses_pid"] {
+            assert!(!is_forbidden_resolved_path(path), "{path} must be allowed");
+        }
+    }
+
+    #[test]
     fn test_classify_rollback() {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
@@ -2432,6 +2543,44 @@ mod tests {
         assert_eq!(outcome.restored, 1);
         assert_eq!(outcome.failed, 2);
         assert_eq!(outcome.skipped, 1);
+    }
+
+    #[test]
+    fn restore_refuses_a_deny_listed_path_behind_an_innocent_param() {
+        // The ledger's recorded path is the write target, so the deny-list must
+        // cover it and not only the parameter spelling next to it: a ledger
+        // that was edited (or written by an older version) can point an
+        // innocent `vm.swappiness` at kernel.core_pattern, and `rollback` runs
+        // as root. The recorder stands in for the kernel write, so the test
+        // never touches procfs.
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            "vm.swappiness".to_string(),
+            RollbackEntry {
+                previous: "10".to_string(),
+                applied: "20".to_string(),
+                path: "/proc/sys/kernel/core_pattern".to_string(),
+            },
+        );
+        let data = RollbackData {
+            version: 1,
+            entries,
+        };
+
+        let mut attempted: Vec<String> = Vec::new();
+        let outcome = restore_entries_with(&data, true, &mut |path, _value| {
+            attempted.push(path.to_string());
+            Ok(())
+        });
+        assert!(
+            attempted.is_empty(),
+            "a deny-listed target must never receive a write: {attempted:?}"
+        );
+        assert_eq!(
+            (outcome.restored, outcome.failed, outcome.skipped),
+            (0, 1, 0),
+            "the entry must be counted as refused, not skipped or restored"
+        );
     }
 
     #[test]
