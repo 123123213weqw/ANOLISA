@@ -157,6 +157,34 @@ impl VerifyBeforeDoneStrategy {
         call.target.is_none().then(|| call.cmd.clone())
     }
 
+    /// Whether `kw` occurs in `cmd_lower` bounded by non-alphanumeric
+    /// characters on both sides.
+    ///
+    /// Bare `contains` read keywords out of other words: "make" matched
+    /// `cat Makefile`, "test" matched `grep latest`, and a session that only
+    /// read files counted as having run a build or suite — suppressing the
+    /// "claims done without verifying" finding.
+    fn contains_keyword(cmd_lower: &str, kw: &str) -> bool {
+        let mut from = 0;
+        while let Some(rel) = cmd_lower[from..].find(kw) {
+            let start = from + rel;
+            let end = start + kw.len();
+            let bounded_before = cmd_lower[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|c| !c.is_alphanumeric());
+            let bounded_after = cmd_lower[end..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric());
+            if bounded_before && bounded_after {
+                return true;
+            }
+            from = end;
+        }
+        false
+    }
+
     /// Oracle (b): claims success but never ran any verification action.
     fn check_no_verification(
         ctx: &AnalysisCtx<'_>,
@@ -171,7 +199,9 @@ impl VerifyBeforeDoneStrategy {
                 return false;
             };
             let cmd_lower = command.to_lowercase();
-            VERIFY_KEYWORDS.iter().any(|kw| cmd_lower.contains(kw))
+            VERIFY_KEYWORDS
+                .iter()
+                .any(|kw| Self::contains_keyword(&cmd_lower, kw))
         });
 
         if has_verification {
@@ -398,6 +428,60 @@ mod tests {
         assert!(VerifyBeforeDoneStrategy::is_error_acknowledged(
             "有一步失败了：cargo test --all 没能跑通",
             &call
+        ));
+    }
+
+    /// The keywords are single words, and bare `contains` matched them inside
+    /// other words: `cat Makefile` satisfied "make", `grep latest` satisfied
+    /// "test". A trace that never built or tested anything then looked
+    /// verified and the "claims done without verifying" finding was
+    /// suppressed.
+    #[test]
+    fn keyword_substrings_of_other_words_are_not_verification() {
+        let inv = TraceInventory {
+            tool_calls: vec![
+                make_call("Bash", r#"{"command":"cat Makefile"}"#, 1.0, false),
+                make_call(
+                    "Bash",
+                    r#"{"command":"grep latest CHANGELOG.md"}"#,
+                    2.0,
+                    false,
+                ),
+            ],
+            user_turns: vec![],
+            final_answer: "全部完成".into(),
+            skill_contract: None,
+        };
+        let client = make_client();
+        let extraction = SharedExtraction::default();
+        let judgments = JudgmentLog::default();
+        let ctx = make_ctx(&inv, &client, &extraction, &judgments);
+
+        assert!(
+            VerifyBeforeDoneStrategy::check_no_verification(&ctx, &claims()).is_some(),
+            "reading a Makefile and grepping 'latest' is not a verification action"
+        );
+    }
+
+    /// Word-bounded matching must still admit real invocations, including
+    /// ones where the keyword is followed by punctuation or ends the command.
+    #[test]
+    fn word_bounded_keywords_still_match_real_commands() {
+        for (command, kw) in [
+            ("cargo test --all", "test"),
+            ("make -j4", "make"),
+            ("cmake -B build", "cmake"),
+            ("npm run build", "build"),
+            ("npx tsc --noEmit", "tsc"),
+        ] {
+            assert!(
+                VerifyBeforeDoneStrategy::contains_keyword(command, kw),
+                "'{command}' must still count as a verification action"
+            );
+        }
+        assert!(!VerifyBeforeDoneStrategy::contains_keyword(
+            "cat makefile.am",
+            "make"
         ));
     }
 }
