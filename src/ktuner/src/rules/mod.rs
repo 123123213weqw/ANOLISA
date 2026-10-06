@@ -5638,11 +5638,40 @@ fn eval_compact_memory(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 }
 
 fn eval_min_slab_ratio(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/min_slab_ratio";
-    if !std::path::Path::new(path).exists() {
+    eval_min_slab_ratio_at(
+        info,
+        recs,
+        "/proc/sys/vm/min_slab_ratio",
+        "/proc/sys/vm/zone_reclaim_mode",
+    )
+}
+
+/// Path-injectable form of [`eval_min_slab_ratio`] (the `eval_*_at` idiom) so
+/// the node-reclaim precondition is assertable against synthetic files.
+///
+/// The knob feeds `pgdat->min_slab_pages` (`setup_min_slab_ratio()` in
+/// mm/page_alloc.c), which only `node_reclaim()` reads — and the allocator
+/// calls node reclaim only while `node_reclaim_enabled()` holds, i.e. while
+/// `/proc/sys/vm/zone_reclaim_mode` is non-zero (include/linux/swap.h and
+/// mm/page_alloc.c, v6.6). ktuner itself recommends turning that mode off on
+/// every multi-NUMA host, so once its own plan is applied (or on any host that
+/// keeps the default 0) the write this rule asks for cannot change any
+/// behavior — the "never recommend a no-op" rule the hardlockup_panic and
+/// page-cluster gates already follow. An unreadable mode file counts as "off",
+/// so the rule stays quiet rather than promising a reclaim it cannot verify.
+fn eval_min_slab_ratio_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    zone_reclaim_path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if info.memory_total_gb < 64 {
+        return 1;
+    }
+    if read_sysctl_u64(zone_reclaim_path) == 0 {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -9232,6 +9261,72 @@ mod tests {
             rec.is_none(),
             "Should not recommend min_slab_ratio for small memory"
         );
+    }
+
+    #[test]
+    fn min_slab_ratio_needs_node_reclaim_enabled() {
+        // vm.min_slab_ratio feeds pgdat->min_slab_pages, which only
+        // node_reclaim() reads, and the allocator only calls node reclaim
+        // while vm.zone_reclaim_mode is non-zero (include/linux/swap.h,
+        // mm/page_alloc.c). ktuner's own advice turns that mode off on
+        // multi-NUMA hosts, so without the gate the rule keeps asking for a
+        // write that cannot change anything.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_min_slab_ratio_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let param = dir.join("min_slab_ratio");
+        std::fs::write(&param, b"3\n").unwrap();
+        let mode_off = dir.join("zone_reclaim_mode.off");
+        std::fs::write(&mode_off, b"0\n").unwrap();
+        let mode_on = dir.join("zone_reclaim_mode.on");
+        std::fs::write(&mode_on, b"1\n").unwrap();
+        let mode_missing = dir.join("zone_reclaim_mode.missing");
+
+        let mut info = make_test_info();
+        info.memory_total_gb = 256;
+
+        for mode in [&mode_off, &mode_missing] {
+            let mut recs = Vec::new();
+            eval_min_slab_ratio_at(
+                &info,
+                &mut recs,
+                param.to_str().unwrap(),
+                mode.to_str().unwrap(),
+            );
+            assert!(
+                recs.is_empty(),
+                "{}: node reclaim is off, the knob cannot act",
+                mode.display()
+            );
+        }
+
+        let mut recs = Vec::new();
+        eval_min_slab_ratio_at(
+            &info,
+            &mut recs,
+            param.to_str().unwrap(),
+            mode_on.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.min_slab_ratio"),
+            "node reclaim enabled keeps the rule"
+        );
+
+        // The memory gate still applies first.
+        info.memory_total_gb = 16;
+        let mut recs = Vec::new();
+        eval_min_slab_ratio_at(
+            &info,
+            &mut recs,
+            param.to_str().unwrap(),
+            mode_on.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "small memory still skips the rule");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
