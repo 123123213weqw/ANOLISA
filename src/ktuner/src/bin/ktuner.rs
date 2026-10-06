@@ -230,21 +230,26 @@ fn dry_run_output(in_scope: &[Recommendation], applicable: &[Recommendation]) ->
 
 /// Extend a short-circuit body with the keys a `--dry-run` caller reads.
 ///
-/// `--dry-run` answers with `dry_run`, `would_apply` and `would_skip` on every
-/// host: the short-circuit shapes predate the flag, so a host where every
-/// recommendation was filtered out answered with none of them and a script
-/// could not tell that invocation from a non-dry-run one — it read
-/// `would_apply`, found nothing and had no way to distinguish "nothing to
-/// plan" from "the flag was ignored". `would_apply` is empty here because
-/// nothing is applicable, `would_skip` lists everything in scope, and `status`
-/// keeps the short-circuit vocabulary (`optimal` / `blocked`).
+/// `--dry-run` answers with `dry_run`, `would_apply`, `would_skip` and
+/// `blocked` on every host: the short-circuit shapes predate the flag, so a
+/// host where every recommendation was filtered out answered with none of
+/// them and a script could not tell that invocation from a non-dry-run one —
+/// it read `would_apply`, found nothing and had no way to distinguish
+/// "nothing to plan" from "the flag was ignored". `would_apply` is empty here
+/// because nothing is applicable, `would_skip` lists everything in scope,
+/// `blocked` stays its length (the count the planned shape reports, and the
+/// sum of the short-circuit's `blocked_unwritable` /
+/// `blocked_runtime_dangerous` partitions), and `status` keeps the
+/// short-circuit vocabulary (`optimal` / `blocked`).
 fn dry_run_preview(mut body: serde_json::Value, in_scope: &[Recommendation]) -> serde_json::Value {
     if let Some(object) = body.as_object_mut() {
         object.insert("dry_run".to_string(), json!(true));
         object
             .entry("would_apply".to_string())
             .or_insert_with(|| json!([]));
-        object.insert("would_skip".to_string(), json!(would_skip_json(in_scope)));
+        let would_skip = would_skip_json(in_scope);
+        object.insert("blocked".to_string(), json!(would_skip.len()));
+        object.insert("would_skip".to_string(), json!(would_skip));
     }
     body
 }
@@ -997,6 +1002,10 @@ mod tests {
             preview["would_skip"],
             json!([{ "param": "vm.swappiness", "reason": "unwritable" }])
         );
+        // `blocked` stays the skip-list count on every dry-run shape, the way
+        // the planned shape already reports it: a script reading the key must
+        // not see it vanish exactly on the host where everything is blocked.
+        assert_eq!(preview["blocked"], json!(1));
         // The short-circuit vocabulary and its counts are untouched.
         assert_eq!(preview["status"], json!("blocked"));
         assert_eq!(preview["recommendations"], json!(1));
@@ -1009,6 +1018,7 @@ mod tests {
         assert_eq!(preview["dry_run"], json!(true));
         assert_eq!(preview["would_apply"], json!([]));
         assert_eq!(preview["would_skip"], json!([]));
+        assert_eq!(preview["blocked"], json!(0));
         assert_eq!(preview["status"], json!("optimal"));
     }
 
