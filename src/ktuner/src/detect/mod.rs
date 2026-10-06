@@ -737,6 +737,13 @@ fn read_processes() -> Result<Vec<ProcessInfo>> {
                     if is_monitoring_helper(&fname) {
                         continue;
                     }
+                    // A client tool names the service it talks to, not the
+                    // service: `clickhouse-client` and `kafka-topics.sh` are
+                    // not a database or a broker, and only the host that runs
+                    // the daemon should get the daemon's rules.
+                    if is_service_tool(&fname) {
+                        continue;
+                    }
                     // For a JVM the name is just "java" (likewise
                     // "python"/"node"/"beam.smp"), so the actual service is
                     // invisible. Recover it from cmdline.
@@ -805,28 +812,95 @@ fn cmdline_names_helper<'a>(args: impl Iterator<Item = &'a str>) -> bool {
     if is_monitoring_helper_name(program) {
         return true;
     }
-    match program.rsplit('/').next().unwrap_or_default() {
+    if is_shell_program(program) {
         // `sh -c "node_exporter --web.listen-address=..."` runs the collector as
         // the payload, not as argv[0]; the payload's first word is its command.
-        "sh" | "bash" | "dash" | "zsh" | "ksh" => {
-            args.get(1) == Some(&"-c")
-                && args
-                    .get(2)
-                    .and_then(|&payload| payload.split_whitespace().next())
-                    .is_some_and(is_monitoring_helper_name)
-        }
+        return args.get(1) == Some(&"-c")
+            && args
+                .get(2)
+                .and_then(|&payload| payload.split_whitespace().next())
+                .is_some_and(is_monitoring_helper_name);
+    }
+    if program.rsplit('/').next().unwrap_or_default() == "java" {
         // A JVM names its program in the jar after `-jar`; argv[0] is only the
         // launcher. `java -jar jmx_prometheus_httpserver-1.2.1.jar 5556
         // config.yaml` is the Prometheus JMX exporter's documented standalone
         // form — a collector whose jar carries no "exporter" token, which is
         // how a metrics-only host kept being detected as a Java workload.
-        "java" => args
+        return args
             .iter()
             .position(|a| *a == "-jar")
             .and_then(|i| args.get(i + 1))
-            .is_some_and(|&jar| jvm_jar_names_helper(jar)),
-        _ => false,
+            .is_some_and(|&jar| jvm_jar_names_helper(jar));
     }
+    false
+}
+
+/// Whether `program` (an argv[0]) is a shell that a script file is run under.
+fn is_shell_program(program: &str) -> bool {
+    matches!(
+        program.rsplit('/').next().unwrap_or_default(),
+        "sh" | "bash" | "dash" | "zsh" | "ksh"
+    )
+}
+
+/// ClickHouse's client-side entry points. The vendor's `clickhouse-client`
+/// package ships every one of them as a symlink to the single multi-call
+/// `clickhouse` binary, so the kernel truncates the client's comm to a prefix
+/// the server binary's own name shares (`clickhouse-clie` / `clickhouse-serv`)
+/// and the name alone cannot tell the two apart. The program name can.
+const CLICKHOUSE_CLIENT_TOOLS: &[&str] = &[
+    "clickhouse-benchmark",
+    "clickhouse-client",
+    "clickhouse-compressor",
+    "clickhouse-format",
+    "clickhouse-local",
+    "clickhouse-obfuscator",
+];
+
+/// Whether the program `program` is a *tool* of a service rather than the
+/// service itself.
+///
+/// A service ktuner identifies through its runtime — the JVM/Erlang daemons in
+/// [`RUNTIME_SERVICE_MARKERS`] — is never the process named after it: the
+/// daemon runs as `java` (or the Erlang VM) and is decided from the runtime's
+/// own command line, so an executable called `kafka-topics.sh`, `spark-submit`
+/// or `elasticsearch-keystore` can only be one of its tools. ClickHouse has the
+/// same shape through its multi-call binary. Both share the service's name
+/// prefix with a `-` boundary, which is what `has_process` matches, so a host
+/// that only talks to a service running elsewhere used to get that service's
+/// rules and workload classification.
+fn program_names_service_tool(program: &str) -> bool {
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    if CLICKHOUSE_CLIENT_TOOLS.contains(&basename) {
+        return true;
+    }
+    RUNTIME_SERVICE_MARKERS.iter().any(|(_, service)| {
+        basename
+            .strip_prefix(service)
+            .is_some_and(|rest| rest.starts_with('-'))
+    })
+}
+
+/// Whether `pid` runs a service tool instead of the workload.
+///
+/// Like [`is_monitoring_helper`], the program decides: argv[0] for a binary
+/// (a multi-call tool is started under its own name), and — because the kernel
+/// runs a script under its interpreter — the script path in the argument after
+/// argv[0] when that is a shell. `/proc/<pid>/comm` keeps the script's own
+/// name, which is exactly the name that must not satisfy a service match.
+fn is_service_tool(pid: &str) -> bool {
+    let Some(cmdline) = read_cmdline_from(&format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let mut args = cmdline.split('\0').filter(|arg| !arg.is_empty());
+    let Some(program) = args.next() else {
+        return false;
+    };
+    if program_names_service_tool(program) {
+        return true;
+    }
+    is_shell_program(program) && args.next().is_some_and(program_names_service_tool)
 }
 
 /// Whether the jar a JVM runs names a metrics collector. The Prometheus JMX
@@ -1753,6 +1827,142 @@ mod tests {
             helper,
             "a non-UTF-8 program path must not hide the collector"
         );
+    }
+
+    /// A client tool of a service names the service it talks to, not the
+    /// service: `has_process("clickhouse")` was satisfied by
+    /// `clickhouse-client` (ClickHouse ships its client as another name of the
+    /// same multi-call binary, and /proc/<pid>/comm truncates both the client
+    /// and the server to `clickhouse-clie` / `clickhouse-serv`, so the name
+    /// cannot separate them) — the same false-positive class #4100 removed for
+    /// the collectors and `etcdctl`, one step further.
+    #[test]
+    fn service_client_tool_is_not_the_service() {
+        let root = std::env::temp_dir().join(format!("ktuner_client_tool_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        let client_path = root.join("clickhouse-client");
+        fs::copy("/bin/sleep", &client_path).expect("copy sleep to the client's name");
+
+        let mut client = std::process::Command::new(&client_path)
+            .arg("30")
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a client-named process");
+        let pid = client.id().to_string();
+        wait_for_cmdline(&pid, b"clickhouse-client");
+
+        // The kernel gives it the truncated server prefix as comm...
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("client comm")
+            .trim()
+            .to_string();
+        assert_eq!(comm, "clickhouse-clie");
+        // The process list must decide from the program, not that prefix.
+        let info = gather_system_info().expect("gather system info");
+        let listed_as_clickhouse = info.has_process("clickhouse");
+
+        client.kill().ok();
+        client.wait().ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert!(
+            !listed_as_clickhouse,
+            "a host running only the ClickHouse client must not look like a database host"
+        );
+    }
+
+    /// The same for a script: the kernel keeps the script's name in
+    /// /proc/<pid>/comm (`kafka-topics.sh`) while argv[0] is the interpreter
+    /// that runs it, so a tool script satisfied `has_process("kafka")` — and a
+    /// host that only administers a broker elsewhere then ran the streaming
+    /// rules and classified as a broker.
+    #[test]
+    fn service_tool_script_is_not_the_service() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = std::env::temp_dir().join(format!("ktuner_tool_script_{}", std::process::id()));
+        fs::remove_dir_all(&root).ok();
+        fs::create_dir_all(&root).expect("create temp dir");
+        // A Kafka client tool: the daemon itself runs as a JVM, so an
+        // executable named after the service is a tool of it.
+        let script = root.join("kafka-topics.sh");
+        fs::write(&script, b"#!/bin/sh\nsleep 30\n").expect("write tool script");
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).expect("make it runnable");
+
+        let mut tool = std::process::Command::new(&script)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn a tool-named script");
+        let pid = tool.id().to_string();
+        wait_for_cmdline(&pid, b"kafka-topics.sh");
+
+        let comm = fs::read_to_string(format!("/proc/{pid}/comm"))
+            .expect("tool comm")
+            .trim()
+            .to_string();
+        let info = gather_system_info().expect("gather system info");
+        let listed_as_kafka = info.has_process("kafka");
+
+        tool.kill().ok();
+        tool.wait().ok();
+        fs::remove_dir_all(&root).ok();
+
+        assert_eq!(comm, "kafka-topics.sh");
+        assert!(
+            !listed_as_kafka,
+            "kafka-topics.sh is a client tool, not the broker"
+        );
+    }
+
+    /// The program names the tool filter must catch and the daemon names it
+    /// must keep. ClickHouse is the case a name can never decide: its client,
+    /// server and the multi-call binary all share the `clickhouse` prefix, so
+    /// the filter is a list of the client-side names — the server name and the
+    /// bare multi-call binary (which runs the server) stay services.
+    #[test]
+    fn service_tool_names_exclude_the_daemons() {
+        for tool in [
+            // The vendor's clickhouse-client package ships each of these as a
+            // symlink to the multi-call binary.
+            "clickhouse-benchmark",
+            "clickhouse-client",
+            "clickhouse-compressor",
+            "clickhouse-format",
+            "clickhouse-local",
+            "clickhouse-obfuscator",
+            "/usr/bin/clickhouse-client",
+            // Scripts of a JVM-hosted service: the daemon itself is the JVM.
+            "kafka-topics.sh",
+            "kafka-server-start.sh",
+            "/opt/kafka/bin/kafka-consumer-groups.sh",
+            "spark-submit",
+            "hadoop-daemon.sh",
+            "elasticsearch-keystore",
+        ] {
+            assert!(
+                program_names_service_tool(tool),
+                "{tool} is a tool, not the service"
+            );
+        }
+        for daemon in [
+            "clickhouse",
+            "clickhouse-server",
+            "/usr/bin/clickhouse",
+            "kafka",
+            "spark",
+            "hadoop",
+            "elasticsearch",
+            "java",
+            "postgres",
+            "mysqld",
+            "memcached",
+            "nginx",
+        ] {
+            assert!(
+                !program_names_service_tool(daemon),
+                "{daemon} is the service, not a tool"
+            );
+        }
     }
 
     #[test]
