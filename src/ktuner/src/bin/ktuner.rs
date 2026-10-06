@@ -88,12 +88,7 @@ fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
 
     let score = eval.score();
     let counts = category::RecCounts::from_recs(&recs);
-    // What `score` would report once this view has been applied. Not
-    // `score + shown weight`: `score` is floored at 30, so adding the shown
-    // weight counts that floor as a gain and promises points the untouched
-    // findings still keep off the board (on a 66-finding host,
-    // `--conservative` promised 72 while applying it lands on the floor, 30).
-    let predicted_score = eval.score_after_applying(&recs);
+    let predicted_score = predicted_score(&eval, &recs);
 
     let recs_json: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
 
@@ -145,6 +140,26 @@ fn skip_reason(rec: &Recommendation) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// What `score` would report once this environment's plan has run: the
+/// penalty of everything the plan leaves, i.e. the findings outside `view`
+/// plus the entries `skip_reason` says no write path will take. Not
+/// `score + shown weight`: `score` is floored at 30, so adding the shown
+/// weight counts that floor as a gain and promises points the untouched
+/// findings still keep off the board (on a 66-finding host, `--conservative`
+/// promised 72 while applying it lands on the floor, 30). And not the whole
+/// view either, which is the same promise one step further out: counting the
+/// skipped entries predicted a score `tune` cannot deliver — on a container
+/// whose /proc/sys is read-only every entry is skipped and `check` reported
+/// the tuned score while the plan answered "blocked, applied 0".
+fn predicted_score(eval: &rules::EvalResult, view: &[Recommendation]) -> usize {
+    let applicable: Vec<Recommendation> = view
+        .iter()
+        .filter(|rec| skip_reason(rec).is_none())
+        .cloned()
+        .collect();
+    eval.score_after_applying(&applicable)
 }
 
 /// The `would_skip` payload: every in-scope recommendation a real run would
@@ -1090,6 +1105,35 @@ mod tests {
         assert!(
             entries[2].get("skip_reason").is_none(),
             "an entry the plan writes carries no skip reason"
+        );
+    }
+
+    #[test]
+    fn predicted_score_ignores_the_entries_the_plan_skips() {
+        // The prediction is the score after TUNING, and tuning here is the
+        // plan: `tune` skips vm.nr_hugepages (runtime-dangerous) and every
+        // unwritable entry, `fix` refuses both. Counting them promised points
+        // no write path delivers — on a container whose /proc/sys is
+        // read-only, `check` reported the fully tuned score while
+        // `tune --dry-run` answered "blocked" and a real tune applied 0.
+        let view = vec![
+            rec("vm.nr_hugepages", true), // writable but runtime-dangerous
+            rec("vm.swappiness", false),  // unwritable
+            rec("fs.file-max", true),     // applicable: the only plan entry
+        ];
+        let eval = evaluation(view.clone());
+        // Only fs.file-max's penalty (3) comes off: the two skipped entries
+        // keep theirs, so the plan reaches 94, not 100.
+        assert_eq!(predicted_score(&eval, &view), 94);
+
+        // A fully blocked plan delivers nothing, so the prediction is the
+        // score the host already has — never the tuned score.
+        let blocked = vec![rec("vm.swappiness", false), rec("vm.nr_hugepages", true)];
+        let eval = evaluation(blocked.clone());
+        assert_eq!(predicted_score(&eval, &blocked), eval.score());
+        assert!(
+            predicted_score(&eval, &blocked) < 100,
+            "a blocked plan must not promise the tuned score"
         );
     }
 
