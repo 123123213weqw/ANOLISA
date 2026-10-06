@@ -1825,8 +1825,48 @@ fn eval_tcp_syncookies(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
 }
 
 fn eval_send_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/all/send_redirects";
+    eval_send_redirects_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/all/send_redirects",
+        std::path::Path::new("/proc/sys/net/ipv4/conf"),
+    )
+}
+
+/// Path-injectable form of [`eval_send_redirects`] (the `eval_*_at` idiom) so
+/// the forwarding precondition is assertable against a synthetic conf tree.
+///
+/// The knob only decides whether this host *sends* an ICMP redirect, and a
+/// redirect is sent from exactly one place: `ip_forward()` (net/ipv4/
+/// ip_forward.c) calls `ip_rt_send_redirect()`, which re-checks
+/// `IN_DEV_TX_REDIRECTS` before anything goes out. A host whose input
+/// interface does not forward never reaches that code — `ip_route_input_slow()`
+/// (net/ipv4/route.c) turns a non-local destination into an error route
+/// instead:
+///
+/// ```text
+///    if (!IN_DEV_FORWARD(in_dev)) {
+///        err = -EHOSTUNREACH;
+///        goto no_route;
+///    }
+/// ```
+///
+/// which is what the kernel documentation summarises as "Send redirects, if
+/// router" (Documentation/networking/ip-sysctl.rst). This engine recommends
+/// `net.ipv4.ip_forward = 0` on every host without containers/VPNs/routers, so
+/// after its own plan the write cannot change anything there. An unreadable
+/// conf tree counts as "no forwarding", so the rule stays quiet when it cannot
+/// verify that a redirect could ever be sent.
+fn eval_send_redirects_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    conf_root: &std::path::Path,
+) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    if !any_interface_forwards(conf_root) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -1842,6 +1882,24 @@ fn eval_send_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
         });
     }
     1
+}
+
+/// Whether any interface — every per-interface entry plus the `all` and
+/// `default` templates — has forwarding enabled, which is what makes the
+/// redirect path reachable at all (see [`eval_send_redirects_at`]). An
+/// unreadable or missing tree reports `false`, so a rule that promises to stop
+/// redirects it cannot prove are possible stays quiet.
+fn any_interface_forwards(conf_root: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(conf_root) else {
+        return false;
+    };
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        let forwarding = entry.path().join("forwarding");
+        if read_sysctl_u64(&forwarding.to_string_lossy()) != 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn eval_perf_event_paranoid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -4399,9 +4457,31 @@ fn eval_default_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
     1
 }
 
-fn eval_default_send_redirects(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/default/send_redirects";
-    if !std::path::Path::new(path).exists() {
+fn eval_default_send_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_default_send_redirects_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/send_redirects",
+        std::path::Path::new("/proc/sys/net/ipv4/conf"),
+    )
+}
+
+/// Path-injectable form of [`eval_default_send_redirects`] (the `eval_*_at`
+/// idiom). The `default` template is what new interfaces inherit, and a
+/// redirect can still only be sent by an interface that forwards — see
+/// [`eval_send_redirects_at`] for the kernel path and the documentation line.
+/// The `default` forwarding template counts as forwarding here, so a host that
+/// arms future interfaces keeps the recommendation.
+fn eval_default_send_redirects_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    conf_root: &std::path::Path,
+) -> usize {
+    if !info.param_exists(path) {
+        return 1;
+    }
+    if !any_interface_forwards(conf_root) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -9067,6 +9147,85 @@ mod tests {
             assert_eq!(rec.recommended_value, "0");
             assert_eq!(rec.category, Category::Security);
         }
+    }
+
+    #[test]
+    fn send_redirects_advice_needs_a_forwarding_interface() {
+        // ip_route_input_slow() turns a non-local destination into an
+        // EHOSTUNREACH error route when the input interface does not forward
+        // ("if (!IN_DEV_FORWARD(in_dev)) { err = -EHOSTUNREACH; goto no_route; }"),
+        // so ip_forward() — the only caller of ip_rt_send_redirect(), where
+        // IN_DEV_TX_REDIRECTS is checked — never runs. The kernel documentation
+        // states the same precondition: "Send redirects, if router."
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_send_redirects_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+
+        let info = make_test_info();
+        let all = write("all/send_redirects", "1\n");
+        let default = write("default/send_redirects", "1\n");
+        for interface in ["all", "default", "lo", "eth0"] {
+            write(&format!("{interface}/forwarding"), "0\n");
+        }
+
+        // Nothing forwards, so no redirect can be sent on this host.
+        let mut recs = Vec::new();
+        eval_send_redirects_at(&info, &mut recs, all.to_str().unwrap(), &dir);
+        eval_default_send_redirects_at(&info, &mut recs, default.to_str().unwrap(), &dir);
+        assert!(
+            recs.is_empty(),
+            "a host that forwards nothing cannot send a redirect"
+        );
+
+        // One forwarding interface keeps both rules.
+        write("eth0/forwarding", "1\n");
+        let mut recs = Vec::new();
+        eval_send_redirects_at(&info, &mut recs, all.to_str().unwrap(), &dir);
+        eval_default_send_redirects_at(&info, &mut recs, default.to_str().unwrap(), &dir);
+        assert_eq!(recs.len(), 2, "a router still gets both recommendations");
+
+        // The `default` template alone arms future interfaces, so it counts.
+        write("eth0/forwarding", "0\n");
+        write("default/forwarding", "1\n");
+        let mut recs = Vec::new();
+        eval_default_send_redirects_at(&info, &mut recs, default.to_str().unwrap(), &dir);
+        assert!(!recs.is_empty(), "the template arms new interfaces");
+
+        // A missing tree cannot prove a redirect is possible.
+        write("default/forwarding", "0\n");
+        let mut recs = Vec::new();
+        eval_send_redirects_at(
+            &info,
+            &mut recs,
+            all.to_str().unwrap(),
+            &dir.join("missing"),
+        );
+        eval_default_send_redirects_at(
+            &info,
+            &mut recs,
+            default.to_str().unwrap(),
+            &dir.join("missing"),
+        );
+        assert!(recs.is_empty(), "an unreadable tree stays quiet");
+
+        // A disabled knob stays quiet even where a router exists.
+        write("eth0/forwarding", "1\n");
+        let off = write("default/send_redirects_off", "0\n");
+        let mut recs = Vec::new();
+        eval_default_send_redirects_at(&info, &mut recs, off.to_str().unwrap(), &dir);
+        assert!(recs.is_empty(), "an already-disabled knob is satisfied");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
