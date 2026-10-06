@@ -924,7 +924,27 @@ fn syn_backlog_recommendation(
 }
 
 fn eval_rmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/rmem_max";
+    eval_rmem_max_at(info, recs, "/proc/sys/net/core/rmem_max")
+}
+
+/// Path-injectable form of [`eval_rmem_max`] (the `eval_*_at` idiom) so the
+/// reason's claim is assertable against a temp file on any host.
+///
+/// `net.core.rmem_max` bounds what an application can ask for with an
+/// explicit `setsockopt(SO_RCVBUF)`: `sock_setsockopt()` clamps the request
+/// with `min_t(u32, val, READ_ONCE(sysctl_rmem_max))`, and TCP disables
+/// automatic tuning for that socket — the sysctl documentation spells the
+/// resulting split out for `tcp_rmem`: "Calling setsockopt() with SO_RCVBUF
+/// disables automatic tuning of that socket's receive buffer size, in which
+/// case this value is ignored". The cap for TCP's *automatic* tuning is
+/// `tcp_rmem[2]` alone — `tcp_rcv_space_adjust()` grows the buffer with
+/// `min_t(u64, ..., READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_rmem[2]))` — and
+/// `sysctl_rmem_max` has no reader in the TCP receive path at all (tree-wide
+/// it is consumed by the SO_RCVBUF clamp, the window-scale guess in
+/// `tcp_select_initial_window()` and IPVS). Raising it lets applications
+/// request bigger explicit buffers; it is not what makes the `tcp_rmem` max
+/// effective.
+fn eval_rmem_max_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -937,7 +957,7 @@ fn eval_rmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
             param: "net.core.rmem_max".to_string(),
             current_value: current.to_string(),
             recommended_value: "16777216".to_string(),
-            reason: "rmem_max 是 TCP 接收缓冲区的硬上限，不调大它 tcp_rmem 的 max 值不会生效"
+            reason: "万兆网卡场景下，应用显式 setsockopt(SO_RCVBUF) 能申请的上限偏小；TCP 自动调优的上限由 net.ipv4.tcp_rmem 的 max 单独决定，不受此值约束"
                 .to_string(),
             confidence: Confidence::High,
             category: Category::Performance,
@@ -948,7 +968,20 @@ fn eval_rmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 }
 
 fn eval_wmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/wmem_max";
+    eval_wmem_max_at(info, recs, "/proc/sys/net/core/wmem_max")
+}
+
+/// Path-injectable form of [`eval_wmem_max`] (the `eval_*_at` idiom) so the
+/// reason's claim is assertable against a temp file on any host.
+///
+/// The send-side twin of [`eval_rmem_max_at`]: `net.core.wmem_max` clamps an
+/// explicit `setsockopt(SO_SNDBUF)` (`sock_setsockopt()` uses
+/// `min_t(u32, val, READ_ONCE(sysctl_wmem_max))`), while TCP's automatic
+/// tuning is capped by `tcp_wmem[2]` alone — `tcp_sndbuf_expand()` writes
+/// `min(sndmem, READ_ONCE(sock_net(sk)->ipv4.sysctl_tcp_wmem[2]))`. Raising
+/// it lets applications request bigger explicit buffers; it is not what makes
+/// the `tcp_wmem` max effective.
+fn eval_wmem_max_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -961,7 +994,7 @@ fn eval_wmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
             param: "net.core.wmem_max".to_string(),
             current_value: current.to_string(),
             recommended_value: "16777216".to_string(),
-            reason: "wmem_max 是 TCP 发送缓冲区的硬上限，不调大它 tcp_wmem 的 max 值不会生效"
+            reason: "万兆网卡场景下，应用显式 setsockopt(SO_SNDBUF) 能申请的上限偏小；TCP 自动调优的上限由 net.ipv4.tcp_wmem 的 max 单独决定，不受此值约束"
                 .to_string(),
             confidence: Confidence::High,
             category: Category::Performance,
@@ -10531,6 +10564,54 @@ mod tests {
                 assert!(recs.iter().any(|r| r.param.contains("unres_qlen_bytes")));
             }
         }
+    }
+
+    #[test]
+    fn test_core_mem_max_reasons_name_the_explicit_buffer_cap() {
+        // net.core.rmem_max/wmem_max bound an explicit setsockopt(SO_RCVBUF /
+        // SO_SNDBUF) request (sock_setsockopt clamps it with sysctl_*mem_max),
+        // while TCP's automatic tuning is capped by tcp_rmem[2] / tcp_wmem[2]
+        // (tcp_rcv_space_adjust / tcp_sndbuf_expand). The core maxima cannot
+        // unlock the triples, so the reason must not claim that they do.
+        let mut info = make_test_info();
+        info.network = vec![crate::detect::NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_core_mem_max_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rmem = dir.join("rmem_max");
+        let wmem = dir.join("wmem_max");
+        std::fs::write(&rmem, "212992\n").unwrap();
+        std::fs::write(&wmem, "212992\n").unwrap();
+
+        let mut recs = Vec::new();
+        eval_rmem_max_at(&info, &mut recs, rmem.to_str().unwrap());
+        eval_wmem_max_at(&info, &mut recs, wmem.to_str().unwrap());
+        let r = recs
+            .iter()
+            .find(|r| r.param == "net.core.rmem_max")
+            .expect("a 10G host under 16MB gets the recommendation");
+        let w = recs
+            .iter()
+            .find(|r| r.param == "net.core.wmem_max")
+            .expect("a 10G host under 16MB gets the recommendation");
+        assert!(r.reason.contains("SO_RCVBUF"), "{}", r.reason);
+        assert!(w.reason.contains("SO_SNDBUF"), "{}", w.reason);
+        assert!(
+            !r.reason.contains("tcp_rmem 的 max 值不会生效"),
+            "{}",
+            r.reason
+        );
+        assert!(
+            !w.reason.contains("tcp_wmem 的 max 值不会生效"),
+            "{}",
+            w.reason
+        );
     }
 
     #[test]
