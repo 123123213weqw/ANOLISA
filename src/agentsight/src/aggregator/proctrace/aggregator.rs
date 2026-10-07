@@ -165,9 +165,9 @@ impl ProcessEventAggregator {
                         // fd 2 is stderr; fd 1 (and any other descriptor)
                         // keeps the legacy stdout behaviour.
                         if event.fd == Some(2) {
-                            aggregated.add_stderr(data.as_bytes(), event.timestamp_ns);
+                            aggregated.add_stderr(data, event.timestamp_ns);
                         } else {
-                            aggregated.add_stdout(data.as_bytes(), event.timestamp_ns);
+                            aggregated.add_stdout(data, event.timestamp_ns);
                         }
                     }
                 }
@@ -374,7 +374,7 @@ mod tests {
             comm: "bash".to_string(),
             timestamp_ns: 2000,
             args: None,
-            stdout_data: Some("boom\n".to_string()),
+            stdout_data: Some(b"boom\n".to_vec()),
             fd: Some(2),
             filename: None,
         };
@@ -404,11 +404,69 @@ mod tests {
             ppid: 0,
             ptid: 0,
             comm: "chatty".to_string(),
+            filename: None,
             timestamp_ns: ts,
             args: None,
-            stdout_data: Some(data.to_string()),
+            stdout_data: Some(data.as_bytes().to_vec()),
             fd: Some(1),
         }
+    }
+
+    /// A multi-byte character split across two reads is only recoverable if
+    /// both chunks reach the byte-oriented buffer verbatim. The parse layer
+    /// used to decode each chunk lossily, so each half of the split character
+    /// became its own U+FFFD and the concatenated output never contained the
+    /// character the process actually printed.
+    #[test]
+    fn split_multibyte_stdout_survives_chunk_boundaries() {
+        use crate::parser::proctrace::ProcTraceParser;
+        use crate::probes::proctrace::{
+            PROCTRACE_EVENT_STDOUT, ProcEventHeader, VariableEvent,
+        };
+
+        fn chunk(pid: u32, ts: u64, payload: Vec<u8>) -> ParsedProcEvent {
+            let header = ProcEventHeader {
+                source: 0,
+                timestamp_ns: ts,
+                pid,
+                tid: pid,
+                ppid: 1,
+                ptid: 1,
+                uid: 0,
+                event_type: PROCTRACE_EVENT_STDOUT,
+                data_len: 0,
+                comm: [0; 16],
+                cgroup_id: 0,
+            };
+            let event = VariableEvent::Stdout {
+                header,
+                fd: 1,
+                payload,
+            };
+            ProcTraceParser::parse_variable(&event).expect("stdout chunk parses")
+        }
+
+        let mut agg = ProcessEventAggregator::new();
+        agg.process_parsed_event(&exec_event(300, 100, "tool", "echo 你", 1000));
+
+        // "你" is E4 BD A0; the probe delivers it as E4 BD then A0 across two
+        // reads.
+        agg.process_parsed_event(&chunk(300, 1100, vec![0xE4, 0xBD]));
+        agg.process_parsed_event(&chunk(300, 1200, vec![0xA0]));
+
+        let text = agg
+            .aggregates
+            .get(&300)
+            .expect("process exists")
+            .stdout_string();
+        assert!(
+            text.contains('你'),
+            "the split character must be reassembled, got {text:?}"
+        );
+        assert!(
+            !text.contains('\u{fffd}'),
+            "no replacement character may be synthesized, got {text:?}"
+        );
     }
 
     #[test]

@@ -45,8 +45,14 @@ pub struct ParsedProcEvent {
     pub timestamp_ns: u64,
     /// Command arguments (for exec events)
     pub args: Option<String>,
-    /// Stdout data (for stdout events)
-    pub stdout_data: Option<String>,
+    /// Stdout data (for stdout events), as raw bytes.
+    ///
+    /// Bytes, not text: a multi-byte character split across two reads is only
+    /// recoverable if both halves are kept verbatim — the aggregation buffer
+    /// is byte-oriented and every reader converts lossily at render time, so
+    /// a lossy conversion here would replace each half with U+FFFD and lose
+    /// the character even after concatenation.
+    pub stdout_data: Option<Vec<u8>>,
     /// Output file descriptor for stdout events (1 = stdout, 2 = stderr).
     /// `None` for event types that carry no descriptor (exec, exit).
     pub fd: Option<u32>,
@@ -80,11 +86,14 @@ impl ProcTraceParser {
             } => {
                 // A stdout chunk is arbitrary process bytes: a tool printing
                 // binary, or a multibyte character split across two chunks,
-                // has no valid UTF-8. Dropping the event for that lost the
-                // bytes entirely — the aggregation layer is byte-oriented and
-                // converts lossily at read time (`stdout_string`), so a lossy
-                // decode here keeps the same contract and the event.
-                let stdout_data = Some(String::from_utf8_lossy(payload).into_owned());
+                // has no valid UTF-8. Dropping the event lost the bytes
+                // entirely, but decoding lossily here was just as lossy in a
+                // different way: each half of a character split across two
+                // chunks became its own U+FFFD, so even after concatenation
+                // the character was gone. The event keeps the raw bytes; the
+                // aggregation layer is byte-oriented and every reader converts
+                // lossily at render time (`stdout_string`).
+                let stdout_data = Some(payload.clone());
                 Some(ParsedProcEvent {
                     event_type: ProcEventType::Stdout,
                     pid: header.pid,
@@ -146,10 +155,11 @@ impl ProcTraceParser {
             }
             ProcEventType::Stdout => {
                 let data = parsed.stdout_data?;
-                let display_data = if data.len() > 100 {
-                    format!("{}...", boundary_preview(&data, 100))
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let display_data = if text.len() > 100 {
+                    format!("{}...", boundary_preview(&text, 100))
                 } else {
-                    data.clone()
+                    text.clone()
                 };
 
                 Some(ChromeTraceEvent {
@@ -223,15 +233,18 @@ impl TraceArgs for ParsedProcEvent {
                 if let Some(ref data) = self.stdout_data {
                     args.insert("len".to_string(), json!(data.len()));
 
-                    // Add data preview (truncated)
-                    let preview = if data.len() > 200 {
+                    // Add data preview (truncated), decoded at render time so
+                    // bytes that only form a character across chunk
+                    // boundaries are not corrupted here.
+                    let text = String::from_utf8_lossy(data);
+                    let preview = if text.len() > 200 {
                         format!(
                             "{}... ({} bytes total)",
-                            boundary_preview(data, 200),
+                            boundary_preview(&text, 200),
                             data.len()
                         )
                     } else {
-                        data.clone()
+                        text.into_owned()
                     };
                     args.insert("data".to_string(), json!(preview));
                 }
@@ -265,11 +278,12 @@ impl ParsedProcEvent {
         let name = match self.event_type {
             ProcEventType::Exec => format!("exec: {}", self.comm),
             ProcEventType::Stdout => {
-                let data = self.stdout_data.as_ref().cloned().unwrap_or_default();
-                let display_data = if data.len() > 100 {
-                    format!("{}...", boundary_preview(&data, 100))
+                let data = self.stdout_data.clone().unwrap_or_default();
+                let text = String::from_utf8_lossy(&data).into_owned();
+                let display_data = if text.len() > 100 {
+                    format!("{}...", boundary_preview(&text, 100))
                 } else {
-                    data.clone()
+                    text.clone()
                 };
                 format!("stdout: {}", display_data.trim())
             }
@@ -312,7 +326,7 @@ mod tests {
             filename: None,
             timestamp_ns: 0,
             args: None,
-            stdout_data: Some(data.to_string()),
+            stdout_data: Some(data.as_bytes().to_vec()),
             fd: Some(1),
         }
     }
@@ -337,8 +351,9 @@ mod tests {
         assert_eq!(parsed.event_type, ProcEventType::Stdout);
         let data = parsed.stdout_data.expect("stdout data");
         assert!(
-            data.ends_with('A'),
-            "the decodable tail must survive: {data:?}"
+            data.ends_with(b"A"),
+            "the decodable tail must survive: {:?}",
+            String::from_utf8_lossy(&data)
         );
     }
 
@@ -395,6 +410,6 @@ mod tests {
 
         let parsed = ProcTraceParser::parse_variable(&event).expect("stdout event parses");
         assert_eq!(parsed.fd, Some(2));
-        assert_eq!(parsed.stdout_data.as_deref(), Some("err\n"));
+        assert_eq!(parsed.stdout_data.as_deref(), Some(b"err\n".as_slice()));
     }
 }
