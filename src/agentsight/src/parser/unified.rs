@@ -57,7 +57,8 @@ impl Parser {
         // before any stateless heuristic: a read that continues a frame split
         // across TLS records starts inside a payload and can look like
         // anything, so it would never match the frame detection below.
-        if self.http2_parser.is_tracking(&ssl_event) {
+        let routed_by_h2_state = self.http2_parser.is_tracking(&ssl_event);
+        if routed_by_h2_state {
             let frames = self.http2_parser.parse(ssl_event.clone());
             if !frames.is_empty() {
                 return ParseResult {
@@ -84,8 +85,12 @@ impl Parser {
             }
         }
 
-        // 2. HTTP/2 detection (binary frame protocol)
-        if ssl_event.is_http2() {
+        // 2. HTTP/2 detection (binary frame protocol). Skipped for events the
+        // tracking gate already handed to the parser above: `parse` consumes
+        // the retained reassembly prefix and stores a new tail, so parsing the
+        // same event a second time merges its bytes into that tail again and
+        // the duplicated stream can surface as a corrupted frame.
+        if !routed_by_h2_state && ssl_event.is_http2() {
             let frames = self.http2_parser.parse(ssl_event.clone());
             if !frames.is_empty() {
                 return ParseResult {
@@ -282,6 +287,45 @@ mod tests {
 
     fn make_ssl_event(data: Vec<u8>) -> Rc<SslEvent> {
         make_ssl_event_with_rw(data, 0)
+    }
+
+    /// A read on a connection the h2 parser is already reassembling must be
+    /// parsed exactly once. `parse` consumes the retained prefix and stores a
+    /// new tail, so the stateless `is_http2` gate re-parsing the same read
+    /// merged its bytes into that tail a second time — and the duplicated
+    /// stream could complete a frame the first, correct parse had left
+    /// incomplete, emitting it with the read's bytes twice in its payload.
+    #[test]
+    fn tracked_http2_read_is_not_parsed_twice() {
+        let parser = Parser::new();
+
+        // First read: a complete SETTINGS frame followed by the header and a
+        // 4-byte prefix of a HEADERS frame declaring a 21-byte payload. The
+        // stateless gate routes the read (SETTINGS fits), the partial HEADERS
+        // is retained for reassembly.
+        let mut first = h2_frame(0x04, 0, 0, &[]);
+        let mut partial_headers = vec![0, 0, 21, 0x01, 0, 0, 0, 0, 1];
+        partial_headers.extend_from_slice(b"abcd");
+        first.extend_from_slice(&partial_headers);
+        let result = parser.parse_ssl_event(make_ssl_event(first));
+        assert!(
+            matches!(result.messages[0], ParsedMessage::Http2Frames(_)),
+            "the complete SETTINGS frame must be emitted"
+        );
+
+        // Second read on the same connection: a WINDOW_UPDATE frame —
+        // complete and frame-shaped, so `is_http2()` accepts it, but not one
+        // of the emitted frame types. Re-parsing it duplicated its bytes.
+        let second = h2_frame(0x08, 0, 0, &[0; 4]);
+        let result = parser.parse_ssl_event(make_ssl_event(second));
+
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| matches!(m, ParsedMessage::Http2Frames(_))),
+            "a read already consumed by the reassembly gate must not be re-parsed into a frame"
+        );
     }
 
     #[test]
