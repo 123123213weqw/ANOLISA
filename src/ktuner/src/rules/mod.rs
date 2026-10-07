@@ -3709,22 +3709,21 @@ fn eval_rps_sock_flow_entries(info: &SystemInfo, recs: &mut Vec<Recommendation>)
 }
 
 /// Path-injectable form of [`eval_rps_sock_flow_entries`] (the `eval_*_at`
-/// idiom) so the RPS precondition is assertable against a synthetic sysfs
+/// idiom) so the RFS precondition is assertable against a synthetic sysfs
 /// tree instead of the live `/sys/class/net`.
 ///
-/// The kernel only picks a receive CPU for RPS/RFS while `rps_needed` is set
-/// (net/core/dev.c: `if (static_branch_unlikely(&rps_needed)) { ...
-/// cpu = get_rps_cpu(skb->dev, skb, &rflow); ... }`), and that key is raised
-/// per receive queue by `store_rps_map()` (net/core/net-sysfs.c: `if (map)
-/// static_branch_inc(&rps_needed);`) — i.e. only once a queue has a non-empty
-/// `rps_cpus` mask. The global flow table this rule sizes is read inside
-/// `get_rps_cpu()`, so on a host whose queues never had `rps_cpus` written
-/// (the default: every `/sys/class/net/*/queues/rx-*/rps_cpus` is 0) the table
-/// is never consulted and the reason's promise ("启用 RFS 流分发表可将网络
-/// 处理分散到多核，减少 CPU 热点提升吞吐") cannot be delivered by this write.
-/// The kernel documentation states the matching requirement: "The
-/// functionality remains disabled until explicitly configured" and "Both of
-/// these need to be set before RFS is enabled for a receive queue"
+/// The global flow table this rule sizes is read only by `get_rps_cpu()`, and
+/// that read sits behind the per-queue flow table: net/core/dev.c does
+/// `if (!flow_table && !map) goto done;` and consults `sock_flow_table` inside
+/// `if (flow_table && sock_flow_table) { ... }`. The per-queue table is what
+/// `rps_flow_cnt` sizes, so a receive queue that has only `rps_cpus` set takes
+/// the plain-RPS branch and never reads the global table, while a queue with
+/// `rps_flow_cnt` reaches it even when every `rps_cpus` is left at 0 —
+/// `rps_sock_flow_sysctl()` raises the RPS gate itself when the global table
+/// becomes non-zero (net/core/sysctl_net_core.c: `static_branch_inc(&rps_needed);
+/// static_branch_inc(&rfs_needed);`). The kernel documentation states the
+/// matching requirement next to the two flow-table knobs: "Both of these need
+/// to be set before RFS is enabled for a receive queue"
 /// (Documentation/networking/scaling.rst).
 fn eval_rps_sock_flow_entries_at(
     info: &SystemInfo,
@@ -3739,7 +3738,7 @@ fn eval_rps_sock_flow_entries_at(
     if max_speed < 10000 {
         return 1;
     }
-    if !rps_configured(net_root) {
+    if !rfs_flow_table_configured(net_root) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -3758,12 +3757,13 @@ fn eval_rps_sock_flow_entries_at(
     1
 }
 
-/// Whether any receive queue has RPS configured — a non-zero `rps_cpus` mask —
-/// which is what makes the kernel enter its RPS/RFS steering path at all (see
-/// [`eval_rps_sock_flow_entries_at`]). `rps_cpus` holds a hex CPU bitmap that
-/// may carry comma-separated 64-bit words, so "configured" means any hex digit
-/// other than 0; a queue without the file, or with `0`, steers nothing.
-fn rps_configured(net_root: &std::path::Path) -> bool {
+/// Whether any receive queue has its RFS flow table configured — a non-zero
+/// `rps_flow_cnt` — the per-queue half of the pair `get_rps_cpu()` consults
+/// before reading the global table this rule sizes (see
+/// [`eval_rps_sock_flow_entries_at`]). A queue without the file, or with `0`,
+/// holds no flow table and never reaches the global one; `rps_cpus` on its own
+/// steers through plain RPS instead.
+fn rfs_flow_table_configured(net_root: &std::path::Path) -> bool {
     let Ok(interfaces) = std::fs::read_dir(net_root) else {
         return false;
     };
@@ -3775,10 +3775,10 @@ fn rps_configured(net_root: &std::path::Path) -> bool {
             if !queue.file_name().to_string_lossy().starts_with("rx-") {
                 continue;
             }
-            let Ok(mask) = std::fs::read_to_string(queue.path().join("rps_cpus")) else {
+            let Ok(count) = std::fs::read_to_string(queue.path().join("rps_flow_cnt")) else {
                 continue;
             };
-            if mask.chars().any(|c| c.is_ascii_hexdigit() && c != '0') {
+            if count.trim().parse::<u64>().is_ok_and(|count| count > 0) {
                 return true;
             }
         }
@@ -8673,15 +8673,17 @@ mod tests {
     }
 
     #[test]
-    fn rps_flow_table_is_only_sized_where_rps_is_configured() {
-        // dev.c only picks a receive CPU for RPS/RFS while `rps_needed` is
-        // set, and net-sysfs.c raises that key per receive queue when
-        // `rps_cpus` becomes non-empty. With every mask left at 0 the global
-        // flow table is never read, so raising it cannot spread any traffic —
-        // the shape the rule used to fire on (a 10-GbE host with the default
-        // rps_sock_flow_entries).
+    fn rfs_flow_table_is_only_sized_where_the_queue_flow_table_is() {
+        // get_rps_cpu() consults the global table only after the receive
+        // queue's own flow table exists (net/core/dev.c: `if (!flow_table &&
+        // !map) goto done;` ... `if (flow_table && sock_flow_table) { ... }`),
+        // and that per-queue table is what `rps_flow_cnt` sizes. A queue with
+        // only `rps_cpus` set takes the plain-RPS branch and never reads the
+        // global table; a queue with `rps_flow_cnt` reaches it even when every
+        // `rps_cpus` mask is left at 0, because writing the global table
+        // raises `rps_needed` itself (net/core/sysctl_net_core.c).
         let dir = std::env::temp_dir().join(format!(
-            "ktuner_rps_cpus_{}_{:?}",
+            "ktuner_rfs_flow_cnt_{}_{:?}",
             std::process::id(),
             std::thread::current().id()
         ));
@@ -8700,28 +8702,33 @@ mod tests {
             name: "eth0".to_string(),
             speed_mbps: 10000,
         }];
-        // A transmit queue that carries a mask must not count, and neither
-        // must any receive mask that is entirely zero.
-        write("eth0/queues/tx-0/rps_cpus", "0000000f\n");
-        for mask in ["0\n", "00000000\n", "00000000,00000000\n"] {
-            write("eth0/queues/rx-0/rps_cpus", mask);
-            let mut recs = Vec::new();
-            eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
-            assert!(recs.is_empty(), "rps_cpus={mask:?} steers no traffic");
-        }
-
-        // A configured receive queue keeps the rule, including masks that
-        // span comma-separated 64-bit words.
-        write("eth0/queues/rx-0/rps_cpus", "00000000,00000030\n");
+        // The shape RFS needs: a receive queue with its own flow table, even
+        // though no queue carries an `rps_cpus` mask.
+        write("eth0/queues/rx-0/rps_cpus", "0\n");
+        write("eth0/queues/rx-0/rps_flow_cnt", " 2048 \n");
         let mut recs = Vec::new();
         eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
         assert!(
             recs.iter()
                 .any(|r| r.param == "net.core.rps_sock_flow_entries"),
-            "a configured RPS queue makes the global table matter"
+            "rps_flow_cnt reaches the global table without any rps_cpus"
         );
 
-        // An unreadable tree counts as unconfigured instead of panicking.
+        // `rps_cpus` on its own steers through plain RPS and never reads the
+        // global table.
+        write("eth0/queues/rx-0/rps_flow_cnt", "0\n");
+        write("eth0/queues/rx-0/rps_cpus", "00000000,00000030\n");
+        let mut recs = Vec::new();
+        eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
+        assert!(recs.is_empty(), "rps_cpus alone reads no flow table");
+
+        // A transmit queue's flow count must not count, and an unreadable tree
+        // counts as unconfigured instead of panicking.
+        write("eth0/queues/rx-0/rps_cpus", "0\n");
+        write("eth0/queues/tx-0/rps_flow_cnt", "4096\n");
+        let mut recs = Vec::new();
+        eval_rps_sock_flow_entries_at(&info, &mut recs, param.to_str().unwrap(), &dir);
+        assert!(recs.is_empty(), "a transmit queue holds no rx flow table");
         let mut recs = Vec::new();
         eval_rps_sock_flow_entries_at(
             &info,
