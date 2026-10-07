@@ -335,10 +335,11 @@ impl HttpConnectionAggregator {
                 // body and every body continuation afterwards would hit the
                 // no-op fallback of `process_raw_body_data`, silently dropping
                 // the prompt. Keep the pending body state instead.
-                if matches!(
+                let interim = matches!(
                     assembly.parsed_headers(),
                     Ok(Some(ref response)) if is_informational(response.status_code)
-                ) {
+                );
+                if interim {
                     self.insert(
                         id,
                         ConnectionState::RequestBodyPending {
@@ -347,6 +348,25 @@ impl HttpConnectionAggregator {
                             body_buffer,
                         },
                     );
+                    // The interim response may share this read with the final
+                    // one — a capture that missed the body-completion write
+                    // leaves the state here, and the server's interim and
+                    // final statuses then arrive coalesced. Dropping the rest
+                    // of the read lost the final response; reprocess the bytes
+                    // after the interim headers, exactly like the interim
+                    // loop in `process_response` does for other states.
+                    let Ok(Some(interim_response)) = assembly.parsed_headers() else {
+                        return None;
+                    };
+                    let consumed = interim_response
+                        .body_offset
+                        .min(event.buf_size() as usize);
+                    if consumed < event.buf_size() as usize {
+                        let mut remainder = event.clone();
+                        remainder.buf = event.buf[consumed..].to_vec();
+                        remainder.len = remainder.buf.len() as u32;
+                        return self.process_response_bytes(&remainder);
+                    }
                     return None;
                 }
                 request.reassembled_body = Some(body_buffer);

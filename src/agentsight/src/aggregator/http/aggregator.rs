@@ -1809,6 +1809,61 @@ mod tests {
         }
     }
 
+    /// The interim response can share its read with the final one — the shape
+    /// a capture that missed the body-completion write produces, since the
+    /// server coalesces its interim and final statuses into what the client
+    /// reads as one buffer. Keeping the pending-body state used to drop the
+    /// rest of the read, so the final status (and the pair) was lost until
+    /// idle eviction.
+    #[test]
+    fn batched_interim_and_final_response_completes_the_pair() {
+        let mut aggregator = HttpConnectionAggregator::new();
+        let pid = 4322;
+        let ssl_ptr = 0xC100;
+
+        // `Expect: 100-continue` request whose body the capture never saw
+        // complete: the connection is still in RequestBodyPending when the
+        // coalesced response read arrives.
+        let headers = "POST /v1/chat/completions HTTP/1.1\r\nHost: api.openclaw.com\r\nContent-Type: application/json\r\nExpect: 100-continue\r\nContent-Length: 7\r\n\r\n".to_string();
+        let header_end = headers.len();
+        let request_event = create_mock_ssl_event_with_buf(pid, ssl_ptr, headers.into_bytes(), 1);
+        let request = ParsedRequest {
+            method: "POST".to_string(),
+            path: "/v1/chat/completions".to_string(),
+            version: 11,
+            headers: HashMap::from([
+                ("content-length".to_string(), "7".to_string()),
+                ("expect".to_string(), "100-continue".to_string()),
+            ]),
+            body_offset: header_end,
+            body_len: 0,
+            source_event: request_event,
+            reassembled_body: None,
+        };
+        aggregator.process_request(request);
+        assert!(matches!(
+            aggregator.connections.peek(&ConnectionId { pid, ssl_ptr }),
+            Some(ConnectionState::RequestBodyPending { .. })
+        ));
+
+        // One read carries the interim status *and* the final one.
+        let coalesced = create_mock_ssl_event_with_buf(
+            pid,
+            ssl_ptr,
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\r\n".to_vec(),
+            0,
+        );
+        let result = aggregator.process_raw_body_data(&coalesced);
+
+        let Some(AggregatedResult::HttpComplete(pair)) = result else {
+            panic!("the final status must complete the pair, got {result:?}");
+        };
+        assert_eq!(
+            pair.response.status_code(), 408,
+            "the final status after the interim one must be reported, not the interim itself"
+        );
+    }
+
     #[test]
     fn test_expect_continue_interim_response_keeps_pending_body() {
         let mut aggregator = HttpConnectionAggregator::new();
