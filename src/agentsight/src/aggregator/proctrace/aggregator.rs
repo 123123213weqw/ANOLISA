@@ -404,6 +404,7 @@ mod tests {
             ppid: 0,
             ptid: 0,
             comm: "chatty".to_string(),
+            filename: None,
             timestamp_ns: ts,
             args: None,
             stdout_data: Some(data.to_string()),
