@@ -32,6 +32,13 @@ fn lex(src: &str) -> Result<Vec<Tok>, String> {
             i += 1;
             let start = i;
             while i < b.len() && b[i] != b'"' {
+                if b[i] == 0 {
+                    return Err("string literals must not contain NUL bytes: the engine's \
+                         prefix/suffix/contains matchers compare only the leading \
+                         nonzero bytes of a literal, so a NUL silently truncates \
+                         the installed matcher"
+                        .into());
+                }
                 i += 1;
             }
             if i >= b.len() {
@@ -152,6 +159,18 @@ impl P {
         Ok(Some(arg))
     }
 
+    /// Reads one pattern literal. An empty pattern lowers to a matcher that
+    /// can never fire (an exact literal no runtime path equals; the engine
+    /// rejects an empty contains literal), so a `block`/`kill` clause or a
+    /// taint source carrying one silently installs no enforcement at all.
+    fn pattern(&mut self) -> Result<String, String> {
+        let pattern = self.string()?;
+        if pattern.is_empty() {
+            return Err("pattern literals must not be empty".into());
+        }
+        Ok(pattern)
+    }
+
     fn target(&mut self, op: Op) -> Result<Target, String> {
         let kind = if let Some(Tok::Word(w)) = self.peek() {
             if w == "file" || w == "endpoint" || w == "exec" {
@@ -165,7 +184,7 @@ impl P {
         } else {
             return Err("expected node kind in target".into());
         };
-        let mut pattern = self.string()?;
+        let mut pattern = self.pattern()?;
         // Implicit basename matching: if the pattern contains no '/', treat it
         // as a basename match by prepending "**/".
         if kind == Kind::Exec && !pattern.contains('/') {
@@ -213,18 +232,18 @@ impl P {
                 }
                 Ok(Cond::Target {
                     negate,
-                    pattern: self.string()?,
+                    pattern: self.pattern()?,
                 })
             }
             "lineage-includes" => {
                 self.eat("exec")?;
                 Ok(Cond::LineageIncludes {
-                    exec: self.string()?,
+                    exec: self.pattern()?,
                 })
             }
             "after" => {
                 let gate_op = P::op(&self.word()?)?;
-                let gate_pattern = self.string()?;
+                let gate_pattern = self.pattern()?;
                 let gate_exit = if self.is_word("exits") {
                     self.next();
                     if gate_op != Op::Exec {
@@ -243,7 +262,7 @@ impl P {
                     self.next();
                     loop {
                         let op = P::op(&self.word()?)?;
-                        let pat = self.string()?;
+                        let pat = self.pattern()?;
                         let arg = self.arg(op)?;
                         since.push((op, pat, arg));
                         if self.is_word("or") {
@@ -320,7 +339,7 @@ pub fn parse(src: &str) -> Result<Policy, String> {
                     o => return Err(format!("expected '=' in source, got {:?}", o)),
                 }
                 let kind = P::kind(&p.word()?)?;
-                let pattern = p.string()?;
+                let pattern = p.pattern()?;
                 pol.sources.push(Source {
                     label,
                     kind,
@@ -333,7 +352,7 @@ pub fn parse(src: &str) -> Result<Policy, String> {
                 let label = p.word()?;
                 p.eat("by")?;
                 p.eat("exec")?;
-                let gate = p.string()?;
+                let gate = p.pattern()?;
                 pol.xforms.push(Xform {
                     endorse,
                     label,
@@ -401,6 +420,28 @@ mod tests {
                 Tok::Word("\u{e0}".into()),
                 Tok::Colon
             ]
+        );
+    }
+
+    /// The engine matchers compare only the leading nonzero bytes of a literal
+    /// (taint.h taint_prefix/taint_suffix/taint_contains), so a NUL inside a
+    /// path pattern silently truncates it: "/tmp/a\0b/**" installs a prefix
+    /// matcher on "/tmp/a" that matches every path under it — wider than the
+    /// authored policy. Reject NUL at lex time instead.
+    #[test]
+    fn lexer_rejects_nul_bytes_inside_string_literals() {
+        let error = match lex("source S = file \"/tmp/a\0b/**\"") {
+            Ok(_) => panic!("a NUL inside a string literal must be rejected at lex time"),
+            Err(error) => error,
+        };
+        assert!(error.contains("NUL"), "{error}");
+        let src = concat!(
+            "source S = file \"/tmp/a\0b/**\"\n",
+            "rule r:\n  block write file \"/x\" if S\n  because \"x\"\n"
+        );
+        assert!(
+            crate::dsl::compile_str(src).is_err(),
+            "a NUL inside a pattern literal must be rejected at compile time"
         );
     }
 }

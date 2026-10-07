@@ -386,6 +386,91 @@ fn test_get_token_timeseries_returns_buckets() {
     cleanup_db(&path);
 }
 
+/// A row whose output_tokens is NULL (interrupted / never-recorded output)
+/// still contributes its input tokens, so a bucket's total_tokens must equal
+/// input_tokens + output_tokens. The unguarded SUM(input + output) dropped the
+/// whole row from the total while input_tokens kept it, breaking the
+/// invariant total >= input.
+#[test]
+fn test_token_totals_survive_null_output_tokens() {
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_null_output_totals_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    {
+        let conn = store.conn.lock().unwrap();
+        let sql = "INSERT INTO genai_events (\
+                   call_id, event_type, start_timestamp_ns, end_timestamp_ns,\
+                   provider, model, input_tokens, output_tokens,\
+                   agent_name, pid, status, event_json\
+                   ) VALUES (?1,'llm_call',?2,?3,?4,?5,?6,?7,?8,?9,'complete','{}')";
+        conn.execute(
+            sql,
+            params![
+                "null-out",
+                BASE_NS,
+                BASE_NS + STEP_NS,
+                "openai",
+                "gpt-4",
+                100_i64,
+                None::<i64>,
+                "agent-n",
+                1_i32
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            sql,
+            params![
+                "full-row",
+                BASE_NS + STEP_NS,
+                BASE_NS + 2 * STEP_NS,
+                "openai",
+                "gpt-4",
+                50_i64,
+                25_i64,
+                "agent-n",
+                1_i32
+            ],
+        )
+        .unwrap();
+    }
+
+    let bucket = store
+        .get_token_timeseries(BASE_NS, BASE_NS + 2 * STEP_NS, None, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(bucket.input_tokens, 150, "NULL output must not hide input");
+    assert_eq!(bucket.output_tokens, 25);
+    assert_eq!(
+        bucket.total_tokens, 175,
+        "total must equal input + output, not drop NULL-output rows"
+    );
+
+    let model_bucket = store
+        .get_model_timeseries(BASE_NS, BASE_NS + 2 * STEP_NS, None, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(model_bucket.total_tokens, 175);
+
+    let summary = store.get_agent_token_summary().unwrap();
+    assert_eq!(summary.len(), 1);
+    assert_eq!(summary[0].input_tokens, 150);
+    assert_eq!(summary[0].output_tokens, 25);
+    assert_eq!(summary[0].total_tokens, 175);
+
+    drop(store);
+    cleanup_db(&path);
+}
+
 #[test]
 fn test_get_token_timeseries_respects_requested_bucket_count() {
     // A span of 5 steps over 3 buckets floors bucket_ns to 5*STEP/3, and the
@@ -1065,6 +1150,44 @@ fn turn_indices_survive_a_null_call_id_row() {
     cleanup_db(&path);
 }
 
+/// The plain call-turn reader must survive the same NULL `call_id` row its
+/// sibling `get_tool_call_turn_indices` already skips (#5265): a NULL (only
+/// producible by a foreign writer) must not error the whole map, and the
+/// valid entries of every session must survive.
+#[test]
+fn call_turn_indices_survives_null_call_id_row() {
+    let (store, path) = create_populated_store("call_turns_null_id");
+    {
+        // Fixture-only raw insert: the malformed row is timestamped after
+        // every valid sess-1 row so the expected turn indices below are
+        // order-independent.
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO genai_events (\
+             call_id, event_type, start_timestamp_ns, end_timestamp_ns, duration_ns,\
+             provider, model, input_tokens, output_tokens, total_tokens,\
+             session_id, trace_id, conversation_id, agent_name, pid,\
+             status, tool_call_ids, event_json, process_name, user_query\
+             ) VALUES (NULL,'llm_call',?1,?2,?3,'openai','gpt-4',1,1,2,\
+             'sess-1','trace-1','conv-1','agent-a',100,'pending',NULL,'{}','proc-a',NULL)",
+            params![BASE_NS + 6 * STEP_NS, BASE_NS + 7 * STEP_NS, STEP_NS],
+        )
+        .unwrap();
+    }
+
+    let m = store.get_call_turn_indices(&["sess-1", "sess-2"]).unwrap();
+
+    // Valid sess-1 entries survive with their expected turns.
+    assert_eq!(m["call-1"], 1);
+    assert_eq!(m["call-2"], 2);
+    assert_eq!(m["call-3"], 3);
+    assert_eq!(m["call-6"], 4);
+    // The malformed row must not poison other sessions either.
+    assert_eq!(m["call-4"], 1);
+    assert!(m.contains_key("call-5"));
+    cleanup_db(&path);
+}
+
 #[test]
 fn test_list_traces_by_session() {
     let (store, path) = create_populated_store("traces");
@@ -1639,6 +1762,104 @@ fn test_insert_pending_records_idle_origin_and_match_key() {
 }
 
 #[test]
+fn test_complete_pending_promotion_keeps_captured_request_evidence() {
+    // 710a01ec0 established the contract for the call-id UPDATE: the
+    // completing call's `input_messages`/`system_instructions` are `None`
+    // whenever the semantic parse produced no messages, and completing must
+    // not erase the request view `insert_pending` captured — "the request view
+    // is the only record of what the caller sent". The match-key UPDATE that
+    // promotes an idle-drain snapshot binds both columns raw, so it wiped
+    // them.
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_promote_evidence_{}.db",
+        std::process::id()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+    let info = PendingCallInfo {
+        call_id: "idle-evidence".to_string(),
+        trace_id: None,
+        conversation_id: Some("c-idle".to_string()),
+        session_id: Some("s-idle".to_string()),
+        start_timestamp_ns: BASE_NS as u64,
+        pid: 42,
+        process_name: "claude".to_string(),
+        agent_name: Some("claude".to_string()),
+        http_method: Some("POST".to_string()),
+        http_path: Some("/v1/messages".to_string()),
+        input_messages: Some(r#"[{"role":"user","content":"captured evidence"}]"#.to_string()),
+        system_instructions: Some("captured system prompt".to_string()),
+        user_query: Some("hello".to_string()),
+        is_sse: true,
+        model: Some("claude-sonnet".to_string()),
+        provider: Some("anthropic".to_string()),
+        call_kind: "main".to_string(),
+        pending_origin: PendingOrigin::IdleDrain,
+        pending_match_key: Some("match-evidence".to_string()),
+    };
+    store.insert_pending(&info).unwrap();
+
+    // The completing call carries no parsed request messages.
+    let request = LLMRequest {
+        messages: vec![],
+        temperature: None,
+        max_tokens: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        top_p: None,
+        top_k: None,
+        seed: None,
+        stop_sequences: None,
+        stream: true,
+        tools: None,
+        raw_body: None,
+    };
+    let mut call = LLMCall::new(
+        "real-response-id".to_string(),
+        BASE_NS as u64,
+        "anthropic".to_string(),
+        "claude-sonnet".to_string(),
+        request,
+        42,
+        "claude".to_string(),
+    );
+    call.metadata.insert(
+        "pending_match_key".to_string(),
+        "match-evidence".to_string(),
+    );
+    call.metadata
+        .insert("call_kind".to_string(), "main".to_string());
+
+    store
+        .complete_pending(&GenAISemanticEvent::LLMCall(call))
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (input_messages, system_instructions, status): (Option<String>, Option<String>, String) =
+        conn.query_row(
+            "SELECT input_messages, system_instructions, status FROM genai_events",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(status, "complete");
+    assert_eq!(
+        input_messages.as_deref(),
+        Some(r#"[{"role":"user","content":"captured evidence"}]"#),
+        "promotion must not erase the captured request view"
+    );
+    assert_eq!(
+        system_instructions.as_deref(),
+        Some("captured system prompt"),
+        "promotion must not erase the captured system prompt"
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
+
+#[test]
 fn test_complete_pending_promotes_idle_snapshot_by_match_key() {
     let path =
         std::env::temp_dir().join(format!("test_genai_idle_promote_{}.db", std::process::id()));
@@ -1755,6 +1976,148 @@ fn test_complete_pending_promotes_idle_snapshot_by_match_key() {
     assert_eq!(trace_id, "real-response-id");
     assert_eq!(origin, "idle_drain");
     assert_eq!(first_output, Some(BASE_NS + STEP_NS / 2));
+    drop(conn);
+    cleanup_db(&path);
+}
+
+/// Two idle snapshots can share one match key: `insert_pending` adopts a
+/// snapshot only when the candidate set is a single row ("Ambiguous idle
+/// snapshots … preserving snapshots"), so the completion then lands in
+/// `complete_pending`'s match-key branch instead of the call-id one. That
+/// branch wrote the evidence columns unconditionally, so a completion whose
+/// parsed request carried no messages erased the request view the drain had
+/// captured — the same loss the call-id branch already guards against.
+#[test]
+fn test_complete_pending_keeps_captured_evidence_on_the_match_key_branch() {
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_pending_evidence_match_key_{}.db",
+        std::process::id()
+    ));
+    cleanup_db(&path);
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .unwrap();
+
+    let info = PendingCallInfo {
+        call_id: "idle-dup-a".to_string(),
+        trace_id: None,
+        conversation_id: Some("c-dup".to_string()),
+        session_id: Some("s-dup".to_string()),
+        start_timestamp_ns: BASE_NS as u64,
+        pid: 42,
+        process_name: "claude".to_string(),
+        agent_name: Some("claude".to_string()),
+        http_method: Some("POST".to_string()),
+        http_path: Some("/v1/messages".to_string()),
+        input_messages: Some(
+            r#"[{"role":"user","content":"what changed in the parser?"}]"#.to_string(),
+        ),
+        system_instructions: Some(r#"[{"role":"system","content":"be terse"}]"#.to_string()),
+        user_query: Some("what changed in the parser?".to_string()),
+        is_sse: true,
+        model: Some("claude-sonnet".to_string()),
+        provider: Some("anthropic".to_string()),
+        call_kind: "main".to_string(),
+        pending_origin: PendingOrigin::IdleDrain,
+        pending_match_key: Some("match-dup".to_string()),
+    };
+    store.insert_pending(&info).unwrap();
+    let second = PendingCallInfo {
+        call_id: "idle-dup-b".to_string(),
+        trace_id: None,
+        conversation_id: Some("c-dup".to_string()),
+        session_id: Some("s-dup".to_string()),
+        start_timestamp_ns: (BASE_NS + 1) as u64,
+        pid: 42,
+        process_name: "claude".to_string(),
+        agent_name: Some("claude".to_string()),
+        http_method: Some("POST".to_string()),
+        http_path: Some("/v1/messages".to_string()),
+        input_messages: Some(
+            r#"[{"role":"user","content":"what changed in the parser?"}]"#.to_string(),
+        ),
+        system_instructions: Some(r#"[{"role":"system","content":"be terse"}]"#.to_string()),
+        user_query: Some("what changed in the parser?".to_string()),
+        is_sse: true,
+        model: Some("claude-sonnet".to_string()),
+        provider: Some("anthropic".to_string()),
+        call_kind: "main".to_string(),
+        pending_origin: PendingOrigin::IdleDrain,
+        pending_match_key: Some("match-dup".to_string()),
+    };
+    store.insert_pending(&second).unwrap();
+
+    // The completing event carries no parsed request messages and does not
+    // reuse either snapshot's call id.
+    let mut call = LLMCall::new(
+        "real-dup".to_string(),
+        BASE_NS as u64,
+        "anthropic".to_string(),
+        "claude-sonnet".to_string(),
+        LLMRequest {
+            messages: vec![],
+            temperature: None,
+            max_tokens: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop_sequences: None,
+            stream: true,
+            tools: None,
+            raw_body: None,
+        },
+        42,
+        "claude".to_string(),
+    );
+    call.set_response(
+        LLMResponse {
+            messages: vec![OutputMessage {
+                role: "assistant".to_string(),
+                parts: vec![MessagePart::Text {
+                    content: "it changed".to_string(),
+                }],
+                name: None,
+                finish_reason: Some("stop".to_string()),
+            }],
+            streamed: true,
+            raw_body: None,
+        },
+        (BASE_NS + STEP_NS) as u64,
+    );
+    call.metadata
+        .insert("response_id".to_string(), "real-dup".to_string());
+    call.metadata
+        .insert("pending_match_key".to_string(), "match-dup".to_string());
+    call.metadata
+        .insert("status_code".to_string(), "200".to_string());
+    call.metadata
+        .insert("call_kind".to_string(), "main".to_string());
+
+    store
+        .complete_pending(&GenAISemanticEvent::LLMCall(call))
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (input, system): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT input_messages, system_instructions FROM genai_events
+             WHERE call_id = 'real-dup'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert!(
+        input
+            .as_deref()
+            .is_some_and(|v| v.contains("what changed in the parser?")),
+        "the match-key branch must keep the captured request view, got {input:?}"
+    );
+    assert!(
+        system.as_deref().is_some_and(|v| v.contains("be terse")),
+        "the captured system instructions must survive too, got {system:?}"
+    );
     drop(conn);
     cleanup_db(&path);
 }
@@ -2180,6 +2543,8 @@ fn test_enrich_pending_from_sse() {
         sse_event_count: Some(42),
         input_tokens: Some(999),
         output_tokens: Some(888),
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
     };
     store.enrich_pending_from_sse("call-5", &e).unwrap();
     let conn = store.conn.lock().unwrap();
@@ -2219,6 +2584,8 @@ fn test_enrich_pending_from_sse_records_tool_call_ids() {
         sse_event_count: Some(3),
         input_tokens: None,
         output_tokens: None,
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
     };
     store.enrich_pending_from_sse("call-5", &e).unwrap();
 
@@ -2234,6 +2601,163 @@ fn test_enrich_pending_from_sse_records_tool_call_ids() {
         ids.as_deref(),
         Some(r#"["call_1"]"#),
         "the enriched tool call must be recorded in the ids column"
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
+
+/// A completed call must not be enriched: `insert_pending` returns early
+/// when the same call_id already exists (leaving a completed row in place),
+/// so a late SSE enrichment targeting that replay must leave the row's
+/// authoritative full-response values untouched.
+#[test]
+fn test_enrich_pending_from_sse_skips_completed_call() {
+    let (store, path) = create_populated_store("enrich_sse_done");
+    let e = SseEnrichment {
+        model: Some("gpt-4-turbo".to_string()),
+        trace_id: Some("trace-enriched".to_string()),
+        provider: Some("openai-e".to_string()),
+        output_messages: Some(
+            r#"[{"role":"assistant","parts":[{"type":"tool_call","id":"late_call","name":"read_file","arguments":{"path":"a"}}]}]"#
+                .to_string(),
+        ),
+        sse_event_count: Some(42),
+        input_tokens: Some(999),
+        output_tokens: Some(888),
+        cache_creation_tokens: None,
+        cache_read_tokens: None,
+    };
+    // call-1 is status='complete' in the fixture.
+    store.enrich_pending_from_sse("call-1", &e).unwrap();
+    let conn = store.conn.lock().unwrap();
+    let (model, tid, it, ot): (String, String, i64, i64) = conn
+        .query_row(
+            "SELECT model, trace_id, input_tokens, output_tokens \
+             FROM genai_events WHERE call_id = 'call-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(model, "gpt-4");
+    assert_eq!(tid, "trace-1");
+    assert_eq!(it, 100);
+    assert_eq!(ot, 50);
+    // The guard must also cover the tool_call_ids column the drain path now
+    // writes (COALESCE(?9, …)): a completed row keeps the ids its own
+    // completion recorded, and never adopts the replay's tool calls.
+    let ids: String = conn
+        .query_row(
+            "SELECT tool_call_ids FROM genai_events WHERE call_id = 'call-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(ids, r#"["tc-1","tc-2"]"#);
+    drop(conn);
+    cleanup_db(&path);
+}
+
+#[test]
+fn test_enrich_pending_from_sse_records_usage_cache_counters() {
+    // Anthropic reports the cache counters in `message_start` usage, outside
+    // `input_tokens`, and bills them on top of it; the live path writes both
+    // the columns and the billed total. The drain enrichment forwarded only
+    // input/output tokens, so a drained Anthropic call kept NULL cache columns
+    // and a `total_tokens` that omitted the cache the provider bills:
+    // `/api/traces` dropped `cache_read_tokens`, the ATIF export lost
+    // `cached_tokens`, and the cache-less totals fed the timeseries and
+    // session-savings aggregates for the very rows that never complete.
+    let (store, path) = create_populated_store("enrich_sse_cache");
+    // What `GenAIBuilder::extract_sse_enrichment` yields for a drained
+    // Anthropic stream (message_start usage merged with message_delta).
+    let enrichment = SseEnrichment {
+        model: Some("claude-sonnet-4-5".to_string()),
+        trace_id: None,
+        provider: None,
+        output_messages: None,
+        sse_event_count: Some(2),
+        input_tokens: Some(10),
+        output_tokens: Some(5),
+        cache_creation_tokens: Some(1234),
+        cache_read_tokens: Some(24576),
+    };
+
+    store
+        .enrich_pending_from_sse("call-5", &enrichment)
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (cc, cr, total): (Option<i64>, Option<i64>, i64) = conn
+        .query_row(
+            "SELECT cache_creation_tokens, cache_read_tokens, total_tokens \
+             FROM genai_events WHERE call_id = 'call-5'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (cc, cr),
+        (Some(1234), Some(24576)),
+        "the drained call must keep the cache counters its stream reported"
+    );
+    assert_eq!(
+        total,
+        10 + 1234 + 24576 + 5,
+        "an anthropic drained call totals the billed input (input + cache) plus output"
+    );
+    drop(conn);
+    cleanup_db(&path);
+}
+
+/// A provider that already counts cached tokens inside its reported input
+/// must not have them added again by the drained-call total — the same rule
+/// `billed_input_col!` states for the aggregations over these rows.
+#[test]
+fn test_enrich_pending_from_sse_does_not_double_count_cached_input() {
+    let (store, path) = create_populated_store("enrich_sse_cache_openai");
+    // OpenAI-style usage: `prompt_tokens` already includes the 64 cached
+    // tokens reported under `prompt_tokens_details.cached_tokens`.
+    let enrichment = SseEnrichment {
+        model: Some("gpt-4o".to_string()),
+        trace_id: None,
+        provider: None,
+        output_messages: None,
+        sse_event_count: Some(2),
+        input_tokens: Some(100),
+        output_tokens: Some(7),
+        cache_creation_tokens: None,
+        cache_read_tokens: Some(64),
+    };
+
+    // Enrichment only reaches calls still pending; call-1 is the fixture's
+    // openai row, so mark it drained-pending first.
+    store
+        .conn
+        .lock()
+        .unwrap()
+        .execute(
+            "UPDATE genai_events SET status = 'pending' WHERE call_id = 'call-1'",
+            [],
+        )
+        .unwrap();
+    store
+        .enrich_pending_from_sse("call-1", &enrichment)
+        .unwrap();
+
+    let conn = store.conn.lock().unwrap();
+    let (cr, total): (Option<i64>, i64) = conn
+        .query_row(
+            "SELECT cache_read_tokens, total_tokens \
+             FROM genai_events WHERE call_id = 'call-1'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(cr, Some(64), "the reported cached part is still recorded");
+    assert_eq!(
+        total,
+        100 + 7,
+        "openai-style input already counts the cached part; adding it again would inflate the total"
     );
     drop(conn);
     cleanup_db(&path);
@@ -2524,6 +3048,90 @@ fn poison_recovery_flush_still_operational() {
     //   - last_flush.lock().unwrap_or_else(|e| e.into_inner())  (mod.rs)
     store.flush();
 
+    cleanup_db(&path);
+}
+
+/// A flush that loses the SQLite write race must keep the drained events so a
+/// later flush retries them instead of silently dropping completed LLM calls.
+#[test]
+fn flush_requeues_events_when_the_database_is_locked() {
+    use crate::genai::exporter::GenAIExporter;
+
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_busy_flush_{}_{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    cleanup_db(&path);
+    let store = GenAISqliteStore::new_with_path_and_batch(
+        &path,
+        Some(crate::config::BatchConfig {
+            max_size: 2,
+            flush_ms: 100,
+        }),
+        crate::config::PeriodicStoragePolicy::default(),
+    )
+    .unwrap();
+
+    // Hold the write lock on a second connection so the synchronous batch flush
+    // fails with SQLITE_BUSY instead of persisting.
+    let blocker = rusqlite::Connection::open(&path).expect("blocker should open");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE;")
+        .expect("blocker should take the write lock");
+
+    let events: Vec<GenAISemanticEvent> = (0..2)
+        .map(|index| {
+            let call = LLMCall::new(
+                format!("busy-flush-{index}"),
+                BASE_NS as u64,
+                "openai".to_string(),
+                "gpt-4".to_string(),
+                LLMRequest {
+                    messages: vec![],
+                    temperature: None,
+                    max_tokens: None,
+                    frequency_penalty: None,
+                    presence_penalty: None,
+                    top_p: None,
+                    top_k: None,
+                    seed: None,
+                    stop_sequences: None,
+                    stream: false,
+                    tools: None,
+                    raw_body: None,
+                },
+                100,
+                "test-agent".to_string(),
+            );
+            GenAISemanticEvent::LLMCall(call)
+        })
+        .collect();
+    store.export(&events);
+
+    blocker
+        .execute_batch("COMMIT;")
+        .expect("blocker should release the write lock");
+    store.flush();
+
+    let conn = store.conn.lock().unwrap();
+    for index in 0..2 {
+        let call_id = format!("busy-flush-{index}");
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM genai_events WHERE call_id = ?1",
+                rusqlite::params![call_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "event {call_id} must survive a busy flush retry");
+    }
+    drop(conn);
+    drop(blocker);
+    drop(store);
     cleanup_db(&path);
 }
 
@@ -3029,4 +3637,72 @@ fn agent_activity_summaries_group_names_and_aggregate_calls() {
 
     drop(store);
     cleanup_size_test_db(&path);
+}
+
+/// A `genai_events` table created before the `conversation_id` column existed
+/// must be migrated before the index batch that references it. SQLite resolves
+/// column names when it prepares `CREATE INDEX`, so with the old ordering the
+/// batch aborted with "no such column: conversation_id" and the store never
+/// initialized (same defect as the interruption store's issue #3314).
+#[test]
+fn legacy_db_without_conversation_id_is_migrated_before_index_creation() {
+    let path = std::env::temp_dir().join(format!(
+        "test_genai_legacy_conversation_{}.db",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        // Shape written by the release before conversation_id was added:
+        // every column the first index batch references except conversation_id.
+        conn.execute_batch(
+            "CREATE TABLE genai_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                call_id TEXT,
+                trace_id TEXT,
+                session_id TEXT,
+                instance TEXT,
+                start_timestamp_ns INTEGER NOT NULL,
+                pid INTEGER,
+                model TEXT,
+                provider TEXT,
+                event_json TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+            );",
+        )
+        .unwrap();
+    }
+
+    let store =
+        GenAISqliteStore::new_with_path(&path, crate::config::PeriodicStoragePolicy::default())
+            .expect("store must initialize on a pre-conversation_id database");
+
+    let conn = store.conn.lock().unwrap();
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_table_info('genai_events')")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        columns.iter().any(|c| c == "conversation_id"),
+        "migration must add conversation_id, got {columns:?}"
+    );
+    let indexes: Vec<String> = conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='index'")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .filter_map(|r| r.ok())
+        .collect();
+    assert!(
+        indexes.iter().any(|i| i == "idx_genai_conversation_id"),
+        "the conversation_id index must exist, got {indexes:?}"
+    );
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
 }

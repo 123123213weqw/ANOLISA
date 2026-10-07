@@ -93,14 +93,34 @@ keeps its JSON counts on stdout and preserves the ledger for retry.
 {"applied": 5, "score_after": 35, "score_before": 30}
 ```
 
-`tune --dry-run` previews the plan instead; `status` uses the same
-vocabulary as the short-circuit path (`planned` here; `optimal`/`blocked`
-when there is nothing to apply), and `blocked` counts recommendations this
-environment filtered out (unwritable or runtime-dangerous):
+When this environment filters recommendations out (unwritable, or
+runtime-dangerous), a real `tune` names them in `would_skip` with the same
+shape as the dry-run preview, so the output reconciles with `check` — which
+keeps reporting those parameters (exit 1) after a successful partial tune:
 
 ```json
-{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ]}
+{"applied": 4, "failed": [], "score_after": 35, "score_before": 30, "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
 ```
+
+The fully-blocked short-circuit body carries the same `would_skip` list
+alongside its counts.
+
+`tune --dry-run` previews the plan instead; `status` uses the same
+vocabulary as the short-circuit path (`planned` here; `optimal`/`blocked`
+when there is nothing to apply). `would_apply` lists the entries a real run
+would write, `would_skip` names the ones this environment filters out (with
+the reason: `unwritable` or `runtime_dangerous`), and `blocked` stays their
+count:
+
+```json
+{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
+```
+
+`ktuner why` carries the same reason on a recommendation no write path will
+take (`skip_reason`: `unwritable` or `runtime_dangerous`; absent when the
+plan would write it), so the explanation never contradicts the plan. `check`
+publishes the same classification on its recommendations, so the diagnosis
+carries the reason without a dry run.
 
 ### rollback output
 
@@ -126,9 +146,13 @@ Plain `ktuner rollback` is unchanged: it restores, finalizes the ledger, and cle
 {"error": "tune requires root (sudo ktuner tune)"}
 ```
 
+Network `net.ipv4.conf` and `net.ipv6.conf` names preserve interface case and literal dots: `ktuner why net/ipv4/conf/Br0.100/forwarding` addresses `Br0.100`. Dotted aliases are also accepted. Persistence retains that path with a slash-first key when an interface contains dots. Built-in rules do not currently generate per-VLAN recommendations.
+
 ## Security
 
 - **Code-execution deny-list**: `kernel.core_pattern`, `kernel.modprobe`, `kernel.hotplug`, `kernel.poweroff_cmd`, `kernel.modules_disabled`, `kernel.kexec_load_disabled`, `kernel.usermodehelper.*`, `fs.binfmt_misc.*` are unconditionally blocked from any write path (tune/fix/rollback). Matching is done on the resolved filesystem path, not the parameter spelling, so slash/dot/traversal variants are all caught.
+- **Runtime-dangerous knobs**: knobs unsafe to change on a live host (`vm.nr_hugepages`) are refused at the same write choke point, for every caller — tune leaves them out of the plan (named in `would_skip` as `runtime_dangerous`), fix refuses them with the advice to persist, and a library import cannot apply them either. Slash/dot spellings of the same knob are both caught.
+- **Concurrent operations**: tune, fix, library imports, and rollback share a lock through original-value reads, writes, recording, and persistence. Originals are read after locking; an unreadable ledger blocks new writes. This coordinates KTuner operations, not external sysctl writers or crash recovery.
 - **Rollback safety**: Partial failures preserve the rollback ledger; originals are never lost.
 - **No autonomous root**: ktuner checks `euid == 0` and errors out if not root. cosh's sandbox-guard + permission prompt ensure the human approves before any `sudo ktuner tune` executes.
 

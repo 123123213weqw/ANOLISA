@@ -176,7 +176,7 @@ def test_runtime_log_capture_detects_fatal_patterns_and_rotation(
 
     source.write_text("new file after rotation\n", encoding="utf-8")
     clean, errors = campaign.capture_runtime_log(source, start, destination)
-    assert clean is True
+    assert clean is None  # Rotation lost part of the measured interval.
     assert errors == []
     assert campaign.log_position(tmp_path / "missing") is None
     assert campaign.capture_runtime_log(None, None, destination) == (None, [])
@@ -341,6 +341,73 @@ def test_campaign_validation_rejects_unsafe_formal_inputs(tmp_path: Path) -> Non
         ),
         "cannot exceed",
     )
+
+
+def test_campaign_validation_classifies_malformed_shapes(
+    tmp_path: Path,
+) -> None:
+    """Malformed sections, QPS members, and thresholds get actionable errors."""
+    from test_benchmark import campaign_data
+
+    base = campaign_data(tmp_path)
+
+    def invalid(mutator: Callable[[dict[str, object]], None], message: str) -> None:
+        value = deepcopy(base)
+        mutator(value)
+        with pytest.raises((TypeError, ValueError), match=message):
+            campaign.validate_campaign(value)
+
+    invalid(lambda value: value.update(capacity=None), "capacity must be an object")
+    invalid(
+        lambda value: value.update(capacity=[{"qps_start": 100}]),
+        "capacity must be an object",
+    )
+    invalid(lambda value: value.update(matrix="matrix"), "matrix must be an object")
+    invalid(lambda value: value.update(matrix=None), "matrix must be an object")
+    invalid(
+        lambda value: value["matrix"].update(qps=[1, [2], 3, 4, 5]),
+        "positive integers",
+    )
+    invalid(
+        lambda value: value["matrix"].update(qps=[1, {"qps": 2}, 3, 4, 5]),
+        "positive integers",
+    )
+    invalid(lambda value: value["matrix"].update(qps=5), "matrix.qps must be a list")
+    invalid(
+        lambda value: value["matrix"].update(qps="auto"), "matrix.qps must be a list"
+    )
+    invalid(
+        lambda value: value["thresholds"].update(max_p99_ms=10**400),
+        "finite non-negative",
+    )
+    invalid(
+        lambda value: value["thresholds"].update(max_p99_ms=-(10**400)),
+        "finite non-negative",
+    )
+    invalid(
+        lambda value: value["capacity"].update(search_start_ratio=10**400),
+        "search_start_ratio",
+    )
+    invalid(
+        lambda value: value["recovery"].update(tolerance_ratio=False),
+        "tolerance_ratio",
+    )
+    invalid(
+        lambda value: value["recovery"].update(tolerance_ratio=True),
+        "tolerance_ratio",
+    )
+
+    campaign.validate_campaign(base)
+    empty_qps = deepcopy(base)
+    empty_qps["matrix"]["qps"] = []
+    campaign.validate_campaign(empty_qps)
+    finite = deepcopy(base)
+    finite["thresholds"]["max_p99_ms"] = 1e9
+    campaign.validate_campaign(finite)
+    ratio = deepcopy(base)
+    ratio["thresholds"]["min_token_accuracy"] = 1.01
+    with pytest.raises(ValueError, match="ratio between 0 and 1"):
+        campaign.validate_campaign(ratio)
 
 
 def test_capacity_requires_a_confirmed_failure_boundary(
@@ -508,6 +575,291 @@ def test_recovery_and_fault_evidence_apply_every_gate(tmp_path: Path) -> None:
     assert fault["failed"] == ["token_accuracy"]
 
 
+def test_fault_evidence_classifies_malformed_artifacts(tmp_path: Path) -> None:
+    """Unusable fault artifact shapes and counters report missing evidence."""
+
+    def evaluate(artifact: object, repetitions: int = 3) -> dict[str, object]:
+        run_path = tmp_path / "fault" / "run-result.json"
+        measurement = run_path.parent / "measurement"
+        measurement.mkdir(parents=True, exist_ok=True)
+        measurement.joinpath("fault-results.json").write_text(
+            json.dumps(artifact), encoding="utf-8"
+        )
+        return campaign_evidence.fault_outcome(
+            run_path,
+            {"summary": summary()},
+            {"repetitions_per_case": repetitions},
+            thresholds(),
+        )
+
+    def complete(outcomes: object, **extra: object) -> dict[str, object]:
+        return {
+            "outcomes": outcomes,
+            "server_healthy_after": True,
+            "process_alive_before": True,
+            "process_alive_after": True,
+            **extra,
+        }
+
+    def each_case(entry: object) -> dict[str, object]:
+        return {name: entry for name in campaign_evidence.FAULT_CASES}
+
+    def full(entry: object) -> dict[str, object]:
+        return complete(each_case(entry))
+
+    # Non-object artifacts are unusable evidence, not crashes.
+    assert evaluate(["not", "an", "object"]) == {
+        "verdict": "INCONCLUSIVE",
+        "missing": ["fault-results.json"],
+        "failed": [],
+    }
+    assert evaluate(None) == {
+        "verdict": "INCONCLUSIVE",
+        "missing": ["fault-results.json"],
+        "failed": [],
+    }
+    assert evaluate("artifact") == {
+        "verdict": "INCONCLUSIVE",
+        "missing": ["fault-results.json"],
+        "failed": [],
+    }
+    # Unusable outcome containers leave every case missing.
+    all_missing = {
+        "verdict": "INCONCLUSIVE",
+        "missing": [f"case:{name}" for name in sorted(campaign_evidence.FAULT_CASES)],
+        "failed": [],
+    }
+    assert evaluate(complete(None)) == all_missing
+    assert evaluate(complete(["invalid_json"])) == all_missing
+    # Malformed per-case objects are missing evidence for that case only.
+    scalar_case = full({"handled": 3})
+    scalar_case["outcomes"]["invalid_json"] = 3
+    assert evaluate(scalar_case)["missing"] == ["case:invalid_json"]
+    list_case = full({"handled": 3})
+    list_case["outcomes"]["invalid_json"] = ["handled", 3]
+    assert evaluate(list_case)["missing"] == ["case:invalid_json"]
+    string_case = full({"handled": 3})
+    string_case["outcomes"]["invalid_json"] = "3"
+    assert evaluate(string_case)["missing"] == ["case:invalid_json"]
+    # Non-integer, boolean, and negative counters are missing, never satisfied.
+    boolean_counter = full({"handled": 3})
+    boolean_counter["outcomes"]["invalid_json"] = {"sent": True, "extra": 2}
+    assert evaluate(boolean_counter)["missing"] == ["case:invalid_json"]
+    boolean_only = full({"handled": 1})
+    boolean_only["outcomes"]["invalid_json"] = {"sent": True}
+    assert evaluate(boolean_only, repetitions=1)["missing"] == ["case:invalid_json"]
+    float_counter = full({"handled": 3})
+    float_counter["outcomes"]["invalid_json"] = {"sent": 1.5, "extra": 1.5}
+    assert evaluate(float_counter)["missing"] == ["case:invalid_json"]
+    string_counter = full({"handled": 3})
+    string_counter["outcomes"]["invalid_json"] = {"sent": "3"}
+    assert evaluate(string_counter)["missing"] == ["case:invalid_json"]
+    negative_counter = full({"handled": 3})
+    negative_counter["outcomes"]["invalid_json"] = {"sent": -3}
+    assert evaluate(negative_counter)["missing"] == ["case:invalid_json"]
+    cancelling = full({"handled": 3})
+    cancelling["outcomes"]["invalid_json"] = {"sent": 5, "weird": -2}
+    assert evaluate(cancelling)["missing"] == ["case:invalid_json"]
+    # Controls: complete positive evidence passes, integer mismatches fail,
+    # and absent cases stay missing.
+    assert evaluate(full({"handled": 3})) == {
+        "verdict": "PASS",
+        "missing": [],
+        "failed": [],
+    }
+    mismatch = full({"handled": 3})
+    mismatch["outcomes"]["invalid_json"] = {"handled": 2}
+    mismatch_result = evaluate(mismatch)
+    assert mismatch_result["verdict"] == "FAIL"
+    assert mismatch_result["failed"] == ["count:invalid_json"]
+    absent = full({"handled": 3})
+    del absent["outcomes"]["invalid_json"]
+    absent_result = evaluate(absent)
+    assert absent_result["verdict"] == "INCONCLUSIVE"
+    assert absent_result["missing"] == ["case:invalid_json"]
+
+
+def write_metrics_csv(measurement: Path, rows: list[tuple[str, str]]) -> None:
+    lines = ["timestamp,rss_mb"] + [f"{stamp},{value}" for stamp, value in rows]
+    measurement.joinpath("metrics.csv").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_k6_jsonl(measurement: Path, records: list[object]) -> None:
+    measurement.joinpath("k6.jsonl").write_text(
+        "\n".join(json.dumps(record) for record in records) + "\n", encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    ("rows", "expected"),
+    [
+        pytest.param(
+            [("0", "100"), ("1", "inf"), ("2", "50")],
+            [(0.0, 100.0), (2.0, 50.0)],
+            id="inf-value",
+        ),
+        pytest.param(
+            [("0", "100"), ("1", "nan"), ("2", "50")],
+            [(0.0, 100.0), (2.0, 50.0)],
+            id="nan-value",
+        ),
+        pytest.param(
+            [("inf", "100"), ("0", "50")],
+            [(0.0, 50.0)],
+            id="inf-timestamp",
+        ),
+        pytest.param(
+            [("nan", "100"), ("1", "50")],
+            [(1.0, 50.0)],
+            id="nan-timestamp",
+        ),
+        pytest.param(
+            [("0", "1" + "0" * 400), ("1", "50")],
+            [(1.0, 50.0)],
+            id="oversized-value",
+        ),
+    ],
+)
+def test_resource_samples_skip_unusable_csv_rows(
+    tmp_path: Path, rows: list[tuple[str, str]], expected: list[tuple[float, float]]
+) -> None:
+    """Non-finite CSV samples are skipped while valid rows are retained."""
+    measurement = tmp_path / "measurement"
+    measurement.mkdir()
+    write_metrics_csv(measurement, rows)
+    assert campaign_evidence.resource_samples(tmp_path / "run", "rss_mb") == expected
+
+
+@pytest.mark.parametrize(
+    ("records", "expected"),
+    [
+        pytest.param(
+            [
+                {"metric": "benchmark_requests", "data": None},
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="null-data",
+        ),
+        pytest.param(
+            [
+                {"metric": "benchmark_requests", "data": "scalar"},
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="scalar-data",
+        ),
+        pytest.param(
+            [
+                {"metric": "benchmark_requests", "data": [{"time": 0, "value": 1}]},
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="list-data",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": 0, "value": True},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="boolean-value",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": 0, "value": float("nan")},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="nan-value",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": 0, "value": float("inf")},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="inf-value",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": float("inf"), "value": 1},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="inf-timestamp",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": "nan", "value": 1},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="nan-string-timestamp",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": 10**400, "value": 1},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="oversized-integer-timestamp",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": 0, "value": 10**400},
+                },
+                {"metric": "benchmark_requests", "data": {"time": 1, "value": 2}},
+            ],
+            {"effective_qps": [(1.0, 2.0)], "latency_p99_ms": []},
+            id="oversized-integer-value",
+        ),
+        pytest.param(
+            [
+                {
+                    "metric": "benchmark_requests",
+                    "data": {"time": "1970-01-01T00:00:02Z", "value": 2},
+                },
+                {
+                    "metric": "benchmark_latency",
+                    "data": {"time": "1970-01-01T00:00:02Z", "value": 20},
+                },
+            ],
+            {"effective_qps": [(2.0, 2.0)], "latency_p99_ms": [(2.0, 20.0)]},
+            id="rfc3339-control",
+        ),
+    ],
+)
+def test_load_samples_skip_unusable_jsonl_records(
+    tmp_path: Path, records: list[object], expected: dict[str, list[tuple[float, float]]]
+) -> None:
+    """Malformed JSONL points are skipped while valid records are retained."""
+    measurement = tmp_path / "measurement"
+    measurement.mkdir()
+    write_k6_jsonl(measurement, records)
+    assert campaign_evidence.load_samples(tmp_path / "run") == expected
+
+
 def test_campaign_audit_rejects_partial_evidence() -> None:
     issues = campaign_evidence.audit_campaign(
         {
@@ -532,18 +884,21 @@ def test_campaign_audit_rejects_partial_evidence() -> None:
     assert "full Rust regression gates were not recorded" in issues
 
 
-def test_campaign_audit_accepts_only_complete_formal_evidence() -> None:
+@pytest.mark.parametrize("repetitions", [1, 3])
+def test_campaign_audit_accepts_only_complete_formal_evidence(
+    repetitions: int,
+) -> None:
     campaign_data = {
-        "capacity": {"qps_resolution": 50, "confirm_repetitions": 3},
+        "capacity": {"qps_resolution": 50, "confirm_repetitions": repetitions},
         "matrix": {
             "qps": [100, 200, 300, 400, 500],
-            "repetitions": 3,
+            "repetitions": repetitions,
             "warmup_seconds": 180,
             "duration_seconds": 900,
         },
         "soak": {"warmup_seconds": 600, "duration_seconds": 14400},
         "recovery": {
-            "repetitions": 3,
+            "repetitions": repetitions,
             "stable_seconds": 600,
             "overload_seconds": 300,
             "recover_seconds": 900,
@@ -557,8 +912,8 @@ def test_campaign_audit_accepts_only_complete_formal_evidence() -> None:
             "safety_limit_reached": False,
             "boundary_confirmed": True,
             "confirmation": {
-                "500": ["PASS", "PASS", "PASS"],
-                "550": ["FAIL", "FAIL", "FAIL"],
+                "500": ["PASS"] * repetitions,
+                "550": ["FAIL"] * repetitions,
             },
         }
         for version in campaign_evidence.VERSIONS
@@ -566,7 +921,7 @@ def test_campaign_audit_accepts_only_complete_formal_evidence() -> None:
     items = []
     for version in campaign_evidence.VERSIONS:
         for qps in campaign_data["matrix"]["qps"]:
-            for repetition in range(1, 4):
+            for repetition in range(1, repetitions + 1):
                 items.append(
                     (
                         Path(f"/{version}/{qps}/{repetition}/run-result.json"),
@@ -596,7 +951,7 @@ def test_campaign_audit_accepts_only_complete_formal_evidence() -> None:
                 },
             )
         )
-        for repetition in range(1, 4):
+        for repetition in range(1, repetitions + 1):
             for label, qps, duration in (
                 ("stable", 400, 600),
                 ("overload", 550, 300),
@@ -633,7 +988,7 @@ def test_campaign_audit_accepts_only_complete_formal_evidence() -> None:
     recovery = {
         (version, repetition): {"verdict": "PASS"}
         for version in campaign_evidence.VERSIONS
-        for repetition in range(1, 4)
+        for repetition in range(1, repetitions + 1)
     }
     faults = {version: {"verdict": "PASS"} for version in campaign_evidence.VERSIONS}
     regression = {

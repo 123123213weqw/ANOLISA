@@ -158,15 +158,7 @@ pub(super) async fn preview_agent_protection(
     };
     let root = query.directory.as_deref().unwrap_or(&workspace);
     let root = match root.canonicalize() {
-        Ok(root) if root.is_dir() && root != Path::new("/") => root,
-        Ok(_) => {
-            return error_response(
-                actix_web::http::StatusCode::BAD_REQUEST,
-                "unsafe_protection_directory",
-                "protection directory cannot be the filesystem root",
-                false,
-            );
-        }
+        Ok(root) if root.is_dir() => root,
         _ => {
             return error_response(
                 actix_web::http::StatusCode::BAD_REQUEST,
@@ -176,6 +168,14 @@ pub(super) async fn preview_agent_protection(
             );
         }
     };
+    if root == Path::new("/") {
+        return error_response(
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "unsafe_protection_directory",
+            "protection directory cannot be the filesystem root",
+            false,
+        );
+    }
     // Run the recursive filesystem scan on the blocking pool so a large or slow
     // directory never ties up an async Actix worker. HOME is only a fallback for
     // an empty default-workspace scan; an explicit directory remains authoritative.
@@ -395,22 +395,26 @@ fn discover_sensitive_files(root: &Path, max_depth: usize, limit: usize) -> Vec<
         root: &Path,
         depth: usize,
         max_depth: usize,
-        limit: usize,
         visited: &mut usize,
         out: &mut Vec<String>,
     ) {
         // Bound the total directory entries inspected so a huge or slow tree
         // with no matches still returns promptly instead of tying up the
-        // scanning worker indefinitely.
+        // scanning worker indefinitely. The `limit` cap is *not* applied here:
+        // stopping the walk at `limit` matches made the surviving subset depend
+        // on readdir order, and this list is what the dashboard submits as the
+        // persisted protection policy. The walk therefore collects every match
+        // (at most `MAX_ENTRIES_VISITED` of them) and the caller keeps the
+        // lexicographically first `limit` of the sorted paths.
         const MAX_ENTRIES_VISITED: usize = 20_000;
-        if depth > max_depth || out.len() >= limit || *visited >= MAX_ENTRIES_VISITED {
+        if depth > max_depth || *visited >= MAX_ENTRIES_VISITED {
             return;
         }
         let Ok(entries) = fs::read_dir(root) else {
             return;
         };
         for entry in entries.flatten() {
-            if out.len() >= limit || *visited >= MAX_ENTRIES_VISITED {
+            if *visited >= MAX_ENTRIES_VISITED {
                 break;
             }
             *visited += 1;
@@ -434,7 +438,7 @@ fn discover_sensitive_files(root: &Path, max_depth: usize, limit: usize) -> Vec<
                         | "test"
                         | "__tests__"
                 ) {
-                    visit(&path, depth + 1, max_depth, limit, visited, out);
+                    visit(&path, depth + 1, max_depth, visited, out);
                 }
             } else if path.is_file() && is_sensitive_file(name.as_ref()) {
                 out.push(path.to_string_lossy().into_owned());
@@ -443,9 +447,10 @@ fn discover_sensitive_files(root: &Path, max_depth: usize, limit: usize) -> Vec<
     }
     let mut files = Vec::new();
     let mut visited = 0usize;
-    visit(root, 0, max_depth, limit, &mut visited, &mut files);
+    visit(root, 0, max_depth, &mut visited, &mut files);
     files.sort();
     files.dedup();
+    files.truncate(limit);
     files
 }
 
@@ -1021,6 +1026,39 @@ mod tests {
         fs::remove_dir_all(&root).ok();
     }
 
+    /// The cap must keep a defined subset. The walk collects matches in
+    /// filesystem order and used to stop at `limit` matches *before* sorting, so
+    /// which secrets survived was decided by readdir order — and the dashboard
+    /// submits exactly this list as the persisted protection policy, leaving the
+    /// rest of the workspace unmonitored without saying so.
+    #[test]
+    fn discover_sensitive_files_keeps_the_first_paths_in_order() {
+        let root = std::env::temp_dir().join(format!("agentsight-scan-order-{}", Uuid::new_v4()));
+        fs::create_dir_all(&root).expect("fixture dir should exist");
+        // Created deliberately out of lexical order, and more than the cap.
+        for prefix in ["d", "b", "e", "a", "c"] {
+            for index in 1..=9 {
+                fs::write(root.join(format!("{prefix}{index}.pem")), b"key").expect("key fixture");
+            }
+        }
+
+        let found = discover_sensitive_files(&root, 2, 4);
+
+        let expected: Vec<String> = (1..=4)
+            .map(|index| {
+                root.join(format!("a{index}.pem"))
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        assert_eq!(
+            found, expected,
+            "the cap must keep the lexicographically first paths"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
     #[test]
     fn is_sensitive_file_matches_real_secrets_not_source() {
         // Real credential-shaped filenames must match.
@@ -1431,6 +1469,55 @@ mod tests {
         assert_eq!(explicit.status(), StatusCode::OK);
         let explicit_body: serde_json::Value = awtest::read_body_json(explicit).await;
         assert_eq!(explicit_body["source_paths"], serde_json::json!([]));
+
+        // A path that exists but is not a directory is not the filesystem
+        // root: the preview must name the real failure.
+        let not_a_dir = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory={}",
+                    canonical.join(".env").display()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(not_a_dir.status(), StatusCode::BAD_REQUEST);
+        let not_a_dir_body: serde_json::Value = awtest::read_body_json(not_a_dir).await;
+        assert_eq!(
+            not_a_dir_body["error"]["code"], "invalid_protection_directory",
+            "an existing file is not the filesystem root: {not_a_dir_body}"
+        );
+
+        // The root guard keeps its own code, and a missing path stays invalid.
+        let root = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory=/"
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(root.status(), StatusCode::BAD_REQUEST);
+        let root_body: serde_json::Value = awtest::read_body_json(root).await;
+        assert_eq!(root_body["error"]["code"], "unsafe_protection_directory");
+        let missing = awtest::call_service(
+            &app,
+            awtest::TestRequest::get()
+                .uri(&format!(
+                    "/api/enforcement/agent-protection/{fallback_pid}?directory=/nonexistent-{}",
+                    Uuid::new_v4()
+                ))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        let missing_body: serde_json::Value = awtest::read_body_json(missing).await;
+        assert_eq!(
+            missing_body["error"]["code"],
+            "invalid_protection_directory"
+        );
 
         fallback_process
             .kill()

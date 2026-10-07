@@ -208,14 +208,24 @@ impl GenAIBuilder {
             return None;
         }
 
-        let tools = obj
-            .get("tools")
+        // DashScope/Bailian native requests nest their sampling parameters
+        // under "parameters" (the OpenAI-compatible spelling is top level), and
+        // that protocol has no typed parser, so this fallback is the only place
+        // that can read them. Without it the output cap is invisible to the
+        // token-limit interruption rules and the request telemetry.
+        let parameters = obj.get("parameters").and_then(|v| v.as_object());
+        let param = |key: &str| {
+            obj.get(key)
+                .or_else(|| parameters.and_then(|params| params.get(key)))
+        };
+
+        let tools = param("tools")
             .and_then(|v| v.as_array())
             .map(|arr| arr.to_vec());
 
         Some(LLMRequest {
             messages,
-            temperature: obj.get("temperature").and_then(|v| v.as_f64()),
+            temperature: param("temperature").and_then(|v| v.as_f64()),
             // The output cap has three spellings: the legacy chat
             // `max_tokens`, the newer chat `max_completion_tokens` (the only
             // one the o-series accepts), and the Responses API
@@ -224,15 +234,15 @@ impl GenAIBuilder {
             // `gen_ai.request.max_tokens` telemetry keep working.
             max_tokens: ["max_tokens", "max_completion_tokens", "max_output_tokens"]
                 .iter()
-                .find_map(|key| obj.get(*key))
+                .find_map(|key| param(key))
                 .and_then(|v| v.as_u64())
                 .map(|v| v as u32),
-            frequency_penalty: obj.get("frequency_penalty").and_then(|v| v.as_f64()),
-            presence_penalty: obj.get("presence_penalty").and_then(|v| v.as_f64()),
-            top_p: obj.get("top_p").and_then(|v| v.as_f64()),
-            top_k: obj.get("top_k").and_then(|v| v.as_f64()),
-            seed: obj.get("seed").and_then(|v| v.as_i64()),
-            stop_sequences: obj.get("stop").and_then(|v| {
+            frequency_penalty: param("frequency_penalty").and_then(|v| v.as_f64()),
+            presence_penalty: param("presence_penalty").and_then(|v| v.as_f64()),
+            top_p: param("top_p").and_then(|v| v.as_f64()),
+            top_k: param("top_k").and_then(|v| v.as_f64()),
+            seed: param("seed").and_then(|v| v.as_i64()),
+            stop_sequences: param("stop").and_then(|v| {
                 v.as_array().map(|arr| {
                     arr.iter()
                         .filter_map(|s| s.as_str().map(String::from))
@@ -390,6 +400,13 @@ impl GenAIBuilder {
             }
         }
 
+        // Refusal text: the answer when the model declines instead of replying.
+        if let Some(ref r) = m.refusal {
+            if !r.is_empty() {
+                parts.push(MessagePart::Text { content: r.clone() });
+            }
+        }
+
         // Tool calls
         if let Some(ref tcs) = m.tool_calls {
             for tc in tcs {
@@ -506,6 +523,7 @@ impl GenAIBuilder {
         }
         let mut content_buf = String::new();
         let mut reasoning_buf = String::new();
+        let mut refusal_buf = String::new();
         let mut finish_reason: Option<String> = None;
         // tool_call delta merging: index -> (id, name, arguments_accumulated)
         let mut tc_map: HashMap<u32, (String, String, String)> = HashMap::new();
@@ -530,6 +548,11 @@ impl GenAIBuilder {
                 // Reasoning
                 if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
                     reasoning_buf.push_str(r);
+                }
+                // Refusal: OpenAI's safety refusal arrives in its own delta
+                // field, with no content delta alongside it.
+                if let Some(r) = delta.get("refusal").and_then(|v| v.as_str()) {
+                    refusal_buf.push_str(r);
                 }
                 // Tool call deltas — merge by index
                 if let Some(calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
@@ -589,6 +612,12 @@ impl GenAIBuilder {
         if !content_buf.is_empty() {
             parts.push(MessagePart::Text {
                 content: content_buf,
+            });
+        }
+        // Refusal text: the model's answer when it declines a request.
+        if !refusal_buf.is_empty() {
+            parts.push(MessagePart::Text {
+                content: refusal_buf,
             });
         }
         // Merged tool calls
@@ -783,13 +812,29 @@ impl GenAIBuilder {
     ///
     /// Shares the analyzer's per-item tool state so interleaved arguments and
     /// done payloads stay attached to their own call. Incomplete calls survive
-    /// without a per-call done event.
+    /// without a per-call done event. A done event keyed by an identity no
+    /// `output_item.added` carried (a capture that attached after the headers)
+    /// cannot be routed by the item state; its complete arguments are still
+    /// kept, re-attached to the call that was current when it arrived.
     pub(super) fn merge_responses_sse_chunks(
         chunks: &[serde_json::Value],
     ) -> Option<(Vec<MessagePart>, Option<String>)> {
         let mut text_buf = String::new();
+        let mut refusal_buf = String::new();
         let mut calls = ResponsesToolCalls::default();
         let mut saw_responses_event = false;
+        // Done payloads the item router cannot attribute: the router matches a
+        // done event by the item id / output index its `output_item.added`
+        // carried, and a capture that started mid-stream can attach before
+        // those headers were seen. Dropping such a payload persists the call
+        // with no arguments even though the done event carries them, so record
+        // it against the last added function_call (the router's current call)
+        // and re-attach it below.
+        let mut last_added: Option<(String, String)> = None;
+        let mut added_item_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        let mut added_indexes: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut orphan_done: Vec<(String, String, String)> = Vec::new();
 
         for chunk in chunks {
             calls.observe(chunk);
@@ -801,7 +846,79 @@ impl GenAIBuilder {
                         text_buf.push_str(delta);
                     }
                 }
-                "response.output_item.added" => saw_responses_event = true,
+                "response.output_item.added" => {
+                    saw_responses_event = true;
+                    let item = chunk.get("item");
+                    if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                        == Some("function_call")
+                    {
+                        if let Some(id) = item.and_then(|i| i.get("id")).and_then(|v| v.as_str()) {
+                            added_item_ids.insert(id.to_string());
+                        }
+                        if let Some(index) = chunk.get("output_index").and_then(|v| v.as_u64()) {
+                            added_indexes.insert(index);
+                        }
+                        last_added = Some((
+                            item.and_then(|i| i.get("call_id"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            item.and_then(|i| i.get("name"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ));
+                    }
+                }
+                "response.refusal.delta" => {
+                    saw_responses_event = true;
+                    if let Some(delta) = chunk.get("delta").and_then(|d| d.as_str()) {
+                        refusal_buf.push_str(delta);
+                    }
+                }
+                "response.refusal.done" => {
+                    // The done event carries the finalized text; the deltas
+                    // may be missing when capture started mid-stream.
+                    saw_responses_event = true;
+                    if let Some(refusal) = chunk.get("refusal").and_then(|r| r.as_str()) {
+                        refusal_buf.clear();
+                        refusal_buf.push_str(refusal);
+                    }
+                }
+                "response.output_item.done" => {
+                    // A capture that started mid-stream may open with a done
+                    // item instead of an added one; the item router recovers
+                    // the complete call from it, so a function_call done item
+                    // proves this is a Responses stream with recoverable
+                    // content. Other item types carry no text here (text
+                    // arrives only as deltas) and must not flip the gate.
+                    if chunk
+                        .get("item")
+                        .and_then(|i| i.get("type"))
+                        .and_then(|t| t.as_str())
+                        == Some("function_call")
+                    {
+                        saw_responses_event = true;
+                    }
+                }
+                "response.function_call_arguments.done" => {
+                    if let Some(arguments) = chunk.get("arguments").and_then(|a| a.as_str()) {
+                        let item_id = chunk.get("item_id").and_then(|v| v.as_str());
+                        let output_index = chunk.get("output_index").and_then(|v| v.as_u64());
+                        let identified = item_id.is_some() || output_index.is_some();
+                        let routed = (item_id.is_some_and(|id| added_item_ids.contains(id)))
+                            || (output_index.is_some_and(|i| added_indexes.contains(&i)));
+                        if identified && !routed && last_added.is_some() {
+                            if let Some((call_id, name)) = &last_added {
+                                orphan_done.push((
+                                    call_id.clone(),
+                                    name.clone(),
+                                    arguments.to_string(),
+                                ));
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -810,7 +927,7 @@ impl GenAIBuilder {
             return None;
         }
 
-        let tool_parts: Vec<_> = calls
+        let mut tool_parts: Vec<_> = calls
             .into_calls()
             .map(|(id, name, arguments)| MessagePart::ToolCall {
                 id: if id.is_empty() { None } else { Some(id) },
@@ -818,10 +935,34 @@ impl GenAIBuilder {
                 arguments: serde_json::from_str(&arguments).ok(),
             })
             .collect();
+        for part in &mut tool_parts {
+            if let MessagePart::ToolCall {
+                id,
+                name,
+                arguments,
+            } = part
+            {
+                if arguments.is_some() {
+                    continue;
+                }
+                if let Some((_, (_, _, payload))) =
+                    orphan_done.iter().enumerate().find(|(_, (oid, oname, _))| {
+                        *oid == id.as_deref().unwrap_or("") && oname == name
+                    })
+                {
+                    *arguments = serde_json::from_str(payload).ok();
+                }
+            }
+        }
 
         let mut parts = Vec::new();
         if !text_buf.is_empty() {
             parts.push(MessagePart::Text { content: text_buf });
+        }
+        if !refusal_buf.is_empty() {
+            parts.push(MessagePart::Text {
+                content: refusal_buf,
+            });
         }
         parts.extend(tool_parts);
 
@@ -1100,6 +1241,42 @@ mod tests {
         assert_eq!(req.max_tokens, Some(2048));
     }
 
+    /// The DashScope/Bailian native protocol nests its sampling parameters
+    /// under `parameters`; reading only top level left the output cap and every
+    /// other parameter empty for that traffic.
+    #[test]
+    fn test_parse_request_body_dashscope_native_parameters() {
+        let body = r#"{
+            "model": "qwen-plus",
+            "input": {"messages": [{"role": "user", "content": "hi"}]},
+            "parameters": {
+                "result_format": "message",
+                "max_tokens": 1024,
+                "temperature": 0.7,
+                "top_p": 0.8,
+                "seed": 42,
+                "stop": ["END"]
+            }
+        }"#;
+
+        let req = GenAIBuilder::parse_request_body(body).expect("native body parses");
+        assert_eq!(req.max_tokens, Some(1024));
+        assert_eq!(req.temperature, Some(0.7));
+        assert_eq!(req.top_p, Some(0.8));
+        assert_eq!(req.seed, Some(42));
+        assert_eq!(req.stop_sequences, Some(vec!["END".to_string()]));
+
+        // A top-level value still wins over the nested one.
+        let body = r#"{
+            "model": "qwen-plus",
+            "input": {"messages": [{"role": "user", "content": "hi"}]},
+            "max_tokens": 7,
+            "parameters": {"max_tokens": 1024}
+        }"#;
+        let req = GenAIBuilder::parse_request_body(body).expect("body parses");
+        assert_eq!(req.max_tokens, Some(7));
+    }
+
     #[test]
     fn test_parse_request_body_responses_max_output_tokens() {
         // The Responses API (codex 0.137+ via dashscope /v1/responses)
@@ -1308,6 +1485,22 @@ mod tests {
         assert!(matches!(&parts[1], MessagePart::Text { content } if content == "answer"));
     }
 
+    /// OpenAI reports a safety refusal in a dedicated `delta.refusal` field
+    /// (no content delta arrives), so a refusal-only stream produced no parts
+    /// at all: both the live path and the drain enrichment persisted the call
+    /// with `output_messages = None`.
+    #[test]
+    fn test_extract_parts_from_sse_body_refusal() {
+        let body = r#"[{"choices":[{"delta":{"refusal":"I can't help with that."}}]},{"choices":[{"delta":{},"finish_reason":"stop"}]}]"#;
+        let (parts, finish) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("a refusal must still yield output");
+        assert_eq!(parts.len(), 1);
+        assert!(
+            matches!(&parts[0], MessagePart::Text { content } if content == "I can't help with that.")
+        );
+        assert_eq!(finish, Some("stop".to_string()));
+    }
+
     /// Anthropic SSE bodies carry no `choices` array, so the merger must
     /// aggregate `content_block_start`/`content_block_delta` events instead of
     /// yielding no parts at all. This is the same merger the dead-pid drain
@@ -1360,6 +1553,26 @@ mod tests {
         let (parts, finish) = GenAIBuilder::merge_sse_chunks(&chunks);
         assert!(parts.is_empty(), "no content blocks means no parts");
         assert_eq!(finish.as_deref(), Some("end_turn"));
+    }
+
+    /// The Responses protocol reports a refusal through its own streaming
+    /// events (`response.refusal.delta`/`done`), which the merger ignored the
+    /// same way the chat-completions path ignored `delta.refusal`.
+    #[test]
+    fn test_extract_parts_from_sse_body_responses_refusal() {
+        let body = r#"[
+            {"type":"response.created","response":{"id":"resp_r1","model":"gpt-5"}},
+            {"type":"response.refusal.delta","delta":"I can't help"},
+            {"type":"response.refusal.delta","delta":" with that."},
+            {"type":"response.refusal.done","refusal":"I can't help with that."},
+            {"type":"response.completed","response":{"id":"resp_r1","status":"completed"}}
+        ]"#;
+        let (parts, _) = GenAIBuilder::extract_parts_from_sse_body(body)
+            .expect("a refusal must still yield output");
+        assert_eq!(parts.len(), 1);
+        assert!(
+            matches!(&parts[0], MessagePart::Text { content } if content == "I can't help with that.")
+        );
     }
 
     /// Responses-API SSE bodies (codex 0.137+ via /v1/responses) carry no
@@ -1710,5 +1923,29 @@ mod tests {
             matches!(&output.parts[0], MessagePart::Reasoning { content } if content == "thinking")
         );
         assert!(matches!(&output.parts[1], MessagePart::Text { content } if content == "Response"));
+    }
+
+    /// The non-streaming body carries the refusal in `message.refusal`; the
+    /// conversion read only content/reasoning/tool_calls, so the refusal text
+    /// was dropped from the recorded output.
+    #[test]
+    fn test_openai_msg_to_output_refusal() {
+        let msg = OpenAIChatMessage {
+            role: crate::analyzer::message::types::MessageRole::Assistant,
+            content: None,
+            reasoning_content: None,
+            refusal: Some("I can't help with that.".to_string()),
+            function_call: None,
+            tool_calls: None,
+            tool_call_id: None,
+            name: None,
+            annotations: None,
+            audio: None,
+        };
+        let output = GenAIBuilder::openai_msg_to_output(&msg, Some("stop"));
+        assert_eq!(output.parts.len(), 1);
+        assert!(
+            matches!(&output.parts[0], MessagePart::Text { content } if content == "I can't help with that.")
+        );
     }
 }

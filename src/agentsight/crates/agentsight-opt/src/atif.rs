@@ -14,7 +14,10 @@
 //! - Producers may record the request **start** time in `extra.start_timestamp`
 //!   (ISO 8601). AgentSight's exporter always does.
 //! - Model inference time of a step = `end − start`. When `start_timestamp` is
-//!   absent, the previous step's timestamp is used as an approximation.
+//!   absent, the previous step's timestamp is used as an approximation —
+//!   unless that previous agent step issued tool calls (and no user step
+//!   intervenes): the interval is then booked as that step's tool window
+//!   instead, so the model/tool split never double-books one gap.
 //! - Tool execution time of a step = next agent step's `start` − this step's
 //!   `end`, valid only when no user step intervenes (a user step means the
 //!   turn ended and the gap is user idle, not tool time).
@@ -26,12 +29,24 @@ use serde::{Deserialize, Serialize};
 /// Max characters kept per tool observation in [`render_trimmed`].
 const OBSERVATION_TRIM_CHARS: usize = 80;
 
+/// Max characters kept per thinking / text block in [`render_trimmed`].
+/// `render_trimmed` feeds LLM prompts (the perf experience-library
+/// strategy), and reasoning models emit tens of thousands of characters of
+/// hidden chain-of-thought per step — uncapped narration is the exact
+/// context overflow `summary` caps its payload to avoid. The same head cap
+/// bounds user narration: a pasted log or config dump in one user turn is
+/// the other routine source of oversized prompt payload.
+const NARRATION_TRIM_CHARS: usize = 800;
+
 // ─── Document types ──────────────────────────────────────────────────────────
 
 /// Root ATIF trajectory document (analysis-side mirror of the shared schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AtifTrajectory {
     pub schema_version: String,
+    /// Informational only (run-scoped); ATIF v1.7 relaxed it to optional, and
+    /// nothing in this crate reads it.
+    #[serde(default)]
     pub session_id: String,
     #[serde(default)]
     pub agent: Option<AtifAgent>,
@@ -65,7 +80,11 @@ pub struct AtifStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timestamp: Option<String>,
     pub source: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "de_step_message",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_name: Option<String>,
@@ -117,6 +136,22 @@ where
             other => other.to_string(),
         }),
     )
+}
+
+/// Flatten a step message to the text the analyzers consume.
+///
+/// ATIF v1.6+ types `StepObject.message` as `String | Array<ContentPart>`, the
+/// array form being how a multimodal step carries its text and attachments. The
+/// in-repo producers always write the string form, but the format is
+/// interoperable, so a document from another producer — or a hand-written one —
+/// used to fail the whole parse with "invalid type: sequence, expected a
+/// string", losing every step of the trajectory rather than flattening one
+/// field. Same reasoning and same result as `de_observation_content` above.
+fn de_step_message<'de, D>(deserializer: D) -> std::result::Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_observation_content(deserializer)
 }
 
 /// One tool result.
@@ -261,6 +296,20 @@ impl AtifToolCall {
         truncate_chars(&json, max_chars)
     }
 
+    /// The command this call ran, when it carries one.
+    ///
+    /// Distinct from [`Self::command_summary`], which is the whole `arguments`
+    /// object: matching command keywords against the summary let *arguments*
+    /// decide the verdict — a `Grep` whose pattern reads `git stash pop`, an
+    /// `Edit` whose replacement text quotes 回退 — and missed a real command
+    /// whose text fell outside the summary window.
+    pub fn command(&self) -> Option<&str> {
+        ["command", "cmd", "script"]
+            .iter()
+            .find_map(|key| self.arguments.get(key).and_then(|value| value.as_str()))
+            .filter(|command| !command.is_empty())
+    }
+
     /// Tool name enriched with subagent type, e.g. `Agent(Explore)`.
     pub fn display_name(&self) -> String {
         let base = if self.function_name.is_empty() {
@@ -333,8 +382,9 @@ pub(crate) fn truncate_chars(raw: &str, max_chars: usize) -> String {
 // ─── LLM-facing rendering ────────────────────────────────────────────────────
 
 /// Render the trajectory as compact readable text for LLM prompts, trimming
-/// tool observations to a short prefix. Preserves step order, sources, tool
-/// names/arguments summaries, and message/reasoning text.
+/// tool observations to a short prefix and narration (thinking / text / user
+/// messages) to a head cap. Preserves step order, sources, and tool
+/// names/arguments summaries.
 pub fn render_trimmed(traj: &AtifTrajectory) -> String {
     let mut out = String::new();
     for step in &traj.steps {
@@ -349,18 +399,27 @@ pub fn render_trimmed(traj: &AtifTrajectory) -> String {
             }
             "user" => {
                 let msg = step.message.as_deref().unwrap_or("");
-                out.push_str(&format!("[{ts}] user: {msg}\n"));
+                out.push_str(&format!(
+                    "[{ts}] user: {}\n",
+                    truncate_chars(msg, NARRATION_TRIM_CHARS)
+                ));
             }
             _ => {
                 out.push_str(&format!("[{ts}] agent (step {}):\n", step.step_id));
                 if let Some(r) = step.reasoning_content.as_deref() {
                     if !r.is_empty() {
-                        out.push_str(&format!("  thinking: {r}\n"));
+                        out.push_str(&format!(
+                            "  thinking: {}\n",
+                            truncate_chars(r, NARRATION_TRIM_CHARS)
+                        ));
                     }
                 }
                 if let Some(m) = step.message.as_deref() {
                     if !m.is_empty() {
-                        out.push_str(&format!("  text: {m}\n"));
+                        out.push_str(&format!(
+                            "  text: {}\n",
+                            truncate_chars(m, NARRATION_TRIM_CHARS)
+                        ));
                     }
                 }
                 for call in step.calls() {
@@ -446,6 +505,72 @@ mod tests {
                 .and_then(|e| e.get("provider_call_id")),
             Some(&serde_json::json!("call_abc"))
         );
+    }
+
+    #[test]
+    fn parses_schema_valid_content_part_array_message() {
+        // ATIF v1.6+ types StepObject.message as `String | Array<ContentPart>`
+        // ("Extended `message` field in `StepObject` to accept either a string
+        // or array of `ContentPart` objects"), and the in-repo producers always
+        // write the string form. A document from another producer used to fail
+        // the whole parse with "invalid type: sequence, expected a string",
+        // losing every step rather than flattening one field.
+        let json = r#"{
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s1",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1, "source": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": [{"type": "text", "text": "What is in this image?"},
+                            {"type": "image", "source": {"media_type": "image/png",
+                                                         "path": "images/step_1_input.png"}}]
+            }]
+        }"#;
+        let traj = AtifTrajectory::from_json(json).expect("spec-valid message array must parse");
+        let message = traj.steps[0]
+            .message
+            .as_deref()
+            .expect("message must survive");
+        assert!(
+            message.contains("What is in this image?"),
+            "content-part message must be flattened to text: {message}"
+        );
+    }
+
+    #[test]
+    fn keeps_string_step_message_verbatim() {
+        // Guard: flattening is a no-op for the string shape the in-repo
+        // producers write.
+        let json = r#"{
+            "schema_version": "ATIF-v1.7",
+            "session_id": "s1",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1, "source": "agent", "timestamp": "2026-01-01T00:00:01Z",
+                "message": "hi\n"
+            }]
+        }"#;
+        let traj = AtifTrajectory::from_json(json).unwrap();
+        assert_eq!(traj.steps[0].message.as_deref(), Some("hi\n"));
+    }
+
+    #[test]
+    fn parses_a_v1_7_document_without_session_id() {
+        // ATIF v1.7 relaxed the top-level `session_id` to optional — the shared
+        // schema types it as `Option<String>` and documents it as "informational
+        // only (run-scoped)", and nothing in this crate reads it. This reader
+        // still required it, so a v1.7-legal document failed the whole parse.
+        let json = r#"{
+            "schema_version": "ATIF-v1.7",
+            "agent": {"name": "a", "version": "1"},
+            "steps": [{
+                "step_id": 1, "source": "user", "timestamp": "2026-01-01T00:00:00Z",
+                "message": "hi"
+            }]
+        }"#;
+        let traj = AtifTrajectory::from_json(json).expect("v1.7 documents may omit session_id");
+        assert_eq!(traj.session_id, "");
+        assert_eq!(traj.steps.len(), 1);
     }
 
     #[test]
@@ -554,5 +679,63 @@ mod tests {
         assert!(text.contains("tool_use Bash: {\"command\":\"ls\"}"));
         assert!(text.contains("[trimmed, 500 chars total]"));
         assert!(!text.contains(&"x".repeat(200)));
+    }
+
+    /// Per-step narration (thinking / text) must be head-capped like tool
+    /// observations: `render_trimmed` feeds the perf experience-library
+    /// prompt, and a reasoning-heavy trace would otherwise ship megabytes of
+    /// hidden chain-of-thought into one LLM call (observed: 240k chars from
+    /// a single step) — the exact context overflow `summary` caps its
+    /// payload to avoid.
+    #[test]
+    fn render_trimmed_caps_thinking_and_text() {
+        let json = String::from(
+            r#"{"schema_version":"ATIF-v1.6","session_id":"s1",
+                "agent":{"name":"a","version":"1"},
+                "steps":[{"step_id":1,"source":"agent","timestamp":"2026-01-01T00:00:05Z",
+                 "reasoning_content":"BIGTHINK","message":"BIGTEXT"}]}"#,
+        )
+        .replace("BIGTHINK", &"think ".repeat(20_000))
+        .replace("BIGTEXT", &"text ".repeat(20_000));
+        let traj = AtifTrajectory::from_json(&json).unwrap();
+        let text = render_trimmed(&traj);
+        assert!(
+            text.chars().count() < 4_000,
+            "narration must be capped, got {} chars for one step",
+            text.chars().count()
+        );
+        assert!(text.contains("thinking: think"));
+        assert!(text.contains("text: text"));
+    }
+
+    /// A user step carrying a pasted payload (a log, a config dump, a whole
+    /// file) must be head-capped like every other narration: `render_trimmed`
+    /// feeds the perf experience-library prompt, and the user turn is the one
+    /// place oversized input routinely enters a trajectory — a single pasted
+    /// log shipped verbatim is the exact context overflow the narration cap
+    /// exists to avoid.
+    #[test]
+    fn render_trimmed_caps_user_messages() {
+        let json = String::from(
+            r#"{"schema_version":"ATIF-v1.6","session_id":"s1",
+                "agent":{"name":"a","version":"1"},
+                "steps":[
+                    {"step_id":1,"source":"user","timestamp":"2026-01-01T00:00:01Z",
+                     "message":"BIGLOG"},
+                    {"step_id":2,"source":"user","timestamp":"2026-01-01T00:00:02Z",
+                     "message":"keep this short turn verbatim"}]}"#,
+        )
+        .replace("BIGLOG", &"log ".repeat(20_000));
+        let traj = AtifTrajectory::from_json(&json).unwrap();
+        let text = render_trimmed(&traj);
+        assert!(
+            text.chars().count() < 4_000,
+            "a pasted user payload must be capped, got {} chars",
+            text.chars().count()
+        );
+        assert!(text.contains("user: log"));
+        assert!(!text.contains(&"log ".repeat(1_000)));
+        // A short user turn is not a pasted payload and stays verbatim.
+        assert!(text.contains("user: keep this short turn verbatim\n"));
     }
 }

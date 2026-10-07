@@ -81,6 +81,8 @@ is a successful no-op (`0`); an unreadable or missing ledger is a command error 
 
 ---
 
+For network conf parameters, interface identity is case-sensitive. Both `net/ipv4/conf/Br0.100/forwarding` and `net.ipv4.conf.Br0.100.forwarding` address the same interface; `br0.100` is a different identity. IPv6 follows the same rule. Persisted records for interfaces with literal dots use slash-first sysctl.d keys so systemd preserves those dots. This supports existing valid records or custom library recommendations; built-in rules do not currently generate per-VLAN recommendations.
+
 ## Permission Boundary
 
 | Command | Root | Effect |
@@ -92,6 +94,7 @@ is a successful no-op (`0`); an unreadable or missing ledger is a command error 
 Safety guarantees:
 
 - **Code-execution deny-list**: parameters that can lead to code execution (`kernel.core_pattern`, `kernel.modprobe`, `kernel.hotplug`, and similar) are unconditionally blocked from every write path. Matching is on the resolved filesystem path, so spelling variants cannot bypass it.
+- **Concurrent operations**: tune, fix, library imports, and rollback serialize original-value reads, writes, ledger updates, and persistence using one lock. A stale diagnosis is never used as a new rollback original; an unreadable ledger blocks new writes. External sysctl writers and crash recovery are outside this guarantee.
 - **Rollback safety**: applied changes are recorded; a partial rollback failure never discards the remaining original values.
 - **No autonomous root**: ktuner errors out unless run as root. When invoked through cosh, the sandbox guard and permission prompt ensure a human approves before any `sudo ktuner tune` runs.
 

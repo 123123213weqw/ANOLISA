@@ -39,6 +39,9 @@ pub(super) async fn summary(
     if let Some(response) = reject_unrepresentable_window(&query) {
         return response;
     }
+    if let Some(response) = reject_unknown_filter_tokens(&query) {
+        return response;
+    }
     let filter = event_filter(&query);
     let summary = match data.audit_service.summary(&filter) {
         Ok(summary) => summary,
@@ -93,6 +96,9 @@ pub(super) async fn events(
     if let Some(response) = reject_unrepresentable_window(&query) {
         return response;
     }
+    if let Some(response) = reject_unknown_filter_tokens(&query) {
+        return response;
+    }
     match data.audit_service.events(&event_filter(&query)) {
         Ok(page) => {
             let state = if page.items.is_empty() { "empty" } else { "ok" };
@@ -120,6 +126,9 @@ pub(super) async fn sessions(
     query: web::Query<AuditQuery>,
 ) -> HttpResponse {
     if let Some(response) = reject_unrepresentable_window(&query) {
+        return response;
+    }
+    if let Some(response) = reject_unknown_filter_tokens(&query) {
         return response;
     }
     let page = match data.audit_service.sessions(&event_filter(&query)) {
@@ -164,6 +173,9 @@ pub(super) async fn cases(
     data: web::Data<AppState>,
     query: web::Query<AuditQuery>,
 ) -> HttpResponse {
+    if let Some(response) = reject_unknown_filter_tokens(&query) {
+        return response;
+    }
     let limit = query.limit.unwrap_or(100).clamp(1, 1_000);
     let offset = query.offset.unwrap_or(0).max(0);
     let agent_id = query.agent_id.as_deref();
@@ -244,13 +256,60 @@ pub(super) async fn review_case(
     }
 }
 
-/// Rejects a window the store cannot represent.
+/// Closed sets the read filters compare literally, mirrored from the writers.
+///
+/// `status` is written by `risk_status`, and `event_type` / `result` by
+/// `EventMetadata::from_event`, so an unknown token can never match a stored
+/// row. Accepting one and answering an empty 200 makes a typo
+/// indistinguishable from a genuinely empty result — the write endpoint here
+/// and the trajectory label filters already reject that with 400 — while the
+/// open-ended identifiers (`policy_id`, `agent_id`, `session_id`,
+/// `binding_id`) stay unchecked on purpose: a valid value may simply have no
+/// rows yet.
+const CASE_STATUS_TOKENS: [&str; 5] = [
+    "open",
+    "confirmed",
+    "false_positive",
+    "accepted_risk",
+    "resolved",
+];
+const EVENT_TYPE_TOKENS: [&str; 5] = [
+    "file_action",
+    "taint_transition",
+    "network_action",
+    "policy_decision",
+    "enforcement_state",
+];
+const EVENT_RESULT_TOKENS: [&str; 6] = [
+    "allowed", "failed", "changed", "blocked", "ready", "degraded",
+];
+
+/// Reject a closed-set filter token that names no row the store can hold.
+fn reject_unknown_filter_tokens(query: &AuditQuery) -> Option<HttpResponse> {
+    let unknown = |value: Option<&String>, allowed: &[&str], name: &str| {
+        value
+            .filter(|value| !allowed.contains(&value.as_str()))
+            .map(|value| format!("{name} '{value}' is not one of {}", allowed.join(", ")))
+    };
+    let message = unknown(query.status.as_ref(), &CASE_STATUS_TOKENS, "status")
+        .or_else(|| unknown(query.event_type.as_ref(), &EVENT_TYPE_TOKENS, "event_type"))
+        .or_else(|| unknown(query.result.as_ref(), &EVENT_RESULT_TOKENS, "result"))?;
+    Some(bad_request(&message))
+}
+
+/// Rejects a window the store cannot represent, and one that runs backwards.
 ///
 /// `AuditQuery` parses the bounds as `u64`, but the store keeps timestamps as
 /// `i64` nanoseconds and fails the conversion with `TimestampOutOfRange` —
 /// which `store_error` renders as a retryable "store unavailable". That reads
 /// as a transient failure and invites the client to retry input that can never
 /// succeed, so the range is refused up front instead.
+///
+/// An inverted range is representable but just as malformed, and the store's
+/// `occurred_at_ns >= start AND <= end` predicate matches nothing for it, so
+/// these endpoints answered an empty 200 — the misreading the window-guard
+/// family (`reject_inverted_window`) eliminated everywhere else. Refuse it
+/// with the same 400 and body, after the range check the cast relies on.
 fn reject_unrepresentable_window(query: &AuditQuery) -> Option<HttpResponse> {
     let too_large = |value: Option<u64>| value.is_some_and(|v| v > i64::MAX as u64);
     if too_large(query.start_ns) || too_large(query.end_ns) {
@@ -262,7 +321,10 @@ fn reject_unrepresentable_window(query: &AuditQuery) -> Option<HttpResponse> {
             }
         })));
     }
-    None
+    super::handlers::reject_inverted_window(
+        query.start_ns.map(|value| value as i64),
+        query.end_ns.map(|value| value as i64),
+    )
 }
 
 fn event_filter(query: &AuditQuery) -> SecurityEventFilter {
@@ -439,6 +501,100 @@ mod tests {
         assert!(reject_unrepresentable_window(&query(Some(i64::MAX as u64), None)).is_none());
         assert!(reject_unrepresentable_window(&query(Some(1), Some(2))).is_none());
         assert!(reject_unrepresentable_window(&query(None, None)).is_none());
+    }
+
+    #[test]
+    fn audit_window_rejects_an_inverted_range() {
+        // The store's `occurred_at_ns >= start AND <= end` predicate matches
+        // nothing when start > end, so without this refusal the endpoints
+        // answer an empty 200 for a malformed window — the misreading the
+        // window-guard family (`reject_inverted_window`) already eliminated
+        // on every sibling endpoint.
+        let query = |start_ns, end_ns| super::AuditQuery {
+            start_ns,
+            end_ns,
+            event_type: None,
+            result: None,
+            policy_id: None,
+            agent_id: None,
+            session_id: None,
+            binding_id: None,
+            status: None,
+            blocked: None,
+            limit: None,
+            offset: None,
+        };
+
+        assert!(reject_unrepresentable_window(&query(Some(2000), Some(1000))).is_some());
+        // Controls: ascending and equal bounds, and one-sided windows, pass.
+        assert!(reject_unrepresentable_window(&query(Some(1000), Some(2000))).is_none());
+        assert!(reject_unrepresentable_window(&query(Some(2000), Some(2000))).is_none());
+        assert!(reject_unrepresentable_window(&query(Some(2000), None)).is_none());
+        assert!(reject_unrepresentable_window(&query(None, Some(1000))).is_none());
+    }
+
+    #[actix_web::test]
+    async fn audit_events_rejects_an_inverted_window() {
+        use actix_web::{App, test as awtest};
+        use std::sync::{Arc, RwLock};
+        use std::time::Instant;
+
+        use crate::server::AppState;
+
+        // An inverted window must draw the family's 400, not the empty 200
+        // the store's range predicate produces for it.
+        let dir = std::env::temp_dir().join(format!("audit-inverted-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let auth_config = crate::config::ServerAuthConfig { enabled: false };
+        let auth = Arc::new(crate::server::auth::DashboardAuth::init(&auth_config, &dir));
+        let state = actix_web::web::Data::new(AppState {
+            storage_path: dir.join("agentsight.db"),
+            genai_store: None,
+            start_time: Instant::now(),
+            health_store: Arc::new(RwLock::new(crate::health::HealthStore::new())),
+            interruption_store: None,
+            evaluation_store: Arc::new(
+                crate::grader::EvaluationStore::new_with_path(&dir.join("evaluation.db")).unwrap(),
+            ),
+            enforcement: None,
+            containment: None,
+            audit_service: Arc::new(agentsight_audit::AuditService::new(
+                crate::security::SecurityStore::open_in_memory()
+                    .unwrap()
+                    .audit_store(),
+            )),
+            security_observability: crate::server::SecurityObservabilityConfig::default(),
+            auth,
+            optimize: None,
+            reuse_store: None,
+            trajectory_store: Arc::new(RwLock::new(None)),
+            reuse_llm_judge_enabled: false,
+            causal_store: None,
+        });
+
+        let app = awtest::init_service(App::new().app_data(state).service(super::events)).await;
+        let request = awtest::TestRequest::get()
+            .uri("/audit/events?start_ns=2000&end_ns=1000")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(
+            response.status(),
+            actix_web::http::StatusCode::BAD_REQUEST,
+            "an inverted window must be rejected, not answered with an empty 200"
+        );
+        let body: serde_json::Value = awtest::read_body_json(response).await;
+        assert_eq!(body["error"], "start_ns must not exceed end_ns");
+
+        // Control: an ascending window on the same instance is a normal 200.
+        let request = awtest::TestRequest::get()
+            .uri("/audit/events?start_ns=1000&end_ns=2000")
+            .to_request();
+        let response = awtest::call_service(&app, request).await;
+        assert_eq!(response.status(), actix_web::http::StatusCode::OK);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     async fn error_body(response: actix_web::HttpResponse) -> serde_json::Value {

@@ -53,6 +53,19 @@ impl Parser {
 
         let _comm = ssl_event.comm.trim_end_matches('\0');
 
+        // 0. Connections already being reassembled as HTTP/2 route by state
+        // before any stateless heuristic: a read that continues a frame split
+        // across TLS records starts inside a payload and can look like
+        // anything, so it would never match the frame detection below.
+        if self.http2_parser.is_tracking(&ssl_event) {
+            let frames = self.http2_parser.parse(ssl_event.clone());
+            if !frames.is_empty() {
+                return ParseResult {
+                    messages: vec![ParsedMessage::Http2Frames(frames)],
+                };
+            }
+        }
+
         // 1. HTTP/1.x detection (text-based protocols)
         if ssl_event.is_http() {
             match self.http_parser.parse(ssl_event.clone()) {
@@ -95,7 +108,17 @@ impl Parser {
             let buf = &ssl_event.buf[..buf_size];
             const TERMINATOR: &[u8] = b"0\r\n\r\n";
 
-            let terminator_pos = if buf.len() >= TERMINATOR.len() && buf.ends_with(TERMINATOR) {
+            // The terminator belongs to the read direction only. A chunked
+            // *request* body's final write also ends with `0\r\n\r\n`; cutting
+            // it here and synthesizing a done event made the aggregator (still
+            // in RequestBodyPending, which drops SSE events) lose those bytes,
+            // so the request body was captured truncated and
+            // `chunked_stream_complete` never fired. Write-direction buffers
+            // must flow through as RawData so the framing completes.
+            let terminator_pos = if ssl_event.rw == 0
+                && buf.len() >= TERMINATOR.len()
+                && buf.ends_with(TERMINATOR)
+            {
                 Some(buf.len() - TERMINATOR.len())
             } else {
                 None
@@ -121,9 +144,21 @@ impl Parser {
                         is_handshake: ssl_event.is_handshake,
                         ssl_ptr: ssl_event.ssl_ptr,
                     };
-                    let prefix_events = self.sse_parser.parse(Rc::new(trimmed));
-                    for ev in prefix_events {
-                        messages.push(ParsedMessage::SseEvent(ev));
+                    let trimmed = Rc::new(trimmed);
+                    let prefix_events = self.sse_parser.parse(Rc::clone(&trimmed));
+                    if prefix_events.is_empty() {
+                        // Not SSE text: for a compressed body these are the
+                        // last compressed bytes, which only the aggregator's
+                        // compressed-buffer state can decode. Dropping them
+                        // truncated the frame, so `dechunk_body` +
+                        // `decompress_body` failed and the whole response
+                        // decoded to zero events. Forward them as a body
+                        // continuation instead.
+                        messages.push(ParsedMessage::RawData(Rc::clone(&trimmed)));
+                    } else {
+                        for ev in prefix_events {
+                            messages.push(ParsedMessage::SseEvent(ev));
+                        }
                     }
                 }
 
@@ -227,7 +262,7 @@ impl Parser {
 mod tests {
     use super::*;
 
-    fn make_ssl_event(data: Vec<u8>) -> Rc<SslEvent> {
+    fn make_ssl_event_with_rw(data: Vec<u8>, rw: i32) -> Rc<SslEvent> {
         let len = data.len();
         Rc::new(SslEvent {
             source: 0,
@@ -237,12 +272,16 @@ mod tests {
             tid: 1,
             uid: 0,
             len: len as u32,
-            rw: 0,
+            rw,
             comm: String::new(),
             buf: data,
             is_handshake: false,
             ssl_ptr: 0x1000,
         })
+    }
+
+    fn make_ssl_event(data: Vec<u8>) -> Rc<SslEvent> {
+        make_ssl_event_with_rw(data, 0)
     }
 
     #[test]
@@ -286,5 +325,84 @@ mod tests {
             result.messages[0],
             ParsedMessage::SseEvent(ref e) if !e.is_done()
         ));
+    }
+
+    /// `0\r\n\r\n` is a chunked-SSE terminator only on the read direction. On
+    /// the write direction it is the final zero-size chunk of a chunked
+    /// request body: cutting it here and synthesizing a done marker made the
+    /// aggregator (in RequestBodyPending, where SSE events are dropped) lose
+    /// those bytes, so the request body was captured truncated and
+    /// `chunked_stream_complete` never fired.
+    #[test]
+    fn test_write_direction_terminator_stays_raw_data() {
+        let parser = Parser::new();
+        let data = b"a\r\n{\"x\":1}\r\n0\r\n\r\n".to_vec();
+        // rw == 1 is the write direction (see `parse_ssl_event` step 3).
+        let event = make_ssl_event_with_rw(data.clone(), 1);
+        let result = parser.parse_ssl_event(event);
+
+        assert_eq!(result.messages.len(), 1);
+        match &result.messages[0] {
+            ParsedMessage::RawData(raw) => assert_eq!(
+                &raw.buf[..raw.buf_size() as usize],
+                data.as_slice(),
+                "write-direction buffer must reach the aggregator intact"
+            ),
+            other => panic!("write-direction buffer must be emitted as RawData, got {other:?}"),
+        }
+    }
+
+    /// Raw HTTP/2 frame: 3-byte length, type, flags, 4-byte stream id, payload.
+    fn h2_frame(frame_type: u8, flags: u8, stream_id: u32, payload: &[u8]) -> Vec<u8> {
+        let len = payload.len();
+        let mut buf = vec![
+            ((len >> 16) & 0xFF) as u8,
+            ((len >> 8) & 0xFF) as u8,
+            (len & 0xFF) as u8,
+            frame_type,
+            flags,
+            ((stream_id >> 24) & 0x7F) as u8,
+            ((stream_id >> 16) & 0xFF) as u8,
+            ((stream_id >> 8) & 0xFF) as u8,
+            (stream_id & 0xFF) as u8,
+        ];
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[test]
+    fn test_split_http2_frame_continuation_is_routed_by_state() {
+        let parser = Parser::new();
+        let payload = br#"{"model":"gpt-4","messages":[{"role":"user"}]}"#;
+        let data = h2_frame(0, 0x01, 3, payload);
+        let split = 9 + payload.len() / 2;
+
+        // The first read carries a complete SETTINGS frame (so the stateless
+        // frame detection succeeds) followed by a truncated DATA frame.
+        let mut first = h2_frame(4, 0x00, 0, &[]);
+        first.extend_from_slice(&data[..split]);
+        let first = parser.parse_ssl_event(make_ssl_event(first));
+        assert!(
+            matches!(
+                first.messages.as_slice(),
+                [ParsedMessage::Http2Frames(frames)] if frames.len() == 1 && frames[0].is_settings()
+            ),
+            "first read must emit only the complete SETTINGS frame, got {:?}",
+            first.messages
+        );
+
+        // The continuation starts inside the DATA payload; without state
+        // routing it would not reach the HTTP/2 parser at all.
+        let second = parser.parse_ssl_event(make_ssl_event(data[split..].to_vec()));
+        let [ParsedMessage::Http2Frames(frames)] = second.messages.as_slice() else {
+            panic!(
+                "continuation must be routed to the HTTP/2 parser, got {:?}",
+                second.messages
+            );
+        };
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].is_data());
+        assert_eq!(frames[0].stream_id, 3);
+        assert_eq!(frames[0].payload(), payload);
     }
 }

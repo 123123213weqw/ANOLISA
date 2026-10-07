@@ -565,14 +565,22 @@ impl GenAIBuilder {
         // `message_start` event carries input_tokens plus the cache counters
         // while the terminal `message_delta` carries only output_tokens, so
         // keeping the last usage-bearing event would record input as 0.
+        // The cache counters ride along into the enrichment: the live path
+        // stores them and totals the billed input, so the drain path must
+        // persist the same numbers for the same call.
         let usage = sse_events
             .iter()
             .filter_map(|e| token_parser.parse_event(e))
             .fold(None, merge_usage);
 
-        let (input_tokens, output_tokens) = match &usage {
-            Some(u) => (Some(u.input_tokens as i64), Some(u.output_tokens as i64)),
-            None => (None, None),
+        let (input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens) = match &usage {
+            Some(u) => (
+                Some(u.input_tokens as i64),
+                Some(u.output_tokens as i64),
+                u.cache_creation_input_tokens.map(|v| v as i64),
+                u.cache_read_input_tokens.map(|v| v as i64),
+            ),
+            None => (None, None, None, None),
         };
 
         // Use model from usage if not found in content chunks
@@ -612,6 +620,8 @@ impl GenAIBuilder {
             sse_event_count: Some(event_count),
             input_tokens,
             output_tokens,
+            cache_creation_tokens,
+            cache_read_tokens,
         })
     }
 
@@ -727,6 +737,49 @@ mod tests {
             MessagePart::Text { content } => assert_eq!(content, "Hello world"),
             other => panic!("expected Text part, got {other:?}"),
         }
+    }
+
+    /// The drain enrichment must carry the cache counters the stream reported,
+    /// as the provider reported them: Anthropic's `message_start` keeps them
+    /// outside `input_tokens`, while OpenAI-style usage counts the cached part
+    /// inside `prompt_tokens` and only details it separately.
+    #[test]
+    fn test_extract_sse_enrichment_carries_usage_cache_counters() {
+        let anthropic = vec![
+            make_sse_event(
+                r#"{"type":"message_start","message":{"id":"msg_cache","type":"message","role":"assistant","model":"claude-sonnet-4-5","content":[],"usage":{"input_tokens":10,"output_tokens":1,"cache_creation_input_tokens":1234,"cache_read_input_tokens":24576}}}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":5}}"#,
+            ),
+        ];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&anthropic).expect("enrichment");
+        assert_eq!(
+            (enrichment.input_tokens, enrichment.output_tokens),
+            (Some(10), Some(5))
+        );
+        assert_eq!(
+            (
+                enrichment.cache_creation_tokens,
+                enrichment.cache_read_tokens
+            ),
+            (Some(1234), Some(24576)),
+            "the drained call must keep the cache counters its stream reported"
+        );
+
+        let openai = vec![
+            make_sse_event(
+                r#"{"model":"gpt-4o","usage":{"prompt_tokens":100,"completion_tokens":7,"total_tokens":107,"prompt_tokens_details":{"cached_tokens":64}}}"#,
+            ),
+            make_sse_event(r#"{"choices":[{"delta":{"content":"hi"}}]}"#),
+        ];
+        let enrichment = GenAIBuilder::extract_sse_enrichment(&openai).expect("enrichment");
+        assert_eq!(
+            enrichment.input_tokens,
+            Some(100),
+            "the reported prompt_tokens already include the cached part"
+        );
+        assert_eq!(enrichment.cache_read_tokens, Some(64));
     }
 
     #[test]
@@ -1103,6 +1156,52 @@ mod tests {
                 assert_eq!(id.as_deref(), Some("call_2"));
                 assert_eq!(name, "list_dir");
                 assert_eq!(arguments, &Some(serde_json::json!({"b": 2})));
+            }
+            other => panic!("expected ToolCall, got {other:?}"),
+        }
+    }
+
+    /// `response.function_call_arguments.done` carries the complete arguments
+    /// for its call; the deltas that precede it are a best-effort stream a
+    /// late-attached capture can miss entirely. The analyzer's aggregator
+    /// prefers the done payload for that reason, so the drain merger has to as
+    /// well — otherwise a drained call is persisted with no arguments.
+    #[test]
+    fn test_extract_sse_enrichment_responses_done_arguments_are_kept() {
+        let events = vec![
+            make_sse_event(
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_d1","name":"get_weather"}}"#,
+            ),
+            // Capture started after the argument deltas: the done event is the
+            // only place the arguments appear.
+            make_sse_event(
+                r#"{"type":"response.function_call_arguments.done","item_id":"fc_d1","arguments":"{\"city\":\"Beijing\"}"}"#,
+            ),
+            make_sse_event(
+                r#"{"type":"response.completed","response":{"id":"resp_d1","model":"qwen-plus"}}"#,
+            ),
+        ];
+
+        let enrichment =
+            GenAIBuilder::extract_sse_enrichment(&events).expect("enrichment from responses SSE");
+        let json = enrichment
+            .output_messages
+            .expect("drained responses output must be persisted");
+        let parsed: Vec<OutputMessage> =
+            serde_json::from_str(&json).expect("must round-trip as Vec<OutputMessage>");
+        match &parsed[0].parts[0] {
+            MessagePart::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                assert_eq!(id.as_deref(), Some("call_d1"));
+                assert_eq!(name, "get_weather");
+                assert_eq!(
+                    arguments,
+                    &Some(serde_json::json!({"city": "Beijing"})),
+                    "the done event's arguments are authoritative"
+                );
             }
             other => panic!("expected ToolCall, got {other:?}"),
         }

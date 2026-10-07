@@ -23,6 +23,19 @@ def read_json(path: Path) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _artifact_number(value: Any) -> float | None:
+    """Read an int/float artifact field, or None for anything else.
+
+    campaign_evidence.finite_float rejects integers too large for float
+    (a corrupted counter in a metrics artifact raises OverflowError from
+    float() and math.isfinite()) and non-finite values, so one outlier
+    reads as missing instead of crashing the whole report.
+    """
+    if not isinstance(value, (int, float)):
+        return None
+    return campaign_evidence.finite_float(value)
+
+
 def nested(value: dict[str, Any], *keys: str) -> float | bool | None:
     """Read a finite numeric or boolean value from nested dictionaries."""
     current: Any = value
@@ -32,9 +45,7 @@ def nested(value: dict[str, Any], *keys: str) -> float | bool | None:
         current = current.get(key)
     if isinstance(current, bool):
         return current
-    if isinstance(current, (int, float)) and math.isfinite(current):
-        return float(current)
-    return None
+    return _artifact_number(current)
 
 
 def display(value: Any, suffix: str = "") -> str:
@@ -79,6 +90,46 @@ def discover(results: Path) -> list[tuple[Path, dict[str, Any]]]:
         (path, read_json(path))
         for path in sorted(results.glob("runs/**/run-result.json"))
     ]
+
+
+def write_run_inventory(
+    results: Path, items: list[tuple[Path, dict[str, Any]]]
+) -> None:
+    """Export every discovered formal run without modifying source evidence."""
+    fields = (
+        "scenario",
+        "version",
+        "label",
+        "repetition",
+        "qps",
+        "duration_seconds",
+        "harness_exit_code",
+        "verdict",
+        "missing_gates",
+        "failed_gates",
+        "result_path",
+    )
+    with (results / "run-inventory.csv").open(
+        "w", encoding="utf-8", newline=""
+    ) as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for path, run in sorted(
+            items, key=lambda item: item[0].relative_to(results).as_posix()
+        ):
+            evaluation = run.get("evaluation") or {}
+            row = {field: run.get(field, "") for field in fields[:7]}
+            row.update(
+                verdict=evaluation.get("verdict", ""),
+                missing_gates=json.dumps(
+                    evaluation.get("missing", []), ensure_ascii=False
+                ),
+                failed_gates=json.dumps(
+                    evaluation.get("failed", []), ensure_ascii=False
+                ),
+                result_path=path.relative_to(results).as_posix(),
+            )
+            writer.writerow(row)
 
 
 def matrix_rows(items: list[tuple[Path, dict[str, Any]]]) -> list[dict[str, Any]]:
@@ -451,11 +502,9 @@ def comparison_summary(
     def values(field: str) -> tuple[float | None, float | None]:
         if before is None or after is None:
             return None, None
-        baseline = before.get(field)
-        optimized = after.get(field)
         return (
-            float(baseline) if isinstance(baseline, (int, float)) else None,
-            float(optimized) if isinstance(optimized, (int, float)) else None,
+            _artifact_number(before.get(field)),
+            _artifact_number(after.get(field)),
         )
 
     def regular_metric(field: str) -> dict[str, float | None]:
@@ -470,16 +519,8 @@ def comparison_summary(
     drop_baseline, drop_optimized = values("drop_rate")
     capacity_baseline = capacities.get("baseline", {}).get("maximum_sustainable_qps")
     capacity_optimized = capacities.get("optimized", {}).get("maximum_sustainable_qps")
-    capacity_before = (
-        float(capacity_baseline)
-        if isinstance(capacity_baseline, (int, float))
-        else None
-    )
-    capacity_after = (
-        float(capacity_optimized)
-        if isinstance(capacity_optimized, (int, float))
-        else None
-    )
+    capacity_before = _artifact_number(capacity_baseline)
+    capacity_after = _artifact_number(capacity_optimized)
     soak_slopes: dict[str, float | None] = {}
     for version in ("baseline", "optimized"):
         runs = [
@@ -850,6 +891,7 @@ def main() -> int:
     campaign_data = campaign.read_json(args.campaign)
     campaign.validate_campaign(campaign_data)
     items = discover(args.results)
+    write_run_inventory(args.results, items)
     rows = matrix_rows(items)
     write_performance(args.results, rows)
     capacities = write_capacity(args.results)

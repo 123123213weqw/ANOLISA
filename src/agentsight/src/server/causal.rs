@@ -275,6 +275,31 @@ struct Attribution {
 
 // ─── Endpoint ────────────────────────────────────────────────────────────────
 
+/// Scopes `id_kind` can name. Omitted means "infer from the value shape".
+const ID_KINDS: [&str; 2] = ["session", "conversation"];
+
+/// Reject an `id_kind` the endpoint cannot honor.
+///
+/// The field is documented as naming what `session_id` carries, and the
+/// dashboard types it as `'session' | 'conversation'`, but every other token
+/// fell back to session scope: an attribution then covered the whole session
+/// while the caller believed it had asked for one conversation, with no error
+/// to notice.
+fn parse_id_kind(id_kind: Option<&str>) -> Result<Option<&str>, HttpResponse> {
+    match id_kind {
+        None => Ok(None),
+        Some(kind) if ID_KINDS.contains(&kind) => Ok(Some(kind)),
+        Some(kind) => Err(HttpResponse::BadRequest().json(serde_json::json!({
+            "error": "invalid_id_kind",
+            "message": format!(
+                "unknown id_kind '{kind}': expected one of {}",
+                ID_KINDS.join(", ")
+            ),
+            "valid_id_kinds": ID_KINDS,
+        }))),
+    }
+}
+
 /// POST /api/causal-attribution
 ///
 /// Runs the offline causal attribution pipeline against the trajectory of the
@@ -293,6 +318,14 @@ pub async fn run_causal_attribution(
         }));
     }
 
+    // `id_kind` is a closed set; the value shape cannot disambiguate a typo
+    // from a real scope, so reject an unknown token instead of silently
+    // attributing the whole session.
+    let id_kind = match parse_id_kind(req.id_kind.as_deref()) {
+        Ok(id_kind) => id_kind,
+        Err(response) => return response,
+    };
+
     let opt = match state.optimize.as_ref() {
         Some(o) => Arc::clone(o),
         None => {
@@ -310,7 +343,7 @@ pub async fn run_causal_attribution(
     // attribute only the events under a specific conversation_id; we keep
     // that id verbatim and pass it to load_trajectory. Any other scope
     // goes through the legacy resolver (32 hex → session UUID fallback).
-    let is_conversation_scope = req.id_kind.as_deref() == Some("conversation");
+    let is_conversation_scope = id_kind == Some("conversation");
     let resolved_session_id = if is_conversation_scope {
         log::info!(
             "Causal attribution: conversation scope — using '{}' as conversation_id directly",
@@ -419,7 +452,7 @@ pub async fn run_causal_attribution(
         &resolved_session_id,
         genai_store.as_deref(),
         trajectory_store.as_deref(),
-        req.id_kind.as_deref(),
+        id_kind,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1437,7 +1470,12 @@ fn probe_atif_column(
             };
             for value in values {
                 if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&value) {
-                    if session_matches(&parsed, session_id) {
+                    // `scoped`: the SQL above filtered by the session column,
+                    // so a document without a session_id field is still known
+                    // to belong to the requested session. In the unscoped
+                    // branch the whole table was scanned, and a row without
+                    // session_id must not be attributed to every caller.
+                    if session_matches(&parsed, session_id, session_column.is_some()) {
                         return Ok(Some(value));
                     }
                 }
@@ -1466,14 +1504,17 @@ fn find_session_column(conn: &rusqlite::Connection, table: &str) -> Result<Optio
         .find(|n| n == "session_id" || n.to_lowercase().contains("session_id")))
 }
 
-/// Best-effort check that a parsed ATIF document carries the requested session
-/// id — used when the hosting table has no dedicated session_id column.
-fn session_matches(doc: &serde_json::Value, session_id: &str) -> bool {
+/// Best-effort check that a parsed ATIF document belongs to the requested
+/// session.
+///
+/// `scoped` says whether the SQL query that produced the document already
+/// filtered on a session column. A document without a top-level `session_id`
+/// is only acceptable in that case: during an unscoped full-table scan
+/// accepting it would return an arbitrary row for any requested session.
+fn session_matches(doc: &serde_json::Value, session_id: &str, scoped: bool) -> bool {
     match doc.get("session_id").and_then(|v| v.as_str()) {
         Some(s) => s == session_id,
-        // No session_id field on the document → accept; the caller has
-        // already scoped the query to a specific session row.
-        None => true,
+        None => scoped,
     }
 }
 

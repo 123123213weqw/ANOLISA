@@ -60,7 +60,7 @@ impl AnalyzeChatmlCommand {
         let mut sorted_events: Vec<ChromeTraceEvent> = events.to_vec();
         sorted_events.sort_by_key(|e| e.ts);
 
-        let breakdowns = Self::process_events(&sorted_events, &tokenizer)?;
+        let breakdowns = Self::process_events(&sorted_events, &tokenizer, &self.model)?;
 
         // Output JSON array of all breakdowns
         let json = if self.pretty {
@@ -77,6 +77,7 @@ impl AnalyzeChatmlCommand {
     fn process_events(
         events: &[ChromeTraceEvent],
         tokenizer: &LlmTokenizer,
+        model_name: &str,
     ) -> anyhow::Result<Vec<ChatMLTokenBreakdown>> {
         let chat_template = tokenizer.clone();
 
@@ -162,7 +163,7 @@ impl AnalyzeChatmlCommand {
             };
 
             if let Some(classified) = classified {
-                let breakdown = compute_breakdown(&classified, tokenizer)?;
+                let breakdown = compute_breakdown(&classified, tokenizer, model_name)?;
                 breakdowns.push(breakdown);
             }
         }
@@ -284,7 +285,7 @@ impl AnalyzeChatmlCommand {
         };
         let body = parsed.as_ref()?;
 
-        let tools = body.get("tools").and_then(|t| t.as_array().cloned());
+        let tools = crate::parser::llm::extract_tools_view(body);
 
         let (mut msgs, system_text) = crate::parser::llm::extract_messages_view(body)?;
         if let Some(system) = system_text {
@@ -316,11 +317,10 @@ impl AnalyzeChatmlCommand {
         // `input_json_delta` fragments.
         let mut anthropic_calls: std::collections::BTreeMap<u64, (String, String, String)> =
             std::collections::BTreeMap::new();
-        // Responses API: one function call in flight at a time (parallel calls
-        // are flushed when the next one starts, matching the analyzer's
-        // aggregator).
-        let mut responses_call: Option<(String, String, String)> = None;
-        let mut responses_calls: Vec<String> = Vec::new();
+        // Responses API: the shared aggregator routes each argument event to
+        // its own output item by id/index and honors a full `done` payload,
+        // matching the live analyzer instead of assuming one call in flight.
+        let mut responses_tool_calls = crate::analyzer::message::ResponsesToolCalls::default();
 
         for event in sse_events {
             // Parse the data field which contains JSON string
@@ -406,45 +406,24 @@ impl AnalyzeChatmlCommand {
                                 }
                             }
                         }
-                        Some("response.output_item.added") => {
-                            if let Some(item) = data_json.get("item") {
-                                if item.get("type").and_then(|v| v.as_str())
-                                    == Some("function_call")
-                                {
-                                    // Parallel tool use: flush the in-flight call
-                                    // before starting the next.
-                                    if let Some((_, name, args)) = responses_call.take() {
-                                        if !name.is_empty() || !args.is_empty() {
-                                            responses_calls.push(format!("{name}: {args}"));
-                                        }
-                                    }
-                                    responses_call = Some((
-                                        item.get("call_id")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default()
-                                            .to_string(),
-                                        item.get("name")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or_default()
-                                            .to_string(),
-                                        String::new(),
-                                    ));
-                                }
-                            }
-                        }
-                        Some("response.function_call_arguments.delta") => {
+                        // Reasoning models stream their thinking on the
+                        // same channel (dashscope qwen3-coder sends
+                        // reasoning_text, the o-series summary_text); both
+                        // belong in reasoning_content, like the chat-completions
+                        // reasoning_content delta and the analyzer's Responses
+                        // aggregation.
+                        Some("response.reasoning_text.delta")
+                        | Some("response.reasoning_summary_text.delta") => {
                             if let Some(delta) = data_json.get("delta").and_then(|v| v.as_str()) {
-                                if let Some((_, _, args)) = responses_call.as_mut() {
-                                    args.push_str(delta);
+                                if !delta.is_empty() {
+                                    reasoning_parts.push(delta.to_string());
                                 }
                             }
                         }
-                        Some("response.function_call_arguments.done") => {
-                            if let Some((_, name, args)) = responses_call.take() {
-                                if !name.is_empty() || !args.is_empty() {
-                                    responses_calls.push(format!("{name}: {args}"));
-                                }
-                            }
+                        Some("response.output_item.added")
+                        | Some("response.function_call_arguments.delta")
+                        | Some("response.function_call_arguments.done") => {
+                            responses_tool_calls.observe(&data_json);
                         }
                         _ => {}
                     }
@@ -527,13 +506,10 @@ impl AnalyzeChatmlCommand {
             }
         }
 
-        // Responses calls in stream order, then a still-in-flight call
-        // (truncated stream without the done event).
-        tool_calls.extend(responses_calls);
-        if let Some((_, name, args)) = responses_call {
-            if !name.is_empty() || !args.is_empty() {
-                tool_calls.push(format!("{name}: {args}"));
-            }
+        // Responses calls in output-item arrival order. `into_calls` also
+        // emits a call whose stream ended before its done event.
+        for (_, name, arguments) in responses_tool_calls.into_calls() {
+            tool_calls.push(format!("{name}: {arguments}"));
         }
 
         ResponseData {
@@ -611,6 +587,8 @@ mod tests {
     use super::*;
     use crate::tokenizer::LlmTokenizer;
     use serde_json::json;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     /// Minimal HuggingFace tokenizer (WordLevel + Whitespace) so the ChatML
     /// path can be exercised in tests without the network or the real Qwen
@@ -656,15 +634,38 @@ mod tests {
   "model_max_length": 32768
 }"#;
 
+    /// Each call writes the fixture to a UNIQUE temp directory: the tests in
+    /// this module run in parallel inside one test binary (one PID), so a
+    /// PID-keyed path is shared by every test and a concurrent writer
+    /// truncates the JSON under a reader's feet ("EOF while parsing a
+    /// value"). Mirrors the `TemporaryRegularFile` idiom in
+    /// `enforcement::target`: PID + nanosecond timestamp + atomic counter.
     fn fixture_tokenizer() -> LlmTokenizer {
-        let dir =
-            std::env::temp_dir().join(format!("agentsight-chatml-fixture-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+        let pid = std::process::id();
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock after UNIX_EPOCH")
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight-chatml-fixture-{pid}-{timestamp}-{counter}"
+        ));
+        // `create_dir`, not `create_dir_all`: a path collision must fail
+        // loudly, never silently share the directory again.
+        std::fs::create_dir(&dir).expect("create unique fixture dir");
         let tokenizer_path = dir.join("tokenizer.json");
         let config_path = dir.join("tokenizer_config.json");
         std::fs::write(&tokenizer_path, TOKENIZER_JSON).expect("write tokenizer.json");
         std::fs::write(&config_path, TOKENIZER_CONFIG_JSON).expect("write tokenizer_config.json");
-        LlmTokenizer::from_file(&tokenizer_path, &config_path).expect("fixture tokenizer loads")
+        let tokenizer = LlmTokenizer::from_file(&tokenizer_path, &config_path)
+            .expect("fixture tokenizer loads");
+        // The tokenizer is loaded fully into memory, so the fixture files can
+        // go away immediately; unique paths must not pile up in the temp dir
+        // across test runs.
+        let _ = std::fs::remove_dir_all(&dir);
+        tokenizer
     }
 
     #[test]
@@ -720,6 +721,28 @@ mod tests {
         assert_eq!(other.tools_tokens, count.tools_tokens);
     }
 
+    #[test]
+    fn breakdown_reports_the_model_the_command_was_given() {
+        // `ChatMLTokenBreakdown::model_name` is documented as the model name
+        // used for tokenization. It used to come from the tokenizer's own
+        // name, which is the file it was loaded from: every auto-downloaded
+        // tokenizer is `tokenizer.json`, so the output reported the literal
+        // string "tokenizer" instead of the requested model.
+        let tokenizer = fixture_tokenizer();
+        let blocks = vec![crate::token_breakdown::types::ChatMLBlock {
+            role: "user".to_string(),
+            raw_content: "hello".to_string(),
+        }];
+        let doc = classify_document(&blocks, None);
+
+        let breakdown =
+            compute_breakdown(&doc, &tokenizer, "qwen3.5-plus").expect("breakdown computes");
+        assert_eq!(
+            breakdown.model_name, "qwen3.5-plus",
+            "the output must name the model the command was given"
+        );
+    }
+
     fn request_event(body: serde_json::Value, ts: u64) -> ChromeTraceEvent {
         let mut event = ChromeTraceEvent::instant("http.request", "http.request", 1, 1, ts);
         event.args = Some(json!({ "body": body }));
@@ -745,7 +768,7 @@ mod tests {
             request_event(json!({"messages": []}), 1),
         ];
 
-        let breakdowns = AnalyzeChatmlCommand::process_events(&events, &tokenizer)
+        let breakdowns = AnalyzeChatmlCommand::process_events(&events, &tokenizer, "test-model")
             .expect("a malformed event must not abort the other events");
         assert_eq!(breakdowns.len(), 1);
     }
@@ -758,7 +781,7 @@ mod tests {
             1,
         )];
 
-        let err = AnalyzeChatmlCommand::process_events(&events, &tokenizer)
+        let err = AnalyzeChatmlCommand::process_events(&events, &tokenizer, "test-model")
             .expect_err("every event failed to render");
         assert!(
             err.to_string()
@@ -941,6 +964,86 @@ mod tests {
         );
     }
 
+    /// A stream that only sends `output_item.added` plus
+    /// `function_call_arguments.done` carries the arguments in the done
+    /// payload; ignoring them recorded the call with empty arguments.
+    #[test]
+    fn sse_responses_done_payload_is_used() {
+        let events = vec![
+            sse(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"tool_a","arguments":""}}"#,
+            ),
+            sse(
+                r#"{"type":"response.function_call_arguments.done","output_index":0,"item_id":"fc_a","arguments":"{\"a\":1}"}"#,
+            ),
+            sse(r#"{"type":"response.completed","response":{}}"#),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.tool_calls, vec!["tool_a: {\"a\":1}".to_string()]);
+    }
+
+    /// Parallel Responses calls interleave their argument deltas; keying only
+    /// on "the most recent call" attached every delta to the last-started call
+    /// and finalized the wrong one.
+    #[test]
+    fn sse_responses_interleaved_deltas_keep_their_call() {
+        let events = vec![
+            sse(
+                r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","id":"fc_a","call_id":"call_a","name":"tool_a","arguments":""}}"#,
+            ),
+            sse(
+                r#"{"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","id":"fc_b","call_id":"call_b","name":"tool_b","arguments":""}}"#,
+            ),
+            sse(
+                r#"{"type":"response.function_call_arguments.delta","output_index":0,"item_id":"fc_a","delta":"{\"a\":1}"}"#,
+            ),
+            sse(
+                r#"{"type":"response.function_call_arguments.delta","output_index":1,"item_id":"fc_b","delta":"{\"b\":2}"}"#,
+            ),
+            sse(r#"{"type":"response.completed","response":{}}"#),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(
+            resp.tool_calls,
+            vec![
+                "tool_a: {\"a\":1}".to_string(),
+                "tool_b: {\"b\":2}".to_string()
+            ]
+        );
+    }
+
+    /// Reasoning models on the Responses API stream their thinking as
+    /// `response.reasoning_text.delta` (dashscope qwen3-coder) or
+    /// `response.reasoning_summary_text.delta` (the o-series); the analyzer
+    /// keeps both, but the trace breakdown dropped them, reporting no
+    /// reasoning at all for a stream that had one.
+    #[test]
+    fn sse_responses_reasoning_deltas_are_kept() {
+        let events = vec![
+            sse(r#"{"type":"response.output_item.added","item":{"type":"reasoning","id":"rs_1"}}"#),
+            sse(r#"{"type":"response.reasoning_text.delta","delta":"Think "}"#),
+            sse(r#"{"type":"response.reasoning_text.delta","delta":"hard."}"#),
+            sse(r#"{"type":"response.output_text.delta","delta":"Hello"}"#),
+            sse(r#"{"type":"response.completed","response":{}}"#),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.content, vec!["Hello".to_string()]);
+        assert_eq!(resp.reasoning_content.as_deref(), Some("Think hard."));
+    }
+
+    /// The o-series spelling (`reasoning_summary_text.delta`) carries the
+    /// same reasoning and must reach `reasoning_content` too.
+    #[test]
+    fn sse_responses_reasoning_summary_deltas_are_kept() {
+        let events = vec![
+            sse(r#"{"type":"response.reasoning_summary_text.delta","delta":"summar"}"#),
+            sse(r#"{"type":"response.reasoning_summary_text.delta","delta":"izing"}"#),
+            sse(r#"{"type":"response.completed","response":{}}"#),
+        ];
+        let resp = AnalyzeChatmlCommand::extract_response_from_sse(&events);
+        assert_eq!(resp.reasoning_content.as_deref(), Some("summarizing"));
+    }
+
     /// The chrome trace stores the request body either as the parsed JSON
     /// object or as its string form; both must yield the same messages.
     #[test]
@@ -965,6 +1068,44 @@ mod tests {
             AnalyzeChatmlCommand::request_body_messages(&string).expect("string body parses");
         assert_eq!(msgs2, msgs);
         assert_eq!(tools2, tools);
+    }
+
+    /// DashScope/Bailian native generation requests carry the message list
+    /// under `input.messages` and every sampling parameter, tools included,
+    /// under a top-level `parameters` object. Only the top-level `tools` was
+    /// read, so a native request reported an empty tool list and its tool
+    /// definitions were missing from the breakdown, while the live request
+    /// parser has read both spellings since 30828845b.
+    #[test]
+    fn request_messages_reads_native_parameters_tools() {
+        let body = json!({
+            "model": "qwen3-max",
+            "input": {"messages": [{"role": "user", "content": "list the files"}]},
+            "parameters": {
+                "tools": [{"type": "function", "function": {"name": "noop"}}],
+            },
+        });
+        let (msgs, tools) =
+            AnalyzeChatmlCommand::request_body_messages(&body).expect("native body parses");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(
+            tools.as_ref().expect("native tools survive").len(),
+            1,
+            "parameters.tools must reach the breakdown"
+        );
+
+        // A top-level `tools` array still wins when both spellings are
+        // present, matching `parse_request_body`.
+        let both = json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "top"}}],
+            "parameters": {"tools": [{"type": "function", "function": {"name": "nested"}}]},
+        });
+        let (_, tools) = AnalyzeChatmlCommand::request_body_messages(&both).expect("body parses");
+        let tools = tools.expect("tools survive");
+        assert_eq!(tools.len(), 1, "the top-level array is the one that counts");
+        assert_eq!(tools[0]["function"]["name"], "top");
     }
 
     /// An OpenAI Responses request (codex 0.137+ via /v1/responses) carries

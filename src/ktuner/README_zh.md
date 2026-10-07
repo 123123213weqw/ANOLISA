@@ -92,13 +92,29 @@ sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 {"applied": 5, "score_after": 35, "score_before": 30}
 ```
 
-`tune --dry-run` 输出的是预览；`status` 与短路路径使用同一套取值
-（此处为 `planned`；无可应用项时为 `optimal`/`blocked`），`blocked`
-为本环境过滤掉的建议数（不可写或运行时危险）：
+当本环境过滤掉了部分建议（不可写，或运行时危险）时，真实 `tune` 会在
+`would_skip` 中列出这些项及原因，形状与 dry-run 预览一致，便于与 `check`
+对账——部分成功后 `check` 仍会对这些参数报 exit 1：
 
 ```json
-{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ]}
+{"applied": 4, "failed": [], "score_after": 35, "score_before": 30, "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
 ```
+
+全部被过滤时的短路输出同样携带 `would_skip` 列表（与计数并存）。
+
+`tune --dry-run` 输出的是预览；`status` 与短路路径使用同一套取值
+（此处为 `planned`；无可应用项时为 `optimal`/`blocked`）。`would_apply`
+列出真实运行会写入的项，`would_skip` 列出本环境过滤掉的项及原因
+（`unwritable` 或 `runtime_dangerous`），`blocked` 为这些项的数量：
+
+```json
+{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
+```
+
+`ktuner why` 对没有任何写路径会采纳的推荐同样携带该原因
+（`skip_reason`：`unwritable` 或 `runtime_dangerous`；计划会写入的项无此
+字段），使解释输出与计划不矛盾。`check` 的推荐项也发布同一分类，
+使诊断输出无需 dry run 就携带该原因。
 
 ### rollback 输出
 
@@ -122,9 +138,13 @@ sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 {"error": "tune requires root (sudo ktuner tune)"}
 ```
 
+网络 `net.ipv4.conf` 和 `net.ipv6.conf` 参数保留网卡大小写与字面点：`ktuner why net/ipv4/conf/Br0.100/forwarding` 指向 `Br0.100`。也接受点分隔别名。网卡包含字面点时，持久化使用首个分隔符为斜杠的键保留路径含义。当前内置规则不生成逐 VLAN 推荐。
+
 ## 安全性
 
 - **代码执行拒绝列表**：`kernel.core_pattern`、`kernel.modprobe`、`kernel.hotplug`、`kernel.poweroff_cmd`、`kernel.modules_disabled`、`kernel.kexec_load_disabled`、`kernel.usermodehelper.*`、`fs.binfmt_misc.*` 在任何写路径（tune/fix/rollback）中都被无条件阻止。匹配基于解析后的文件系统路径而非参数拼写，因此 slash/dot/traversal 变体均会被拦截。
+- **运行时危险参数**：在运行主机上改动不安全的参数（`vm.nr_hugepages`）在同一写入咽喉点被所有调用方拒绝——tune 不将其纳入计划（在 `would_skip` 中标记 `runtime_dangerous`），fix 拒绝并建议持久化，库导入同样无法实时应用。同一参数的 slash/dot 拼写均会被拦截。
+- **并发操作**：tune、fix、库导入和 rollback 从原值读取、写入、记账到持久化共用一把锁。原值在持锁后读取；无法读取账本时阻止新写入。此保护协调 KTuner 操作，不覆盖外部 sysctl 写入者或崩溃恢复。
 - **回滚安全**：部分失败时保留回滚账本；原始值不会丢失。
 - **无自主 root 执行**：ktuner 检查 `euid == 0`，若非 root 则报错退出。cosh 的 sandbox-guard 加上权限提示确保人类在任何 `sudo ktuner tune` 执行前批准操作。
 
