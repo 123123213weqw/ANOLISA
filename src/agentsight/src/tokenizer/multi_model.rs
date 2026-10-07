@@ -373,7 +373,17 @@ mod tests {
     }"#;
 
     fn fixture_tokenizer() -> LlmTokenizer {
-        let dir = std::env::temp_dir().join(format!("agentsight-mm-tok-{}", std::process::id()));
+        // Scoped to the calling thread: tests run in parallel inside one
+        // process, and a process-wide path let one test's `fs::write` truncate
+        // the fixture while another was loading it — the loader then read an
+        // empty file and the suite failed with "EOF while parsing a value"
+        // a third of the runs. The pid keeps processes apart; the thread id
+        // keeps concurrent tests apart.
+        let dir = std::env::temp_dir().join(format!(
+            "agentsight-mm-tok-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
         std::fs::create_dir_all(&dir).expect("create fixture dir");
         let tokenizer_path = dir.join("tokenizer.json");
         let config_path = dir.join("tokenizer_config.json");
@@ -409,6 +419,24 @@ mod tests {
             MultiModelTokenizer::configured().capacity(),
             DEFAULT_TOKENIZER_CACHE_SIZE
         );
+    }
+
+    /// Concurrent tests each build the fixture tokenizer. The fixture path
+    /// used to be shared per process, so one test's `fs::write` truncated
+    /// `tokenizer.json` while another loaded it — the loader read an empty
+    /// file and panicked with "EOF while parsing a value", failing the suite
+    /// roughly one run in three.
+    #[test]
+    fn fixture_tokenizer_is_safe_across_threads() {
+        std::thread::scope(|scope| {
+            for _ in 0..32 {
+                scope.spawn(|| {
+                    for _ in 0..8 {
+                        fixture_tokenizer();
+                    }
+                });
+            }
+        });
     }
 
     /// With `features.tokenizer.enabled = false` the drain fallback must not
