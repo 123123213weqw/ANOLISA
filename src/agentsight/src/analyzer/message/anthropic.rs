@@ -293,6 +293,20 @@ impl AnthropicParser {
                                 }) = current_block
                                 {
                                     input_json.push_str(partial_json);
+                                } else if current_block.is_none() {
+                                    // Fallback: a capture that attached after
+                                    // `content_block_start` never saw the
+                                    // block's id or name, but its argument
+                                    // deltas are still the tool call's whole
+                                    // input — exactly the mid-stream shape the
+                                    // text and thinking arms already recover.
+                                    // Without this the call was persisted with
+                                    // an empty input object.
+                                    current_block = Some(CurrentBlock::ToolUse {
+                                        id: String::new(),
+                                        name: String::new(),
+                                        input_json: partial_json.clone(),
+                                    });
                                 }
                             }
                         }
@@ -1055,6 +1069,51 @@ mod tests {
     }
 
     /// Test: InputJsonDelta fragments are correctly concatenated
+    /// A capture that attaches mid-stream — after `content_block_start`,
+    /// while the tool's argument deltas are still flowing — never learns the
+    /// block's id or name. The text and thinking arms already recover such a
+    /// block from its first delta; the tool arm used to drop every argument
+    /// fragment, persisting the call with an empty input object.
+    #[test]
+    fn test_aggregate_sse_input_json_delta_without_block_start() {
+        let events = serde_json::json!([
+            {
+                "type": "message_start",
+                "message": {
+                    "id": "msg_mid_stream",
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "claude-3-7",
+                    "content": [],
+                    "stop_reason": null,
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                }
+            },
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{\"city\":"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "\"Paris\"}"}},
+            {"type": "content_block_stop", "index": 0},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "tool_use"},
+                "usage": {"output_tokens": 12}
+            }
+        ]);
+
+        let response =
+            AnthropicParser::parse_response(&events).expect("the stream must still aggregate");
+        assert_eq!(response.content.len(), 1, "the tool call must survive");
+        match &response.content[0] {
+            AnthropicContentBlock::ToolUse { input, .. } => {
+                assert_eq!(
+                    input.get("city").and_then(|v| v.as_str()),
+                    Some("Paris"),
+                    "the argument deltas must be recovered, got {input}"
+                );
+            }
+            other => panic!("expected a tool_use block, got {other:?}"),
+        }
+    }
+
     #[test]
     fn test_aggregate_sse_input_json_delta() {
         let events = serde_json::json!([
