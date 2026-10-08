@@ -165,6 +165,27 @@ class TestFailOpen:
         output = _run_hook("")
         assert output == {}
 
+    @pytest.mark.parametrize("input_data", [None, [], "text", 42, False])
+    def test_non_object_json_allows(self, input_data):
+        assert _run_hook(json.dumps(input_data)) == {}
+
+    @pytest.mark.parametrize("cwd", [None, [], {}, 42, False])
+    def test_non_string_cwd_allows_before_skill_lookup(self, cwd, monkeypatch, capsys):
+        monkeypatch.setattr(
+            skill_ledger_hook.sys,
+            "stdin",
+            io.StringIO(json.dumps({"prompt": "$test-skill", "cwd": cwd})),
+        )
+        monkeypatch.setattr(
+            skill_ledger_hook,
+            "_build_skill_catalog",
+            lambda *_args: pytest.fail("invalid cwd must not reach skill lookup"),
+        )
+
+        skill_ledger_hook.main()
+
+        assert capsys.readouterr() == ("", "")
+
     def test_empty_prompt_allows(self, mock_cli):
         env = mock_cli(output=_DRIFTED_CHECK, extra={"SKILL_LEDGER_MODE": "deny"})
         output = _run_hook(

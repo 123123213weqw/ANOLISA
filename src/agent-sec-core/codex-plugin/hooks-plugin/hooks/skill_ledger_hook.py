@@ -380,6 +380,8 @@ def main() -> None:
         input_data = json.load(sys.stdin)
     except (json.JSONDecodeError, EOFError, ValueError):
         return
+    if not isinstance(input_data, dict):
+        return
 
     # 2. Extract user prompt text
     prompt = input_data.get("prompt", "")
@@ -393,6 +395,8 @@ def main() -> None:
 
     # 4. Resolve mentions to installed skill directories via catalog
     cwd = input_data.get("cwd", ".")
+    if not isinstance(cwd, str):
+        return
     catalog = _build_skill_catalog(cwd)
     skills_to_check: list[tuple[str, str]] = []  # (name, dir_path)
     for skill_name in mentions:
