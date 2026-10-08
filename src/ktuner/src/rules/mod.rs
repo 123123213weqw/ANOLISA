@@ -3204,19 +3204,52 @@ fn eval_optmem_max(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current < 81920 {
-        recs.push(Recommendation {
-            param: "net.core.optmem_max".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "81920".to_string(),
-            reason: "套接字辅助缓冲区默认值偏小，增大可支持更多控制消息和套接字选项".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = optmem_max_recommendation(read_sysctl_u64(path), &info.kernel_version) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `net.core.optmem_max` recommendation for an already-read value.
+///
+/// Split out from the file probe so the version-dependent target is testable
+/// on any host.
+///
+/// The kernel default moved from 20 KB (20480 on 64-bit) to 128 KB in Linux
+/// 6.8 (commits f5769faeec36, "net: Namespace-ify sysctl_optmem_max", and
+/// 4944566706b2, "net: increase optmem_max default value": "Regular usage of
+/// TCP tx zerocopy needs a bit more. Google has used 128KB as the default
+/// value for 7 years without any problem."). The fixed 80 KB target now sits
+/// below the default of every 6.8+ kernel, so the advice asks an
+/// administrator who is already under it to stop short of what the kernel
+/// itself ships, and it stays silent for a value in [80 KB, 128 KB) that the
+/// kernel considers low. Keep the target at or above the kernel's own
+/// default; the 80 KB target is kept on the kernels whose default it still
+/// exceeds. Only the 6.8+ target *is* the kernel default — 6.7 documents none
+/// at all and ships 20480 on 64-bit — so the reason names a default on that
+/// path and the recommendation on the other.
+fn optmem_max_recommendation(current: u64, kernel_version: &str) -> Option<Recommendation> {
+    let on_6_8_or_later = kernel_at_least(kernel_version, 6, 8);
+    let target = if on_6_8_or_later { 131072 } else { 81920 };
+    if current >= target {
+        return None;
+    }
+    let note = if on_6_8_or_later {
+        format!("内核默认 {target}")
+    } else {
+        format!("建议提高到 {target}")
+    };
+    Some(Recommendation {
+        param: "net.core.optmem_max".to_string(),
+        current_value: current.to_string(),
+        recommended_value: target.to_string(),
+        reason: format!(
+            "套接字辅助缓冲区上限 {current} 偏低（{note}），增大可支持更多控制消息和套接字选项"
+        ),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_oom_kill_allocating_task(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -9569,6 +9602,73 @@ mod tests {
         eval_optmem_max(&info, &mut recs);
         if let Some(rec) = recs.iter().find(|r| r.param == "net.core.optmem_max") {
             assert_eq!(rec.recommended_value, "81920");
+        }
+    }
+
+    #[test]
+    fn optmem_max_recommendation_tracks_the_kernel_default() {
+        // Kernels whose 20 KB default is still below the 80 KB target keep it.
+        for version in ["5.4.0", "6.6.0", "6.7.0"] {
+            let rec = optmem_max_recommendation(4096, version)
+                .expect("a value under the target is worth raising");
+            assert_eq!(rec.recommended_value, "81920", "kernel {version}");
+            assert_eq!(rec.current_value, "4096");
+            assert_eq!(rec.param, "net.core.optmem_max");
+        }
+        assert!(optmem_max_recommendation(81920, "6.7.0").is_none());
+        // Linux 6.8 made optmem_max per-netns with a 128 KB default
+        // (f5769faeec36 + 4944566706b2), so 80 KB is below what the kernel
+        // ships and must not be the target any more.
+        assert_eq!(
+            optmem_max_recommendation(4096, "6.8.0")
+                .expect("4096 is below the new default too")
+                .recommended_value,
+            "131072"
+        );
+        // A value the kernel now considers low must not stay silent.
+        assert_eq!(
+            optmem_max_recommendation(81920, "7.3.0-rc6")
+                .expect("80 KB is below the 6.8 default of 128 KB")
+                .recommended_value,
+            "131072"
+        );
+        assert!(optmem_max_recommendation(131071, "7.3.0-rc6").is_some());
+        assert!(optmem_max_recommendation(131072, "7.3.0-rc6").is_none());
+        // An unparseable release string keeps the pre-6.8 target.
+        assert_eq!(
+            optmem_max_recommendation(4096, "custom-kernel")
+                .expect("unknown kernels keep the legacy target")
+                .recommended_value,
+            "81920"
+        );
+    }
+
+    #[test]
+    fn optmem_max_reason_names_a_default_only_where_the_target_is_one() {
+        // 6.8 raised the default to 128 KB and the target follows it, so the
+        // modern reason may name the default. The 80 KB kept for older
+        // kernels is a tuning step above their default, not that default:
+        // 6.7 documents none at all (Documentation/admin-guide/sysctl/net.rst
+        // gains the `Default : 128 KB` line only in 6.8) and ships 20480 on
+        // 64-bit, so calling 81920 a kernel default would be wrong there.
+        let modern = optmem_max_recommendation(4096, "7.3.0-rc6").expect("below the target");
+        assert!(
+            modern.reason.contains("内核默认 131072"),
+            "6.8+ target is the kernel default: {}",
+            modern.reason
+        );
+        for version in ["6.6.0", "6.7.0", "custom-kernel"] {
+            let legacy = optmem_max_recommendation(4096, version).expect("below the target");
+            assert!(
+                !legacy.reason.contains("内核默认"),
+                "kernel {version}: the 80 KB target is not a kernel default: {}",
+                legacy.reason
+            );
+            assert!(
+                legacy.reason.contains("81920"),
+                "kernel {version}: the target stays visible in the reason: {}",
+                legacy.reason
+            );
         }
     }
 
