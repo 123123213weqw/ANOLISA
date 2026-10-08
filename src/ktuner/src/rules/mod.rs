@@ -5650,20 +5650,50 @@ fn eval_tcp_recovery(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     if !info.has_listen_sockets() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current == 0 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_recovery".to_string(),
-            current_value: "0".to_string(),
-            recommended_value: "1".to_string(),
-            reason: "未启用 RACK 丢包检测，RACK 比传统 dupthresh 更准确地检测丢包和乱序"
-                .to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = tcp_recovery_recommendation(read_sysctl_u64(path), &info.kernel_version) {
+        recs.push(rec);
     }
     1
+}
+
+/// Value-driven core of the `net.ipv4.tcp_recovery` rule, split from the live
+/// probe so the value and the kernel version are assertable on any host.
+///
+/// The knob is a bitmap; this rule targets bit 0x1
+/// (`TCP_RACK_LOSS_DETECTION`, include/net/tcp.h). Through v6.16 that bit was
+/// the RACK gate: `tcp_is_rack()` (net/ipv4/tcp_input.c) read it and its call
+/// sites skipped RACK loss detection while it was clear, so `tcp_recovery == 0`
+/// really did turn the detection off. Linux 6.17 removed the helper together
+/// with the obsolete RFC3517/RFC6675 recovery code it guarded (commit
+/// 1c120191dcec, "tcp: remove obsolete and unused RFC3517/RFC6675 loss
+/// recovery code"), and the bitmap entry in the sysctl documentation now reads
+/// "RACK: 0x1 enables RACK loss detection, for fast detection of lost
+/// retransmissions and tail drops, and resilience to reordering. currently,
+/// setting this bit to 0 has no effect, since RACK is the only supported loss
+/// detection algorithm" (Documentation/networking/ip-sysctl.rst, v6.17 on).
+/// The bitmap's remaining readers are the other two bits —
+/// `TCP_RACK_STATIC_REO_WND` (net/ipv4/tcp_input.c) and
+/// `TCP_RACK_NO_DUPTHRESH` (net/ipv4/tcp_recovery.c) — and writing `1` leaves
+/// both clear rather than setting them, so from 6.17 on this recommendation
+/// changes no behavior while its reason claims RACK loss detection is off.
+fn tcp_recovery_recommendation(current: u64, kernel_version: &str) -> Option<Recommendation> {
+    // The bit lost its last readers in 6.17; kernels up to 6.16 still consume
+    // it, so only they get the advice.
+    if kernel_at_least(kernel_version, 6, 17) {
+        return None;
+    }
+    if current != 0 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_recovery".to_string(),
+        current_value: "0".to_string(),
+        recommended_value: "1".to_string(),
+        reason: "未启用 RACK 丢包检测，RACK 比传统 dupthresh 更准确地检测丢包和乱序".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_tcp_comp_sack_delay(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -11232,12 +11262,40 @@ mod tests {
 
     #[test]
     fn test_tcp_recovery() {
+        // Shape of the recommendation on a pre-6.17 kernel, where the RACK bit
+        // still has readers.
+        let rec = tcp_recovery_recommendation(0, "6.16.0")
+            .expect("pre-6.17 kernels still consume the RACK bit");
+        assert_eq!(rec.recommended_value, "1");
+        assert_eq!(rec.category, Category::Performance);
+
+        // Host-visible check: on a 6.17+ kernel the rule must stay quiet for
+        // the host it would have advised before.
         let info = make_test_info();
         let mut recs = Vec::new();
         eval_tcp_recovery(&info, &mut recs);
-        if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_recovery") {
-            assert_eq!(rec.recommended_value, "1");
+        if kernel_at_least(&info.kernel_version, 6, 17) {
+            assert!(
+                recs.iter().all(|r| r.param != "net.ipv4.tcp_recovery"),
+                "6.17 removed the RACK bit's readers"
+            );
         }
+    }
+
+    #[test]
+    fn tcp_recovery_recommendation_gates_on_kernel_version() {
+        // Through v6.16 the bit gates RACK loss detection through tcp_is_rack()
+        // (net/ipv4/tcp_input.c), so a host with the bit clear really is
+        // running without it.
+        assert!(tcp_recovery_recommendation(0, "6.6.87.2-microsoft-standard-WSL2").is_some());
+        assert!(tcp_recovery_recommendation(0, "6.16.0").is_some());
+        // 6.17 removed the helper and with it the bit's last readers (commit
+        // 1c120191dcec): RACK detection is unconditional there, so writing 1
+        // back cannot deliver the reason's promise.
+        assert!(tcp_recovery_recommendation(0, "6.17.0").is_none());
+        assert!(tcp_recovery_recommendation(0, "7.3.0-rc6").is_none());
+        // Already enabled: no recommendation on any version.
+        assert!(tcp_recovery_recommendation(1, "6.6.0").is_none());
     }
 
     #[test]
