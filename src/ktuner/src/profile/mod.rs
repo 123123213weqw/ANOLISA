@@ -97,7 +97,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("pulsar")
         // Pulsar keeps its ledgers on BookKeeper bookies, which append and
         // replay them sequentially.
-        || info.has_process("bookkeeper");
+        || info.has_process("bookkeeper")
+        // Logstash is the log-pipeline shipper the runtime marker table
+        // already resolves ("logstash" -> "logstash"): continuous log ETL
+        // is the io-throughput profile's own definition (batch/ETL/log),
+        // so a Logstash-only host must not fall through to mixed.
+        || info.has_process("logstash");
 
     if has_db {
         return WorkloadType::IoLatency;
@@ -397,6 +402,21 @@ mod tests {
         // A database on the same host still outranks the streaming tier.
         assert_eq!(
             classify(&make_info(vec!["pulsar", "postgres"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves a logstash cmdline to "logstash";
+    /// continuous log ETL is io-throughput, not mixed.
+    #[test]
+    fn test_classify_logstash() {
+        assert_eq!(
+            classify(&make_info(vec!["logstash"])),
+            WorkloadType::IoThroughput
+        );
+        // A database on the same host still outranks the pipeline.
+        assert_eq!(
+            classify(&make_info(vec!["logstash", "postgres"])),
             WorkloadType::IoLatency
         );
     }
