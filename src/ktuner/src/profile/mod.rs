@@ -97,7 +97,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("pulsar")
         // Pulsar keeps its ledgers on BookKeeper bookies, which append and
         // replay them sequentially.
-        || info.has_process("bookkeeper");
+        || info.has_process("bookkeeper")
+        // RabbitMQ is the other message broker KNOWN_SERVICES already
+        // detects: durable queues are written to and read from disk, the
+        // same high-throughput IO shape as Kafka/Flink/Spark/Pulsar.
+        // Without this branch a RabbitMQ-only host fell through to Mixed.
+        || info.has_process("rabbitmq");
 
     if has_db {
         return WorkloadType::IoLatency;
@@ -398,6 +403,28 @@ mod tests {
         assert_eq!(
             classify(&make_info(vec!["pulsar", "postgres"])),
             WorkloadType::IoLatency
+        );
+    }
+
+    /// RabbitMQ is a service KNOWN_SERVICES already detects; every other
+    /// message broker (kafka, flink, spark, pulsar) routes to io-throughput,
+    /// so a RabbitMQ-only host must not fall through to mixed.
+    #[test]
+    fn test_classify_rabbitmq() {
+        assert_eq!(
+            classify(&make_info(vec!["rabbitmq"])),
+            WorkloadType::IoThroughput
+        );
+        // A database on the same host still outranks the broker.
+        assert_eq!(
+            classify(&make_info(vec!["rabbitmq", "postgres"])),
+            WorkloadType::IoLatency
+        );
+        // ... and so does the web tier's ordering guard: the broker wins
+        // only when no higher-priority tier is present.
+        assert_eq!(
+            classify(&make_info(vec!["rabbitmq", "nginx"])),
+            WorkloadType::NetworkIntensive
         );
     }
 
