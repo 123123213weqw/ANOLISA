@@ -49,7 +49,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         // oracle is the one OLTP database the canonical predicate already
         // counts (is_database_present); the THP rule counted it in 64bd828e0.
         // An Oracle-only host is an io-latency workload, not mixed.
-        || info.has_process("oracle");
+        || info.has_process("oracle")
+        // Cassandra is the same NoSQL OLTP store class as mongod: the
+        // runtime marker table already resolves org.apache.cassandra
+        // cmdlines to the "cassandra" service, but no classify branch read
+        // it, so a Cassandra-only host fell through to mixed.
+        || info.has_process("cassandra");
     let has_cache = info.has_process("redis-server")
         // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
         // `valkey-server` binary with the same event-loop, memory-resident
@@ -278,6 +283,22 @@ mod tests {
     fn test_classify_clickhouse() {
         assert_eq!(
             classify(&make_info(vec!["clickhouse"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// The runtime marker table resolves org.apache.cassandra cmdlines to the
+    /// "cassandra" service; classify must route that host to the same OLTP
+    /// profile as mongod instead of mixed.
+    #[test]
+    fn test_classify_cassandra() {
+        assert_eq!(
+            classify(&make_info(vec!["cassandra"])),
+            WorkloadType::IoLatency
+        );
+        // A database still outranks the web tier on a combined host.
+        assert_eq!(
+            classify(&make_info(vec!["cassandra", "nginx"])),
             WorkloadType::IoLatency
         );
     }
