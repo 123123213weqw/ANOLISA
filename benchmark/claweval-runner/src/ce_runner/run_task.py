@@ -160,6 +160,14 @@ def discover_tasks(tasks_dir: str, tag: str = None, range_str: str = None,
         if step < 1:
             log(f"[ERROR] Invalid --range step: {step} (must be >= 1)")
             sys.exit(1)
+        if lo < 1 or hi < lo:
+            # Range bounds are 1-based positional indexes. A zero start used
+            # to reach task_dirs[-1:hi] — Python's negative index — which
+            # silently selected nothing (or, for a single task, the last
+            # task), running a batch that shared no tasks with the request.
+            log(f"[ERROR] Invalid --range bounds: {range_str} "
+                f"(expected 1 <= L <= R, e.g. 1-10)")
+            sys.exit(1)
         # Sort by name for consistent ordering, then slice by 1-based positional index
         task_dirs = sorted(task_dirs, key=lambda d: Path(d).name)
         task_dirs = task_dirs[lo - 1 : hi : step]

@@ -310,3 +310,45 @@ class TestDiscoverTasksEdgeCases:
         
         results = discover_tasks(str(tmp_path))
         assert results == []
+
+
+class TestDiscoverTasksRangeBounds:
+    """--range bounds are 1-based positional indexes."""
+
+    def _make(self, tmp_path, count=4):
+        for i in range(1, count + 1):
+            task_dir = tmp_path / f"T{i:03d}_test"
+            task_dir.mkdir()
+            (task_dir / "task.yaml").write_text(
+                f"task_id: T{i:03d}\ntags: [general]\n"
+            )
+
+    def test_range_zero_start_is_rejected(self, tmp_path):
+        """A zero start used to slice task_dirs[-1:hi] and silently select
+        nothing (or, for a single task, the last task)."""
+        from ce_runner.run_task import discover_tasks
+
+        self._make(tmp_path)
+        with pytest.raises(SystemExit):
+            discover_tasks(str(tmp_path), range_str="0-3")
+
+    def test_range_reversed_bounds_are_rejected(self, tmp_path):
+        from ce_runner.run_task import discover_tasks
+
+        self._make(tmp_path)
+        with pytest.raises(SystemExit):
+            discover_tasks(str(tmp_path), range_str="3-1")
+
+    def test_range_single_task_still_works(self, tmp_path):
+        from ce_runner.run_task import discover_tasks
+
+        self._make(tmp_path)
+        results = discover_tasks(str(tmp_path), range_str="1-1")
+        assert [Path(r).name for r in results] == ["T001_test"]
+
+    def test_range_start_one_selects_first(self, tmp_path):
+        from ce_runner.run_task import discover_tasks
+
+        self._make(tmp_path)
+        results = discover_tasks(str(tmp_path), range_str="1-2")
+        assert [Path(r).name for r in results] == ["T001_test", "T002_test"]
