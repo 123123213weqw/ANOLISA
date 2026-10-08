@@ -789,12 +789,23 @@ fn read_network_info_from(net_dir: &Path) -> Result<Vec<NetInfo>> {
     if let Ok(entries) = fs::read_dir(net_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
             let name = entry.file_name().to_string_lossy().to_string();
+            // The tun driver creates tun/tap devices and reports a fixed
+            // SPEED_10000 for every one of them — `tun_setup()` seeds the link
+            // ksettings with `tun_default_link_ksettings()` (v6.6
+            // drivers/net/tun.c:2327/3553-3563; master:2408/3640-3650), and the
+            // sysfs `speed` attribute prints that cached default. It is a
+            // driver default, not a negotiated rate: a host with a 1 GbE NIC
+            // and an UP tunnel was judged a 10 GbE host, and every rule gated
+            // on a 10 GbE link then sized its recommendation for a link the
+            // machine does not have.
             if name == "lo"
                 || name.starts_with("veth")
                 || name.starts_with("br-")
                 || name.starts_with("virbr")
                 || name == "docker0"
                 || name == "bonding_masters"
+                || name.starts_with("tun")
+                || name.starts_with("tap")
             {
                 continue;
             }
@@ -1881,6 +1892,42 @@ mod tests {
         assert_eq!(
             nets.iter().find(|n| n.name == "ens5").unwrap().speed_mbps,
             1000
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The tun driver reports a fixed SPEED_10000 for every device it creates
+    /// (`tun_setup()` seeds the link ksettings with `tun_default_link_ksettings()`
+    /// and `speed_show()` prints that default), so an UP tunnel is not evidence
+    /// of a 10 GbE host link. A 1 GbE host running OpenVPN's default `tun0`
+    /// used to be judged 10 GbE and got the 万兆 recommendations.
+    #[test]
+    fn network_info_ignores_the_tun_drivers_fixed_speed() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_tunnel_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // A 1 GbE NIC next to the tunnel devices the tun driver creates.
+        for (name, speed) in [("eth0", "1000\n"), ("tun0", "10000\n"), ("tap0", "10000\n")] {
+            let iface = dir.join(name);
+            fs::create_dir_all(&iface).expect("create fake interface dir");
+            fs::write(iface.join("speed"), speed).expect("write speed");
+        }
+
+        let mut info = info_with_processes(&[]);
+        info.network = read_network_info_from(&dir).expect("read fake sysfs tree");
+        assert_eq!(
+            info.max_net_speed(),
+            1000,
+            "a tunnel's fixed 10 Gb/s default must not decide the host link speed: {:?}",
+            info.network
+                .iter()
+                .map(|n| (n.name.as_str(), n.speed_mbps))
+                .collect::<Vec<_>>()
         );
 
         fs::remove_dir_all(&dir).ok();
