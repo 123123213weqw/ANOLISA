@@ -177,8 +177,9 @@ _REMOTE_COMMAND_FLAG_OPTIONS = {
 _SHELL_COMMAND_SEPARATOR_RE = re.compile(r"[\n;|&]")
 
 _EMAIL_RE = re.compile(
-    r"(?<![\w.+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}(?![\w.-])"
+    r"(?<![\w.+-])[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9.-]+\.[A-Za-z]{2,63}(?![\w-])"
 )
+_EMAIL_SENTENCE_DELIMITERS = frozenset("\"')]}>,;:!?，。；：！？、）］｝】〕》〉」』”’")
 _PHONE_CN_RE = re.compile(
     r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}(?!\d)"
 )
@@ -232,6 +233,19 @@ def _score_email_with_context(text: str, start: int, end: int, base: float) -> f
     if any(marker in compact_context for marker in _POSITIVE_CONTEXT):
         score += _CONTEXT_POSITIVE_DELTA
     return max(0.0, min(1.0, score))
+
+
+def _has_email_right_boundary(text: str, end: int) -> bool:
+    if end == len(text) or text[end] != ".":
+        return True
+    # A period run is punctuation only when it cannot continue the domain.
+    while end < len(text) and text[end] == ".":
+        end += 1
+    return (
+        end == len(text)
+        or text[end].isspace()
+        or text[end] in _EMAIL_SENTENCE_DELIMITERS
+    )
 
 
 def _is_reserved_email_domain(value: str) -> bool:
@@ -552,6 +566,8 @@ class RegexPiiDetector:
         separator_cursor = 0
         command_start = -1
         for match in _EMAIL_RE.finditer(text):
+            if not _has_email_right_boundary(text, match.end()):
+                continue
             for separator in _SHELL_COMMAND_SEPARATOR_RE.finditer(
                 text, separator_cursor, match.start()
             ):

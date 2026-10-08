@@ -50,6 +50,7 @@ const RESERVED: &[&str] = &[
     "localhost",
     "test",
 ];
+const EMAIL_SENTENCE_DELIMITERS: &str = "\"')]}>,;:!?，。；：！？、）］｝】〕》〉」』”’";
 
 pub(crate) struct BuiltinDetector {
     patterns: BTreeMap<String, Regex>,
@@ -324,6 +325,15 @@ mod resource_tests {
         ));
         assert!(matches.next().is_none());
     }
+
+    #[test]
+    fn email_sentence_period_scan_checks_deadline() {
+        let input = format!("alice@company.cn{} ", ".".repeat(8193));
+        assert!(matches!(
+            email_right_boundary(&input, "alice@company.cn".len(), Some(Instant::now())),
+            Err(ScanError::DeadlineExceeded)
+        ));
+    }
 }
 
 fn candidate<'a>(
@@ -563,9 +573,8 @@ fn next_email<'a>(
         check_deadline(deadline)?;
         cursor.position = whole.start() + 1;
         let before = text.input[..whole.start()].chars().next_back();
-        let after = text.input[whole.end()..].chars().next();
         if before.is_some_and(|c| word(c) || matches!(c, '.' | '+' | '-'))
-            || after.is_some_and(|c| word(c) || matches!(c, '.' | '-'))
+            || !email_right_boundary(text.input, whole.end(), deadline)?
         {
             continue;
         }
@@ -585,6 +594,31 @@ fn next_email<'a>(
         }
     }
     Ok(None)
+}
+
+fn email_right_boundary(
+    input: &str,
+    mut end: usize,
+    deadline: Option<Instant>,
+) -> Result<bool, ScanError> {
+    let Some(after) = input[end..].chars().next() else {
+        return Ok(true);
+    };
+    if after != '.' {
+        return Ok(!word(after) && after != '-');
+    }
+    // A period run is punctuation only when it cannot continue the domain.
+    let start = end;
+    while input.as_bytes().get(end) == Some(&b'.') {
+        if (end - start).is_multiple_of(4096) {
+            check_deadline(deadline)?;
+        }
+        end += 1;
+    }
+    Ok(input[end..]
+        .chars()
+        .next()
+        .is_none_or(|c| space(c) || EMAIL_SENTENCE_DELIMITERS.contains(c)))
 }
 
 fn space(c: char) -> bool {

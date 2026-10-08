@@ -497,6 +497,18 @@ ActionResult 同时设置 error/error_type，stdout 不含 traceback。
 redacted text；只保存 text length/SHA-256、扫描选项和 sanitized finding。Rust backend
 必须在 lifecycle 前使用相同 sanitizer。
 
+### 9.5 邮箱句末边界
+
+Python V1 和 Rust V2 使用相同的句末边界规则：邮箱候选后的连续 ASCII `.` 只有在其后为输入结束、
+空白或固定分隔符时才作为句末标点。固定分隔符为 ASCII 双引号、单引号、`)]}>,;:!?` 和
+`，。；：！？、）］｝】〕》〉」』”’`。没有紧随句号的候选保持原有边界行为；word 字符和 `-`
+仍不能直接作为邮箱右边界。
+
+候选仍须通过完整邮箱语法和长度校验。合法多级域名必须完整匹配；`.123`、`.c`、`.-bad`、
+`._bad` 和 `..evil` 等非法后缀不能通过截取较短域名产生 finding。句末标点不进入 span 或脱敏
+替换范围。置信度计算、保留域名、远程身份、severity、Host policy、截断及 deadline 语义不变。
+该检测修复不改变 CLI/RPC 参数、结果 schema 或扫描器版本标识。
+
 ## 10. `skill_ledger`
 
 ### 10.1 目的

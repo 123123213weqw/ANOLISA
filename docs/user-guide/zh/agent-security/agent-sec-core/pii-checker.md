@@ -176,6 +176,11 @@ agent-sec-cli scan-pii --input ./agent-output.txt --format text
 置信度，`example`、`dummy`、`test`、`sample` 等测试标记可能降低置信度。低于默认 `0.5` 阈值的
 finding 会被忽略，除非使用 `--include-low-confidence`。
 
+邮箱检测支持句末 ASCII 句号及连续句号组成的省略号；连续句号后必须是输入结束、空白或支持的
+句末标点、闭合分隔符。例如，`alice@company.co.uk.` 的 finding 仅包含 `alice@company.co.uk`，
+句号保留在 finding span 和脱敏替换范围之外。`.123`、`.c`、`.-bad`、`._bad` 和 `..evil` 等
+非法域名后缀会被拒绝，不会截取较短邮箱作为 finding。保留域名和远程身份仍沿用原有的低置信度处理。
+
 ## Verdict 与脱敏
 
 Scanner 将 findings 聚合为一个 verdict：

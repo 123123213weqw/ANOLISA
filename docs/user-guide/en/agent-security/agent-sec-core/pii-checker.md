@@ -203,6 +203,13 @@ security keywords can increase confidence, while fixture markers such as `exampl
 `test`, and `sample` can lower it. Findings below the default `0.5` threshold are omitted unless
 `--include-low-confidence` is set.
 
+Email detection accepts sentence-ending ASCII periods, including an ellipsis, when the period run
+is followed by end of input, whitespace, or a supported sentence/closing delimiter. For example,
+`alice@company.co.uk.` produces a finding for `alice@company.co.uk`; the period remains outside
+both the finding span and the redaction replacement. Invalid domain suffixes such as `.123`, `.c`,
+`.-bad`, `._bad`, and `..evil` are rejected without reporting a shorter address. Reserved domains
+and remote identities retain their existing low-confidence handling.
+
 ## Verdicts and redaction
 
 The scanner aggregates findings into one verdict:
