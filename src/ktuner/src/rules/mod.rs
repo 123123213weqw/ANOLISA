@@ -2270,8 +2270,53 @@ fn eval_panic_on_oom(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 }
 
 fn eval_dirty_expire_centisecs(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/vm/dirty_expire_centisecs";
+    eval_dirty_expire_centisecs_at(
+        info,
+        recs,
+        "/proc/sys/vm/dirty_expire_centisecs",
+        "/proc/sys/vm/dirty_writeback_centisecs",
+    )
+}
+
+/// Path-injectable form of [`eval_dirty_expire_centisecs`] (the `eval_*_at`
+/// idiom) so the periodic-writeback precondition is assertable against
+/// synthetic files.
+///
+/// `dirty_expire_interval` only *selects* which inodes the periodic flush
+/// picks: its two writeback readers sit under `if (work->for_kupdate)`
+/// (`fs/fs-writeback.c`, v6.6 :2065-2067 in `wb_writeback()`, master
+/// :2035-2037 in `writeback_sb_inodes()` and :2288-2290 in `wb_writeback()`),
+/// and the only producer of `for_kupdate = 1` is `wb_check_old_data_flush()`,
+/// which opens with `if (!dirty_writeback_interval) return 0;` (v6.6
+/// :2161-2162, master :2382-2385). With `vm.dirty_writeback_centisecs` at
+/// zero — the documented "disables periodic writeback altogether"
+/// configuration (`Documentation/admin-guide/sysctl/vm.rst`) — no periodic
+/// flush ever asks which data is old enough, so shortening the expiry cannot
+/// change when dirty data reaches the disk and the reason's promised smoother
+/// IO cannot materialise. Three other readers exist and are deliberately not
+/// treated as live: `mem_cgroup_track_foreign_dirty_slowpath()` and
+/// `mem_cgroup_flush_foreign()` (`mm/memcontrol.c`, v6.6 :4706/:4723, master
+/// :3931/:3948) only bound how long a *foreign dirtying* record stays valid
+/// for the cgroup-writeback assist — the mechanism documented at
+/// mm/memcontrol.c:4654-4666 — which is not when this host's dirty data is
+/// written back. Staying quiet is the "never recommend a no-op" rule the
+/// hardlockup_panic, page-cluster and min_slab_ratio gates follow.
+///
+/// A missing or unreadable switch keeps the recommendation: the kernel default
+/// is 500 (periodic writeback on) and `vm_table[]` registers the file
+/// unconditionally, so only a synthetic path can end up absent — the same
+/// fail-open rule the core_uses_pid and hardlockup_panic gates follow.
+fn eval_dirty_expire_centisecs_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    writeback_path: &str,
+) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    // No periodic flush, no consumer for the expiry selector.
+    if !periodic_writeback_is_on(writeback_path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -2287,6 +2332,14 @@ fn eval_dirty_expire_centisecs(info: &SystemInfo, recs: &mut Vec<Recommendation>
         });
     }
     1
+}
+
+/// Whether the periodic (kupdate) flush can run at all, i.e. whether
+/// `vm.dirty_expire_centisecs` has a consumer: a non-zero
+/// `/proc/sys/vm/dirty_writeback_centisecs`. A missing file counts as on —
+/// the kernel default is 500 and only a synthetic path can be absent.
+fn periodic_writeback_is_on(writeback_path: &str) -> bool {
+    !std::path::Path::new(writeback_path).exists() || read_sysctl_u64(writeback_path) != 0
 }
 
 fn eval_dirty_writeback_centisecs(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -11128,6 +11181,73 @@ mod tests {
             mode_on.to_str().unwrap(),
         );
         assert!(recs.is_empty(), "small memory still skips the rule");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dirty_expire_needs_periodic_writeback() {
+        // vm.dirty_expire_centisecs only selects which inodes the periodic
+        // flush writes: its writeback readers are gated on work->for_kupdate
+        // (v6.6 fs/fs-writeback.c:2065-2067, master :2035-2037/:2288-2290),
+        // and the only producer of that work, wb_check_old_data_flush(),
+        // returns early while vm.dirty_writeback_centisecs is zero (v6.6
+        // :2161-2162, master :2382-2385), which the kernel documents as
+        // "disables periodic writeback altogether". Without the gate the rule
+        // keeps asking for a shortening that cannot change when dirty data
+        // reaches the disk.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_dirty_expire_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expire = dir.join("dirty_expire_centisecs");
+        std::fs::write(&expire, b"3000\n").unwrap();
+        let writeback_off = dir.join("dirty_writeback_centisecs.off");
+        std::fs::write(&writeback_off, b"0\n").unwrap();
+        let writeback_on = dir.join("dirty_writeback_centisecs.on");
+        std::fs::write(&writeback_on, b"500\n").unwrap();
+        let writeback_missing = dir.join("dirty_writeback_centisecs.missing");
+
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        eval_dirty_expire_centisecs_at(
+            &info,
+            &mut recs,
+            expire.to_str().unwrap(),
+            writeback_off.to_str().unwrap(),
+        );
+        assert!(
+            recs.is_empty(),
+            "periodic writeback is off: a shorter expiry selects nothing"
+        );
+
+        for writeback in [&writeback_on, &writeback_missing] {
+            let mut recs = Vec::new();
+            eval_dirty_expire_centisecs_at(
+                &info,
+                &mut recs,
+                expire.to_str().unwrap(),
+                writeback.to_str().unwrap(),
+            );
+            assert!(
+                recs.iter().any(|r| r.param == "vm.dirty_expire_centisecs"),
+                "{}: a live periodic flush keeps the rule",
+                writeback.display()
+            );
+        }
+
+        // The value gate still applies first.
+        std::fs::write(&expire, b"1500\n").unwrap();
+        let mut recs = Vec::new();
+        eval_dirty_expire_centisecs_at(
+            &info,
+            &mut recs,
+            expire.to_str().unwrap(),
+            writeback_on.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "1500 is not above the target");
 
         std::fs::remove_dir_all(&dir).ok();
     }
