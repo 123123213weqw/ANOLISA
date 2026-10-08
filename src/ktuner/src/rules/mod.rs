@@ -3034,8 +3034,78 @@ fn eval_busy_poll(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     1
 }
 
+/// Seconds `tcp_write_timeout()` waits on an active SYN_SENT connection before
+/// giving up, for `net.ipv4.tcp_syn_retries = retries` and
+/// `net.ipv4.tcp_syn_linear_timeouts = linear`.
+///
+/// The abort is count-based: net/ipv4/tcp_timer.c sets
+/// `max_retransmits = retry_until` and adds
+/// `READ_ONCE(net->ipv4.sysctl_tcp_syn_linear_timeouts)` for TCP_SYN_SENT,
+/// then aborts on the first timer expiry where `icsk_retransmits` has reached
+/// `max_retransmits` — one RTO later than the last retransmission, so the wait
+/// is the sum of `retries + linear + 1` RTOs. `icsk_rto` holds at the initial
+/// RTO while `icsk_backoff <= linear` and doubles only past it
+/// (`icsk_backoff > READ_ONCE(net->ipv4.sysctl_tcp_syn_linear_timeouts)`),
+/// clamped at TCP_RTO_MAX = 120s.
+///
+/// With the documented defaults (retries 6, linear 4) and the initial RTO of
+/// 1s the schedule is 1,1,1,1,1,2,4,8,16,32,64: the last retransmission at
+/// 67s and the final timeout at 131s, the two figures
+/// Documentation/networking/ip-sysctl.rst quotes for `tcp_syn_retries`.
+fn syn_retry_timeout_secs(retries: u64, linear: u64) -> u64 {
+    // Both knobs are u8 sysctls capped at MAX_TCP_SYNCNT = 127; clamping keeps
+    // the loop bounded for a caller-supplied value.
+    let retries = retries.min(127);
+    let linear = linear.min(127);
+    const RTO_MAX_SECS: u64 = 120;
+    let mut total = 0u64;
+    for step in 0..retries + linear + 1 {
+        let rto = if step <= linear {
+            1
+        } else {
+            2u64.saturating_pow((step - linear) as u32)
+                .min(RTO_MAX_SECS)
+        };
+        total = total.saturating_add(rto);
+    }
+    total
+}
+
+/// Seconds `tcp_model_timeout()` models for a live connection with
+/// `net.ipv4.tcp_retries2 = retries`.
+///
+/// `retransmits_timed_out()` reaches the model on the established path with
+/// `rto_base = TCP_RTO_MIN` (net/ipv4/tcp_timer.c), so
+/// `linear_backoff_thresh = ilog2(TCP_RTO_MAX / TCP_RTO_MIN)` = ilog2(600) = 9
+/// and the model is `((2 << boundary) - 1) * rto_base` below that threshold,
+/// `((2 << linear_backoff_thresh) - 1) * rto_base + (boundary -
+/// linear_backoff_thresh) * TCP_RTO_MAX` above it. In milliseconds that is
+/// 205s at the boundary and the 924.6s Documentation/networking/ip-sysctl.rst
+/// quotes as the hypothetical timeout of the default 15 — a lower bound for
+/// the effective timeout, which the kernel re-checks on every RTO.
+fn retries2_timeout_secs(retries: u64) -> u64 {
+    // net/ipv4/sysctl_net_ipv4.c registers the knob as a plain u8.
+    let retries = retries.min(u8::MAX as u64);
+    const RTO_MIN_MS: u64 = 200;
+    const RTO_MAX_MS: u64 = 120_000;
+    // ilog2(TCP_RTO_MAX / TCP_RTO_MIN) = ilog2(120 * HZ / (HZ / 5)).
+    const LINEAR_BACKOFF_THRESH: u64 = 9;
+    let msecs = if retries <= LINEAR_BACKOFF_THRESH {
+        ((2u64 << retries) - 1) * RTO_MIN_MS
+    } else {
+        ((2u64 << LINEAR_BACKOFF_THRESH) - 1) * RTO_MIN_MS
+            + (retries - LINEAR_BACKOFF_THRESH) * RTO_MAX_MS
+    };
+    (msecs + 500) / 1000
+}
+
 fn eval_tcp_retries2(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_retries2";
+    eval_tcp_retries2_at(info, recs, "/proc/sys/net/ipv4/tcp_retries2")
+}
+
+/// Path-injectable form of [`eval_tcp_retries2`] (the `eval_*_at` idiom) so the
+/// reason's figure is assertable against a temp file on any host.
+fn eval_tcp_retries2_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -3046,9 +3116,9 @@ fn eval_tcp_retries2(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
             current_value: current.to_string(),
             recommended_value: "8".to_string(),
             reason: format!(
-                "TCP 重传 {} 次才放弃（约 {}分钟），缩短到 8 次可更快检测断连释放资源",
+                "TCP 重传 {} 次才放弃（内核模型下界约 {} 秒），缩短到 8 次可更快检测断连释放资源",
                 current,
-                if current >= 15 { "13-30" } else { "6-13" }
+                retries2_timeout_secs(current)
             ),
             confidence: Confidence::Medium,
             category: Category::Performance,
@@ -3064,18 +3134,39 @@ fn eval_tcp_retries2(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 // bursts, whereas 1 turns every burst into a hard RST that fails the client.
 
 fn eval_tcp_syn_retries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_syn_retries";
+    eval_tcp_syn_retries_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/tcp_syn_retries",
+        "/proc/sys/net/ipv4/tcp_syn_linear_timeouts",
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_syn_retries`] (the `eval_*_at` idiom).
+///
+/// `linear_path` is `net.ipv4.tcp_syn_linear_timeouts`, a 6.5 addition; on an
+/// older kernel the file is absent and the linear phase the kernel applies is
+/// zero, which is what the reader's missing-file fallback returns.
+fn eval_tcp_syn_retries_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    linear_path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
     if current > 3 {
+        let linear = read_sysctl_u64(linear_path);
         recs.push(Recommendation {
             param: "net.ipv4.tcp_syn_retries".to_string(),
             current_value: current.to_string(),
             recommended_value: "3".to_string(),
             reason: format!(
-                "SYN 重试 {current} 次才放弃（超时约 30 秒），减少到 3 次（约 15 秒）可加速不可达主机的连接失败检测"
+                "SYN 重试 {current} 次才放弃（累计等待约 {} 秒），减少到 3 次（约 {} 秒）可加速不可达主机的连接失败检测",
+                syn_retry_timeout_secs(current, linear),
+                syn_retry_timeout_secs(3, linear)
             ),
             confidence: Confidence::Medium,
             category: Category::Performance, writable: true,
@@ -8803,6 +8894,49 @@ mod tests {
     }
 
     #[test]
+    fn retries2_timeout_matches_the_documented_model() {
+        // Documentation/networking/ip-sysctl.rst: "The default value of 15
+        // yields a hypothetical timeout of 924.6 seconds and is a lower bound
+        // for the effective timeout."
+        assert_eq!(retries2_timeout_secs(15), 925);
+        // The threshold is ilog2(TCP_RTO_MAX / TCP_RTO_MIN) = 9.
+        assert_eq!(retries2_timeout_secs(9), 205);
+        assert_eq!(retries2_timeout_secs(10), 325);
+        // Below the threshold the model is (2^(n+1) - 1) * 200ms.
+        assert_eq!(retries2_timeout_secs(8), 102);
+        assert_eq!(retries2_timeout_secs(0), 0);
+    }
+
+    #[test]
+    fn retries2_reason_states_the_model_timeout() {
+        // The reason used to band the wait into "6-13" / "13-30" minutes. A
+        // host at 9 — the lowest value the rule fires on — actually hits the
+        // model at 204.6s, well under the claimed 6 minutes.
+        for (value, expected) in [(9, "205 秒"), (10, "325 秒"), (15, "925 秒")] {
+            let path = std::env::temp_dir().join(format!(
+                "ktuner_retries2_reason_{}_{:?}_{value}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::write(&path, format!("{value}\n")).unwrap();
+            let mut recs = Vec::new();
+            let checked =
+                eval_tcp_retries2_at(&make_test_info(), &mut recs, path.to_str().unwrap());
+            std::fs::remove_file(&path).ok();
+            assert_eq!(checked, 1);
+            let rec = recs
+                .iter()
+                .find(|r| r.param == "net.ipv4.tcp_retries2")
+                .unwrap_or_else(|| panic!("retries2={value} is above 8, so it must be reported"));
+            assert!(
+                rec.reason.contains(expected),
+                "retries2={value}: reason must state {expected}, got {}",
+                rec.reason
+            );
+        }
+    }
+
+    #[test]
     fn test_file_max() {
         let info = make_test_info();
         let mut recs = Vec::new();
@@ -9001,6 +9135,93 @@ mod tests {
             assert_eq!(rec.recommended_value, "3");
             assert_eq!(rec.confidence, Confidence::Medium);
         }
+    }
+
+    #[test]
+    fn syn_retry_timeout_follows_the_kernel_schedule() {
+        // Documentation/networking/ip-sysctl.rst: the default 6 "corresponds
+        // to 67seconds (with tcp_syn_linear_timeouts = 4) till the last
+        // retransmission ... the final timeout for an active TCP connection
+        // attempt will happen after 131seconds". The abort lands one RTO past
+        // the last retransmission, so the wait covers retries + linear + 1
+        // RTOs: 1,1,1,1,1,2,4,8,16,32,64.
+        assert_eq!(syn_retry_timeout_secs(6, 4), 131);
+        assert_eq!(syn_retry_timeout_secs(3, 4), 19);
+        // Without the linear phase — pre-6.5 kernels, or an admin who zeroed
+        // the knob — the classic 2^(n+1) - 1 schedule is all that is left.
+        assert_eq!(syn_retry_timeout_secs(6, 0), 127);
+        assert_eq!(syn_retry_timeout_secs(3, 0), 15);
+        // Every RTO after the linear phase is clamped at TCP_RTO_MAX.
+        assert_eq!(syn_retry_timeout_secs(127, 127), 14774);
+        assert_eq!(syn_retry_timeout_secs(0, 0), 1);
+    }
+
+    #[test]
+    fn syn_retry_reason_states_the_schedule_it_waits() {
+        // The reason hard-coded "超时约 30 秒" and "约 15 秒", which describe a
+        // retries=4 host with no linear phase. The sysctl default is 6, which
+        // the kernel aborts after 131s, and the recommended 3 lands at 19s.
+        let (retries_path, linear_path) = syn_retry_temp_paths("defaults");
+        std::fs::write(&retries_path, b"6\n").unwrap();
+        std::fs::write(&linear_path, b"4\n").unwrap();
+        let mut recs = Vec::new();
+        let checked = eval_tcp_syn_retries_at(
+            &make_test_info(),
+            &mut recs,
+            retries_path.to_str().unwrap(),
+            linear_path.to_str().unwrap(),
+        );
+        std::fs::remove_file(&retries_path).ok();
+        std::fs::remove_file(&linear_path).ok();
+        assert_eq!(checked, 1);
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "net.ipv4.tcp_syn_retries")
+            .expect("retries=6 is above 3, so the rule must fire");
+        assert!(
+            rec.reason.contains("131 秒") && rec.reason.contains("19 秒"),
+            "reason must state the 131s wait and the 19s target, got {}",
+            rec.reason
+        );
+    }
+
+    #[test]
+    fn syn_retry_reason_without_the_linear_phase() {
+        // 6.5 added net.ipv4.tcp_syn_linear_timeouts; on an older kernel the
+        // file is absent and only the exponential schedule applies.
+        let (retries_path, linear_path) = syn_retry_temp_paths("no-linear");
+        std::fs::write(&retries_path, b"6\n").unwrap();
+        std::fs::remove_file(&linear_path).ok();
+        let mut recs = Vec::new();
+        eval_tcp_syn_retries_at(
+            &make_test_info(),
+            &mut recs,
+            retries_path.to_str().unwrap(),
+            linear_path.to_str().unwrap(),
+        );
+        std::fs::remove_file(&retries_path).ok();
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "net.ipv4.tcp_syn_retries")
+            .expect("a pre-6.5 retries=6 host still waits 127s");
+        assert!(
+            rec.reason.contains("127 秒") && rec.reason.contains("15 秒"),
+            "reason must fall back to the exponential schedule, got {}",
+            rec.reason
+        );
+    }
+
+    /// Two distinct temp paths for the syn-retries sysctls (the second one is
+    /// left for the caller to create or leave missing).
+    fn syn_retry_temp_paths(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "ktuner_syn_retries_{tag}_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let retries = base.with_extension("retries");
+        let linear = base.with_extension("linear");
+        (retries, linear)
     }
 
     #[test]
