@@ -6821,11 +6821,54 @@ fn conntrack_timeout_recommendation(current: u64, recs: &mut Vec<Recommendation>
 }
 
 fn eval_softlockup_all_cpu_backtrace(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/softlockup_all_cpu_backtrace";
-    if !std::path::Path::new(path).exists() {
+    eval_softlockup_all_cpu_backtrace_at(
+        info,
+        recs,
+        "/proc/sys/kernel/softlockup_all_cpu_backtrace",
+        "/proc/sys/kernel/soft_watchdog",
+    )
+}
+
+/// Path-injectable form of [`eval_softlockup_all_cpu_backtrace`] (the
+/// `eval_*_at` idiom) so the soft-detector precondition is assertable against
+/// synthetic files.
+///
+/// The knob's only readers live in `watchdog_timer_fn()`, the soft-lockup
+/// detector's hrtimer callback (`kernel/watchdog.c`, v6.6 :443/:502/:521,
+/// master :812/:875/:896), and both sit inside the report block that runs only
+/// when `is_softlockup()` returns a non-zero duration — a function that opens
+/// with `if ((watchdog_enabled & WATCHDOG_SOFTOCKUP_ENABLED) && watchdog_thresh)`
+/// (v6.6 :409, master :745). With the soft detector off the callback never
+/// reports a soft lockup, so the all-CPU backtrace this rule asks for has no
+/// report to attach to: the recommendation cannot change any behaviour, and the
+/// reason's premise (a soft lockup that prints only the triggering CPU's stack)
+/// cannot arise in the first place. Staying quiet is the "never recommend a
+/// no-op" rule the hardlockup_panic, page-cluster and min_slab_ratio gates
+/// already follow.
+///
+/// `/proc/sys/kernel/soft_watchdog` is that detector's switch as the kernel
+/// itself reports it: `proc_watchdog_common()` normalizes the file to the
+/// *effective* state on read (`*param = (watchdog_enabled & which) != 0`,
+/// v6.6 :753, master :1120), so an explicit 0 means no soft-lockup report can
+/// be produced — including the case where the user left `soft_watchdog` on but
+/// `kernel.watchdog` off. A missing file keeps the recommendation, because the
+/// kernel's default is the soft detector *on*: the same "a failed read leaves
+/// the kernel default, which does use the knob" rule the core_uses_pid gate
+/// follows.
+fn eval_softlockup_all_cpu_backtrace_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    soft_watchdog_path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if info.cpu_cores <= 32 {
+        return 1;
+    }
+    // No soft-lockup report, no place for the all-CPU backtrace to fire.
+    if !soft_lockup_detector_is_live(soft_watchdog_path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -6841,6 +6884,16 @@ fn eval_softlockup_all_cpu_backtrace(info: &SystemInfo, recs: &mut Vec<Recommend
         });
     }
     1
+}
+
+/// Whether a soft-lockup report can still be produced, i.e. whether the
+/// recommendation has anything to attach to. `/proc/sys/kernel/soft_watchdog`
+/// reports the *effective* switch, so any non-zero reading keeps the rule. A
+/// missing file also keeps it: the kernel default is the soft detector *on*,
+/// and the two files share one `CONFIG_SOFTLOCKUP_DETECTOR` table, so only a
+/// synthetic path can end up absent.
+fn soft_lockup_detector_is_live(soft_watchdog_path: &str) -> bool {
+    !std::path::Path::new(soft_watchdog_path).exists() || read_sysctl_u64(soft_watchdog_path) != 0
 }
 
 fn eval_compact_unevictable(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -11669,12 +11722,95 @@ mod tests {
         if std::path::Path::new("/proc/sys/kernel/softlockup_all_cpu_backtrace").exists() {
             assert_eq!(checked, 1);
             let val = read_sysctl_u64("/proc/sys/kernel/softlockup_all_cpu_backtrace");
-            if val == 0 {
+            // The rule only speaks while a soft-lockup report can be produced.
+            let detector = std::path::Path::new("/proc/sys/kernel/soft_watchdog").exists()
+                && read_sysctl_u64("/proc/sys/kernel/soft_watchdog") != 0;
+            if val == 0 && detector {
                 assert!(recs
                     .iter()
                     .any(|r| r.param == "kernel.softlockup_all_cpu_backtrace"));
             }
         }
+    }
+
+    #[test]
+    fn softlockup_backtrace_needs_the_soft_detector() {
+        // kernel.softlockup_all_cpu_backtrace is read only in
+        // watchdog_timer_fn(), the soft-lockup detector's hrtimer callback, and
+        // only inside the report block that is_softlockup() gates on
+        // `watchdog_enabled & WATCHDOG_SOFTOCKUP_ENABLED` (v6.6 watchdog.c
+        // :409/:443, master :745/:812). With the soft detector off no report is
+        // ever produced, so the "all CPU backtrace" the rule recommends has
+        // nothing to extend.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_softlockup_backtrace_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("softlockup_all_cpu_backtrace");
+        std::fs::write(&knob, b"0\n").unwrap();
+        let detector_off = dir.join("soft_watchdog.off");
+        std::fs::write(&detector_off, b"0\n").unwrap();
+        let detector_on = dir.join("soft_watchdog.on");
+        std::fs::write(&detector_on, b"1\n").unwrap();
+        let detector_missing = dir.join("soft_watchdog.missing");
+
+        let mut info = make_test_info();
+        info.cpu_cores = 96;
+
+        let mut recs = Vec::new();
+        eval_softlockup_all_cpu_backtrace_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            detector_off.to_str().unwrap(),
+        );
+        assert!(
+            recs.is_empty(),
+            "the soft detector is off: no soft-lockup report can use the backtrace"
+        );
+
+        for detector in [&detector_on, &detector_missing] {
+            let mut recs = Vec::new();
+            eval_softlockup_all_cpu_backtrace_at(
+                &info,
+                &mut recs,
+                knob.to_str().unwrap(),
+                detector.to_str().unwrap(),
+            );
+            assert!(
+                recs.iter()
+                    .any(|r| r.param == "kernel.softlockup_all_cpu_backtrace"),
+                "{}: a live soft detector keeps the rule",
+                detector.display()
+            );
+        }
+
+        // The CPU gate still applies first.
+        info.cpu_cores = 8;
+        let mut recs = Vec::new();
+        eval_softlockup_all_cpu_backtrace_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            detector_on.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "small hosts still skip the rule");
+
+        // And an already-enabled knob has nothing to recommend.
+        std::fs::write(&knob, b"1\n").unwrap();
+        info.cpu_cores = 96;
+        let mut recs = Vec::new();
+        eval_softlockup_all_cpu_backtrace_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            detector_on.to_str().unwrap(),
+        );
+        assert!(recs.is_empty(), "an enabled knob needs no advice");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
