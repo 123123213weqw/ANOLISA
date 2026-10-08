@@ -490,16 +490,21 @@ fn cmd_why(param: &str) -> Result<i32> {
 /// render every choice and bracket the ACTIVE one, so the value is that
 /// token — the same reading the rules store as a recommendation's `current`,
 /// the ledger records as an original, and `classify_readback` verifies a
-/// write against. Publishing the whole line here flipped the format of
-/// `current` exactly when the recommendation disappeared (the system became
-/// optimal), so an agent polling `why` saw `"madvise"` turn into
-/// `"always [madvise] never"`.
-fn active_value(value: &str) -> &str {
+/// write against. Multi-value sysctls (`net.ipv4.tcp_rmem`, `kernel.sem`) are
+/// separated by TABs in the file, while the rules publish them through
+/// read_sysctl_string's single-space join, so the fields are collapsed here
+/// too. Publishing the raw line flipped the format of `current` exactly when
+/// the recommendation disappeared (the system became optimal), for both
+/// shapes: an agent polling `why` saw `"madvise"` turn into
+/// `"always [madvise] never"`, and `"4096 131072 6291456"` turn into
+/// `"4096\t131072\t6291456"`.
+fn active_value(value: &str) -> String {
     let trimmed = value.trim();
-    trimmed
+    let active = trimmed
         .split_whitespace()
         .find_map(|token| token.strip_prefix('[').and_then(|t| t.strip_suffix(']')))
-        .unwrap_or(trimmed)
+        .unwrap_or(trimmed);
+    active.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn why_with(
@@ -1327,6 +1332,50 @@ mod tests {
                 json!({ "param": "kernel.ostype", "current": "Linux", "status": "optimal" })
             );
         }
+    }
+
+    #[test]
+    fn why_reports_one_value_format_for_a_multi_value_knob() {
+        // The recommendation branch publishes the rules' reading, which
+        // collapses the kernel's field separators to single spaces
+        // (read_sysctl_string). The fallback branch reads the file itself,
+        // and the kernel separates the fields of net.ipv4.tcp_rmem /
+        // kernel.sem with TABs: publishing that raw line flipped the format
+        // of `current` exactly when the recommendation disappeared — the same
+        // flip the bracketed option lists used to have — so an agent polling
+        // `why` saw "4096 131072 6291456" turn into
+        // "4096\t131072\t6291456".
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("4096\t131072\t6291456\n");
+        let (output, code) = why_with("net.ipv4.tcp_rmem", &eval, |path| {
+            Ok(current.read_for(path, "/proc/sys/net/ipv4/tcp_rmem"))
+        })
+        .expect("a readable parameter without a recommendation");
+        assert_eq!(code, 0);
+        assert_eq!(
+            output,
+            json!({
+                "param": "net.ipv4.tcp_rmem",
+                "current": "4096 131072 6291456",
+                "status": "optimal"
+            })
+        );
+        // The recommendation branch reports the same knob in the same
+        // format, so the two branches cannot disagree about the value.
+        let eval = evaluation(vec![Recommendation {
+            param: "net.ipv4.tcp_rmem".to_string(),
+            current_value: "4096 131072 6291456".to_string(),
+            recommended_value: "4096 87380 16777216".to_string(),
+            reason: "existing reason".to_string(),
+            writable: true,
+            ..Default::default()
+        }]);
+        let (with_rec, code) = why_with("net.ipv4.tcp_rmem", &eval, |_| {
+            panic!("a recommendation must not fall through to a filesystem read")
+        })
+        .unwrap();
+        assert_eq!(code, 1);
+        assert_eq!(with_rec["current"], output["current"]);
     }
 
     #[test]
