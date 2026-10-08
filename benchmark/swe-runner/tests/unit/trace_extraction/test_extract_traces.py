@@ -850,3 +850,53 @@ class TestTraceAnalysis:
         assert detail_dir.exists()
         assert not stale_file.exists()
         assert (detail_dir / "astropy__astropy-1.csv").exists()
+
+
+class TestExecCommandClassification:
+    """The exec-command classifiers must recognize commands joined to the next
+    shell segment by ; & | or wrapped in (), not only whitespace-terminated
+    forms — piped and chained invocations are the common agent shapes."""
+
+    def test_pytest_chained_with_semicolon(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import _is_pytest_command
+
+        assert _is_pytest_command("pytest;echo done")
+        assert _is_pytest_command("python -m pytest&&pytest tests/x.py")
+
+    def test_pytest_inside_subshell(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import _is_pytest_command
+
+        assert _is_pytest_command("(cd tests && pytest)")
+
+    def test_git_diff_piped(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import _is_git_diff_command
+
+        assert _is_git_diff_command("git diff|grep '+++'")
+        assert _is_git_diff_command("git diff&&git log -1")
+
+    def test_search_piped_to_head(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import _is_search_command
+
+        assert _is_search_command("rg pattern|head -20")
+
+    def test_plain_forms_still_match(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import (
+            _is_git_diff_command,
+            _is_pytest_command,
+            _is_search_command,
+        )
+
+        assert _is_pytest_command("pytest -q tests/")
+        assert _is_git_diff_command("git diff")
+        assert _is_search_command("grep -rn foo src/")
+
+    def test_non_matching_neighbours_stay_out(self):
+        from swe_runner.trace_extraction.openclaw_jsonl import (
+            _is_git_diff_command,
+            _is_pytest_command,
+            _is_search_command,
+        )
+
+        assert not _is_pytest_command("pytestx --foo")
+        assert not _is_git_diff_command("git difftool")
+        assert not _is_search_command("rgx pattern")
