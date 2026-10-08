@@ -43,9 +43,12 @@ Object keys are emitted in alphabetical order. Read fields by name rather than r
 | 2    | Error (details in stderr JSON) |
 
 `rollback` returns `0` when all recorded values are restored (an empty ledger
-is a successful no-op), `1` when any value failed or its path was missing,
-and `2` for a command error such as an unreadable ledger. Incomplete restoration
-keeps its JSON counts on stdout and preserves the ledger for retry.
+is a successful no-op), `1` when any value failed, its path was missing, or a
+persisted config file could not be removed, and `2` for a command error such as
+an unreadable ledger. Incomplete restoration keeps its JSON counts on stdout and
+preserves the ledger for retry; a persisted file that survived the cleanup
+counts as a failure there, because it re-applies the tuned values on the next
+boot.
 
 ### check output
 

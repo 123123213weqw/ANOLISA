@@ -1429,6 +1429,66 @@ fn restore_entries_with(
     }
 }
 
+/// Delete one persisted config file, reporting what happened. Returns whether
+/// the file is gone: one that survived still re-applies the tuned values on the
+/// next boot, so the caller must not report a finished rollback.
+fn remove_persisted(path: &str, quiet: bool) -> bool {
+    if !Path::new(path).exists() {
+        return true;
+    }
+    match fs::remove_file(path) {
+        Ok(()) => {
+            if !quiet {
+                println!("  已清理 {path}");
+            }
+            true
+        }
+        Err(err) => {
+            if !quiet {
+                println!("  {} {path} : {err}（未清理）", "✗".red());
+            }
+            false
+        }
+    }
+}
+
+/// Delete the persisted config `tune` wrote and, only when every file is gone,
+/// the rollback ledger at `ledger`. Returns how many persisted files could not
+/// be removed.
+///
+/// The removal result used to be discarded while the 已清理 line printed
+/// unconditionally and the ledger was deleted anyway: on an `/etc` that refuses
+/// the delete (immutable file, read-only mount, a directory in the file's
+/// place) `rollback` reported success, exited 0, and dropped the only record of
+/// the originals — the next boot then re-applied every tuned value from the
+/// surviving file with nothing left to roll it back with.
+fn finalize_rollback_at(
+    ledger: &str,
+    sysctl_path: &str,
+    service_path: &str,
+    script_path: &str,
+    quiet: bool,
+) -> usize {
+    let mut failed = 0;
+    if !remove_persisted(sysctl_path, quiet) {
+        failed += 1;
+    }
+    if Path::new(service_path).exists() {
+        systemctl_quiet(&["disable", "ktuner-nonsysctl.service"]);
+        if !remove_persisted(service_path, quiet) {
+            failed += 1;
+        }
+        systemctl_quiet(&["daemon-reload"]);
+    }
+    if !remove_persisted(script_path, quiet) {
+        failed += 1;
+    }
+    if failed == 0 {
+        fs::remove_file(ledger).ok();
+    }
+    failed
+}
+
 fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     let _guard = lock_ledger_at(ROLLBACK_PATH)?;
     if !Path::new(ROLLBACK_PATH).exists() {
@@ -1440,46 +1500,44 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
     let RollbackOutcome {
         restored,
-        failed,
+        mut failed,
         skipped,
     } = restore_entries(&data, quiet);
 
+    // A persisted file that survived cleanup re-applies the tuned values on the
+    // next boot, so the restoration is not complete. Counting it like a failed
+    // or skipped restore is what keeps the ledger for a retry and turns the exit
+    // code into 1 (#4535), instead of a silent success that deletes the
+    // originals.
+    let mut cleanup_failed = 0;
     if rollback_should_finalize(failed, skipped) {
-        if Path::new(SYSCTL_PERSIST_PATH).exists() {
-            fs::remove_file(SYSCTL_PERSIST_PATH).ok();
-            if !quiet {
-                println!("  已清理 {SYSCTL_PERSIST_PATH}");
-            }
-        }
-
-        if Path::new(NONSYSCTL_SERVICE_PATH).exists() {
-            systemctl_quiet(&["disable", "ktuner-nonsysctl.service"]);
-            fs::remove_file(NONSYSCTL_SERVICE_PATH).ok();
-            systemctl_quiet(&["daemon-reload"]);
-            if !quiet {
-                println!("  已清理 {NONSYSCTL_SERVICE_PATH}");
-            }
-        }
-
-        if Path::new(NONSYSCTL_SCRIPT_PATH).exists() {
-            fs::remove_file(NONSYSCTL_SCRIPT_PATH).ok();
-            if !quiet {
-                println!("  已清理 {NONSYSCTL_SCRIPT_PATH}");
-            }
-        }
-
-        fs::remove_file(ROLLBACK_PATH).ok();
-    } else if !quiet {
-        println!(
-            "  {} {} 项恢复失败、{} 项路径缺失，已保留 {} 以便重试（未删除持久化配置）",
-            "⚠".yellow(),
-            failed,
-            skipped,
-            ROLLBACK_PATH
+        cleanup_failed = finalize_rollback_at(
+            ROLLBACK_PATH,
+            SYSCTL_PERSIST_PATH,
+            NONSYSCTL_SERVICE_PATH,
+            NONSYSCTL_SCRIPT_PATH,
+            quiet,
         );
+        failed += cleanup_failed;
     }
 
     if !quiet {
+        if cleanup_failed > 0 {
+            println!(
+                "  {} {} 项持久化配置未能删除，已保留 {} 以便重试（其中的调优值仍会在下次启动时生效）",
+                "⚠".yellow(),
+                cleanup_failed,
+                ROLLBACK_PATH
+            );
+        } else if failed > 0 || skipped > 0 {
+            println!(
+                "  {} {} 项恢复失败、{} 项路径缺失，已保留 {} 以便重试（未删除持久化配置）",
+                "⚠".yellow(),
+                failed,
+                skipped,
+                ROLLBACK_PATH
+            );
+        }
         println!();
         println!("  共恢复 {restored} 项配置。");
     }
@@ -2567,6 +2625,103 @@ mod tests {
         assert!(!rollback_should_finalize(1, 0)); // a write failed
         assert!(!rollback_should_finalize(0, 1)); // a path was absent — the missed case
         assert!(!rollback_should_finalize(2, 3));
+    }
+
+    /// A persisted file that survives the cleanup re-applies the tuned values on
+    /// the next boot, so the rollback is not complete: the failure has to be
+    /// counted — which keeps the ledger for a retry and turns the exit code into
+    /// 1 — instead of printing 已清理 and deleting the ledger that still holds
+    /// the originals.
+    ///
+    /// A directory standing in for the persisted file makes `remove_file` fail
+    /// with `EISDIR` on every filesystem, so this needs neither root nor a
+    /// read-only `/etc`.
+    #[test]
+    fn test_cleanup_failure_keeps_the_ledger_and_reports_incomplete() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_cleanup_failure_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let ledger = dir.join("rollback.json");
+        fs::write(&ledger, b"{}").expect("write ledger");
+        let sysctl = dir.join("99-ktuner.conf");
+        fs::create_dir_all(&sysctl).expect("create a directory where the file belongs");
+        let service = dir.join("ktuner-nonsysctl.service");
+        let script = dir.join("apply-nonsysctl.sh");
+        fs::write(&script, b"#!/bin/sh\n").expect("write script");
+
+        let cleanup_failed = finalize_rollback_at(
+            ledger.to_str().unwrap(),
+            sysctl.to_str().unwrap(),
+            service.to_str().unwrap(),
+            script.to_str().unwrap(),
+            true,
+        );
+
+        assert_eq!(
+            cleanup_failed, 1,
+            "exactly the file that could not be removed is counted"
+        );
+        assert!(
+            ledger.exists(),
+            "the ledger keeps the originals the surviving file will re-apply, \
+             so a failed cleanup must not delete it"
+        );
+        assert!(!script.exists(), "the removable files are still cleaned up");
+
+        // What those counts mean for the caller: a cleanup failure is an
+        // incomplete restoration, like a failed or skipped restore, so the
+        // ledger survives and `rollback` exits 1 rather than 0.
+        let outcome = RollbackOutcome {
+            restored: 3,
+            failed: cleanup_failed,
+            skipped: 0,
+        };
+        assert!(!outcome.is_complete());
+        assert_eq!(classify_rollback(&outcome), RollbackStatus::Partial);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The success path is unchanged: every persisted file goes first, and only
+    /// then the ledger.
+    #[test]
+    fn test_cleanup_deletes_every_file_and_then_the_ledger() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_cleanup_complete_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let ledger = dir.join("rollback.json");
+        fs::write(&ledger, b"{}").expect("write ledger");
+        let sysctl = dir.join("99-ktuner.conf");
+        fs::write(&sysctl, b"vm.swappiness = 10\n").expect("write sysctl file");
+        let service = dir.join("ktuner-nonsysctl.service");
+        fs::write(&service, b"[Unit]\n").expect("write unit file");
+        let script = dir.join("apply-nonsysctl.sh");
+        fs::write(&script, b"#!/bin/sh\n").expect("write script");
+
+        let cleanup_failed = finalize_rollback_at(
+            ledger.to_str().unwrap(),
+            sysctl.to_str().unwrap(),
+            service.to_str().unwrap(),
+            script.to_str().unwrap(),
+            true,
+        );
+
+        assert_eq!(cleanup_failed, 0);
+        assert!(!sysctl.exists() && !service.exists() && !script.exists());
+        assert!(
+            !ledger.exists(),
+            "a complete cleanup drops the ledger with the persisted config"
+        );
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
