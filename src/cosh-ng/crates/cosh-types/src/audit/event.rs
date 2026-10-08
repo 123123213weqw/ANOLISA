@@ -279,8 +279,11 @@ impl Default for AuditSettings {
     fn default() -> Self {
         Self {
             mode: AuditMode::BestEffort,
+            // Per-user execution-audit budget: 30 days and 100 MiB, whichever
+            // comes first. Approved by the user; the decision record is not
+            // committed to this repository, so the values are stated here.
             retention_days: 30,
-            max_disk_bytes: 1024 * 1024 * 1024,
+            max_disk_bytes: 100 * 1024 * 1024,
             mode_source: AuditSettingSource::Default,
             retention_days_source: AuditSettingSource::Default,
             max_disk_bytes_source: AuditSettingSource::Default,

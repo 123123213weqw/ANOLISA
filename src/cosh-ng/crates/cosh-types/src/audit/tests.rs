@@ -282,3 +282,19 @@ fn unknown_event_payload_is_bounded() {
     event.data = serde_json::json!({"future": "x".repeat(MAX_UNKNOWN_DATA_BYTES + 1)});
     assert!(event.validate().is_err());
 }
+
+/// Drift guard for the approved per-user execution-audit budget of 30 days and
+/// 100 MiB. These defaults are what Core passes to `schedule_retention`, so a
+/// change here silently alters how much audit history every user keeps.
+///
+/// This case pins the *values* only; it does not prove the cap is enforced. The
+/// enforcement side lives in `cosh-platform`'s retention tests, which drive
+/// `schedule_retention` with a one-byte `max_disk_bytes`. The approval decision
+/// record is not committed to this repository, so the numbers are stated here
+/// rather than cited.
+#[test]
+fn audit_settings_default_matches_the_approved_per_user_budget() {
+    let settings = AuditSettings::default();
+    assert_eq!(settings.retention_days, 30);
+    assert_eq!(settings.max_disk_bytes, 100 * 1024 * 1024);
+}

@@ -18,6 +18,9 @@ mod animation;
 mod approval;
 #[path = "raw_cli/audit.rs"]
 mod audit;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[path = "support/audit_system_config.rs"]
+mod audit_system_config;
 #[path = "raw_cli/auth.rs"]
 mod auth;
 #[path = "raw_cli/auth_ecs.rs"]
@@ -54,6 +57,8 @@ mod heavy;
 mod host_executed;
 #[path = "raw_cli/i18n.rs"]
 mod i18n;
+#[path = "raw_cli/log_budget.rs"]
+mod log_budget;
 #[path = "raw_cli/memory_hook.rs"]
 mod memory_hook;
 #[path = "raw_cli/mode.rs"]

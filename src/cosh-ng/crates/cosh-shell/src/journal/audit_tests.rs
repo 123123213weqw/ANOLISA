@@ -603,3 +603,86 @@ fn walk_segment_text(root: &Path) -> String {
     }
     text
 }
+
+fn approval_input(status: &'static str) -> ShellApprovalAuditInput<'static> {
+    ShellApprovalAuditInput {
+        id: "approval-s02",
+        audit_ref: None,
+        session_id: "session-1",
+        run_id: "run-1",
+        request_id: Some("request-1"),
+        tool_use_id: Some("tool-1"),
+        subject: "run_shell_command",
+        risk: "medium",
+        assessment: None,
+        preview: "$ echo ok",
+        status,
+    }
+}
+
+/// S02: a *real* audit write failure must fail the governed boundary closed and
+/// then recover, without recreating the recorder.
+///
+/// The failure is injected by making an ancestor of the audit root a regular
+/// file, so `openat(O_DIRECTORY)` fails with ENOTDIR. Unlike `chmod 000`, this
+/// is not a DAC check, so running the suite as root cannot bypass it.
+#[test]
+fn required_mode_real_write_failure_blocks_then_recovers() {
+    let base = private_root();
+    let blocker = base.join("blocker");
+    std::fs::write(&blocker, b"not a directory").unwrap();
+    let audit_root = blocker.join("audit");
+
+    assert!(
+        AuditSegmentWriter::create(&audit_root).is_err(),
+        "precondition: the audit root must be genuinely unusable"
+    );
+
+    let mut recorder = ShellAuditRecorder {
+        writer: AuditSegmentWriter::create(&audit_root).ok(),
+        writer_root: Some(audit_root.clone()),
+        mode: AuditMode::Required,
+        shell_session_id: "session-1".to_string(),
+        seen_events: 0,
+        hash_salt: "salt".to_string(),
+        degraded: true,
+        warning_emitted: false,
+        owned_approvals: std::collections::HashSet::new(),
+        resolved_approvals: std::collections::HashSet::new(),
+        command_refs: std::collections::HashMap::new(),
+    };
+    assert!(recorder.writer.is_none());
+
+    // Registering the request is an optional record: it degrades to None
+    // instead of erroring, and still marks Shell ownership so the governed
+    // resolution below cannot be skipped as externally owned.
+    assert!(recorder
+        .record_approval_requested(approval_input("pending"))
+        .is_none());
+
+    let blocked = recorder.record_approval_resolved(approval_input("approved"));
+    assert!(
+        blocked
+            .unwrap_err()
+            .starts_with("AUDIT_REQUIRED_UNAVAILABLE"),
+        "required audit must fail closed on a real write failure"
+    );
+
+    // Positive control after recovery: the same recorder dispatches again once
+    // the root is usable, so the block is caused by the write failure alone.
+    // The replacement directory must satisfy the writer's private-directory
+    // rule (0700, owned by us), which is the same check that made the unusable
+    // root fail.
+    std::fs::remove_file(&blocker).unwrap();
+    std::fs::create_dir_all(&audit_root).unwrap();
+    std::fs::set_permissions(&audit_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let recovered = recorder
+        .record_approval_resolved(approval_input("approved"))
+        .expect("recorder must recover once the audit root is usable");
+    assert!(
+        recovered.is_some(),
+        "recovered resolution must yield an event id"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
