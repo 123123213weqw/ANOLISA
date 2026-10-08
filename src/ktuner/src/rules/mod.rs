@@ -4660,19 +4660,52 @@ fn eval_laptop_mode(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current != 0 && info.memory_total_gb >= 16 {
-        recs.push(Recommendation {
-            param: "vm.laptop_mode".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "服务器环境启用了笔记本省电模式，会延迟磁盘写入增加数据丢失风险".to_string(),
-            confidence: Confidence::High,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = laptop_mode_recommendation(
+        read_sysctl_u64(path),
+        info.memory_total_gb,
+        &info.kernel_version,
+    ) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `vm.laptop_mode` recommendation for an already-read value.
+///
+/// Split out from the file probe so the kernel-version gate is testable on any
+/// host.
+///
+/// Laptop mode was removed in Linux 7.0 (commit 64dd89ae01f2, "mm/block/fs:
+/// remove laptop_mode"): every reader of the knob is gone — the deferred
+/// writeback after an IO completion (block/blk-mq.c), the `may_writepage`
+/// gate in reclaim (mm/vmscan.c), the balance_dirty_pages early writeback and
+/// the delayed `laptop_mode_wb_timer` (mm/page-writeback.c), XFS's early log
+/// work (fs/xfs/xfs_super.c) and the post-sync timer cancel (fs/sync.c) —
+/// while the sysctl itself stays behind a handler that only warns
+/// "vm.laptop_mode is deprecated. Ignoring setting." on write
+/// (mm/page-writeback.c). Recommending 0 there promises less write delay that
+/// can no longer happen, and each applied write adds a deprecation warning to
+/// the kernel log, so from 7.0 on the rule stays quiet.
+fn laptop_mode_recommendation(
+    current: u64,
+    memory_total_gb: u64,
+    kernel_version: &str,
+) -> Option<Recommendation> {
+    if kernel_at_least(kernel_version, 7, 0) {
+        return None;
+    }
+    if current == 0 || memory_total_gb < 16 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "vm.laptop_mode".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: "服务器环境启用了笔记本省电模式，会延迟磁盘写入增加数据丢失风险".to_string(),
+        confidence: Confidence::High,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_tcp_adv_win_scale(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -11242,6 +11275,25 @@ mod tests {
         // Unparseable strings keep the caller's legacy behavior.
         assert!(!kernel_at_least("", 4, 15));
         assert!(!kernel_at_least("custom-kernel", 4, 15));
+    }
+
+    #[test]
+    fn laptop_mode_recommendation_gates_on_kernel_version() {
+        // Through 6.19 the knob still defers writeback, so the advice holds.
+        let rec = laptop_mode_recommendation(5, 64, "6.19.0")
+            .expect("pre-7.0 kernels still consume the vm.laptop_mode knob");
+        assert_eq!(rec.current_value, "5");
+        assert_eq!(rec.recommended_value, "0");
+        assert_eq!(rec.category, Category::Performance);
+        assert!(laptop_mode_recommendation(5, 64, "5.15.0-microsoft-standard-WSL2").is_some());
+        // 7.0 removed laptop mode (commit 64dd89ae01f2): the sysctl survives
+        // only as a deprecated write-without-effect knob, so the advice would
+        // promise less write delay that can no longer happen.
+        assert!(laptop_mode_recommendation(5, 64, "7.0.0").is_none());
+        assert!(laptop_mode_recommendation(5, 64, "7.3.0-rc6").is_none());
+        // Already off, or not a big-memory host: no advice on any version.
+        assert!(laptop_mode_recommendation(0, 64, "6.19.0").is_none());
+        assert!(laptop_mode_recommendation(5, 8, "6.19.0").is_none());
     }
 
     #[test]
