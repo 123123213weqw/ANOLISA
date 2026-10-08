@@ -6784,6 +6784,7 @@ fn eval_hung_task_warnings(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -
 fn eval_overcommit_ratio(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     let oc_path = "/proc/sys/vm/overcommit_memory";
     let ratio_path = "/proc/sys/vm/overcommit_ratio";
+    let kbytes_path = "/proc/sys/vm/overcommit_kbytes";
     if !std::path::Path::new(ratio_path).exists() {
         return 1;
     }
@@ -6792,7 +6793,16 @@ fn eval_overcommit_ratio(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
         return 1;
     }
     let ratio = read_sysctl_u64(ratio_path);
-    overcommit_ratio_recommendation(oc_mode, ratio, is_database_present(info), recs);
+    // The ratio reads 0 while its counterpart holds the commit limit, so the
+    // probe has to hand the value branch that counterpart to tell "disabled"
+    // apart from "too low". A kernel without the kbytes file reports 0, which
+    // leaves the ratio advice exactly as it was.
+    let kbytes = if std::path::Path::new(kbytes_path).exists() {
+        read_sysctl_u64(kbytes_path)
+    } else {
+        0
+    };
+    overcommit_ratio_recommendation(oc_mode, ratio, kbytes, is_database_present(info), recs);
     1
 }
 
@@ -6820,16 +6830,31 @@ fn is_database_present(info: &SystemInfo) -> bool {
 
 /// Pure core of the `vm.overcommit_ratio` rule: a strict-mode
 /// (`overcommit_memory == 2`) database host whose ratio sits below 80 gets
-/// exactly one raise-to-80 recommendation. Split from the /proc probe so the
-/// branch is assertable on any host instead of only on one already running
-/// `overcommit_memory=2`.
+/// exactly one raise-to-80 recommendation — unless `vm.overcommit_kbytes`
+/// holds the commit limit, in which case the ratio reads 0 because the kernel
+/// disabled it rather than because it is low.
+///
+/// `overcommit_kbytes` is the ratio's counterpart: `overcommit_ratio_handler`
+/// zeroes `sysctl_overcommit_kbytes` on every write and
+/// `overcommit_kbytes_handler` zeroes `sysctl_overcommit_ratio`, so only one
+/// of the pair is ever configured, and `vm_commit_limit()` prefers a non-zero
+/// kbytes. vm.rst's overcommit_kbytes section states the pair outright:
+/// "Only one of them may be specified at a time. Setting one disables the
+/// other (which then appears as 0 when read)." Raising a disabled ratio to 80
+/// therefore does not adjust the limit the administrator set — it replaces a
+/// fixed commit limit with 80% of RAM, which is the opposite of what the
+/// reason promises.
+///
+/// Split from the /proc probe so the branch is assertable on any host instead
+/// of only on one already running `overcommit_memory=2`.
 fn overcommit_ratio_recommendation(
     oc_mode: u64,
     ratio: u64,
+    kbytes: u64,
     db_present: bool,
     recs: &mut Vec<Recommendation>,
 ) {
-    if !db_present || oc_mode != 2 || ratio >= 80 {
+    if kbytes != 0 || !db_present || oc_mode != 2 || ratio >= 80 {
         return;
     }
     recs.push(Recommendation {
@@ -7263,12 +7288,12 @@ mod tests {
         // A strict-mode host running only client tooling must not be tuned:
         // under the old substring predicate mysqldump/mysqlrouter passed here.
         let mut recs = Vec::new();
-        overcommit_ratio_recommendation(2, 50, false, &mut recs);
+        overcommit_ratio_recommendation(2, 50, 0, false, &mut recs);
         assert!(recs.is_empty(), "client tools are not a database workload");
 
         // The genuine case still fires with the documented value.
         let mut recs = Vec::new();
-        overcommit_ratio_recommendation(2, 50, true, &mut recs);
+        overcommit_ratio_recommendation(2, 50, 0, true, &mut recs);
         assert_eq!(recs.len(), 1);
         assert_eq!(recs[0].param, "vm.overcommit_ratio");
         assert_eq!(recs[0].current_value, "50");
@@ -7278,13 +7303,42 @@ mod tests {
         // Non-strict overcommit modes stay silent even for a real database.
         for oc_mode in [0, 1] {
             let mut recs = Vec::new();
-            overcommit_ratio_recommendation(oc_mode, 50, true, &mut recs);
+            overcommit_ratio_recommendation(oc_mode, 50, 0, true, &mut recs);
             assert!(recs.is_empty(), "mode {oc_mode} is not strict overcommit");
         }
         // A ratio already at or above the floor needs no change.
         let mut recs = Vec::new();
-        overcommit_ratio_recommendation(2, 80, true, &mut recs);
+        overcommit_ratio_recommendation(2, 80, 0, true, &mut recs);
         assert!(recs.is_empty(), "80 already meets the floor");
+    }
+
+    #[test]
+    fn overcommit_ratio_stays_quiet_while_kbytes_holds_the_limit() {
+        // A host pinned to a fixed commit limit reads overcommit_ratio as 0:
+        // the kernel's overcommit_ratio_handler zeroes sysctl_overcommit_kbytes
+        // on every write and overcommit_kbytes_handler zeroes the ratio
+        // (mm/util.c), so only one of the pair is ever configured — vm.rst's
+        // overcommit_kbytes section says so outright ("Setting one disables
+        // the other (which then appears as 0 when read)").
+        //
+        // That zero is the DISABLED counterpart, not a low ratio, and
+        // vm_commit_limit() prefers the non-zero kbytes. Raising the ratio to
+        // 80 there would not lift the limit the administrator set — it would
+        // silently replace a fixed 8 GiB with 80% of RAM, the opposite of what
+        // the rule's reason promises. The advice must not fire.
+        let mut recs = Vec::new();
+        overcommit_ratio_recommendation(2, 0, 8 * 1024 * 1024 * 1024, true, &mut recs);
+        assert!(
+            recs.is_empty(),
+            "kbytes holds the commit limit, so the zero ratio is disabled, not low: {recs:?}"
+        );
+
+        // The same zero ratio with no kbytes twin is the "nothing configured"
+        // case the rule exists for, and still fires.
+        let mut recs = Vec::new();
+        overcommit_ratio_recommendation(2, 0, 0, true, &mut recs);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].recommended_value, "80");
     }
 
     #[test]
