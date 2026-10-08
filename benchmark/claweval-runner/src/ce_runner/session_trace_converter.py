@@ -512,8 +512,25 @@ def convert_session_to_trace(
 
                 del tool_call_map[tool_call_id]
 
-    # Sort body events by timestamp (stable sort preserves original order for ties)
-    body_events.sort(key=lambda e: e["timestamp"])
+    # Sort body events by timestamp. The timestamps carry UTC offsets from the
+    # session file (and UTC `now_iso()` for synthesized ones), so comparing
+    # the raw strings orders "+08:00" wall times against UTC as text: an
+    # 11:00+08:00 event (03:00Z) sorted after a 09:00+00:00 one, flipping the
+    # question/answer order the grader reads. Compare parsed instants instead;
+    # the sort stays stable, and an unparsable timestamp falls back to its
+    # text so the event is never dropped.
+    def _sort_key(event: dict) -> tuple:
+        raw = event.get("timestamp", "")
+        try:
+            parsed = datetime.fromisoformat(normalize_timestamp(raw))
+            epoch = parsed.timestamp() if parsed.tzinfo else parsed.replace(
+                tzinfo=timezone.utc
+            ).timestamp()
+        except (ValueError, OSError, TypeError):
+            return (1, raw)
+        return (0, epoch)
+
+    body_events.sort(key=_sort_key)
 
     # 3. Build output: trace_start + sorted body + tail (audit + trace_end)
     output_events: list[dict] = [
