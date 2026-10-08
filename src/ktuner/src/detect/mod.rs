@@ -133,6 +133,15 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
     // OpenRC, ...), so whitelist those to avoid misclassifying them as
     // containers (which would wrongly mark params read-only and steer the user
     // to the host-export workflow).
+    //
+    // `dumb-init` is deliberately absent: it is "designed to run as PID 1
+    // inside minimal container environments" (its own README), and outside
+    // containers it is a child of a supervisor rather than PID 1, so its name
+    // at PID 1 identifies a container — the same shim class as `tini`, which
+    // this list has never included. It was the remaining case of a cgroup-v2
+    // container (whose /proc/1/cgroup is the namespace root `0::/`) still being
+    // reported as a bare host, now that systemd's own containers carry the
+    // /run/systemd/container marker.
     if let Some(sched) = read_text_lossy(&root.join("proc/1/sched")) {
         const KNOWN_INIT: &[&str] = &[
             "systemd",
@@ -144,7 +153,6 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
             "upstart",
             "busybox",
             "procd",
-            "dumb-init",
         ];
         let comm = sched.split_whitespace().next().unwrap_or("");
         if !KNOWN_INIT.iter().any(|i| comm.starts_with(i)) {
@@ -2084,6 +2092,44 @@ mod tests {
         );
 
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `dumb-init` is a container's PID 1, not a bare host's init system: it is
+    /// "designed to run as PID 1 inside minimal container environments", and
+    /// outside containers it runs as a child of a supervisor rather than as
+    /// PID 1. A container with no marker file left — the cgroup-v2 shape whose
+    /// `/proc/1/cgroup` is the namespace root `0::/` — must report Container,
+    /// exactly like its peer shim `tini`, which the whitelist never listed.
+    #[test]
+    fn runtime_env_reads_dumb_init_as_a_container_init() {
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_dumb_init_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+        // A private cgroup namespace: PID 1's own cgroup is the namespace root,
+        // so the cgroup check sees no container path.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+
+        fs::write(proc1.join("sched"), b"dumb-init (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(
+            runtime_env_from(&root),
+            RuntimeEnv::Container,
+            "dumb-init is a container's PID 1, not a bare host's init"
+        );
+
+        // Its peer shim, never whitelisted, already reads as a container.
+        fs::write(proc1.join("sched"), b"tini (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+
+        // Guard: a real host init with the same cgroup is still a bare host.
+        fs::write(proc1.join("sched"), b"systemd (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
     }
 
     /// `/proc/1/sched` starts with PID 1's comm, which may hold non-UTF-8
