@@ -387,7 +387,13 @@ impl NativeLineState {
         self.dirty = false;
         self.in_paste = false;
         self.pending_paste_delimiter.clear();
-        self.multiline_paste_observed = false;
+        // `multiline_paste_observed` is NOT reset here: it is take()-style
+        // observation state (read once per chunk by `observe_native_line`),
+        // not mirror state. A paste tool or fast terminal can batch the
+        // multiline paste and its submitting newline into one PTY read; the
+        // newline reaches this `clear()` in the same chunk that set the
+        // flag, and resetting it here would drop the MultilinePasteObserved
+        // event the #1932 F5 hint depends on.
     }
 
     fn pop_visible_char(&mut self) {
@@ -653,43 +659,5 @@ fn incomplete_escape_suffix(bytes: &[u8]) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{starts_native_intercept_candidate, NativeLineState};
-
-    #[test]
-    fn native_intercept_candidate_only_starts_at_line_start() {
-        let mut state = NativeLineState::default();
-
-        assert!(starts_native_intercept_candidate(b"/", &state, false));
-        assert!(starts_native_intercept_candidate(
-            b"?? hello",
-            &state,
-            false
-        ));
-        assert!(!starts_native_intercept_candidate(
-            "你".as_bytes(),
-            &state,
-            false
-        ));
-        assert!(starts_native_intercept_candidate(
-            "你".as_bytes(),
-            &state,
-            true
-        ));
-        state.observe_shell_bytes(b"vim .");
-        assert!(!starts_native_intercept_candidate(b"/", &state, true));
-        assert!(!starts_native_intercept_candidate(
-            b"?? hello",
-            &state,
-            true
-        ));
-        assert!(!starts_native_intercept_candidate(
-            "你".as_bytes(),
-            &state,
-            true
-        ));
-
-        state.observe_shell_bytes(b"\n");
-        assert!(starts_native_intercept_candidate(b"/mode", &state, false));
-    }
-}
+#[path = "event_parser_tests.rs"]
+mod event_parser_tests;
