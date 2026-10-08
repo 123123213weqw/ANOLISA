@@ -92,7 +92,7 @@ clap = { version = "4.6", features = ["derive"] }
 dirs = "6"
 fancy-regex = "0.16"
 log = "0.4"
-nix = { version = "0.31", default-features = false, features = ["user"] }
+nix = { version = "0.31", default-features = false, features = ["user", "fs"] }
 regex = "1.10"
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled"] }

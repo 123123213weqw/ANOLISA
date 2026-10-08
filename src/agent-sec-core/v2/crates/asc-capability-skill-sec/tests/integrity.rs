@@ -291,7 +291,7 @@ fn source_exclusions_and_snapshot_strictness_match_the_contract() {
 fn special_files_never_block_source_or_snapshot_hashing() {
     let (_dir, path) = state();
     let fifo = path.join("fifo");
-    rustix::fs::mkfifoat(rustix::fs::CWD, &fifo, rustix::fs::Mode::RUSR).unwrap();
+    nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
     let _socket = std::os::unix::net::UnixListener::bind(path.join("socket")).unwrap();
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

@@ -50,7 +50,7 @@ pub(crate) struct Entry {
     pub path: String,
     pub kind: EntryKind,
     pub size: u64,
-    device: u64,
+    device: rustix::fs::Dev,
     inode: u64,
 }
 
@@ -244,8 +244,11 @@ impl ScanTree {
                     .map_err(|e| io_error(&entry.path, e))?,
             );
         }
-        let before = parent.metadata().map_err(|e| io_error(&entry.path, e))?;
-        if !before.is_file() || before.dev() != entry.device || before.ino() != entry.inode {
+        let before = rustix::fs::fstat(&parent).map_err(|e| io_error(&entry.path, e))?;
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+            || before.st_dev != entry.device
+            || before.st_ino != entry.inode
+        {
             return Err(SkillSecError::Integrity(
                 "Skill entry changed before scan".into(),
             ));

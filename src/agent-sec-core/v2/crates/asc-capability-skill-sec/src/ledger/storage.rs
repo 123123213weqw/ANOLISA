@@ -156,7 +156,12 @@ impl Directory {
         result
     }
 
-    pub fn write_new(&self, name: &str, bytes: &[u8], mode: u32) -> Result<File, SkillSecError> {
+    pub fn write_new(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        mode: rustix::fs::RawMode,
+    ) -> Result<File, SkillSecError> {
         validate_name(name)?;
         let path = self.path.join(name);
         let mut file = File::from(

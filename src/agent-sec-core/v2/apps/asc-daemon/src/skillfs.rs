@@ -2,14 +2,14 @@
 
 mod auth;
 mod resolver;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests;
 use crate::skill_worker::{Queue, SkillWorker};
 
 use asc_action_types::CallerIdentity;
 use asc_capability_skill_sec::executor::SkillEnvironment;
 use asc_capability_skill_sec::{SkillIdentity, SkillRoot, SkillSecError};
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use asc_daemon_core::ActionService;
 use asc_daemon_handler::DaemonDispatcher;
 use asc_daemon_service::{
@@ -59,7 +59,7 @@ pub enum SkillFsError {
     /// Invalid configuration or resolver response.
     #[error("SkillFS: {0}")]
     Invalid(&'static str),
-    /// The background worker cannot currently admit a notification.
+    /// The integration is unsupported or the worker cannot currently admit a notification.
     #[error("SkillFS: {0}")]
     Unavailable(&'static str),
     /// Socket or filesystem failure.
@@ -94,8 +94,13 @@ impl SkillFsBridge {
     /// Validates mount bindings and loads resources before registering the application runtime.
     ///
     /// # Errors
-    /// Rejects overlapping roots and unsafe keys.
+    /// Rejects non-Linux platforms, overlapping roots and unsafe keys.
     pub fn prepare(config: SkillFsConfig, worker: &SkillWorker) -> Result<Self, SkillFsError> {
+        if !cfg!(target_os = "linux") {
+            return Err(SkillFsError::Unavailable(
+                "SkillFS integration requires Linux",
+            ));
+        }
         validate_config(&config)?;
         let secret = resolver::load_secret(&config.auth_key_file)?;
         Ok(Self {
@@ -474,4 +479,23 @@ struct Change {
     skill_id: String,
     event_kind: String,
     paths: Vec<String>,
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod unsupported_platform_tests {
+    use super::{SkillFsBridge, SkillFsConfig, SkillFsError, SkillWorker};
+
+    #[test]
+    fn prepare_rejects_platform_before_validating_configuration() {
+        let config = SkillFsConfig {
+            auth_key_file: "/unused-skillfs-key".into(),
+            mounts: Vec::new(),
+        };
+        assert!(matches!(
+            SkillFsBridge::prepare(config, &SkillWorker::default()),
+            Err(SkillFsError::Unavailable(
+                "SkillFS integration requires Linux"
+            ))
+        ));
+    }
 }

@@ -137,7 +137,7 @@ mod tests {
     #[test]
     fn consumer_errors_and_kernel_identity_remain_distinct_from_protocol_errors() {
         let directory = tempfile::tempdir().unwrap();
-        let state = directory.path().join("state");
+        let state = directory.path().canonicalize().unwrap().join("state");
         fs::create_dir(&state).unwrap();
         fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
         let service = Arc::new(
@@ -199,7 +199,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
-                    state_dir: directory.path().into(),
+                    state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },
                 ScannerRegistry::default(),
@@ -252,7 +252,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
-                    state_dir: directory.path().into(),
+                    state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },
                 ScannerRegistry::default(),

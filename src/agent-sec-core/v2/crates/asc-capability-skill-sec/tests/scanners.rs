@@ -327,6 +327,25 @@ fn yaml_merge_keys_preserve_network_findings_and_verdicts() {
 }
 
 #[test]
+fn missing_manifest_takes_priority_over_directory_limits() {
+    let (_temporary, root) = skill();
+    fs::remove_file(root.join("SKILL.md")).unwrap();
+    // Coverage limits must not mask the missing-manifest input error.
+    let nested = (0..33).fold(root.clone(), |path, _| path.join("d"));
+    fs::create_dir_all(nested).unwrap();
+    let result = analyze(&root, deadline()).unwrap();
+    assert_eq!(result.exit_code, 2);
+    assert_eq!(result.data["errors"][0]["code"], "skill-manifest-missing");
+
+    fs::write(root.join("SKILL.md"), MANIFEST).unwrap();
+    let result = analyze(&root, deadline()).unwrap();
+    assert_eq!(result.exit_code, 1);
+    assert_eq!(result.data["errors"][0]["code"], "directory-depth-limit");
+}
+
+// macOS filesystems reject non-UTF-8 names before scanner traversal can be tested.
+#[cfg(target_os = "linux")]
+#[test]
 fn missing_manifest_is_rejected_before_directory_enumeration() {
     use std::os::unix::ffi::OsStrExt as _;
 
