@@ -4468,11 +4468,67 @@ fn eval_printk(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 }
 
 fn eval_watchdog_thresh(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/watchdog_thresh";
-    if !std::path::Path::new(path).exists() {
+    eval_watchdog_thresh_at(
+        info,
+        recs,
+        "/proc/sys/kernel/watchdog_thresh",
+        "/proc/sys/kernel/soft_watchdog",
+    )
+}
+
+/// Path-injectable form of [`eval_watchdog_thresh`] (the `eval_*_at` idiom) so
+/// the soft-detector precondition is assertable against synthetic files.
+///
+/// The reason promises fewer false soft-lockup reports, and those reports come
+/// from the soft detector: `is_softlockup()` opens with
+/// `(watchdog_enabled & WATCHDOG_SOFTLOCKUP_ENABLED) && watchdog_thresh`
+/// (kernel/watchdog.c; the gate is at v6.6:409, where the enum still carries
+/// its `WATCHDOG_SOFTOCKUP_ENABLED` spelling, and at 7.3-rc6:745), so while the
+/// detector is off no report is produced for any threshold.
+/// `/proc/sys/kernel/soft_watchdog` reports that switch as the kernel itself
+/// normalizes it on read (`proc_watchdog_common()` writes `*param =
+/// (watchdog_enabled & which) != 0`, v6.6:753, 7.3-rc6:1120), so an explicit 0
+/// is the effective state.
+///
+/// The readers that remain are not the effect the reason promises:
+/// `get_softlockup_thresh()` (v6.6:318, 7.3-rc6:654) only feeds the soft
+/// report comparison, `set_sample_period()` (v6.6:334, 7.3-rc6:670) is called
+/// unconditionally by `__lockup_detector_reconfigure()` even with both
+/// detectors off (v6.6:629, 7.3-rc6:1016) and only sets the soft timer's
+/// period, the `watchdog_enabled && watchdog_thresh` gates next to it decide
+/// only whether that timer runs (v6.6:631, 7.3-rc6:1018; setup gate v6.6:662,
+/// 7.3-rc6:1044), and the hardlockup detector reads
+/// `hw_nmi_get_sample_period(watchdog_thresh)` (kernel/watchdog_perf.c,
+/// v6.6:120, 7.3-rc6:127/:134/:268) — a period this advice would only
+/// lengthen.
+///
+/// A missing file keeps the recommendation: only a kernel built without
+/// CONFIG_SOFTLOCKUP_DETECTOR lacks it, and the value still feeds the hard
+/// detector there (the same fail-open shape the all-CPU backtrace gate uses).
+/// A file that exists but cannot be read or parsed keeps it too — only a
+/// value the reader actually produced counts as the switch being off.
+fn eval_watchdog_thresh_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    soft_watchdog_path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     if info.cpu_cores < 32 {
+        return 1;
+    }
+    // No soft-lockup report, nothing for a low threshold to misfire on.
+    // Only a successfully read 0 is the off switch. `read_sysctl_u64` maps a
+    // failed read or a malformed value to 0 as well, so a masked or garbled
+    // proc entry (a container's, typically) would otherwise silence advice a
+    // live detector asked for; the missing-file rule below keeps it instead.
+    let soft_detector_off = std::fs::read_to_string(soft_watchdog_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        == Some(0);
+    if soft_detector_off {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -11002,6 +11058,116 @@ mod tests {
             rec.is_none(),
             "Should not recommend watchdog_thresh for small CPU count"
         );
+    }
+
+    #[test]
+    fn watchdog_thresh_needs_the_soft_detector() {
+        // kernel.watchdog_thresh is read by the soft detector's report and
+        // timer path — is_softlockup() opens with `watchdog_enabled &
+        // WATCHDOG_SOFTOCKUP_ENABLED && watchdog_thresh` (v6.6 watchdog.c:409,
+        // 7.3-rc6:745) — and by the hardlockup detector's sampling period
+        // (hw_nmi_get_sample_period, watchdog_perf.c v6.6:120, 7.3-rc6:127).
+        // The reason promises fewer false soft-lockup reports, and none of the
+        // remaining reads produces one, so with the soft detector off the
+        // advice cannot deliver anything.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_watchdog_thresh_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("watchdog_thresh");
+        std::fs::write(&knob, b"10\n").unwrap();
+        let soft_off = dir.join("soft_watchdog.off");
+        std::fs::write(&soft_off, b"0\n").unwrap();
+        let soft_on = dir.join("soft_watchdog.on");
+        std::fs::write(&soft_on, b"1\n").unwrap();
+        let soft_missing = dir.join("soft_watchdog.missing");
+
+        let mut info = make_test_info();
+        info.cpu_cores = 96;
+
+        let mut recs = Vec::new();
+        eval_watchdog_thresh_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            soft_on.to_str().unwrap(),
+        );
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "kernel.watchdog_thresh")
+            .expect("a live soft detector keeps the advice");
+        assert_eq!(rec.current_value, "10");
+        assert_eq!(rec.recommended_value, "30");
+
+        let mut recs = Vec::new();
+        eval_watchdog_thresh_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            soft_off.to_str().unwrap(),
+        );
+        assert!(
+            recs.is_empty(),
+            "the soft detector is off: no soft-lockup report to make less frequent: {recs:?}"
+        );
+
+        let mut recs = Vec::new();
+        eval_watchdog_thresh_at(
+            &info,
+            &mut recs,
+            knob.to_str().unwrap(),
+            soft_missing.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "kernel.watchdog_thresh"),
+            "a missing switch is a kernel-config fact; the hard detector still reads the value"
+        );
+    }
+
+    #[test]
+    fn watchdog_thresh_keeps_the_advice_when_the_switch_cannot_be_read() {
+        // `read_sysctl_u64` maps a failed read or parse to 0, so a masked proc
+        // entry, an empty file or malformed content would otherwise read as
+        // "the soft detector is off" and silence advice that a live detector
+        // asked for. Only a successfully read 0 is that switch; anything the
+        // reader cannot interpret stays with the missing-file rule and keeps
+        // the recommendation.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_watchdog_unreadable_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("watchdog_thresh");
+        std::fs::write(&knob, b"10\n").unwrap();
+        // Malformed content and an empty file: the parse fails.
+        let malformed = dir.join("soft_watchdog.malformed");
+        std::fs::write(&malformed, b"off\n").unwrap();
+        let empty = dir.join("soft_watchdog.empty");
+        std::fs::write(&empty, b"").unwrap();
+        // A directory reads as an IO error even for an unprivileged process.
+        let as_dir = dir.join("soft_watchdog.dir");
+        std::fs::create_dir_all(&as_dir).unwrap();
+
+        let mut info = make_test_info();
+        info.cpu_cores = 96;
+
+        for path in [&malformed, &empty, &as_dir] {
+            let mut recs = Vec::new();
+            eval_watchdog_thresh_at(
+                &info,
+                &mut recs,
+                knob.to_str().unwrap(),
+                path.to_str().unwrap(),
+            );
+            assert!(
+                recs.iter().any(|r| r.param == "kernel.watchdog_thresh"),
+                "{}: an unreadable switch is not a disabled detector: {recs:?}",
+                path.display()
+            );
+        }
     }
 
     #[test]
