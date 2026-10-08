@@ -97,7 +97,12 @@ pub fn classify(info: &SystemInfo) -> WorkloadType {
         || info.has_process("pulsar")
         // Pulsar keeps its ledgers on BookKeeper bookies, which append and
         // replay them sequentially.
-        || info.has_process("bookkeeper");
+        || info.has_process("bookkeeper")
+        // MinIO is the object-store server KNOWN_SERVICES already detects
+        // ("minio", "MinIO"): large sequential PUT/GET traffic is the
+        // high-throughput IO shape the profile text describes
+        // (batch/ETL/log), so a MinIO-only host must not fall to mixed.
+        || info.has_process("minio");
 
     if has_db {
         return WorkloadType::IoLatency;
@@ -397,6 +402,22 @@ mod tests {
         // A database on the same host still outranks the streaming tier.
         assert_eq!(
             classify(&make_info(vec!["pulsar", "postgres"])),
+            WorkloadType::IoLatency
+        );
+    }
+
+    /// MinIO is a service KNOWN_SERVICES already detects; an object-store
+    /// server is high-throughput sequential IO, the io-throughput profile's
+    /// own definition, not mixed.
+    #[test]
+    fn test_classify_minio() {
+        assert_eq!(
+            classify(&make_info(vec!["minio"])),
+            WorkloadType::IoThroughput
+        );
+        // A database on the same host still outranks the storage tier.
+        assert_eq!(
+            classify(&make_info(vec!["minio", "postgres"])),
             WorkloadType::IoLatency
         );
     }
