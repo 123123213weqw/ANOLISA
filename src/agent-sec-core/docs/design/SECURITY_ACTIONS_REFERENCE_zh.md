@@ -698,10 +698,13 @@ root 注入依赖；agent-sec-cli 只处理终端交互和 RPC DTO，不读取�
 V2 使用 fancy-regex，回溯上限 1,000,000、循环预算 200 ms；不承诺 20 ms 中断单次匹配。
 100 条自定义发现之后首次省略命中会停止后续匹配。自定义规则直接采用 fancy-regex 原生语义；
 与 Python 不同本身不构成错误，invalid_regex 仅用于实际解析/编译/引擎限制或加载求值失败。
-检测语义版本 `scanner_version=2.0.0` 纳入规则标识，成功/失败报告及审计均保留；
-内置 engine 为 regex_v2，自定义为 fancy_regex。此版本修复空 claims JWT 的候选漏报，
+检测语义版本 `scanner_version=2.0.1` 纳入规则标识，成功/失败报告及审计均保留；
+内置 engine 为 regex_v2，自定义为 fancy_regex。2.0.0 修复空 claims JWT 的候选漏报，
 接受结构正确的大整数/深层 JSON；身份证统一 decimal 校验并支持全角 X，银行卡排除全零。
-其他格式、置信度、位置和脱敏契约保留，变化由独立质量用例定义。
+2.0.1 与保留的 Python 检测器同步要求完整卡号表达式、支持网络的前缀/长度组合及 Luhn；
+非常规分组及不合法表达式内部的局部匹配被拒绝。格式范围和边界见
+[PII 用户指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/pii-checker.md#支持的银行卡格式)。
+其他检测类型、置信度和脱敏格式保留，变化由共享卡号语料及独立质量用例定义。
 
 差分和限制由 capability 的 `tests/compatibility.rs`、`tests/custom_rules.rs`、冻结 142 个
 V1 合成用例及单测验证。完整差异、未来 Evidence 边界和回滚见

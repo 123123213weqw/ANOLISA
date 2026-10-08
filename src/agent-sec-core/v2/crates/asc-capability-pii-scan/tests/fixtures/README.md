@@ -26,3 +26,9 @@ is not regenerated to hide intentional differences. Custom rule behavior is vali
 
 The source hashes remain the reproducible oracle identity after implementation-branch
 rebases; `source_commit` records the original capture checkout, not the final PR tip.
+
+`credit_cards.json` is a separate, explicit card-structure corpus shared by the retained
+Python detector and Rust 2.0.1. It includes synthetic network/format boundaries and
+the original 214-byte OpenClaw and 840-byte Cosh-NG benign tool outputs, with input
+SHA-256 identities. Its expected findings and redactions describe the new contract;
+adding or changing these cases does not regenerate the historical `v1.json` oracle.

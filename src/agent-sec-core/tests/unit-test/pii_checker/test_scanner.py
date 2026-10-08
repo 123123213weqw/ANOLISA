@@ -1,6 +1,8 @@
 """Unit tests for the PII scanner."""
 
+import json
 import time
+from pathlib import Path
 
 import pytest
 from agent_sec_cli.pii_checker.detectors.base import PiiCandidate
@@ -8,6 +10,37 @@ from agent_sec_cli.pii_checker.detectors.regex import RegexPiiDetector
 from agent_sec_cli.pii_checker.models import PiiFinding
 from agent_sec_cli.pii_checker.redactor import redact_text
 from agent_sec_cli.pii_checker.scanner import DEFAULT_MAX_BYTES, PiiScanner
+
+CARD_CASES = json.loads(
+    (
+        Path(__file__).resolve().parents[3]
+        / "v2/crates/asc-capability-pii-scan/tests/fixtures/credit_cards.json"
+    ).read_text()
+)["cases"]
+
+
+@pytest.mark.parametrize("case", CARD_CASES, ids=lambda case: case["id"])
+def test_credit_card_structure_and_complete_spans(case):
+    text = case["text"]
+    result = _scan(
+        text, raw_evidence=True, redact_output=True, include_low_confidence=True
+    )
+    cards = [f for f in result["findings"] if f["type"] == "credit_card"]
+    assert [f["raw_evidence"] for f in cards] == case["cards"]
+    for finding in cards:
+        span = finding["span"]
+        assert text[span["start"] : span["end"]] == finding["raw_evidence"]
+        assert finding["severity"] == "warn"
+    assert result["redacted_text"] == case["redacted_text"]
+
+
+def test_long_invalid_card_expression_preserves_later_card():
+    text = "1-" * 50_000 + "4111111111111111; card-4111111111111111"
+    result = _scan(text, raw_evidence=True, redact_output=True)
+    cards = [f for f in result["findings"] if f["type"] == "credit_card"]
+    assert len(cards) == 1
+    assert cards[0]["span"] == {"start": len(text) - 16, "end": len(text)}
+    assert result["redacted_text"] == text[:-16] + "[REDACTED_CARD:1111]"
 
 
 @pytest.fixture(autouse=True)

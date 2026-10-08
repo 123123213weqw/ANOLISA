@@ -8,6 +8,92 @@ const EMPTY_CLAIMS_JWT: &str =
     "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.e30.y4pnSuvml8A03eqm8Uvz1gZ5ZQX_WGHDAdzFmzhAR5g";
 
 #[test]
+fn credit_card_structure_and_complete_spans() {
+    let corpus: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/credit_cards.json")).unwrap();
+    let scanner = PiiScanner::new().unwrap();
+    for case in corpus["cases"].as_array().unwrap() {
+        let text = case["text"].as_str().unwrap();
+        let report = scanner
+            .scan(
+                text,
+                &PiiScanOptions {
+                    raw_evidence: true,
+                    redact_output: true,
+                    include_low_confidence: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let cards: Vec<_> = report
+            .findings
+            .iter()
+            .filter(|f| f.pii_type == "credit_card")
+            .collect();
+        let actual: Vec<_> = cards
+            .iter()
+            .map(|f| f.raw_evidence.as_deref().unwrap())
+            .collect();
+        let expected: Vec<_> = case["cards"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(actual, expected, "{}", case["id"]);
+        for card in cards {
+            let value: String = text
+                .chars()
+                .skip(card.span.start)
+                .take(card.span.end - card.span.start)
+                .collect();
+            assert_eq!(Some(value.as_str()), card.raw_evidence.as_deref());
+        }
+        assert_eq!(
+            report.redacted_text.as_deref(),
+            case["redacted_text"].as_str(),
+            "{}",
+            case["id"]
+        );
+        assert_eq!(report.summary.coverage.status, CoverageStatus::Complete);
+    }
+}
+
+#[test]
+fn long_invalid_card_expression_preserves_later_card() {
+    let text = format!(
+        "{}4111111111111111; card-4111111111111111",
+        "1-".repeat(50_000)
+    );
+    let report = PiiScanner::new()
+        .unwrap()
+        .scan(
+            &text,
+            &PiiScanOptions {
+                raw_evidence: true,
+                redact_output: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let cards: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.pii_type == "credit_card")
+        .collect();
+    assert_eq!(cards.len(), 1);
+    assert_eq!(
+        (cards[0].span.start, cards[0].span.end),
+        (text.len() - 16, text.len())
+    );
+    assert_eq!(
+        report.redacted_text.unwrap(),
+        format!("{}[REDACTED_CARD:1111]", &text[..text.len() - 16])
+    );
+    assert_eq!(report.summary.coverage.status, CoverageStatus::Complete);
+}
+
+#[test]
 fn all_eleven_types_have_positive_and_negative_examples() {
     let scanner = PiiScanner::new().unwrap();
     for (kind, positive, negative) in [

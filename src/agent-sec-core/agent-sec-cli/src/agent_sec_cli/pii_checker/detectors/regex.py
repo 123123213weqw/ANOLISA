@@ -5,8 +5,8 @@ import re
 from agent_sec_cli.pii_checker.detectors.base import PiiCandidate
 from agent_sec_cli.pii_checker.models import PiiCategory, PiiSeverity
 from agent_sec_cli.pii_checker.validators import (
-    luhn_check,
     validate_cn_id,
+    validate_credit_card,
     validate_email,
     validate_jwt,
 )
@@ -182,7 +182,7 @@ _EMAIL_RE = re.compile(
 _PHONE_CN_RE = re.compile(
     r"(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d[-\s]?\d{4}[-\s]?\d{4}(?!\d)"
 )
-_CREDIT_CARD_RE = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_CREDIT_CARD_RE = re.compile(r"\d[\d -]*")
 _CN_ID_RE = re.compile(r"(?<!\d)\d{17}[\dXx](?!\w)")
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(?![A-Za-z0-9_-])"
@@ -505,15 +505,17 @@ class RegexPiiDetector:
 
     def _detect_credit_cards(self, text: str, candidates: list[PiiCandidate]) -> None:
         for match in _CREDIT_CARD_RE.finditer(text):
-            value = match.group(0)
-            if luhn_check(value):
+            # Consume the whole expression even when only a suffix would validate.
+            value = match.group(0).rstrip(" -")
+            span = (match.start(), match.start() + len(value))
+            if validate_credit_card(value):
                 self._add_candidate(
                     candidates,
                     pii_type="credit_card",
                     value=value,
-                    span=match.span(),
+                    span=span,
                     confidence=_score_with_context(
-                        text, *match.span(), _BASE_CONFIDENCE["credit_card"]
+                        text, *span, _BASE_CONFIDENCE["credit_card"]
                     ),
                     metadata={"validator": "luhn"},
                 )
