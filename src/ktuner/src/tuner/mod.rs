@@ -88,10 +88,10 @@ fn apply_locked(
     let mut failed: Vec<ApplyFailure> = Vec::new();
     let mut clamped: Vec<ClampNote> = Vec::new();
     for (i, rec) in recommendations.iter().enumerate() {
-        // A *_bytes knob clears its ratio sibling as a side effect; snapshot
-        // the sibling before the write or the original ratio is unrecorded
+        // A mutually exclusive knob disables its twin as a side effect;
+        // snapshot the twin before the write or its original is unrecorded
         // and no rollback can ever bring it back. (The `applied` counter
-        // below already counts writes, not ledger records, so the sibling
+        // below already counts writes, not ledger records, so the twin
         // record leaves the batch's progress and exit code unchanged.)
         let sibling = cleared_sibling_entry(&rec.param);
         match apply_recordable(rec) {
@@ -135,11 +135,11 @@ fn apply_locked(
                     applied_rec.current_value = previous;
                     applied_recs.push(applied_rec);
                 }
-                // A *_bytes write cleared the ratio sibling as a kernel side
-                // effect: record what was live before the write (the snapshot
-                // above), or no rollback can ever bring that original back.
-                // The sibling is a live change of the pair even when the knob
-                // itself was unrecordable, so it lands outside the branch.
+                // The write disabled the mutually exclusive twin: record what
+                // was live before the write (the snapshot above), or no
+                // rollback can ever bring that original back. The twin is a
+                // live change of the pair even when the knob itself was
+                // unrecordable, so it lands outside the branch.
                 if let Some(entry) = sibling {
                     applied_recs.push(sibling_rec(entry));
                 }
@@ -211,8 +211,8 @@ pub struct AppliedFix {
 pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
     let guard = lock_ledger_at(ROLLBACK_PATH)?;
     load_rollback()?;
-    // Snapshot the ratio sibling before the write: a *_bytes knob clears it
-    // as a kernel side effect, and only the ledger can bring the original
+    // Snapshot the twin before the write: a mutually exclusive knob disables
+    // it as a kernel side effect, and only the ledger can bring the original
     // back on rollback.
     let sibling = cleared_sibling_entry(&rec.param);
     let (previous, outcome) = apply_recordable(rec)?;
@@ -222,7 +222,7 @@ pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
         applied.current_value = recorded.clone();
         batch.push(applied);
     }
-    // The cleared sibling is a live change of the pair even when the knob
+    // The disabled twin is a live change of the pair even when the knob
     // itself was unrecordable (no readable pristine value), so it extends
     // the batch regardless.
     batch.extend(sibling.map(sibling_rec));
@@ -265,25 +265,42 @@ fn apply_recordable(rec: &Recommendation) -> Result<(Option<String>, WriteOutcom
     Ok((previous, outcome))
 }
 
-/// The ratio knob the kernel clears as a side effect of writing `param`.
-/// `vm.dirty_bytes` and `vm.dirty_background_bytes` are mutually exclusive
-/// with their ratio twins — writing one zeroes the other (mm/page-writeback.c
-/// clears the sibling whenever the value changes; the rules state the same
-/// invariant when they cap the percentage advice to <64GB hosts) — so
-/// applying a bytes knob is a live change to TWO knobs while the batch
-/// records one.
+/// The twin knob the kernel disables as a side effect of writing `param`.
+/// The kernel keeps two mutually exclusive sysctl pairs — `vm.dirty_bytes` /
+/// `vm.dirty_ratio` (and the `dirty_background_` twins) and
+/// `vm.overcommit_kbytes` / `vm.overcommit_ratio` — where writing either knob
+/// zeroes the other: mm/page-writeback.c zeroes the dirty twin on every
+/// write (dirty_background_ratio_handler / dirty_background_bytes_handler)
+/// or on every changing one (dirty_ratio_handler / dirty_bytes_handler), and
+/// mm/util.c zeroes the overcommit twin on every write
+/// (overcommit_ratio_handler / overcommit_kbytes_handler). vm.rst states the
+/// rule for the overcommit pair: "Setting one disables the other (which then
+/// appears as 0 when read)". Applying one of these knobs is therefore a live
+/// change to TWO knobs while the batch records one.
+///
+/// The mapping is bidirectional on purpose: the ratio write disables the
+/// bytes twin too, so the same `applied = "0"` record has to be captured
+/// whichever side the write landed on. `vm.overcommit_ratio` is the
+/// reachable case — a strict-overcommit host with a fixed
+/// `vm.overcommit_kbytes` limit reads the ratio as 0, the ratio rule then
+/// treats that 0 as "too low" and the write silently disables the fixed
+/// limit, whose original only the ledger can bring back.
 fn cleared_sibling(param: &str) -> Option<&'static str> {
     match param {
         "vm.dirty_bytes" => Some("vm.dirty_ratio"),
+        "vm.dirty_ratio" => Some("vm.dirty_bytes"),
         "vm.dirty_background_bytes" => Some("vm.dirty_background_ratio"),
+        "vm.dirty_background_ratio" => Some("vm.dirty_background_bytes"),
+        "vm.overcommit_kbytes" => Some("vm.overcommit_ratio"),
+        "vm.overcommit_ratio" => Some("vm.overcommit_kbytes"),
         _ => None,
     }
 }
 
-/// Ledger tuple for the ratio knob a `*_bytes` write is about to clear:
-/// `(sibling, live value, "0")`, read BEFORE the write lands — after it the
-/// kernel has already zeroed the sibling and the original is gone forever.
-/// None when `param` clears nothing, the sibling is unreadable, or it holds
+/// Ledger tuple for the twin a mutually exclusive write is about to disable:
+/// `(twin, live value, "0")`, read BEFORE the write lands — after it the
+/// kernel has already zeroed the twin and the original is gone forever.
+/// None when `param` disables nothing, the twin is unreadable, or it holds
 /// no configured value. The recorded `applied` is "0" because that is the
 /// value the kernel puts live, exactly like a clamped read-back (#4160): the
 /// ledger must describe live reality for both knobs of the pair, or a
@@ -295,8 +312,8 @@ fn cleared_sibling_entry(param: &str) -> Option<(String, String, String)> {
     sibling_cleared_record(sibling, &live)
 }
 
-/// Pure decision core of [`cleared_sibling_entry`]: whether a `*_bytes` write
-/// that sees `live` on the ratio sibling must record it. A sibling that is
+/// Pure decision core of [`cleared_sibling_entry`]: whether a write that
+/// sees `live` on the mutually exclusive twin must record it. A twin that is
 /// already 0 (or unreadably empty) loses nothing, so nothing is recorded.
 fn sibling_cleared_record(sibling: &str, live: &str) -> Option<(String, String, String)> {
     (!live.is_empty() && live != "0")
@@ -313,6 +330,20 @@ fn sibling_rec(entry: (String, String, String)) -> Recommendation {
         recommended_value: entry.2,
         ..Default::default()
     }
+}
+
+/// Whether `param`'s ledger entry records a kernel side effect: a knob a
+/// mutually exclusive twin's write disabled, so its `applied` is 0 while the
+/// twin that disabled it is still recorded. Both consumers of the pair share
+/// this predicate — persistence never re-applies such a line after its
+/// clearer's (the clearer reproduces the zeroed twin at boot), and the
+/// restore writes it AFTER its clearer (whose write would zero it again).
+fn is_cleared_twin(
+    entries: &BTreeMap<String, RollbackEntry>,
+    param: &str,
+    entry: &RollbackEntry,
+) -> bool {
+    entry.applied == "0" && entries.keys().any(|k| cleared_sibling(k) == Some(param))
 }
 
 /// The result of a verified write: the value now live in the kernel.
@@ -988,9 +1019,9 @@ pub fn apply_import(param: &str, value: &str, current: Option<&str>) -> Result<(
         Err(error) if current.is_some() => return Err(error),
         Err(_) => None,
     };
-    // A bytes knob clears its ratio sibling as a kernel side effect; snapshot
-    // it before the write so the imported change records both knobs of the
-    // pair and stays reversible.
+    // A mutually exclusive knob disables its twin as a kernel side effect;
+    // snapshot it before the write so the imported change records both knobs
+    // of the pair and stays reversible.
     let sibling = cleared_sibling_entry(param);
     let outcome = write_and_verify(param, value)?;
     if let Some(previous) = previous {
@@ -1031,16 +1062,12 @@ fn render_persistence(
             ));
             has_nonsysctl = true;
         } else if param.contains('.') || param.contains('/') {
-            // The kernel re-clears the ratio sibling when the bytes line is
-            // applied at boot, and a later "ratio = 0" line would zero the
-            // bytes value right back — so the side-effect record of a cleared
-            // ratio is never persisted while its clearer is in the ledger:
-            // the bytes line alone reproduces the live pair state (bytes set,
-            // ratio cleared).
-            let clearer_recorded = entries
-                .keys()
-                .any(|k| cleared_sibling(k) == Some(param.as_str()));
-            if clearer_recorded && entry.applied == "0" {
+            // The kernel re-disables the twin when the clearer line is
+            // applied at boot, and a later "twin = 0" line would zero the
+            // clearer's value right back — so the side-effect record of a
+            // disabled twin is never persisted while its clearer is in the
+            // ledger: the clearer line alone reproduces the live pair state.
+            if is_cleared_twin(entries, param, entry) {
                 continue;
             }
             // A slash as the first separator makes sysctl.d preserve literal
@@ -1283,7 +1310,23 @@ fn restore_entries_with(
     let mut verified: Vec<&String> = Vec::new();
     let mut failed = 0;
     let mut skipped = 0;
-    for (param, entry) in &data.entries {
+    // A disabled twin is restored AFTER its clearer: the clearer's write
+    // zeroes the twin whenever it lands, so a twin written first would be
+    // wiped again by the clearer's own restore. That is what key order does
+    // for the dirty pairs (`vm.dirty_bytes` before `vm.dirty_ratio`), but
+    // not for the overcommit pair, where the disabled `vm.overcommit_kbytes`
+    // sorts before the `vm.overcommit_ratio` that disables it.
+    let ordered: Vec<(&String, &RollbackEntry)> = data
+        .entries
+        .iter()
+        .filter(|(param, entry)| !is_cleared_twin(&data.entries, param, entry))
+        .chain(
+            data.entries
+                .iter()
+                .filter(|(param, entry)| is_cleared_twin(&data.entries, param, entry)),
+        )
+        .collect();
+    for (param, entry) in ordered {
         // The deny-list is enforced on BOTH fields: the parameter name (what a
         // ktuner-written ledger records) and the recorded path, which is the
         // file the kernel actually receives. Every ledger ktuner writes has the
@@ -1351,10 +1394,12 @@ fn restore_entries_with(
     // Re-check every verified restore AFTER all writes ran. A per-write
     // read-back only proves its own file held `previous` at that moment; a
     // later write can move an earlier-restored knob behind its back — the
-    // kernel zeroes the vm.dirty_ratio <-> vm.dirty_bytes sibling on every
-    // changing write (mm/page-writeback.c dirty_ratio_handler /
-    // dirty_bytes_handler), and BTreeMap order restores the bytes knob of
-    // each pair first. A diverging re-read is a failure so rollback never
+    // kernel zeroes the twin of a mutually exclusive pair on the clearer's
+    // write (mm/page-writeback.c dirty_ratio_handler / dirty_bytes_handler,
+    // mm/util.c overcommit_ratio_handler / overcommit_kbytes_handler). The
+    // order above restores a clearer before its twin, but a ledger that
+    // recorded only one side, or a knob in a chain, can still leave a
+    // diverging value. A diverging re-read is a failure so rollback never
     // reports Full (and deletes the ledger) while a recorded original is not
     // the live value. Write-only tunables (read fails) stay verified: their
     // read-back never held anything to diverge from.
@@ -1706,6 +1751,106 @@ mod tests {
         let config = config.unwrap();
         assert!(config.contains("vm.dirty_bytes = 1073741824"));
         assert!(config.contains("vm.dirty_ratio = 5"));
+    }
+
+    #[test]
+    fn mutually_exclusive_writes_record_the_twin_they_disable() {
+        // Writing either knob of a mutually exclusive sysctl pair disables
+        // the other, which then reads 0 — vm.rst states it for the
+        // overcommit pair ("Setting one disables the other (which then
+        // appears as 0 when read)") and the handlers do it for the dirty
+        // pair too (mm/page-writeback.c dirty_ratio_handler /
+        // dirty_background_ratio_handler versus their bytes twins; mm/util.c
+        // overcommit_ratio_handler / overcommit_kbytes_handler). Every write
+        // therefore moves TWO knobs, and the disabled twin's original has to
+        // reach the ledger or no rollback can bring it back.
+        for (param, twin, live) in [
+            ("vm.overcommit_ratio", "vm.overcommit_kbytes", "8589934592"),
+            ("vm.overcommit_kbytes", "vm.overcommit_ratio", "80"),
+            ("vm.dirty_bytes", "vm.dirty_ratio", "20"),
+            ("vm.dirty_ratio", "vm.dirty_bytes", "1073741824"),
+            (
+                "vm.dirty_background_bytes",
+                "vm.dirty_background_ratio",
+                "10",
+            ),
+            (
+                "vm.dirty_background_ratio",
+                "vm.dirty_background_bytes",
+                "268435456",
+            ),
+        ] {
+            assert_eq!(
+                cleared_sibling(param),
+                Some(twin),
+                "writing {param} disables {twin}"
+            );
+            assert_eq!(
+                sibling_cleared_record(twin, live),
+                Some((twin.to_string(), live.to_string(), "0".to_string())),
+                "the configured twin is recorded with its pre-write value"
+            );
+        }
+        // A strict-overcommit host with a fixed overcommit_kbytes limit: the
+        // ratio reads 0 (disabled, not low), the rule recommends 80, and the
+        // write disables the limit. Both records land in the ledger, with the
+        // disabled limit's original preserved as its `previous`.
+        let data = merge_entries(
+            RollbackData {
+                version: 1,
+                entries: BTreeMap::new(),
+            },
+            [
+                (
+                    "vm.overcommit_ratio".to_string(),
+                    "0".to_string(),
+                    "80".to_string(),
+                ),
+                sibling_cleared_record("vm.overcommit_kbytes", "8589934592")
+                    .expect("the fixed limit is recorded before the write"),
+            ],
+        );
+        assert_eq!(data.entries["vm.overcommit_ratio"].applied, "80");
+        assert_eq!(
+            data.entries["vm.overcommit_kbytes"].previous, "8589934592",
+            "the disabled twin's original is what a rollback writes back"
+        );
+        assert_eq!(data.entries["vm.overcommit_kbytes"].applied, "0");
+    }
+
+    #[test]
+    fn render_persistence_omits_the_disabled_overcommit_twin() {
+        // The inverse of the dirty-ratio case: the ledger holds the fixed
+        // overcommit_kbytes limit after a ratio write disabled it, so the
+        // twin's record carries applied = 0. Persisting "vm.overcommit_ratio
+        // = 0" after the kbytes line would make systemd zero the just-applied
+        // fixed limit at boot — the tuning would silently vanish across
+        // reboots. The kbytes line alone reproduces the live pair state.
+        let entries = BTreeMap::from([
+            (
+                "vm.overcommit_kbytes".to_string(),
+                RollbackEntry {
+                    previous: "0".into(),
+                    applied: "8589934592".into(),
+                    path: "/proc/sys/vm/overcommit_kbytes".into(),
+                },
+            ),
+            (
+                "vm.overcommit_ratio".to_string(),
+                RollbackEntry {
+                    previous: "80".into(),
+                    applied: "0".into(),
+                    path: "/proc/sys/vm/overcommit_ratio".into(),
+                },
+            ),
+        ]);
+        let (config, _) = render_persistence(&entries);
+        let config = config.unwrap();
+        assert!(config.contains("vm.overcommit_kbytes = 8589934592"));
+        assert!(
+            !config.contains("overcommit_ratio"),
+            "the disabled twin's record must not be re-applied at boot: {config}"
+        );
     }
 
     #[test]
@@ -2955,6 +3100,80 @@ mod tests {
             !rollback_should_finalize(outcome.failed, outcome.skipped),
             "a cleared sibling must keep the ledger for inspection"
         );
+    }
+
+    #[test]
+    fn restore_lands_the_disabled_twin_after_its_clearer() {
+        // The overcommit pair is mutually exclusive and the kernel clears it
+        // UNCONDITIONALLY: mm/util.c overcommit_ratio_handler zeroes
+        // sysctl_overcommit_kbytes on every successful write, value change or
+        // not (`if (ret == 0 && write) sysctl_overcommit_kbytes = 0;`), and
+        // the reverse handler does the same. A strict-overcommit host with a
+        // fixed kbytes limit reads the ratio as 0, so ktuner's ratio
+        // recommendation fires and the write disables the limit. The ledger
+        // then holds both knobs, and the restore has to write the disabled
+        // kbytes AFTER the ratio: key order puts "vm.overcommit_kbytes"
+        // first, so writing it there would be undone by the ratio's own
+        // restore a moment later.
+        let dir = AtomicTestDir::new("overcommit_twin_restore");
+        let kbytes = dir.0.join("overcommit_kbytes");
+        let ratio = dir.0.join("overcommit_ratio");
+        let kbytes_path = kbytes.to_str().unwrap().to_string();
+        let ratio_path = ratio.to_str().unwrap().to_string();
+        // Live state when the rollback runs: ratio 80, fixed limit disabled.
+        fs::write(&ratio, "80").unwrap();
+        fs::write(&kbytes, "0").unwrap();
+        let entries = BTreeMap::from([
+            (
+                "vm.overcommit_kbytes".to_string(),
+                RollbackEntry {
+                    previous: "8589934592".into(),
+                    applied: "0".into(),
+                    path: kbytes_path.clone(),
+                },
+            ),
+            (
+                "vm.overcommit_ratio".to_string(),
+                RollbackEntry {
+                    previous: "0".into(),
+                    applied: "80".into(),
+                    path: ratio_path.clone(),
+                },
+            ),
+        ]);
+        // The kernel write, simulated on plain files: every write to one knob
+        // of the pair disables the other, changed value or not.
+        let mut kernel = |path: &str, value: &str| -> std::io::Result<()> {
+            fs::write(path, value)?;
+            if path == ratio_path {
+                fs::write(&kbytes, "0")
+            } else if path == kbytes_path {
+                fs::write(&ratio, "0")
+            } else {
+                Ok(())
+            }
+        };
+        let outcome = restore_entries_with(
+            &RollbackData {
+                version: 1,
+                entries,
+            },
+            true,
+            &mut kernel,
+        );
+        assert_eq!(
+            fs::read_to_string(&kbytes).unwrap(),
+            "8589934592",
+            "the disabled fixed limit comes back with the rollback"
+        );
+        assert_eq!(
+            fs::read_to_string(&ratio).unwrap(),
+            "0",
+            "the ratio the kernel disabled is left at its recorded original"
+        );
+        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.failed, 0);
+        assert!(rollback_should_finalize(outcome.failed, outcome.skipped));
     }
 
     #[test]
