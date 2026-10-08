@@ -123,10 +123,17 @@ pub fn strip_system_context(text: &str) -> String {
         }
     }
 
-    // Phase 3: Strip trailing system command lines
+    // Phase 3: Strip trailing system command lines. Only a suffix that ends
+    // the text (after whitespace) is a trailing command: the same sentence
+    // quoted in the middle of a genuine user message is that message's
+    // content, and truncating at it used to drop everything the user wrote
+    // after the quote.
     for suffix in SYSTEM_TEXT_SUFFIXES {
         if let Some(pos) = result.rfind(suffix) {
-            result.truncate(pos);
+            let tail = &result[pos + suffix.len()..];
+            if tail.trim().is_empty() {
+                result.truncate(pos);
+            }
         }
     }
 
@@ -306,6 +313,20 @@ fn extract_final_answer(traj: &AtifTrajectory) -> String {
 mod tests {
     use super::*;
     use crate::atif::AtifTrajectory;
+
+    #[test]
+    fn mid_text_system_suffix_is_kept() {
+        // The suffix quoted inside a genuine user message is content, not a
+        // trailing command; stripping at it used to drop the rest of the turn.
+        let text = "First check the fixture.\nPlease reflect and reorganize the target file.\nThen update the README.";
+        assert_eq!(strip_system_context(text), text);
+    }
+
+    #[test]
+    fn trailing_system_suffix_is_still_stripped() {
+        let text = "Do the work.\nPlease reflect and reorganize the target file.  ";
+        assert_eq!(strip_system_context(text), "Do the work.");
+    }
 
     fn traj(steps_json: &str) -> AtifTrajectory {
         AtifTrajectory::from_json(&format!(
