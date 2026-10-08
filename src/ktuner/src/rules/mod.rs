@@ -5896,24 +5896,51 @@ fn eval_tcp_comp_sack_delay(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
     1
 }
 
-fn eval_skb_frag_coalesce(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+fn eval_skb_frag_coalesce(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     let path = "/proc/sys/net/core/skb_defer_max";
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     let current = read_sysctl_u64(path);
-    if current < 64 {
-        recs.push(Recommendation {
-            param: "net.core.skb_defer_max".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "64".to_string(),
-            reason: format!("SKB 延迟释放上限 {current} 偏低，增大可减少跨 CPU 的内存释放开销"),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = skb_defer_max_recommendation(current, &info.kernel_version) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `net.core.skb_defer_max` recommendation for an already-read value.
+///
+/// Split out from the file probe so the version-dependent target is testable
+/// on any host.
+///
+/// The kernel default moved from 64 to 128 in Linux 6.19 (commit
+/// b61785852ed0, "net: increase skb_defer_max default to 128": the old value
+/// "is very conservative, and can be increased to avoid too many calls to
+/// kick_defer_list_purge()"). A fixed target of 64 therefore tells an
+/// administrator whose value is below the new default to settle at half of
+/// it, and stays silent for a value in [64, 128) that the kernel now
+/// considers too small. Track the kernel's own default instead; 64 is still
+/// the right target on the kernels that default to it.
+fn skb_defer_max_recommendation(current: u64, kernel_version: &str) -> Option<Recommendation> {
+    let target = if kernel_at_least(kernel_version, 6, 19) {
+        128
+    } else {
+        64
+    };
+    if current >= target {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.core.skb_defer_max".to_string(),
+        current_value: current.to_string(),
+        recommended_value: target.to_string(),
+        reason: format!(
+            "SKB 延迟释放上限 {current} 偏低（内核默认 {target}），增大可减少跨 CPU 的内存释放开销"
+        ),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_neigh_proxy_delay(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -11270,6 +11297,43 @@ mod tests {
         assert!(tcp_adv_win_scale_recommendation(1, "7.0.0-29-generic").is_none());
         // Already at or above the target on any version.
         assert!(tcp_adv_win_scale_recommendation(2, "5.10.0").is_none());
+    }
+
+    #[test]
+    fn skb_defer_max_recommendation_tracks_the_kernel_default() {
+        // Kernels that still default to 64 keep the old target.
+        for version in ["6.6.0", "6.18.0", "3.10.0-1160.el7"] {
+            let rec = skb_defer_max_recommendation(32, version)
+                .expect("a value below the old default is still worth raising");
+            assert_eq!(rec.recommended_value, "64", "kernel {version}");
+            assert_eq!(rec.current_value, "32");
+            assert_eq!(rec.param, "net.core.skb_defer_max");
+        }
+        assert!(skb_defer_max_recommendation(64, "6.18.0").is_none());
+        // Linux 6.19 raised the default to 128 (commit b61785852ed0), so 64
+        // is no longer a sane target: the advice must follow the new default.
+        assert_eq!(
+            skb_defer_max_recommendation(32, "6.19.0")
+                .expect("32 is below the new default too")
+                .recommended_value,
+            "128"
+        );
+        // A value the kernel now considers too small must not stay silent.
+        assert_eq!(
+            skb_defer_max_recommendation(64, "7.3.0-rc6")
+                .expect("64 is below the 6.19 default of 128")
+                .recommended_value,
+            "128"
+        );
+        assert!(skb_defer_max_recommendation(127, "7.3.0-rc6").is_some());
+        assert!(skb_defer_max_recommendation(128, "7.3.0-rc6").is_none());
+        // An unparseable release string keeps the pre-6.19 target.
+        assert_eq!(
+            skb_defer_max_recommendation(32, "custom-kernel")
+                .expect("unknown kernels keep the legacy target")
+                .recommended_value,
+            "64"
+        );
     }
 
     #[test]
