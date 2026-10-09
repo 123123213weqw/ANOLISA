@@ -2,8 +2,8 @@ use super::*;
 use crate::agent::run::{ActiveAgentRun, AgentRunOrigin};
 use crate::approval::handoff::{
     approval_shell_handoff_validation_message, command_matches_trust_key,
-    fallback_bash_execution_path, trust_key_from_command, trusted_command_from_request,
-    ApprovedBashExecutionPath,
+    fallback_bash_execution_path, raw_bash_command, trust_key_from_command,
+    trusted_command_from_request, ApprovedBashExecutionPath,
 };
 use crate::approval::requests::{approval_request_from_governed_event, record_approval_requests};
 use crate::approval::resolution::{
@@ -18,32 +18,116 @@ use std::os::unix::fs::PermissionsExt;
 use std::time::{Duration, Instant};
 
 #[test]
-fn trust_key_from_command_normalizes_full_command() {
+fn trust_key_from_command_keeps_the_approved_content_intact() {
     assert_eq!(
         trust_key_from_command("git status").as_deref(),
         Some("git status")
     );
-    assert_eq!(
-        trust_key_from_command("npm   test").as_deref(),
-        Some("npm test")
-    );
     assert_eq!(trust_key_from_command("ls").as_deref(), Some("ls"));
     assert_eq!(trust_key_from_command("git -v").as_deref(), Some("git -v"));
+    // Only the `$ ` display prefix is parsed away, and only by
+    // `raw_bash_command`; nothing is trimmed. Interior whitespace is part of
+    // the command - collapsing it made two different commands share one
+    // approval - and edge bytes are part of it too, because bash does not
+    // ignore all of them (an escaped trailing space, CR, VT and FF are argument
+    // data). A cosmetic mismatch therefore costs one extra approval instead of
+    // widening an earlier one.
+    assert_eq!(
+        trust_key_from_command("  git status  ").as_deref(),
+        Some("  git status  ")
+    );
+    assert_ne!(
+        trust_key_from_command("npm   test").as_deref(),
+        trust_key_from_command("npm test").as_deref()
+    );
+    assert_ne!(
+        trust_key_from_command("touch a\ntouch b").as_deref(),
+        trust_key_from_command("touch a touch b").as_deref()
+    );
+    assert_ne!(
+        trust_key_from_command("touch a\ttouch b").as_deref(),
+        trust_key_from_command("touch a touch b").as_deref()
+    );
+    assert_ne!(
+        trust_key_from_command(r#"sed -i "s/a  b/X/" f"#).as_deref(),
+        trust_key_from_command(r#"sed -i "s/a b/X/" f"#).as_deref()
+    );
+    // Shell metas need no surrounding spaces, so the spaced and unspaced forms
+    // are different text and must not share a key either.
+    assert_ne!(
+        trust_key_from_command("echo a; touch /tmp/x").as_deref(),
+        trust_key_from_command("echo a;touch /tmp/x").as_deref()
+    );
+    assert_ne!(
+        trust_key_from_command("echo a | wc -l").as_deref(),
+        trust_key_from_command("echo a|wc -l").as_deref()
+    );
 }
 
 #[test]
-fn trust_key_from_command_strips_dollar_prefix() {
+fn trust_key_keeps_a_dollar_prefixed_command_distinct() {
+    // The `$ ` display prefix is stripped exactly once, by `raw_bash_command`,
+    // at the single place a preview is turned back into a command. Stripping
+    // inside the key as well let a proposal whose raw text starts with `$ `
+    // reuse the key of the command without it and auto-approve a different
+    // program.
     assert_eq!(
-        trust_key_from_command("$ git status").as_deref(),
-        Some("git status")
+        trust_key_from_command("$ echo hi").as_deref(),
+        Some("$ echo hi")
     );
     assert_eq!(
-        trust_key_from_command("$ npm test").as_deref(),
-        Some("npm test")
+        trust_key_from_command("  $ echo hi  ").as_deref(),
+        Some("  $ echo hi  ")
+    );
+    assert_ne!(
+        trust_key_from_command("$ echo hi").as_deref(),
+        trust_key_from_command("echo hi").as_deref()
+    );
+    // The preview round-trip is the single strip: preview `$ $ echo hi`
+    // derives the raw command `$ echo hi`, whose key keeps the prefix, while
+    // preview `$ echo hi` derives `echo hi`.
+    assert_eq!(
+        trust_key_from_command(raw_bash_command("$ $ echo hi")).as_deref(),
+        Some("$ echo hi")
     );
     assert_eq!(
-        trust_key_from_command("$ ls -la").as_deref(),
-        Some("ls -la")
+        trust_key_from_command(raw_bash_command("$ echo hi")).as_deref(),
+        Some("echo hi")
+    );
+}
+
+#[test]
+fn trust_key_keeps_unicode_edge_whitespace_that_bash_treats_as_data() {
+    // U+00A0 and friends are ordinary filename characters in bash, so a key
+    // that dropped them would let `touch /tmp/staged` approve a proposal for
+    // `touch /tmp/staged\u{00a0}` - a different path on disk. No edge
+    // whitespace is normalized away, ASCII or otherwise.
+    let with_nbsp = "touch /tmp/staged\u{00a0}";
+    assert_eq!(
+        trust_key_from_command(with_nbsp).as_deref(),
+        Some(with_nbsp)
+    );
+    assert_ne!(
+        trust_key_from_command(with_nbsp).as_deref(),
+        trust_key_from_command("touch /tmp/staged").as_deref()
+    );
+    // Leading Unicode whitespace is part of the first word in bash, so it
+    // stays in the key as well.
+    assert_eq!(
+        trust_key_from_command("\u{00a0}touch /tmp/staged").as_deref(),
+        Some("\u{00a0}touch /tmp/staged")
+    );
+    // No edge normalization at all remains in the authorization path: even
+    // ASCII edge whitespace stays in the key, because a trim heuristic cannot
+    // tell ignorable edges from escaped or control-byte edges. Tolerating
+    // pasted or configured edge whitespace is a non-authorization concern.
+    assert_eq!(
+        trust_key_from_command("  touch /tmp/staged\t\n").as_deref(),
+        Some("  touch /tmp/staged\t\n")
+    );
+    assert_eq!(
+        trust_key_from_command(raw_bash_command("$ touch /tmp/staged\u{00a0}")).as_deref(),
+        Some(with_nbsp)
     );
 }
 
@@ -1124,6 +1208,15 @@ fn governed_shell_tool_call(command: &str) -> GovernedEvent {
 }
 
 #[test]
+fn trust_key_rejects_blank_commands_without_changing_valid_bytes() {
+    for command in ["", " ", "\t\n", "\r\u{000b}\u{000c}", "\u{00a0}"] {
+        assert_eq!(trust_key_from_command(command), None, "{command:?}");
+    }
+    let command = "  echo byte-exact\\ ";
+    assert_eq!(trust_key_from_command(command).as_deref(), Some(command));
+}
+
+#[test]
 fn trust_key_from_command_empty_input() {
     assert_eq!(trust_key_from_command(""), None);
 }
@@ -1751,6 +1844,48 @@ fn classifier_verdict_wires_irrecoverable_panel_flag() {
     assert!(!assessment_is_irrecoverable(&runtime_assessment_summary(
         &benign
     )));
+}
+
+#[test]
+fn trust_key_preserves_escaped_and_control_edge_bytes() {
+    // Edge bytes are not always separators bash ignores: a trailing space
+    // escaped by a backslash is part of the filename, and CR/VT/FF are not in
+    // bash's IFS, so trimming them - Unicode or ASCII alike - would let
+    // `touch /tmp/x\` and `touch /tmp/x\ ` share a key while executing
+    // different arguments. The authorization key keeps raw bytes;
+    // edge-whitespace tolerance belongs to a non-authorization layer.
+    let backslash = "touch /tmp/x\\";
+    let escaped_space = "touch /tmp/x\\ ";
+    assert_eq!(
+        trust_key_from_command(backslash).as_deref(),
+        Some(backslash)
+    );
+    assert_eq!(
+        trust_key_from_command(escaped_space).as_deref(),
+        Some(escaped_space)
+    );
+    assert_ne!(
+        trust_key_from_command(backslash).as_deref(),
+        trust_key_from_command(escaped_space).as_deref()
+    );
+    for control in ['\r', '\x0b', '\x0c'] {
+        let suffixed = format!("touch /tmp/x{control}");
+        assert_eq!(
+            trust_key_from_command(&suffixed).as_deref(),
+            Some(suffixed.as_str()),
+            "edge control byte U+{:04X} must stay in the key",
+            control as u32
+        );
+        assert_ne!(
+            trust_key_from_command(&suffixed).as_deref(),
+            trust_key_from_command("touch /tmp/x").as_deref()
+        );
+    }
+    // The single `$ ` display-prefix parse is the only normalization left.
+    assert_eq!(
+        trust_key_from_command(raw_bash_command("$ touch /tmp/x\\ ")).as_deref(),
+        Some(escaped_space)
+    );
 }
 
 #[test]

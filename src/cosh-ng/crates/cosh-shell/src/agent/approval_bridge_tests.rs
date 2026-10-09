@@ -950,6 +950,439 @@ fn auto_mode_preloaded_trust_key_does_not_auto_approve_high_risk() {
     assert!(state.control.shell_handoff().approved_is_empty());
 }
 
+/// A private per-test audit root that removes itself on drop.
+///
+/// `test_with_root` needs a real directory to open a segment writer in; without
+/// it every auto-approval degrades to `blocked_audit_required` and a test can no
+/// longer tell "the user was asked" from "the audit sink was missing". Bind this
+/// before the `InlineState` holding the recorder so the recorder drops first.
+struct TempAuditRoot(std::path::PathBuf);
+
+impl TempAuditRoot {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TempAuditRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn unique_audit_root(label: &str) -> TempAuditRoot {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time")
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "cosh-shell-{label}-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).expect("create audit root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))
+            .expect("private audit root");
+    }
+    TempAuditRoot(root.canonicalize().expect("canonical audit root"))
+}
+
+#[test]
+fn trusted_single_line_command_does_not_auto_approve_a_multiline_command() {
+    // E01: a session trust key must stay bound to the command the user
+    // actually approved. Folding every whitespace run made the two-line
+    // command below share a key with the single-line `touch`, so trusting
+    // either one silently authorized running the other.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-multiline");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/staged touch /tmp/published")
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/staged\ntouch /tmp/published" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render multiline approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_command_does_not_auto_approve_a_dollar_prefixed_variant() {
+    // The `$ ` display prefix is stripped exactly once, where the preview is
+    // turned back into a command, and never again inside the trust key. A
+    // second strip would let a trusted `echo hi` also approve a proposal whose
+    // raw text is `$ echo hi`, i.e. a different program, so the variant must
+    // keep its own key and ask.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-dollar-variant");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("echo hi").expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "$ echo hi" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render dollar-prefixed variant approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_dollar_prefixed_command_still_auto_approves_the_identical_command() {
+    // Positive control for the test above: the prefixed text is a command like
+    // any other, so trusting it verbatim must still auto-approve the identical
+    // proposal. The fix binds keys exactly; it does not disable trust keys for
+    // prefixed commands.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-dollar-exact");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("$ echo hi").expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "$ echo hi" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render identical prefixed approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Approved,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_none());
+}
+
+#[test]
+fn trusted_command_does_not_auto_approve_a_unicode_whitespace_suffixed_variant() {
+    // U+00A0 is a filename character in bash, not ignorable edge whitespace,
+    // so trimming it would let a trusted `touch /tmp/cosh-e01-nbsp` approve a
+    // proposal for `touch /tmp/cosh-e01-nbsp\u{00a0}` - a different path -
+    // while the handoff executed the suffixed bytes. No edge byte is
+    // normalized, so the variant must keep its own key and ask.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-nbsp-variant");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/cosh-e01-nbsp")
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/cosh-e01-nbsp\u{00a0}" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render nbsp-suffixed approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_unicode_whitespace_suffixed_command_still_auto_approves_the_identical_command() {
+    // Positive control for the test above: the suffixed bytes are a command
+    // like any other, so trusting them verbatim must still auto-approve the
+    // identical proposal. The fix preserves meaningful bytes; it does not
+    // disable trust keys for commands that contain them.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-nbsp-exact");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/cosh-e01-nbsp\u{00a0}")
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/cosh-e01-nbsp\u{00a0}" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render identical nbsp approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Approved,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_none());
+}
+
+#[test]
+fn trusted_command_does_not_auto_approve_a_different_quoted_argument() {
+    // Same defect through quoted whitespace: the two `sed` scripts below edit
+    // different text, but one folded key covered both.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-quoted");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command(r#"sed -i "s/a b/X/" notes.txt"#)
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "sed -i \"s/a  b/X/\" notes.txt" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render quoted-argument approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_command_still_auto_approves_the_identical_command() {
+    // Positive control: binding the key to the exact command must not break
+    // the feature the trust key exists for.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-identical");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/staged").expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/staged" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render identical-command approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Approved,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_none());
+}
+
 #[test]
 fn trust_mode_surfaces_hook_followup_approval_after_auto_approved_tool() {
     // #1920 regression: after the trust path auto-approves the shell
@@ -2656,5 +3089,259 @@ fn auto_mode_preloaded_trust_checks_executable_control_input() {
                 "{input}"
             );
         }
+    }
+}
+
+#[test]
+fn trusted_command_does_not_auto_approve_an_escaped_trailing_space_variant() {
+    // The trailing space in `touch /tmp/cosh-e01-esc\ ` is escaped, so bash
+    // passes it as part of the filename; collapsing edge whitespace would put
+    // it under the key of `touch /tmp/cosh-e01-esc\` and auto-approve a
+    // different argument. The authorization key keeps raw bytes, so the
+    // variant must ask.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-escaped-space");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/cosh-e01-esc\\")
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/cosh-e01-esc\\ " }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render escaped-space approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_command_does_not_auto_approve_a_cr_suffixed_variant() {
+    // Same class through a control byte: CR is not in bash's IFS, so a
+    // trailing `\r` is argument data, not ignorable edge whitespace. CR can
+    // never reach execution - `ShellHandoffRequest::validate` rejects control
+    // characters - so this test pins key distinction and blocking only, and
+    // makes no claim about executed bytes.
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-cr-suffix");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    state.control.trust.trust_session_command(
+        crate::approval::handoff::trust_key_from_command("touch /tmp/cosh-e01-cr")
+            .expect("trust key"),
+    );
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": "touch /tmp/cosh-e01-cr\r" }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render cr-suffixed approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Pending,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    assert!(state.approvals.active_panel_id.is_some());
+    assert!(state.control.shell_handoff().approved_is_empty());
+}
+
+#[test]
+fn trusted_escaped_space_command_queues_a_handoff_with_the_same_bytes() {
+    // Positive control and same-source check on a command the real handoff path
+    // accepts: `ShellHandoffRequest::validate` rejects control characters, so a
+    // CR-suffixed command can never be queued or executed and is covered by the
+    // key-distinction and block tests only. Trusting these bytes verbatim
+    // auto-approves the identical proposal and queues a real handoff, and
+    // `emit_next_approved` is the step that hands bytes to the PTY, so what it
+    // emits must equal both the proposal and the minted key - authorization and
+    // execution drawing from one source, not from two independently normalized
+    // strings.
+    let command = "touch /tmp/cosh-e01-esc-exact\\ ";
+    let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+    let audit_root = unique_audit_root("e01-esc-exact");
+    let mut state = InlineState {
+        approval_mode: CoshApprovalMode::Auto,
+        audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+            audit_root.path(),
+        )),
+        ..InlineState::default()
+    };
+    let key = crate::approval::handoff::trust_key_from_command(command).expect("trust key");
+    state.control.trust.trust_session_command(key.clone());
+    let governed = [GovernedEvent {
+        decision: GovernanceDecision::Display,
+        policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+        event: AgentEvent::ToolPermissionRequest {
+            run_id: "run-1".to_string(),
+            request_id: "ctrl-1".to_string(),
+            tool_name: "Bash".to_string(),
+            tool_input: serde_json::json!({ "command": command }),
+            tool_use_id: "toolu-1".to_string(),
+            hook_requires_approval: false,
+            audit_ref: None,
+        },
+        reason: "shell command".to_string(),
+        display_text: "shell command".to_string(),
+        auto_execute: false,
+    }];
+    let mut output = Vec::new();
+
+    crate::agent::events::render_agent_structured_events(
+        &mut state,
+        &governed,
+        None,
+        AgentRunOrigin::Standard,
+        &mut output,
+        &adapter,
+    )
+    .expect("render identical escaped-space approval");
+
+    assert_eq!(state.approvals.requests.len(), 1);
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Approved,
+        "execution_path={:?}",
+        state.approvals.requests[0].execution_path,
+    );
+    // Drive the real queue: `queue_approved_shell_handoff` parked the request
+    // in the approved deque, and `emit_next_approved` is the step that hands
+    // those bytes to the PTY. What it emits is what bash will run.
+    let emitted = state
+        .control
+        .shell_handoff_mut()
+        .emit_next_approved(0)
+        .expect("the approved request was queued and emits to the PTY");
+    assert_eq!(
+        emitted.command, command,
+        "emitted bytes must equal the proposal"
+    );
+    assert_eq!(
+        emitted.command, key,
+        "emitted bytes must equal the minted key"
+    );
+    assert!(state.control.shell_handoff().pending_front().is_some());
+}
+
+#[test]
+fn configured_blank_commands_do_not_auto_approve_invalid_handoffs() {
+    for command in [" ", "\t\n", "\r\u{000b}\u{000c}", "\u{00a0}"] {
+        let mut config = crate::config::CoshConfig::default();
+        config.approval_mode = CoshApprovalMode::Auto;
+        config.trusted_commands.push(command.to_string());
+        let audit_root = unique_audit_root("blank-config-key");
+        let mut state = InlineState {
+            approval_mode: config.approval_mode,
+            audit: Some(crate::journal::audit::ShellAuditRecorder::test_with_root(
+                audit_root.path(),
+            )),
+            ..InlineState::default()
+        };
+        for configured in &config.trusted_commands {
+            if let Some(key) = crate::approval::handoff::trust_key_from_command(configured) {
+                state.control.trust.trust_session_command(key);
+            }
+        }
+        let governed = [GovernedEvent {
+            decision: GovernanceDecision::Display,
+            policy_decision: GovernancePolicyDecision::NeedsUserApproval,
+            event: AgentEvent::ToolPermissionRequest {
+                run_id: "run-1".to_string(),
+                request_id: "ctrl-blank".to_string(),
+                tool_name: "Bash".to_string(),
+                tool_input: serde_json::json!({ "command": command }),
+                tool_use_id: "toolu-blank".to_string(),
+                hook_requires_approval: false,
+                audit_ref: None,
+            },
+            reason: "shell command".to_string(),
+            display_text: "shell command".to_string(),
+            auto_execute: false,
+        }];
+        let adapter = AdapterInstance::QwenCli(QwenCliAdapter::default());
+        let mut output = Vec::new();
+        crate::agent::events::render_agent_structured_events(
+            &mut state,
+            &governed,
+            None,
+            AgentRunOrigin::Standard,
+            &mut output,
+            &adapter,
+        )
+        .expect("render configured blank command");
+        assert_eq!(state.approvals.requests.len(), 1);
+        assert_eq!(
+            state.approvals.requests[0].status,
+            ApprovalRequestStatus::Pending,
+            "{command:?}"
+        );
+        assert!(state.approvals.active_panel_id.is_some());
+        assert!(state.control.trust.session_trusted_commands().is_empty());
+        assert!(state.control.shell_handoff().approved_is_empty());
+        assert!(state.control.shell_handoff().pending_front().is_none());
     }
 }

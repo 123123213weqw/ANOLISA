@@ -25,8 +25,12 @@ pub(super) fn fallback_bash_execution_path(command: &str) -> ApprovedBashExecuti
     }
 }
 
-pub(super) fn raw_bash_command(preview: &str) -> &str {
-    preview.strip_prefix("$ ").unwrap_or(preview).trim()
+pub(crate) fn raw_bash_command(preview: &str) -> &str {
+    // Only the `$ ` display prefix is parsed away, once, here. No trimming:
+    // edge bytes are not reliably ignorable in bash (an escaped trailing
+    // space, CR, VT and FF are argument data), so any trim would let two
+    // commands that execute differently share one authorization key.
+    preview.strip_prefix("$ ").unwrap_or(preview)
 }
 
 pub(crate) fn queue_approved_shell_handoff(
@@ -264,11 +268,24 @@ pub(super) fn build_shell_handoff_request(
 }
 
 pub(crate) fn trust_key_from_command(command: &str) -> Option<String> {
-    let cmd = raw_bash_command(command);
-    if cmd.trim().is_empty() || cmd.contains('\0') {
+    // The retained key is byte-for-byte; its value is never trimmed:
+    // an escaped trailing space, CR, VT, FF or U+00A0 at an edge is argument
+    // data in bash, so normalizing edges lets commands that execute
+    // differently share one key. Edge-whitespace tolerance for pasted or
+    // configured commands belongs to a non-authorization comparison layer and
+    // is deliberately not built here. The `$ ` display prefix is parsed once,
+    // by `raw_bash_command`, at the single place a preview is turned back into
+    // a command. Structured inputs derive their actual command directly;
+    // minting, matching and revocation use this byte-exact key after command
+    // derivation. Configured trusted commands also use this key unchanged.
+    // Blank eligibility matches handoff validation; retained bytes stay intact.
+    if command.trim().is_empty() || command.contains('\0') {
         return None;
     }
-    Some(cmd.split_whitespace().collect::<Vec<_>>().join(" "))
+    // The key must stay byte-identical to the command the user approved.
+    // Folding interior whitespace let `touch a\ntouch b` and `touch a touch b`
+    // share one key, so trusting either silently authorized running the other.
+    Some(command.to_string())
 }
 
 pub(crate) fn command_matches_trust_key(command: &str, trusted: &HashSet<String>) -> bool {
