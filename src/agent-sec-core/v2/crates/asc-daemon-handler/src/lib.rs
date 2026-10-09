@@ -22,3 +22,5 @@ pub use asc_security_events::query::SecurityEventQueries;
 pub use dispatcher::DaemonDispatcher;
 pub use query::SecurityQueryHandler;
 pub use rejection::JsonRejectionEncoder;
+
+mod observability_query;

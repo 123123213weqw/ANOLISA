@@ -519,6 +519,8 @@ agent-sec-cli harden --downstream-help
 
 ## Observability
 
+Rust V2 的 report/review 仅通过 daemon 查询。普通用户只见自身数据；root 可查全部。查询身份仅来自 UDS peer。report 保留 V1 的 `--session-id`、`--last`、`--format`，review 不增加业务参数，report JSON 不新增 UID 字段。`observability schema` 在本地从 Rust 契约动态生成兼容 V1 的记录 Schema。
+
 ```bash
 # 交互式下钻 TUI（需要交互式终端）
 agent-sec-cli observability review

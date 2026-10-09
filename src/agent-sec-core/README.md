@@ -551,6 +551,8 @@ agent-sec-cli harden --downstream-help
 
 ## Observability
 
+Rust V2 report/review query the daemon exclusively. Ordinary users see their own records; root can query all owners. Query identity comes only from the UDS peer. Report keeps V1’s `--session-id`, `--last`, and `--format`; review takes no command-specific options. Report JSON adds no UID field. `observability schema` generates the V1-compatible record schema locally from the Rust contracts.
+
 ```bash
 # Interactive drill-down TUI (requires an interactive terminal)
 agent-sec-cli observability review

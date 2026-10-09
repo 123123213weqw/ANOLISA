@@ -109,8 +109,19 @@ fn run(cli: &Cli) -> Result<u8, RunError> {
                 )
                 .map_err(RunError::Output);
         }
+        Plan::ObservabilitySchema => {
+            use std::io::Write;
+            let schema = asc_observability::observability_record_json_schema();
+            let text = serde_json::to_string_pretty(&schema)
+                .map_err(|error| RunError::Output(io::Error::other(error)))?;
+            writeln!(io::stdout().lock(), "{text}").map_err(RunError::Output)?;
+            return Ok(0);
+        }
         Plan::Daemon { socket } => socket,
     };
+    if let Some(result) = cli.run_observability_query(socket) {
+        return result.map_err(RunError::Output);
+    }
     // Scan-prompt resolves its own request batch (one per input line or
     // conversation payload) and prints diagnostics around them, so it owns
     // its transport loop instead of sharing the single-request path.

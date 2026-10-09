@@ -990,7 +990,7 @@ server frame proof。普通 V2 请求仍由原 closed envelope 解析，不接�
 成功响应为 `{requestId,result:{}}`，且发生在 JSONL、SQLite 两次写入成功之后。
 完整输入、错误、部分成功语义、V1 CLI 兼容边界与 OBS-001..006 executable fixtures 见
 [V2 可观测单条采集契约](V2_OBSERVABILITY_INGESTION_zh.md)。这不是 V1 新增 RPC，
-不改变本文 CURRENT V1 方法清单；本批没有新增查询接口。
+不改变本文 CURRENT V1 方法清单；后续 obs 查询扩展见第 17 节。
 
 ## 16. [TARGET V2][IMPLEMENTED, PROCESS-LOCAL] Scope assignment（SCOPE-CR-002）
 
@@ -1029,3 +1029,17 @@ Scope 来源和固定进程身份，不包含完整 Scope 或 scopeRevision。
 
 真实 procfs + scripted Client 组合验证自动下发/清理；UDS、CLI 和 bootstrap 验证公开接口。
 这不构成磁盘恢复、真实 AgentSight 或 kernel enforcement 证据。旧 Probe 入口继续拒绝。
+
+## 17. [TARGET V2：obs 已实现] 当前用户查询
+
+V2 已注册 `obs.sessions.list`、`obs.runs.list`、`obs.timeline.get`，使用 V2 信封；
+CLI report/TUI review 只通过 daemon 读取。`sec.summary`、`sec.events.list/get/count_by` 的契约见第 6 节。
+obs 普通用户范围固定为内核认证的 UDS peer UID；root 可查询全部；obs 请求不接受 uid/owner_uid 或转发身份。
+参数、分页、关联与错误契约，以及 QRY-001..011 完整验收矩阵和当前证据见
+[V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)。
+obs 查询采用 LocalUser access policy 和服务端 QueryScope，不改变本文 CURRENT V1 事实。
+`obs.sessions.list` 接受可选精确 `session_id`，先应用 UID、session、时间过滤，再统计与分页；
+跨 owner 同名 session 仍返回独立条目；仅 root 的重名条目使用 `UID_SessionId` 作为下钻定位符，
+正常 ID 保持原样。组合名称仍有歧义时拒绝；原始存储 ID 和安全关联不变，详见查询设计 §4.1。
+内部 `DaemonDispatcher::handle` 使用命名的 5 秒 convenience budget；真实 UDS dispatch
+使用 transport 配置生成的 `DispatchControl`，不受该默认值替代。

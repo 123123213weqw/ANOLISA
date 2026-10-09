@@ -610,7 +610,7 @@ RPM 安装套件通过 914 项，并单独通过修正后的 systemd 生命周�
 ## [TARGET V2] 可观测采集存储接线（DPROC-022）
 
 `obs.record` 的 JSONL/SQLite writers 使用与安全事件相同的已解析 daemon 系统数据目录，
-显式装配、惰性初始化，无 HOME fallback。可观测双写仅通过 daemon 持有的
+显式装配，无 HOME fallback；obs schema 在启动时准备，JSONL 惰性初始化。可观测双写仅通过 daemon 持有的
 `ConfiguredObservabilitySinks` 实例，不提供进程全局可观测写入口。关闭时保留 sinks 到 transport/blocking drain
 之后再执行 close/保留期维护。具体路径、失败及有界关闭语义见
 [V2 可观测单条采集契约](V2_OBSERVABILITY_INGESTION_zh.md#3-数据路径与生命周期)。
@@ -639,3 +639,37 @@ Scope update、Scope revision 参数及手动 Binding mutation 已移除，应�
 单进程 Scope/Binding 快照不构成 daemon 重启恢复证据。procfs/runtime/Adapter 的 scripted
 Client 组合验证自动 Binding 和清理；bootstrap SIGTERM 验证任务停止，CLI/UDS 验证权限与
 公开接口。本节不声明 RPM/systemd 实测、真实 AgentSight 或 kernel enforcement。
+
+## [TARGET V2 obs 已实现，安装态待验收] 当前用户查询范围（DPROC-QRY-001）
+
+查询 reader 使用与 writer 一致的显式系统数据路径，由 daemon 装配；只读连接随每次查询结束关闭，writers 在请求 drain 后关闭。
+CLI/TUI 不直读数据库；普通用户按 UDS peer UID 过滤，root 可查询全部；非 root 的
+PolicyAdministrator 不获得跨 UID 查询权限。可观测数据在单次 INSERT 中持久化 peer UID，
+JSONL 同时写入可信顶层 `uid`。首版 obs schema revision 1 直接包含必填 UID 和归属索引；
+SQLite 与 JSONL writer 均强制携带 UID，不提供无 UID writer、旧 schema 自动升级或 V1 数据导入。
+初始化失败时 obs 查询不可用且采集显式报错。
+存储失败边界和真实跨 UID 安装态验收见
+[V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)。
+三个 obs 查询和 CLI report/review 已接线。DPROC-QRY-001 安装态跨 UID 验收仍待执行，
+不能以库内 scope 测试或当前用户的 UDS 进程测试替代。
+
+启动边界：security SQLite 必要 schema 初始化失败仍阻止 READY；随后单独准备三项可选
+查询索引，失败记录具体原因并继续 admission，查询可能变慢。当前建索引仍在 READY 前同步
+执行；已有索引使用 IF NOT EXISTS，新索引需扫描/排序历史记录。大库首次启动成本未测量，
+此变更只隔离索引错误，不提供耗时上限或后台重建能力。obs 初始化失败的既有降级策略保持不变。
+
+DPROC-QRY-001 源码 fixture：
+`v2/crates/asc-event-sink/src/configured.rs::tests::query_index_failure_does_not_disable_required_storage`
+验证索引失败后仍可写安全事件；
+`v2/apps/asc-daemon/tests/bootstrap.rs::daemon_binds_when_optional_query_indexes_fail`
+在 root 分支验证真实二进制继续监听并输出诊断。非 root 执行仅验证 daemon 的启动身份拒绝，
+不算该启动场景通过。QRY-001..011 的逐项 fixture 映射见查询设计 §8；安装态仍未执行。
+
+
+DPROC-QRY-001 查询身份补充：所有查询的授权范围仅由 UDS peer UID 决定；不接受
+`uid/owner_uid` 参数，CLI 不提供对应选项。root 默认 All，普通用户固定 Own(peer_uid)。
+root 列表只在跨 owner 同名时返回 `UID_SessionId`；组合名称由服务端解析到已有数据，
+不授予权限，普通用户不解析该前缀。组合名称仍有歧义时拒绝，不混合不同 owner。
+可执行 fixture：`v2/apps/asc-cli/tests/observability_query.rs` 验证真实 peer、UID 参数拒绝、
+无 UID 的 report/review；`v2/crates/asc-persistence-sqlite/tests/owned_queries.rs` 验证 root
+组合名称、普通用户隔离和歧义拒绝。以上不替代安装态不同 UID/systemd 验收。

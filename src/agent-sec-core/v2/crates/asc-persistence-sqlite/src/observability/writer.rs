@@ -16,7 +16,7 @@ use asc_security_events::ConfigError;
 use asc_sqlite_kernel::{KernelError, SqliteSink, SqliteStore, current_epoch};
 
 use crate::observability::policy::ObservabilityFaultPolicy;
-use crate::observability::repository::ObservabilityEventRepository;
+use crate::observability::repository::{ObservabilityEventRepository, check_schema};
 use crate::observability::table::OBSERVABILITY_TABLES;
 
 /// `SQLite` index writer for observability records.
@@ -48,8 +48,8 @@ impl ObservabilitySqliteWriter {
 
     /// Builds a writer with an explicit retention window.
     ///
-    /// No migrator is passed and no write lock is taken — both match v1: this
-    /// stream is still at schema revision 1 and holds no `threading.Lock`.
+    /// Revision 2 converges older stores by adding a nullable owner column and
+    /// owner-scoped indexes; historical rows keep a `NULL` owner.
     ///
     /// # Errors
     ///
@@ -74,6 +74,17 @@ impl ObservabilitySqliteWriter {
         })
     }
 
+    /// Initializes or validates the schema before admitting queries.
+    ///
+    /// # Errors
+    /// Returns storage failures or unsupported schema revisions.
+    pub fn probe(&self) -> Result<(), KernelError> {
+        self.sink
+            .store()
+            .with_connection(true, check_schema)?
+            .ok_or(KernelError::Disabled)
+    }
+
     /// Returns the underlying sink.
     #[must_use]
     pub const fn sink(
@@ -89,8 +100,8 @@ impl ObservabilitySqliteWriter {
     }
 
     /// Inserts `record`, swallowing every fault.
-    pub fn write(&self, record: &ObservabilityRecord) {
-        self.sink.write(record);
+    pub fn write(&self, record: &ObservabilityRecord, uid: u32) {
+        self.sink.write(&(record.clone(), uid));
     }
 
     /// Inserts `record`, surfacing ingestion failures.
@@ -99,8 +110,12 @@ impl ObservabilitySqliteWriter {
     ///
     /// Returns [`KernelError`] carrying one of v1's three `OSError` messages, or
     /// the original error for a malformed record and for schema drift.
-    pub fn write_or_raise(&self, record: &ObservabilityRecord) -> Result<(), KernelError> {
-        self.sink.write_or_raise(record)
+    pub fn write_or_raise(
+        &self,
+        record: &ObservabilityRecord,
+        uid: u32,
+    ) -> Result<(), KernelError> {
+        self.sink.write_or_raise(&(record.clone(), uid))
     }
 
     /// Runs the gated maintenance pass and drops the connection.
@@ -181,8 +196,10 @@ mod tests {
         let writer = ObservabilitySqliteWriter::new(&path).expect("writer");
         assert!(!path.exists(), "construction must not touch the filesystem");
 
-        writer.write(&record());
-        writer.write_or_raise(&record()).expect("second write");
+        writer.write(&record(), 1000);
+        writer
+            .write_or_raise(&record(), 1000)
+            .expect("second write");
         writer.close_at(1000.0);
 
         let store = Arc::new(
@@ -211,8 +228,8 @@ mod tests {
         std::fs::create_dir(&path).expect("occupy the path");
 
         let writer = ObservabilitySqliteWriter::new(&path).expect("writer");
-        writer.write(&record());
-        assert!(writer.write_or_raise(&record()).is_err());
+        writer.write(&record(), 1000);
+        assert!(writer.write_or_raise(&record(), 1000).is_err());
     }
 
     /// A failing retention pass stays silent and leaves the gate unmarked.
@@ -230,7 +247,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("observability.db");
         let writer = ObservabilitySqliteWriter::new(&path).expect("writer");
-        writer.write(&record());
+        writer.write(&record(), 1000);
 
         // Removing the table from a second connection is the cheapest way to
         // make the `DELETE` inside the retention pass fail for real.
