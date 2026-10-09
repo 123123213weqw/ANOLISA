@@ -307,8 +307,16 @@ fn apply_recordable(rec: &Recommendation) -> Result<(Option<String>, WriteOutcom
 /// `vm.overcommit_kbytes` limit reads the ratio as 0, the ratio rule then
 /// treats that 0 as "too low" and the write silently disables the fixed
 /// limit, whose original only the ledger can bring back.
+///
+/// The table is keyed on the dotted spelling, but the caller's spelling is not
+/// fixed: `apply_import` resolves both spellings to one file
+/// ([`param_to_path`]), which is the separator handling `validate_import_value`
+/// documents ("other separator spellings that map to the same file cannot slip
+/// past") and the reason 33c0d669a dotted-normalized the runtime-dangerous
+/// guard. A slashed spelling that missed the table would clear the twin with
+/// no record of its original — the loss the table exists to prevent.
 fn cleared_sibling(param: &str) -> Option<&'static str> {
-    match param {
+    match param.replace('/', ".").as_str() {
         "vm.dirty_bytes" => Some("vm.dirty_ratio"),
         "vm.dirty_ratio" => Some("vm.dirty_bytes"),
         "vm.dirty_background_bytes" => Some("vm.dirty_background_ratio"),
@@ -360,12 +368,25 @@ fn sibling_rec(entry: (String, String, String)) -> Recommendation {
 /// this predicate — persistence never re-applies such a line after its
 /// clearer's (the clearer reproduces the zeroed twin at boot), and the
 /// restore writes it AFTER its clearer (whose write would zero it again).
+///
+/// Both sides of the comparison are canonical. `cleared_sibling` answers in
+/// the dotted spelling, but a KEY is the raw spelling the caller used:
+/// `merge_entries` matches an existing record by the path the parameter
+/// resolves to and keeps the FIRST key, so a twin disabled by a later run
+/// stays under the slashed key an earlier import wrote. Comparing that raw key
+/// against the canonical answer would miss the pair, persist its zero line and
+/// restore it before its clearer — whose own restore then zeroes it again,
+/// losing the pristine value the record exists to bring back.
 fn is_cleared_twin(
     entries: &BTreeMap<String, RollbackEntry>,
     param: &str,
     entry: &RollbackEntry,
 ) -> bool {
-    entry.applied == "0" && entries.keys().any(|k| cleared_sibling(k) == Some(param))
+    let canonical = param.replace('/', ".");
+    entry.applied == "0"
+        && entries
+            .keys()
+            .any(|k| cleared_sibling(k).is_some_and(|twin| twin == canonical))
 }
 
 /// The result of a verified write: the value now live in the kernel.
@@ -1937,6 +1958,94 @@ mod tests {
             !config.contains("overcommit_ratio"),
             "the disabled twin's record must not be re-applied at boot: {config}"
         );
+    }
+
+    /// The twin lookup must answer for the separator spellings every other
+    /// write path resolves to the same file: `apply_import` takes the slash
+    /// spelling of a sysctl — `validate_import_value` resolves the parameter
+    /// "the same way the write path does, so `kernel/sysrq` and other separator
+    /// spellings that map to the same file cannot slip past", and 33c0d669a
+    /// dotted-normalized the runtime-dangerous guard for exactly this reason.
+    /// `cleared_sibling` matched the dotted spelling only, so a slashed
+    /// clearer wrote the knob, the kernel zeroed its twin, and the ledger kept
+    /// no entry for the twin's original — the loss
+    /// [`mutually_exclusive_writes_record_the_twin_they_disable`] pins for the
+    /// dotted spelling, with the same consequence: a rollback restores what the
+    /// ledger holds, reports a full restore, and leaves the twin zeroed.
+    #[test]
+    fn cleared_sibling_accepts_the_separator_spellings_import_resolves() {
+        for (param, twin) in [
+            ("vm/dirty_bytes", "vm.dirty_ratio"),
+            ("vm/dirty_ratio", "vm.dirty_bytes"),
+            ("vm/dirty_background_bytes", "vm.dirty_background_ratio"),
+            ("vm/dirty_background_ratio", "vm.dirty_background_bytes"),
+            ("vm/overcommit_kbytes", "vm.overcommit_ratio"),
+            ("vm/overcommit_ratio", "vm.overcommit_kbytes"),
+        ] {
+            assert_eq!(
+                cleared_sibling(param),
+                Some(twin),
+                "the slash spelling {param} resolves to the same file as its dotted form"
+            );
+        }
+        // A knob outside the pairs disables nothing, whichever separator the
+        // caller used.
+        for param in ["vm.swappiness", "vm/swappiness", "net/ipv4/tcp_syncookies"] {
+            assert_eq!(cleared_sibling(param), None, "{param} disables no twin");
+        }
+    }
+
+    /// The pair can be recorded under the spelling the caller imported the
+    /// CLEARER with: a first run writes the slashed `vm/overcommit_kbytes`, a
+    /// later one applies the dotted ratio, and `merge_entries` matches the twin
+    /// record to the existing entry by resolved path while keeping the first
+    /// key — so the zeroed twin sits under the slashed spelling. The predicate
+    /// both consumers share must still recognize it: otherwise persistence
+    /// writes the `= 0` line and the restore writes the twin BEFORE its
+    /// clearer, whose own write zeroes the just-restored value again.
+    #[test]
+    fn cleared_twin_is_recognized_under_the_importers_spelling() {
+        let entries = BTreeMap::from([
+            (
+                "vm/overcommit_kbytes".to_string(),
+                RollbackEntry {
+                    previous: "4194304".to_string(),
+                    applied: "0".to_string(),
+                    path: "/proc/sys/vm/overcommit_kbytes".to_string(),
+                },
+            ),
+            (
+                "vm.overcommit_ratio".to_string(),
+                RollbackEntry {
+                    previous: "50".to_string(),
+                    applied: "100".to_string(),
+                    path: "/proc/sys/vm/overcommit_ratio".to_string(),
+                },
+            ),
+        ]);
+        assert!(
+            is_cleared_twin(
+                &entries,
+                "vm/overcommit_kbytes",
+                &entries["vm/overcommit_kbytes"]
+            ),
+            "the zeroed twin recorded under the imported slash key must count"
+        );
+        assert!(
+            !is_cleared_twin(
+                &entries,
+                "vm.overcommit_ratio",
+                &entries["vm.overcommit_ratio"]
+            ),
+            "the clearer is not a side-effect record"
+        );
+        let (config, _) = render_persistence(&entries);
+        let config = config.unwrap();
+        assert!(
+            !config.contains("vm/overcommit_kbytes"),
+            "the zero line of a cleared twin must not be persisted:\n{config}"
+        );
+        assert!(config.contains("vm.overcommit_ratio = 100"), "{config}");
     }
 
     #[test]
