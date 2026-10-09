@@ -1170,6 +1170,13 @@ const RUNTIME_SERVICE_MARKERS: &[(&str, &str)] = &[
     ("org.apache.solr", "solr"),
     ("solr", "solr"),
     ("logstash", "logstash"),
+    // A BookKeeper bookie (Pulsar's storage node) runs
+    // org.apache.bookkeeper.server.Main; Pulsar up to 2.6 and BookKeeper up
+    // to 4.5 launched org.apache.bookkeeper.proto.BookieServer directly. Only
+    // these entry points are mapped: AutoRecoveryMain and BookieShell live
+    // under the same root but keep no ledger storage.
+    ("org.apache.bookkeeper.server", "bookkeeper"),
+    ("org.apache.bookkeeper.proto.BookieServer", "bookkeeper"),
     ("org.apache.pulsar", "pulsar"),
     ("pulsar", "pulsar"),
     ("org.apache.catalina", "tomcat"),
@@ -2674,6 +2681,37 @@ mod tests {
         let cmdline =
             "java\u{0}-cp\u{0}/opt/kafka/libs/kafka_2.13-3.7.0.jar\u{0}com.example.kafka.ConsumerApp";
         assert_eq!(runtime_service_from_cmdline(cmdline), None);
+    }
+
+    #[test]
+    fn test_runtime_service_matches_the_bookkeeper_bookie() {
+        // A Pulsar storage node runs BookKeeper bookies, not the broker: both
+        // `pulsar bookie` and BookKeeper's own `bookkeeper bookie` exec
+        // org.apache.bookkeeper.server.Main. The bookie owns the server
+        // package from the root, like org.apache.kafka.connect for Kafka.
+        let cmdline =
+            "java\0-Xmx2g\0org.apache.bookkeeper.server.Main\0--conf\0/pulsar/conf/bookkeeper.conf";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("bookkeeper"));
+
+        // Pulsar up to 2.6 and BookKeeper up to 4.5 started the bookie through
+        // its own entry point instead.
+        let cmdline =
+            "java\0org.apache.bookkeeper.proto.BookieServer\0--conf\0/pulsar/conf/bookkeeper.conf";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("bookkeeper"));
+
+        // The autorecovery daemon and the shell share the bookkeeper root but
+        // keep no ledger storage, so they are not the bookie.
+        for class in [
+            "org.apache.bookkeeper.replication.AutoRecoveryMain",
+            "org.apache.bookkeeper.bookie.BookieShell",
+        ] {
+            let cmdline = format!("java\0{class}\0--conf\0/pulsar/conf/bookkeeper.conf");
+            assert_eq!(runtime_service_from_cmdline(&cmdline), None, "{class}");
+        }
+
+        // The broker is still Pulsar.
+        let cmdline = "java\0org.apache.pulsar.PulsarBrokerStarter\0--broker-conf";
+        assert_eq!(runtime_service_from_cmdline(cmdline), Some("pulsar"));
     }
 
     #[test]

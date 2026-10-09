@@ -1822,7 +1822,10 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
     let is_streaming = info.has_process("kafka")
         || info.has_process("flink")
         || info.has_process("spark")
-        || info.has_process("hadoop");
+        || info.has_process("hadoop")
+        // A bookie's ledger storage sorts each flush by ledger and reads
+        // ahead on a cache miss, so its catch-up reads are sequential.
+        || info.has_process("bookkeeper");
 
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
@@ -8790,6 +8793,33 @@ mod tests {
             "Should recommend read_ahead_kb for HDD with kafka"
         );
         assert_eq!(rec.unwrap().recommended_value, "2048");
+    }
+
+    #[test]
+    fn test_hdd_read_ahead_on_a_bookkeeper_bookie() {
+        // A bookie's ledger storage keeps each ledger's entries together and
+        // reads ahead on a cache miss, so its catch-up reads are sequential
+        // on the disk: the same HDD case as a Kafka broker.
+        let mut info = make_test_info();
+        info.disks = vec![DiskInfo {
+            name: "sdb".to_string(),
+            disk_type: DiskType::HDD,
+            scheduler: "mq-deadline".to_string(),
+            available_schedulers: vec!["mq-deadline".to_string()],
+            nr_requests: 128,
+            read_ahead_kb: 128,
+            rq_affinity: 1,
+        }];
+        info.processes = vec![ProcessInfo {
+            name: "bookkeeper".to_string(),
+        }];
+        let recs = evaluate(&info).unwrap().recommendations;
+        let rec = recs.iter().find(|r| r.param == "block/sdb/read_ahead_kb");
+        assert_eq!(
+            rec.map(|r| r.recommended_value.as_str()),
+            Some("2048"),
+            "a bookie on an HDD should get the read-ahead advice"
+        );
     }
 
     #[test]
