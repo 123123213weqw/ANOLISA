@@ -1852,13 +1852,38 @@ fn eval_read_ahead_kb(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
     1
 }
 
+/// Whether the device exposes a request (blk-mq) queue at all.
+///
+/// `queue/scheduler`, `queue/nr_requests` and `queue/rq_affinity` are
+/// registered in ONE attribute group the kernel makes visible only for
+/// request-based queues: `blk_mq_queue_attr_visible()` returns 0 unless
+/// `queue_is_mq()` (v6.6 `block/blk-sysfs.c`:686-694 and
+/// `include/linux/blkdev.h`:609; 7.3-rc6 `block/blk-sysfs.c`:830-841, whose
+/// array is introduced as "Request-based queue attributes that are not
+/// relevant for bio-based queues"). The NVMe multipath head device is exactly
+/// such a queue — the driver builds it with `blk_alloc_disk()` (v6.6
+/// `drivers/nvme/host/multipath.c`:534, 7.3-rc6 :765), so `nvme0n1`, the
+/// device carrying the filesystem, has NONE of the three files, while the
+/// per-path devices that actually queue the I/O are blk-mq disks
+/// (`blk_mq_alloc_disk()`, v6.6 `drivers/nvme/host/core.c`:3583, 7.3-rc6
+/// :4264) and keep their advice. An empty scheduler list is that marker: the
+/// list can only be empty when the file could not be read, and a readable
+/// file always names at least the active scheduler.
+fn has_request_queue(disk: &DiskInfo) -> bool {
+    !disk.available_schedulers.is_empty()
+}
+
 fn eval_nr_requests(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     for disk in &info.disks {
         // Without an elevator the kernel caps nr_requests at the hardware tag
         // depth (larger writes fail with EINVAL), and switching to `none`
         // resets it to that depth, so under `none` the value cannot be raised.
         let scheduler = nvme_scheduler_target(disk).unwrap_or(&disk.scheduler);
-        if disk.disk_type == DiskType::NVMe && disk.nr_requests < 256 && scheduler != "none" {
+        if disk.disk_type == DiskType::NVMe
+            && has_request_queue(disk)
+            && disk.nr_requests < 256
+            && scheduler != "none"
+        {
             recs.push(Recommendation {
                 param: format!("block/{}/nr_requests", disk.name),
                 current_value: disk.nr_requests.to_string(),
@@ -1878,7 +1903,7 @@ fn eval_rq_affinity(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
         return 1;
     }
     for disk in &info.disks {
-        if disk.disk_type == DiskType::NVMe && disk.rq_affinity != 2 {
+        if disk.disk_type == DiskType::NVMe && has_request_queue(disk) && disk.rq_affinity != 2 {
             recs.push(Recommendation {
                 param: format!("block/{}/rq_affinity", disk.name),
                 current_value: disk.rq_affinity.to_string(),
@@ -8561,6 +8586,36 @@ mod tests {
             rec.is_none(),
             "Should not recommend nr_requests when already high"
         );
+    }
+
+    #[test]
+    fn bio_based_disk_gets_no_request_queue_knobs() {
+        // The head device of an NVMe multipath host (`nvme0n1`, the one that
+        // carries the filesystem) is allocated with blk_alloc_disk() — a
+        // bio-based queue (v6.6 drivers/nvme/host/multipath.c:534, 7.3-rc6
+        // :765). The kernel registers queue/scheduler, queue/nr_requests and
+        // queue/rq_affinity in ONE attribute group that
+        // blk_mq_queue_attr_visible() hides unless queue_is_mq() (v6.6
+        // block/blk-sysfs.c:686-694; 7.3-rc6 :830-841, whose array is
+        // introduced as "Request-based queue attributes that are not relevant
+        // for bio-based queues"), so detection reads exactly the sentinels
+        // below and none of the three files can be written. The per-path
+        // devices that queue the I/O are blk-mq disks (blk_mq_alloc_disk(),
+        // v6.6 drivers/nvme/host/core.c:3583, 7.3-rc6 :4264) and keep the
+        // advice.
+        let mut info = make_test_info();
+        info.numa_nodes = 2;
+        info.disks[0].scheduler = "unknown".to_string();
+        info.disks[0].available_schedulers = Vec::new();
+        info.disks[0].nr_requests = 0;
+        info.disks[0].rq_affinity = 0;
+        let recs = evaluate(&info).unwrap().recommendations;
+        for knob in ["scheduler", "nr_requests", "rq_affinity"] {
+            assert!(
+                !recs.iter().any(|r| r.param.contains(knob)),
+                "a bio-based queue exposes no {knob} file to write"
+            );
+        }
     }
 
     #[test]
