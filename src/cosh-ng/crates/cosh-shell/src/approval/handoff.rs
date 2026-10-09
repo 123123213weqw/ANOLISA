@@ -206,6 +206,19 @@ pub(crate) fn shell_handoff_command_from_request(
     Err("provider shell tool input has no command field".to_string())
 }
 
+/// The command a session trust key authorizes: the text a handoff executes, never
+/// the card's display preview. The two differ for any input shape whose preview
+/// falls back to the serialized tool input — a `{"cmd": ...}` request displays
+/// the JSON object and executes the `cmd` value — and the uncertain-effect
+/// revocation keys off the executed text, so a key minted from the preview is one
+/// no revocation can reach.
+///
+/// `None` when no executable command can be derived. Callers must read that as
+/// "not trusted": such a request earns no lasting trust and no auto-approval.
+pub(crate) fn trusted_command_from_request(request: &RuntimeApprovalRequest) -> Option<String> {
+    shell_handoff_command_from_request(request).ok()
+}
+
 fn shell_handoff_exact_preview(request: &RuntimeApprovalRequest, command: &str) -> String {
     let expected = format!("$ {command}");
     if request.preview == expected {

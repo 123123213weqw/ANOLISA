@@ -2,7 +2,8 @@ use super::*;
 use crate::agent::run::{ActiveAgentRun, AgentRunOrigin};
 use crate::approval::handoff::{
     approval_shell_handoff_validation_message, command_matches_trust_key,
-    fallback_bash_execution_path, trust_key_from_command, ApprovedBashExecutionPath,
+    fallback_bash_execution_path, trust_key_from_command, trusted_command_from_request,
+    ApprovedBashExecutionPath,
 };
 use crate::approval::requests::{approval_request_from_governed_event, record_approval_requests};
 use crate::approval::resolution::{
@@ -1239,6 +1240,139 @@ fn run_batch_consent_covers_is_fail_closed() {
     assert_eq!(state.control.trust.run_batch_consent(), None);
 }
 
+/// The sweep's block lookup keys by the command a handoff actually executes and
+/// fails closed when no executable command can be derived. A `{"cmd": ...}`
+/// input displays the serialized object as its preview while executing the `cmd`
+/// value, so a preview-derived key would miss the block and let turn consent
+/// replay a command whose earlier attempt left the effect uncertain. Requests
+/// with no derivable command never reach the sweep through the bridge (they are
+/// classified high risk), which is why this branch is pinned here rather than
+/// end to end.
+#[test]
+fn turn_consent_block_lookup_uses_the_executable_command() {
+    let mut state = InlineState::default();
+    let command = "touch /tmp/cosh-e05-cmdshape";
+    let key = crate::approval::handoff::trust_key_from_command(command).expect("trust key");
+    state
+        .control
+        .trust
+        .block_command_for_turn_consent("run-1", &key);
+
+    let cmd_shaped = provider_tool_request("Bash", Some(serde_json::json!({ "cmd": command })));
+    assert_ne!(
+        cmd_shaped.preview,
+        format!("$ {command}"),
+        "precondition: the card shows the serialized object, not the command"
+    );
+    assert!(
+        super::blocked_from_turn_consent(&state, &cmd_shaped, &HashSet::new()),
+        "the blocked key comes from the executed command, not the preview"
+    );
+
+    let other = provider_tool_request("Bash", Some(serde_json::json!({ "cmd": "df -h" })));
+    assert!(
+        !super::blocked_from_turn_consent(&state, &other, &HashSet::new()),
+        "an unblocked command is still swept, so the lookup is not blanket-true"
+    );
+
+    let opaque = provider_tool_request("Bash", Some(serde_json::json!({ "arguments": command })));
+    assert!(crate::approval::handoff::shell_handoff_command_from_request(&opaque).is_err());
+    assert!(
+        super::blocked_from_turn_consent(&state, &opaque, &HashSet::new()),
+        "no derivable command means no proof it is unblocked"
+    );
+
+    let no_input = provider_tool_request("Bash", None);
+    assert!(crate::approval::handoff::shell_handoff_command_from_request(&no_input).is_err());
+    assert!(super::blocked_from_turn_consent(
+        &state,
+        &no_input,
+        &HashSet::new()
+    ));
+}
+
+/// Session trust is keyed by the command a handoff executes, so mint, match and
+/// the uncertain-effect revocation all name the same text. A `{"cmd": ...}`
+/// request displays the serialized object and executes the `cmd` value; keying
+/// trust by that preview would leave a key no revocation can reach.
+#[test]
+fn trusted_command_is_the_executed_command_not_the_display_preview() {
+    let cmd_shaped =
+        provider_tool_request("Bash", Some(serde_json::json!({ "cmd": "touch /tmp/t" })));
+    assert_eq!(
+        trusted_command_from_request(&cmd_shaped).as_deref(),
+        Some("touch /tmp/t")
+    );
+    // This fixture's preview is a stand-in, not the serialized object
+    // `presentation_bash` really produces for a `cmd` input; the bridge
+    // regression pins that real shape. What is asserted here is that the
+    // derived command is the `cmd` value and not the preview text.
+    assert_ne!(cmd_shaped.preview, "$ touch /tmp/t");
+
+    let command_shaped =
+        provider_tool_request("Bash", Some(serde_json::json!({ "command": "df -h" })));
+    assert_eq!(
+        trusted_command_from_request(&command_shaped).as_deref(),
+        Some("df -h")
+    );
+
+    let opaque = provider_tool_request("Bash", Some(serde_json::json!({ "arguments": "df -h" })));
+    assert_eq!(trusted_command_from_request(&opaque), None);
+    assert_eq!(
+        trusted_command_from_request(&provider_tool_request("Bash", None)),
+        None
+    );
+}
+
+/// AlwaysTrust mints the executed command's key. A request that cannot produce
+/// an executable command resolves Blocked, and a Blocked resolution never mints,
+/// so no lasting trust can come out of it either; the `None` side of the
+/// derivation itself is pinned by the test above.
+#[test]
+fn always_trust_mints_the_executed_command_key() {
+    let mut opaque_state = InlineState::default();
+    opaque_state.approvals.requests.push(provider_tool_request(
+        "Bash",
+        Some(serde_json::json!({ "arguments": "touch /tmp/opaque" })),
+    ));
+    assert_eq!(opaque_state.approvals.requests[0].risk, "medium");
+
+    let opaque_decision =
+        apply_approval_decision(&mut opaque_state, 0, ApprovalCommandKind::AlwaysTrust)
+            .expect("approval decision");
+    assert_eq!(
+        opaque_decision.request.status,
+        ApprovalRequestStatus::Blocked,
+        "a request with no executable command cannot be handed off"
+    );
+    assert!(
+        opaque_state
+            .control
+            .trust
+            .session_trusted_commands()
+            .is_empty(),
+        "no lasting trust survives a resolution that never executes"
+    );
+
+    let mut cmd_state = InlineState::default();
+    cmd_state.approvals.requests.push(provider_tool_request(
+        "Bash",
+        Some(serde_json::json!({ "cmd": "touch /tmp/minted" })),
+    ));
+    apply_approval_decision(&mut cmd_state, 0, ApprovalCommandKind::AlwaysTrust)
+        .expect("approval decision");
+    let executed_key = trust_key_from_command("touch /tmp/minted").expect("trust key");
+    assert!(
+        cmd_state
+            .control
+            .trust
+            .session_trusted_commands()
+            .contains(&executed_key),
+        "the minted key is the executed command's: {:?}",
+        cmd_state.control.trust.session_trusted_commands()
+    );
+}
+
 /// Blocked turn decisions keep the blocked title and never grant consent.
 #[test]
 fn approve_turn_blocked_request_does_not_grant_consent() {
@@ -1617,4 +1751,160 @@ fn classifier_verdict_wires_irrecoverable_panel_flag() {
     assert!(!assessment_is_irrecoverable(&runtime_assessment_summary(
         &benign
     )));
+}
+
+#[test]
+fn captured_turn_sweep_keeps_unknown_effect_retries_pending_after_owner_stops() {
+    let adapter = AdapterInstance::QwenCli(crate::adapter::QwenCliAdapter::default());
+    for native_first in [false, true] {
+        for status in [
+            "failed",
+            "interrupted",
+            "timed_out",
+            crate::types::SHELL_HANDOFF_UNTRACKED_STATUS,
+            "completed",
+        ] {
+            let (mut state, approval_rx) = state_with_active_control_run("run-1");
+            let command = "touch /tmp/captured-unknown-effect";
+            let handoff = ShellHandoffRequest::new(
+                command,
+                format!("$ {command}"),
+                "provider-tool-call",
+                "agent",
+                "attempt",
+                "run-1",
+                10,
+            )
+            .expect("handoff");
+            let mut block = state
+                .agent_run
+                .active
+                .as_ref()
+                .expect("owner")
+                .request
+                .command_block
+                .clone();
+            block.command = command.to_string();
+            block.exit_code = if status == "completed" { 0 } else { 1 };
+            crate::runtime::evidence_delivery::record_shell_handoff_completion(
+                &mut state, &handoff, &block, status,
+            );
+            for (id, text) in [
+                ("grant", "touch /tmp/captured-grant"),
+                ("other", "touch /tmp/captured-other"),
+                ("retry", command),
+                ("after", "touch /tmp/captured-after"),
+            ] {
+                let mut request = turn_request(id, "run-1", text, "medium");
+                request.request_id = Some(format!("ctrl-{id}"));
+                request.tool_use_id = Some(format!("tool-{id}"));
+                if native_first && id == "grant" {
+                    request.subject = "Read".to_string();
+                    request.tool_input = Some(serde_json::json!({ "file_path": "Cargo.toml" }));
+                    request.preview = "Cargo.toml".to_string();
+                }
+                let mut governed =
+                    governed_provider_tool_permission(&format!("ctrl-{id}"), &format!("tool-{id}"));
+                if let AgentEvent::ToolPermissionRequest {
+                    tool_name,
+                    tool_input,
+                    ..
+                } = &mut governed.event
+                {
+                    *tool_name = request.subject.clone();
+                    *tool_input = request.tool_input.clone().expect("input");
+                }
+                state
+                    .agent_run
+                    .active
+                    .as_mut()
+                    .expect("owner")
+                    .governed_events
+                    .push(governed);
+                state.approvals.requests.push(request);
+            }
+            let mut approve = ShellEvent::user_input_intercepted("session-1", "grant");
+            approve.component = Some("card".to_string());
+            approve.message = Some("approve_turn".to_string());
+            render_approval_actions(&[approve], &[], &adapter, &mut state, &mut Vec::new(), 700)
+                .expect("approve turn and deliver");
+            if native_first {
+                assert!(approval_rx.try_iter().any(|message| matches!(message,
+                    crate::adapter::ApprovalChannelMessage::Response(response)
+                        if response.request_id == "ctrl-grant" && matches!(response.decision, ApprovalDecision::Allow)
+                )), "the first delivery must respond natively before the sweep stops the owner");
+            }
+            assert!(
+                state.agent_run.active.is_none(),
+                "delivery must stop the owner"
+            );
+            assert_eq!(state.control.trust.run_batch_consent(), None);
+            let expected = if status == "completed" {
+                ApprovalRequestStatus::Approved
+            } else {
+                ApprovalRequestStatus::Pending
+            };
+            assert_eq!(
+                state.approvals.requests[2].status, expected,
+                "{status}, native_first={native_first}"
+            );
+            for index in [0, 1, 3] {
+                assert_eq!(
+                    state.approvals.requests[index].status,
+                    ApprovalRequestStatus::Approved
+                );
+            }
+            let mut queued = Vec::new();
+            while let Some(request) = state.control.shell_handoff_mut().emit_next_approved(701) {
+                queued.push(request.command);
+                state.control.shell_handoff_mut().pop_pending();
+            }
+            assert_eq!(
+                queued.iter().any(|text| text == command),
+                status == "completed"
+            );
+            assert!(queued
+                .iter()
+                .any(|text| text == "touch /tmp/captured-after"));
+        }
+    }
+}
+
+#[test]
+fn turn_consent_blocks_do_not_cover_a_foreign_run() {
+    let mut state = InlineState::default();
+    let command = "touch /tmp/run-bound-effect";
+    let key = trust_key_from_command(command).expect("key");
+    state
+        .control
+        .trust
+        .block_command_for_turn_consent("run-1", &key);
+    let request = turn_request("foreign", "run-2", command, "medium");
+    assert!(!super::blocked_from_turn_consent(
+        &state,
+        &request,
+        &HashSet::new()
+    ));
+    state.approvals.requests.push(request);
+    state
+        .control
+        .trust
+        .grant_run_batch_consent("run-2".to_string());
+    let adapter = AdapterInstance::QwenCli(crate::adapter::QwenCliAdapter::default());
+    super::sweep_batch_consented_requests("run-2", None, &adapter, &mut state, &mut Vec::new())
+        .expect("foreign run sweep");
+    assert_eq!(
+        state.approvals.requests[0].status,
+        ApprovalRequestStatus::Approved
+    );
+    let queued = state
+        .control
+        .shell_handoff_mut()
+        .emit_next_approved(702)
+        .expect("foreign command queued");
+    assert_eq!(queued.command, command);
+    assert!(state
+        .control
+        .trust
+        .is_blocked_for_turn_consent("run-1", &key));
 }
