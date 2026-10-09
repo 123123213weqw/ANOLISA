@@ -5552,19 +5552,49 @@ fn eval_suid_dumpable(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current != 0 {
-        recs.push(Recommendation {
-            param: "fs.suid_dumpable".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "SUID 程序的 core dump 可能泄露敏感信息（如密码哈希），应禁用".to_string(),
-            confidence: Confidence::High,
-            category: Category::Security,
-            writable: true,
-        });
+    if let Some(rec) = suid_dumpable_recommendation(read_sysctl_u64(path)) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `fs.suid_dumpable` recommendation for an already-read value; split
+/// from the file probe so the per-mode reason is assertable on any host.
+///
+/// The leak the reason names belongs to mode 1: "the core dump is owned by the
+/// current user and no security is applied. ... This is insecure as it allows
+/// regular users to examine the memory contents of privileged processes"
+/// (Documentation/admin-guide/sysctl/fs.rst, "suid_dumpable": v6.6:253-258,
+/// 7.3.0-rc6:258-263).
+///
+/// Mode 2 is the table's "(suidsafe)" mode and dumps into a controlled target
+/// instead. The kernel handles the dump as root (`cred->fsuid =
+/// GLOBAL_ROOT_UID`, v6.6 fs/coredump.c:567-568, 7.3.0-rc6:1189) and only when
+/// the core name is a pipe handler or a fully qualified path -- with a relative
+/// pattern it skips the dump outright ("can only dump core to fully qualified
+/// path", "Skipping core dump", v6.6 fs/coredump.c:657-662; 7.3.0-rc6:872-891)
+/// -- "we dump it as root in mode 2, and only into a controlled environment
+/// (pipe handler or fully qualified path)" (v6.6 fs/coredump.c:559-564,
+/// 7.3.0-rc6:1181-1187). A mode-2 host therefore gets the mode's own handling
+/// rule, not the mode-1 sentence about a dump a regular user can read.
+fn suid_dumpable_recommendation(current: u64) -> Option<Recommendation> {
+    if current == 0 {
+        return None;
+    }
+    let reason = if current == 2 {
+        "fs.suid_dumpable=2（suidsafe）下特权进程的 core dump 由内核以 root 身份处理，只允许 core_pattern 的管道处理器或绝对路径（相对路径会被跳过）；该模式要求目标能小心处理特权 core dump，不需要这类调试通道时应恢复默认 0"
+    } else {
+        "SUID 程序的 core dump 可能泄露敏感信息（如密码哈希），应禁用"
+    };
+    Some(Recommendation {
+        param: "fs.suid_dumpable".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: reason.to_string(),
+        confidence: Confidence::High,
+        category: Category::Security,
+        writable: true,
+    })
 }
 
 fn eval_icmp_ignore_bogus(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -12938,6 +12968,53 @@ mod tests {
                 assert_eq!(recs.last().unwrap().category, Category::Security);
             } else {
                 assert!(!triggered);
+            }
+        }
+    }
+
+    #[test]
+    fn suid_dumpable_reason_follows_the_mode_in_force() {
+        // fs.rst's suid_dumpable table makes only mode 1 the leak case ("the
+        // core dump is owned by the current user and no security is applied.
+        // ... This is insecure as it allows regular users to examine the
+        // memory contents of privileged processes"); mode 2 is "(suidsafe)"
+        // and the kernel writes it as root, only to a pipe handler or a fully
+        // qualified path, skipping a relative pattern outright
+        // (fs/coredump.c). The mode-1 sentence must not be emitted on a mode-2
+        // host, and the mode must still be advised off (0) in both cases.
+        for (current, expects_rec) in [(0_u64, false), (1, true), (2, true)] {
+            let rec = suid_dumpable_recommendation(current);
+            assert_eq!(rec.is_some(), expects_rec, "value {current}");
+            let rec = match rec {
+                Some(rec) => rec,
+                None => continue,
+            };
+            assert_eq!(rec.param, "fs.suid_dumpable");
+            assert_eq!(rec.current_value, current.to_string());
+            assert_eq!(rec.recommended_value, "0");
+            assert_eq!(rec.category, Category::Security);
+            if current == 2 {
+                assert!(
+                    !rec.reason.contains("泄露"),
+                    "mode 2 is the controlled dump mode: {}",
+                    rec.reason
+                );
+                assert!(
+                    rec.reason.contains("root"),
+                    "mode 2 names the privileged writer: {}",
+                    rec.reason
+                );
+                assert!(
+                    rec.reason.contains("管道处理器或绝对路径"),
+                    "mode 2 names the kernel's target restriction: {}",
+                    rec.reason
+                );
+            } else {
+                assert!(
+                    rec.reason.contains("泄露"),
+                    "mode 1 keeps the user-readable-leak reason: {}",
+                    rec.reason
+                );
             }
         }
     }
