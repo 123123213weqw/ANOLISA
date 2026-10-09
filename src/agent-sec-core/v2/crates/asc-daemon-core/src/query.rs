@@ -275,10 +275,13 @@ pub trait SecurityQueries: Send + Sync {
         window: QueryWindow,
         control: &QueryControl,
     ) -> Result<QuerySecurityCounts, QueryError>;
-    /// Retrieves scoped candidates for one observation; never silently truncates matches.
+    /// Retrieves scoped candidates with V1 truncation and best-effort storage reads.
+    ///
+    /// The `SQLite` adapter reads at most 1000 rows, skips malformed candidates, and
+    /// returns no correlations on storage failure so observations remain available.
     ///
     /// # Errors
-    /// Propagates invalid scope, storage, resource, and cancellation failures.
+    /// Propagates invalid scope and cancellation failures.
     fn candidates(
         &self,
         scope: QueryScope,
@@ -394,7 +397,7 @@ impl ObservabilityQueryService {
     /// Produces an observation page and its same-owner security correlations.
     ///
     /// # Errors
-    /// Rejects ambiguity and propagates failures without emitting partial timelines.
+    /// Rejects ambiguity and propagates observation, response-budget and cancellation failures.
     #[allow(clippy::too_many_arguments)] // Wire contract has two identifiers plus bounded query options.
     pub fn timeline(
         &self,

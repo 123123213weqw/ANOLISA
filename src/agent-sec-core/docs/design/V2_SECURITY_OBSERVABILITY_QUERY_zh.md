@@ -141,13 +141,15 @@ invalid_argument；后续 sec RPC 必须沿用同一规则。未知来源安全�
 查询超时返回 deadline_exceeded；超过响应/资源预算返回 resource_exhausted；其他存储错误返回 internal。
 错误不回显原始内容、数据库路径或其他用户记录是否存在。
 身份范围内无记录是成功的空结果；不存在/不可见的 session/run 返回空列表。
-存储损坏、无权限或不支持的 schema 不能伪装成“没有事件”。
-当前 reader 的容错空结果语义不能原样承担这一职责，需要适配层提供可区分的失败结果。
+Observability 主数据和安全计数的存储损坏、无权限或不支持的 schema 显式报错。
+Timeline 的可选安全关联恢复 V1 的可用性优先行为：候选查询先按 UID 过滤，再按时间/event_id
+正序最多读取前 1000 条，不检测或报告候选截断；坏记录跳过，关联存储故障返回空关联，
+继续展示 observability 页面并写安全诊断。权限错误和取消/deadline 不降级。
 
 复用现有 blocking dispatch、取消和 deadline 机制，沿用 V1 query 的 5 秒请求预算。
 SQL 执行也必须受有界等待/中断控制，不能只在 handler 入口检查 deadline。
-响应保持在现有 transport/client 帧预算内；大量 details、分组结果或关联项超限时明确报错，
-不静默截断或输出不完整的成功 JSON。正常查询不产生新的业务安全事件，避免查询污染统计；
+响应保持在现有 transport/client 帧预算内；主数据、分组结果或最终响应超限时明确报错。
+可选关联读取仍有单行/候选集约 4 MiB 预算；超过该预算按关联存储故障降级为空关联。正常查询不产生新的业务安全事件，避免查询污染统计；
 沿用安全诊断日志且不记录敏感查询结果。
 
 ## 5. UDS UID 归属与存储扩展 [TARGET V2]
@@ -231,7 +233,7 @@ CLI 的查询调用使用普通函数/闭包，不另设 Transport trait 或 Cli
 | QRY-008 | V1 关联 fixtures：精确/回退、hook/category、时间边界、单条与批量等价；候选读取先按 UID 过滤 |
 | QRY-009 | report 授权范围内 --last、text/json、LLM/工具/安全统计；root 使用列表返回的 session ID 下钻、重名 session 不混合；多页完整读取；TUI 下钻与非交互终端行为 |
 | QRY-010 | daemon 不可用时 CLI 不读本地库/不启动 daemon；数据库权限/损坏错误不伪装无事件；查询不创建/迁移库 |
-| QRY-011 | deadline、SQLite 等待/取消、超大 details/分组/timeline 响应有界；失败无部分成功 JSON或敏感诊断 |
+| QRY-011 | deadline、SQLite 等待/取消、超大 details/分组/timeline 响应有界；主数据/响应失败无部分成功 JSON或敏感诊断；可选关联故障不阻断页面 |
 | DPROC-QRY-001 | 安装态 CLI 只能通过 daemon 读系统数据；真实跨 UID 与重启验收，源码进程测试不替代 systemd/RPM 验收 |
 
 交付证据必须分别报告库内 fixtures、CLI/daemon 本地 E2E 和安装态跨 UID 验证，
@@ -248,10 +250,10 @@ CLI 的查询调用使用普通函数/闭包，不另设 Transport trait 或 Cli
 | QRY-005 | `owned_queries.rs::initial_schema_requires_uid`、`schema_rejects_missing_null_and_invalid_uids`；覆盖本地初始化、必填 UID 约束和重开后归属，不替代安装态验收 |
 | QRY-006 | `v2/apps/asc-cli/src/commands/observability/query.rs::compatibility_tests::report_matches_frozen_v1_json_and_text` 覆盖 obs report；sec 输出由基线 events CLI fixtures 覆盖 |
 | QRY-007 | `owned_queries.rs::totals_and_half_open_time_windows_precede_pagination`、`exact_session_filter_preserves_scope_totals_and_time_window`；上述 CLI UDS fixture 覆盖多页 timeline |
-| QRY-008 | `v2/crates/asc-daemon-core/src/query/correlation.rs::tests::frozen_v1_single_and_batch_matches_agree_with_core`；QRY-003 fixture 验证候选 UID 隔离 |
+| QRY-008 | `v2/crates/asc-daemon-core/src/query/correlation.rs::tests::frozen_v1_single_and_batch_matches_agree_with_core`；`owned_queries.rs::correlation_candidates_keep_v1_order_and_limit_without_failing_timeline`、`malformed_candidates_do_not_hide_valid_correlations_or_observations`、`candidate_storage_failures_do_not_fail_the_observation_page`；QRY-003 fixture 验证候选 UID 隔离 |
 | QRY-009 | 上述 CLI UDS fixture（含 PTY 正常/信号退出）；`query.rs::tests::root_last_preserves_result_attribution_and_named_session_rejects_ambiguity`、`named_session_is_resolved_in_one_filtered_rpc` |
 | QRY-010 | `owned_queries.rs::missing_corrupt_unready_and_malformed_stores_are_not_empty_successes`；上述 CLI UDS fixture 覆盖 daemon 不可用与无本地回退 |
-| QRY-011 | `owned_queries.rs::live_cancellation_interrupts_sql_instead_of_only_checking_ingress`、`oversized_payloads_fail_without_partial_timeline_results`；`query.rs::tests::a_later_page_failure_emits_no_partial_report`；不代表全部分组/传输边界已验收 |
+| QRY-011 | `owned_queries.rs::live_cancellation_interrupts_sql_instead_of_only_checking_ingress`、`oversized_payloads_fail_without_partial_timeline_results`；`query.rs::tests::a_later_page_failure_emits_no_partial_report`；`owned_queries.rs::candidate_fault_tolerance_preserves_scope_and_deadline_errors`；不代表全部分组/传输边界已验收 |
 | DPROC-QRY-001 | 源码 fixture：`v2/apps/asc-daemon/tests/bootstrap.rs::daemon_binds_when_optional_query_indexes_fail`（root 分支验证 admission/诊断）；安装态跨 UID、systemd/RPM 与重启验收未执行 |
 
 ### 8.1 V1 功能对齐是完成条件
@@ -287,8 +289,10 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
 
 - **架构与授权**：CLI 持久化查询全部经 daemon；root 全量查询时 JSON 新增 uid，
   同名 session 要求选定 owner，防止跨用户合并。本地生成 schema 不受 daemon-only 限制。
-- **故障可见性**：V1 可忽略安全库/关联故障；V2 明确失败且不输出部分报告，防止把
-  查询失败误报为没有安全事件。损坏 metadata/metrics 也不会以原始片段掩盖存储错误。
+- **故障边界**：Timeline 的可选安全关联恢复 V1 容错：候选取前 1000 条、坏记录跳过、
+  存储故障返回空关联，优先保证页面可用；此时空关联不代表完整读取或没有安全事件。
+  Observability 主数据、安全计数和完整 report 的读取故障仍明确失败，不输出部分报告；
+  损坏 metadata/metrics 也不会以原始片段掩盖存储错误。
 - **系统资源限制**：V1 TUI 一次加载所有行；V2 按 100 条 observation 分页，关联项不计入
   页长，保留全部可访问记录并提供翻页。字体、颜色和控件样式随技术栈变化，用户功能不减少。
 - **数值约束**：report 字节计数接受非负整数、可转换字符串、布尔值与截断小数；无效值、
@@ -310,8 +314,9 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
   sec 查询保留基线 PR #6745 的 `SecurityQueryHandler`、存储端口和授权范围，本次不重构该路径。
 - obs reader 使用独立只读连接，每个操作在事务中统计和分页；不调用容错返回空结果的旧 reader。
   SQL progress handler 和关联循环检查同一个实时取消信号。各 RPC 沿用 5 秒 dispatch 预算；
-  SQL busy wait 上限 200 ms。单行与候选集约 4 MiB、候选最多 1000 条，最终响应预留信封预算；
-  超限明确报错，不截断候选。按 observation 分页，关联使用 V1 单条规则，结果与 V1 批量语义相同。
+  SQL busy wait 上限 200 ms。单行与候选集约 4 MiB，最终响应预留信封预算；
+  候选按 V1 取前 1000 条，坏记录跳过，关联读取的存储/资源故障降级为空关联并记录诊断。
+  主数据和最终响应超限仍报错。按 observation 分页，关联使用 V1 单条匹配规则。
 - `obs.sessions.list` 的可选 `session_id` 在 SQL 分组、计数与分页之前精确匹配，
   不改变 UID/时间过滤。CLI 指定 session 时只发一次 session 查询（limit=2），
   root 原始同名 session 的 total > 1 仍报歧义，应使用列表返回的组合 ID；不扫描无关 session。

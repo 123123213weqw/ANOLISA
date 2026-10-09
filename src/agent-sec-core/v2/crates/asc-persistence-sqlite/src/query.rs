@@ -1,4 +1,4 @@
-//! Strict, cancellable read adapters for daemon query ports; never create or migrate stores.
+//! Cancellable read adapters with V1 correlation tolerance; never create or migrate stores.
 
 use std::path::{Path, PathBuf};
 
@@ -445,89 +445,107 @@ impl SecurityQueries for SqliteSecurityQueries {
             "after_tool_call" => "('pii_scan')",
             _ => return Ok(Vec::new()),
         };
-        let conn = open(
-            &self.path,
-            asc_security_events::SECURITY_EVENTS_SQLITE_SCHEMA_VERSION,
-            control,
-        )?;
-        let mut filter = Filter::new(
-            QueryScope::Own(owner),
-            "uid",
-            QueryWindow::default(),
-            "timestamp_epoch",
-        );
-        filter.text("session_id", &record.session_id);
-        let real_run = !record.run_id.trim().is_empty()
-            && record.run_id != asc_daemon_core::query::ZERO_RUN_ID;
-        let exact = real_run
-            && record
-                .tool_call_id
-                .as_deref()
-                .is_some_and(|s| !s.trim().is_empty());
-        if real_run {
-            filter.text("run_id", &record.run_id);
-        }
-        if exact {
-            if let Some(tool) = &record.tool_call_id {
-                filter.text("tool_call_id", tool);
+        let result = (|| {
+            let conn = open(
+                &self.path,
+                asc_security_events::SECURITY_EVENTS_SQLITE_SCHEMA_VERSION,
+                control,
+            )?;
+            let mut filter = Filter::new(
+                QueryScope::Own(owner),
+                "uid",
+                QueryWindow::default(),
+                "timestamp_epoch",
+            );
+            filter.text("session_id", &record.session_id);
+            let real_run = !record.run_id.trim().is_empty()
+                && record.run_id != asc_daemon_core::query::ZERO_RUN_ID;
+            let exact = real_run
+                && record
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty());
+            if real_run {
+                filter.text("run_id", &record.run_id);
             }
-        } else if !(real_run && record.hook == "before_agent_run") {
-            filter.add(
-                "timestamp_epoch",
-                ">=",
-                SqlValue::Real(record.timestamp_epoch - 10.0),
+            if exact {
+                if let Some(tool) = &record.tool_call_id {
+                    filter.text("tool_call_id", tool);
+                }
+            } else if !(real_run && record.hook == "before_agent_run") {
+                filter.add(
+                    "timestamp_epoch",
+                    ">=",
+                    SqlValue::Real(record.timestamp_epoch - 10.0),
+                );
+                filter.add(
+                    "timestamp_epoch",
+                    "<=",
+                    SqlValue::Real(record.timestamp_epoch + 10.0),
+                );
+            }
+            let sql = format!(
+                "SELECT event_id,event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,call_id,tool_call_id,details FROM security_events{} AND category IN {categories} ORDER BY timestamp_epoch,event_id LIMIT 1000",
+                filter.sql()
             );
-            filter.add(
-                "timestamp_epoch",
-                "<=",
-                SqlValue::Real(record.timestamp_epoch + 10.0),
-            );
+            let rows = collect(&conn, &sql, &filter, |row| {
+                Ok(security_candidate(row)
+                    .inspect_err(|_| {
+                        tracing::warn!(target: "asc_process_diagnostic",
+                        "security correlation candidate skipped: malformed row");
+                    })
+                    .ok())
+            })?;
+            control.check()?;
+            Ok(rows
+                .into_iter()
+                .flatten()
+                .map(|(event, timestamp_epoch)| QuerySecurityEvent {
+                    event,
+                    timestamp_epoch,
+                })
+                .collect())
+        })();
+        match result {
+            Err(QueryError::Unavailable | QueryError::Internal | QueryError::ResourceExhausted) => {
+                tracing::warn!(target: "asc_process_diagnostic",
+                    "security correlation candidate query failed; showing observations without correlations");
+                control.check()?;
+                Ok(Vec::new())
+            }
+            result => result,
         }
-        let sql = format!(
-            "SELECT event_id,event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,call_id,tool_call_id,details FROM security_events{} AND category IN {categories} ORDER BY timestamp_epoch,event_id LIMIT 1001",
-            filter.sql()
-        );
-        let rows = collect(&conn, &sql, &filter, |row| {
-            let outcome: String = row.get(3)?;
-            let result = match outcome.as_str() {
-                "succeeded" => EventResult::Succeeded,
-                "failed" => EventResult::Failed,
-                _ => return Err(rusqlite::Error::InvalidQuery),
-            };
-            let Value::Object(details) = object(row, 13)? else {
-                return Err(rusqlite::Error::InvalidQuery);
-            };
-            Ok((
-                SecurityEvent {
-                    event_id: row.get(0)?,
-                    event_type: row.get(1)?,
-                    category: row.get(2)?,
-                    result,
-                    timestamp: row.get(4)?,
-                    trace_id: row.get(6)?,
-                    pid: row.get(7)?,
-                    uid: row.get(8)?,
-                    session_id: row.get(9)?,
-                    run_id: row.get(10)?,
-                    call_id: row.get(11)?,
-                    tool_call_id: row.get(12)?,
-                    details,
-                },
-                row.get::<_, f64>(5)?,
-            ))
-        })?;
-        if rows.len() > 1000 {
-            return Err(QueryError::ResourceExhausted);
-        }
-        control.check()?;
-        Ok(rows
-            .into_iter()
-            .map(|(event, timestamp_epoch)| QuerySecurityEvent {
-                event,
-                timestamp_epoch,
-            })
-            .collect())
     }
+}
+
+fn security_candidate(row: &Row<'_>) -> rusqlite::Result<(SecurityEvent, f64)> {
+    let outcome: String = row.get(3)?;
+    let result = match outcome.as_str() {
+        "succeeded" => EventResult::Succeeded,
+        "failed" => EventResult::Failed,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let Value::Object(details) = object(row, 13)? else {
+        return Err(rusqlite::Error::InvalidQuery);
+    };
+    Ok((
+        SecurityEvent {
+            event_id: row.get(0)?,
+            event_type: row.get(1)?,
+            category: row.get(2)?,
+            result,
+            timestamp: row.get(4)?,
+            trace_id: row.get(6)?,
+            pid: row.get(7)?,
+            uid: row.get(8)?,
+            session_id: row.get(9)?,
+            run_id: row.get(10)?,
+            call_id: row.get(11)?,
+            tool_call_id: row.get(12)?,
+            details,
+        },
+        row.get(5)?,
+    ))
 }
 
 // A qualified session is a root resource locator, never a caller identity.
