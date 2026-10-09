@@ -53,7 +53,7 @@ fn main() {
         Ok(cli) => cli,
         Err(e) if e.use_stderr() => {
             let out = json!({ "error": e.to_string().trim_end() });
-            eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+            print_error_json(&out);
             std::process::exit(e.exit_code());
         }
         Err(e) => {
@@ -88,7 +88,7 @@ fn main() {
         Ok(code) => std::process::exit(code),
         Err(e) => {
             let out = json!({ "error": format!("{e:#}") });
-            eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+            print_error_json(&out);
             std::process::exit(2);
         }
     }
@@ -118,6 +118,19 @@ fn write_stdout(rendered: &str) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
         other => other.map_err(|error| anyhow::anyhow!("cannot write to stdout: {error}")),
     }
+}
+
+/// Report a command's error body on stderr.
+///
+/// The body is the detail; the exit status is the machine-readable verdict,
+/// and the README documents the error code as a contract. A failed write here
+/// must therefore not replace that status: `eprintln!` panics on a write error
+/// (a full filesystem behind a redirected log, a pipe whose reader left) and
+/// answered 101 instead of the documented error code.
+fn print_error_json(body: &serde_json::Value) {
+    let rendered = serde_json::to_string_pretty(body).unwrap_or_else(|_| body.to_string());
+    let mut stderr = std::io::stderr().lock();
+    let _ = std::io::Write::write_fmt(&mut stderr, format_args!("{rendered}\n"));
 }
 
 fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
