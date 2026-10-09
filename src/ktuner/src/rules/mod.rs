@@ -5875,7 +5875,12 @@ fn eval_percpu_pagelist_high_fraction(info: &SystemInfo, recs: &mut Vec<Recommen
 }
 
 fn eval_accept_ra(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_accept_ra_at(info, recs, "/proc/sys/net/ipv6/conf/default/accept_ra")
+    eval_accept_ra_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv6/conf/default/accept_ra",
+        std::path::Path::new("/proc/sys/net/ipv6/conf"),
+    )
 }
 
 /// Path-injectable form of [`eval_accept_ra`] (the `eval_*_at` idiom).
@@ -5888,13 +5893,38 @@ fn eval_accept_ra(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 /// parses "-1" to Err and falls back to 0 — the *disabled* value — so the old
 /// `> 0` gate stayed silent on a host that accepts RAs. This is the IPv6
 /// counterpart of the ipv4 devconf booleans read signed in f57a3c81a.
-fn eval_accept_ra_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+///
+/// `ipv6_accept_ra()` is not a bare truthiness test, though — it is
+///
+/// ```text
+///    return idev->cnf.forwarding ? idev->cnf.accept_ra == 2 : idev->cnf.accept_ra;
+/// ```
+///
+/// so on a host that forwards, only the hybrid value 2 accepts Router
+/// Advertisements at all. The documentation states the same thing as the
+/// functional default ("accept_ra - INTEGER ... 1 Accept Router Advertisements
+/// if forwarding is disabled ... Functional default: disabled if local
+/// forwarding is enabled", Documentation/networking/ip-sysctl.rst). Advising
+/// `0` there does not shield the host from anything: the interfaces already
+/// ignore the slot, so the promise the reason makes cannot hold. Reading the
+/// conf tree again is what "forwarding" means here; an unreadable tree counts
+/// as non-forwarding, so the rule stays quiet only when it can prove the
+/// premise is already met (see [`any_interface_forwards`]).
+fn eval_accept_ra_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    conf_root: &std::path::Path,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
     let current = read_sysctl_i64(path);
     if current != 0 {
+        if current != 2 && any_interface_forwards(conf_root) {
+            return 1;
+        }
         recs.push(Recommendation {
             param: "net.ipv6.conf.default.accept_ra".to_string(),
             current_value: current.to_string(),
@@ -11644,7 +11674,7 @@ mod tests {
         ] {
             std::fs::write(&path, content).unwrap();
             let mut recs = Vec::new();
-            eval_accept_ra_at(&info, &mut recs, path.to_str().unwrap());
+            eval_accept_ra_at(&info, &mut recs, path.to_str().unwrap(), &dir.join("conf"));
             let rec = recs
                 .iter()
                 .find(|r| r.param == "net.ipv6.conf.default.accept_ra");
@@ -11656,6 +11686,49 @@ mod tests {
             if let Some(rec) = rec {
                 assert_eq!(rec.recommended_value, "0");
             }
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn accept_ra_skips_a_forwarding_host() {
+        // ipv6_accept_ra() (include/net/ipv6.h) is
+        // `forwarding ? accept_ra == 2 : accept_ra`, so with forwarding armed
+        // the slot cannot make an interface accept Router Advertisements
+        // unless it holds the hybrid value 2 — the documentation calls this
+        // the functional default "disabled if local forwarding is enabled"
+        // and the value 2 "Overrule forwarding behaviour". The advice for
+        // accept_ra=1 on such a host therefore promises a risk the host does
+        // not have, and writing 0 cannot change what any interface does.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_accept_ra_fwd_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let conf = dir.join("conf");
+        std::fs::create_dir_all(conf.join("default")).unwrap();
+        std::fs::create_dir_all(conf.join("eth0")).unwrap();
+        let path = conf.join("default/accept_ra");
+        let interface = conf.join("eth0/forwarding");
+        let info = make_test_info();
+
+        for (forwarding, accept_ra, expected) in [
+            ("0\n", "1\n", true),
+            ("1\n", "1\n", false),
+            ("1\n", "2\n", true),
+        ] {
+            std::fs::write(&interface, forwarding).unwrap();
+            std::fs::write(&path, accept_ra).unwrap();
+            let mut recs = Vec::new();
+            eval_accept_ra_at(&info, &mut recs, path.to_str().unwrap(), &conf);
+            let found = recs
+                .iter()
+                .any(|r| r.param == "net.ipv6.conf.default.accept_ra");
+            assert_eq!(
+                found, expected,
+                "interface forwarding={forwarding} accept_ra={accept_ra}"
+            );
         }
 
         std::fs::remove_dir_all(&dir).ok();
