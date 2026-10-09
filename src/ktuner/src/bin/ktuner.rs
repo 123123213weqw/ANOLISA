@@ -57,7 +57,9 @@ fn main() {
             std::process::exit(e.exit_code());
         }
         Err(e) => {
-            print!("{e}");
+            // --help / --version text, which a pipeline may truncate: the same
+            // closed-stdout handling the result bodies get.
+            let _ = write_stdout(&e.to_string());
             std::process::exit(e.exit_code());
         }
     };
@@ -82,6 +84,32 @@ fn main() {
             eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
             std::process::exit(2);
         }
+    }
+}
+
+/// Print a command's JSON body, treating a closed stdout as a graceful stop
+/// instead of a panic.
+///
+/// `ktuner check | head -1` used to abort with "failed printing to stdout:
+/// Broken pipe" and exit 101 — the status the README reserves for the
+/// command's own verdict — because Rust's `println!` panics on a write error.
+/// A consumer that stopped reading is a pipeline condition, not a crash: the
+/// work is done by the time the report is rendered, so the command finishes
+/// and answers with the exit code its own verdict earned. The sibling anolisa
+/// CLI was filed with this exact symptom and fixed the same way (#1430). A
+/// write error that is NOT a broken pipe (a full disk behind a redirect)
+/// stays a real error and surfaces as the README's stderr JSON body, exit 2.
+fn print_json(value: &serde_json::Value) -> Result<()> {
+    write_stdout(&serde_json::to_string_pretty(value)?)
+}
+
+/// Write one already-rendered stdout body. See [`print_json`] for the
+/// broken-pipe policy.
+fn write_stdout(rendered: &str) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    match std::io::Write::write_fmt(&mut stdout, format_args!("{rendered}\n")) {
+        Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(Into::into),
     }
 }
 
@@ -130,7 +158,7 @@ fn cmd_check(cat: Option<String>, conservative: bool) -> Result<i32> {
         "workload": format!("{workload}"),
         "services": detected_services,
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    print_json(&output)?;
 
     let code = if recs.is_empty() { 0 } else { 1 };
     Ok(code)
@@ -359,13 +387,13 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
         } else {
             output
         };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
         return Ok(code);
     }
 
     if dry_run {
         let output = dry_run_output(&recs, &applicable);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
         return Ok(0);
     }
 
@@ -374,7 +402,7 @@ fn cmd_tune(dry_run: bool, conservative: bool, cat: Option<String>) -> Result<i3
     let score_after = eval_after.score();
 
     let output = tune_output(&recs, &outcome, score_before, score_after);
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    print_json(&output)?;
     // Mirror `check`'s exit convention (1 = attention needed): a tune that
     // failed some or all writes must not report success — the old code exited
     // 0 even when every write failed (e.g. read-only /proc/sys in a container).
@@ -465,7 +493,7 @@ fn cmd_fix(param: &str) -> Result<i32> {
         output["requested"] = json!(rec.recommended_value);
         output["note"] = json!("内核实际生效值与推荐值不同（已按实际生效值记录并持久化，可回滚）");
     }
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    print_json(&output)?;
     Ok(0)
 }
 
@@ -481,7 +509,7 @@ fn cmd_why(param: &str) -> Result<i32> {
         // collapse into an empty "current".
         std::fs::read_to_string(path).map(Some)
     })?;
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    print_json(&output)?;
     Ok(code)
 }
 
@@ -567,7 +595,7 @@ fn cmd_rollback(list: bool) -> Result<i32> {
         // here WITHOUT the destructive path having run first.
         let entries = tuner::rollback_preview()?;
         let output = rollback_list_output(&entries);
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        print_json(&output)?;
         return Ok(0);
     }
     let outcome = tuner::rollback_quiet()?;
@@ -578,7 +606,7 @@ fn cmd_rollback(list: bool) -> Result<i32> {
         "skipped": outcome.skipped,
         "status": format!("{status:?}"),
     });
-    println!("{}", serde_json::to_string_pretty(&output)?);
+    print_json(&output)?;
     Ok(rollback_exit_code(&outcome))
 }
 
