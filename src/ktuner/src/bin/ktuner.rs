@@ -58,8 +58,15 @@ fn main() {
         }
         Err(e) => {
             // --help / --version text, which a pipeline may truncate: the same
-            // closed-stdout handling the result bodies get.
-            let _ = write_stdout(&e.to_string());
+            // closed-stdout handling the result bodies get. A write error that
+            // is NOT a closed pipe is a real error, so it takes the README's
+            // error shape (stderr JSON, exit 2) instead of exiting 0 on text
+            // that never reached the consumer.
+            if let Err(error) = write_stdout(&e.to_string()) {
+                let out = json!({ "error": format!("{error:#}") });
+                eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+                std::process::exit(2);
+            }
             std::process::exit(e.exit_code());
         }
     };
@@ -96,9 +103,9 @@ fn main() {
 /// A consumer that stopped reading is a pipeline condition, not a crash: the
 /// work is done by the time the report is rendered, so the command finishes
 /// and answers with the exit code its own verdict earned. The sibling anolisa
-/// CLI was filed with this exact symptom and fixed the same way (#1430). A
-/// write error that is NOT a broken pipe (a full disk behind a redirect)
-/// stays a real error and surfaces as the README's stderr JSON body, exit 2.
+/// CLI was filed with this exact symptom and fixed the same way. A write
+/// error that is NOT a broken pipe (a full disk behind a redirect) stays a
+/// real error and surfaces as the README's stderr JSON body, exit 2.
 fn print_json(value: &serde_json::Value) -> Result<()> {
     write_stdout(&serde_json::to_string_pretty(value)?)
 }
@@ -109,7 +116,7 @@ fn write_stdout(rendered: &str) -> Result<()> {
     let mut stdout = std::io::stdout().lock();
     match std::io::Write::write_fmt(&mut stdout, format_args!("{rendered}\n")) {
         Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        other => other.map_err(Into::into),
+        other => other.map_err(|error| anyhow::anyhow!("cannot write to stdout: {error}")),
     }
 }
 

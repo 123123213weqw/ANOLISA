@@ -1,22 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-//! A consumer that stops reading early is a normal pipeline condition, not a
-//! crash: `ktuner check | head -1` must not abort with a Rust panic and the
-//! exit status of a failed process.
-//!
-//! The README's exit codes are the command's own verdict (0 = nothing to
-//! recommend, 1 = recommendations, 2 = error). A closed pipe replaced them
-//! with 101 — this crate sets no `panic = "abort"`, so the release profile
-//! unwinds the same way the debug one CI runs does — plus a panic message a
-//! pipeline consumer never asked for.
-//! The sibling anolisa CLI was filed with exactly this symptom and fixed by
-//! treating a closed stdout as a graceful stop (#1430); the CLI here still
-//! panics.
-//!
-//! The one-page pipe is the capacity `pipe(7)` documents for a user at the
-//! pipe-page soft limit ("if [it] is exceeded, newly created pipes have a
-//! capacity of one page"), and it is what makes the condition deterministic:
-//! `ktuner check`'s JSON cannot fit in one page, so the write that meets the
-//! closed read end is guaranteed rather than a timing race.
+//! A consumer that stops reading early, or a stdout that cannot take the
+//! bytes, must reach the README's exit codes and stderr JSON instead of a Rust
+//! panic or a silent success.
 #![cfg(target_os = "linux")]
 
 use std::io::Read;
@@ -33,6 +18,14 @@ fn check_json_len() -> Option<usize> {
         .output()
         .expect("run ktuner check");
     (out.stdout.len() > 4096).then_some(out.stdout.len())
+}
+
+/// A stdout that fails every write: `/dev/full` answers ENOSPC.
+fn full_stdout() -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .ok()
 }
 
 #[test]
@@ -53,9 +46,10 @@ fn a_closed_stdout_does_not_panic_the_cli() {
         .expect("spawn ktuner check");
     let mut stdout = child.stdout.take().expect("piped stdout");
 
-    // Shrink the pipe to one page (F_SETPIPE_SZ rounds up to the system page
-    // size, so read back what the kernel granted and fail loudly if it is not
-    // smaller than the report this host produces).
+    // Shrink the pipe to one page: `pipe(7)` documents that capacity for a
+    // user at the pipe-page soft limit, and F_SETPIPE_SZ rounds up to the
+    // system page size, so read back what the kernel granted and fail loudly
+    // if it is not smaller than the report this host produces.
     let granted = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETPIPE_SZ, 4096) };
     assert!(granted >= 4096, "F_SETPIPE_SZ failed");
     if (granted as usize) >= json_len {
@@ -89,5 +83,44 @@ fn a_closed_stdout_does_not_panic_the_cli() {
     assert!(
         output.status.signal().is_none(),
         "the command was killed by a signal instead of finishing"
+    );
+}
+
+#[test]
+fn a_failed_help_write_is_an_error_not_a_success() {
+    let Some(full) = full_stdout() else {
+        eprintln!("skipping: /dev/full is not available on this host");
+        return;
+    };
+
+    // Control: the same help text through a working stdout is still a success.
+    let control = Command::new(env!("CARGO_BIN_EXE_ktuner"))
+        .arg("--help")
+        .output()
+        .expect("run ktuner --help");
+    assert_eq!(control.status.code(), Some(0), "help text is not an error");
+    assert!(!control.stdout.is_empty(), "clap rendered no help text");
+
+    // A write error that is not a closed pipe (a full device) is a real error:
+    // the README documents the details as stderr JSON with exit 2, and text
+    // that never reached the consumer must not keep the success code.
+    let failed = Command::new(env!("CARGO_BIN_EXE_ktuner"))
+        .arg("--help")
+        .stdout(Stdio::from(full))
+        .output()
+        .expect("run ktuner --help with a full stdout");
+    assert_eq!(
+        failed.status.code(),
+        Some(2),
+        "a failed help write must not exit 0"
+    );
+    let stderr = String::from_utf8_lossy(&failed.stderr);
+    assert!(
+        stderr.contains("\"error\""),
+        "the write error must reach stderr as JSON; stderr was:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("stdout"),
+        "the body must name the stream that failed (AGENTS.md 3.4); stderr was:\n{stderr}"
     );
 }
