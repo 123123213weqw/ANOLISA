@@ -116,9 +116,10 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
             return RuntimeEnv::Container;
         }
     }
-    // Both files are read lossily: cgroup paths and PID 1's comm (the first
-    // token of /proc/1/sched) may hold non-UTF-8 bytes, which made
-    // `read_to_string` skip the check and report a container as `BareHost`.
+    // Both files are read lossily: cgroup paths and PID 1's comm (the
+    // content of /proc/1/comm, the first token of /proc/1/sched) may hold
+    // non-UTF-8 bytes, which made `read_to_string` skip the check and report
+    // a container as `BareHost`.
     if let Some(cgroup) = read_text_lossy(&root.join("proc/1/cgroup")) {
         if cgroup.contains("docker")
             || cgroup.contains("kubepods")
@@ -142,7 +143,21 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
     // container (whose /proc/1/cgroup is the namespace root `0::/`) still being
     // reported as a bare host, now that systemd's own containers carry the
     // /run/systemd/container marker.
-    if let Some(sched) = read_text_lossy(&root.join("proc/1/sched")) {
+    //
+    // The name is read from /proc/1/comm first: that file is registered
+    // unconditionally (v6.6 `fs/proc/base.c`:3264, :3609), while the sched
+    // dump that carries the same name as its first line — `"%s (%d,
+    // #threads: %d)"` of `p->comm` (v6.6 `kernel/sched/debug.c`) — is
+    // registered only when the kernel is built with CONFIG_SCHED_DEBUG (v6.6
+    // `fs/proc/base.c`:3255-3257 for the group leader, :3606-3608 for a
+    // thread; upstream removed the gate in v6.15). A kernel built without
+    // that option has no sched file at all, so this fallback used to be
+    // skipped and a container whose PID 1 has an unknown init was reported
+    // as a bare host. The sched file stays as the second source, so a tree
+    // that carries only it still decides the same way.
+    let pid1_name = read_text_lossy(&root.join("proc/1/comm"))
+        .or_else(|| read_text_lossy(&root.join("proc/1/sched")));
+    if let Some(name) = pid1_name {
         const KNOWN_INIT: &[&str] = &[
             "systemd",
             "init",
@@ -154,7 +169,7 @@ fn runtime_env_from(root: &Path) -> RuntimeEnv {
             "busybox",
             "procd",
         ];
-        let comm = sched.split_whitespace().next().unwrap_or("");
+        let comm = name.split_whitespace().next().unwrap_or("");
         if !KNOWN_INIT.iter().any(|i| comm.starts_with(i)) {
             return RuntimeEnv::Container;
         }
@@ -2260,6 +2275,54 @@ mod tests {
         // Guard: a known init with a plain cgroup is still a bare host.
         fs::write(proc1.join("cgroup"), b"0::/init.scope\n").expect("write cgroup");
         assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// `/proc/<pid>/sched` is registered only when the kernel is built with
+    /// CONFIG_SCHED_DEBUG (v6.6 `fs/proc/base.c`:3255-3257 for the group
+    /// leader, :3606-3608 for a thread; upstream removed the gate in v6.15),
+    /// while `/proc/<pid>/comm` is registered unconditionally (:3264, :3609)
+    /// and names exactly what the sched dump prints first: its first line is
+    /// `"%s (%d, #threads: %d)"` of `p->comm` (v6.6 `kernel/sched/debug.c`).
+    /// On a kernel without the debug option the sched file does not exist at
+    /// all, so the fallback used to be skipped and a container whose PID 1
+    /// has an unknown init stayed a bare host.
+    #[test]
+    fn runtime_env_reads_pid1_comm_without_the_sched_file() {
+        let root = std::env::temp_dir().join(format!(
+            "ktuner_pid1_comm_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&root).ok();
+        let proc1 = root.join("proc/1");
+        fs::create_dir_all(&proc1).expect("create temp proc dir");
+        // A private cgroup namespace: PID 1's own cgroup is the namespace
+        // root, so only the init's name can decide.
+        fs::write(proc1.join("cgroup"), b"0::/\n").expect("write cgroup");
+
+        // No `sched` file — the shape of a kernel built without
+        // CONFIG_SCHED_DEBUG.
+        fs::write(proc1.join("comm"), b"dumb-init\n").expect("write comm");
+        assert_eq!(
+            runtime_env_from(&root),
+            RuntimeEnv::Container,
+            "PID 1's comm decides an unknown init even without /proc/1/sched"
+        );
+        // Non-UTF-8 comm bytes survive the lossy read, as for the sched file.
+        fs::write(proc1.join("comm"), b"app\xff\n").expect("write comm");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
+        // A known init is still a bare host, from the same source.
+        fs::write(proc1.join("comm"), b"systemd\n").expect("write comm");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+
+        // The older source still decides when comm is the missing one.
+        fs::remove_file(proc1.join("comm")).ok();
+        fs::write(proc1.join("sched"), b"s6-svscan (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::BareHost);
+        fs::write(proc1.join("sched"), b"nginx (1, #threads: 1)\n").expect("write sched");
+        assert_eq!(runtime_env_from(&root), RuntimeEnv::Container);
 
         fs::remove_dir_all(&root).ok();
     }
