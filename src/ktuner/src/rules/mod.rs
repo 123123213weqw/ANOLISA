@@ -1936,6 +1936,31 @@ fn eval_nr_requests(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
 }
 
 fn eval_rq_affinity(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_rq_affinity_at(info, recs, "/proc/cmdline", "/proc/version")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the forced-threading guard
+/// below is assertable against temp files on any host.
+///
+/// `blk_mq_complete_need_ipi()` returns false BEFORE it reads the
+/// SAME_COMP/SAME_FORCE bits this rule writes when interrupts are forced
+/// into threads (v6.6 `block/blk-mq.c`:1149-1174, 7.3-rc6 :1254-1275): with
+/// every handler running in an IRQ thread, raising the completion softirq
+/// from an SMP call only wakes ksoftirqd, which the kernel's own comment
+/// rates "probably worse than completing the request on a different cache
+/// domain", so the completion stays where the interrupt fired and the write
+/// cannot deliver the reason's promise. Those two bits have no other reader
+/// in either tree (`block/blk-sysfs.c` shows and stores them, `block/blk-mq.c`
+/// is the only consumer).
+fn eval_rq_affinity_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    cmdline_path: &str,
+    version_path: &str,
+) -> usize {
+    if irqs_forced_threaded(cmdline_path, version_path) {
+        return 1;
+    }
     if info.numa_nodes <= 1 {
         return 1;
     }
@@ -1954,6 +1979,39 @@ fn eval_rq_affinity(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize 
         }
     }
     1
+}
+
+/// Whether the kernel runs interrupt handlers in threads
+/// (`force_irqthreads()`): statically on for a CONFIG_PREEMPT_RT build —
+/// whose UTS banner carries `PREEMPT_RT`, the
+/// `preempt-flag-$(CONFIG_PREEMPT_RT)` line both versions'
+/// `init/Makefile` feeds into `UTS_VERSION` — and switched on at boot by the
+/// `threadirqs` kernel parameter (`include/linux/interrupt.h`:511-519 and
+/// `kernel/irq/manage.c`:27-36 in v6.6, :28-35 in 7.3-rc6). A kernel built
+/// without CONFIG_IRQ_FORCED_THREADING reads false in both files.
+fn irqs_forced_threaded(cmdline_path: &str, version_path: &str) -> bool {
+    if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
+        // The early parameter accepts both spellings; `setup_forced_irqthreads`
+        // ignores the value.
+        //
+        // A kernel built without CONFIG_IRQ_FORCED_THREADING registers no
+        // handler for it and keeps `force_irqthreads()` false, while
+        // `/proc/cmdline` still shows the token the loader passed: the guard
+        // then drops a recommendation the kernel would honour. That
+        // configuration is not readable from userspace portably, so the token
+        // is taken at face value and the residual error is a lost
+        // recommendation, not an inert one.
+        if cmdline
+            .split_whitespace()
+            .any(|t| t == "threadirqs" || t.starts_with("threadirqs="))
+        {
+            return true;
+        }
+    }
+    match std::fs::read_to_string(version_path) {
+        Ok(version) => version.contains("PREEMPT_RT"),
+        Err(_) => false,
+    }
 }
 
 // ─── CPU/Scheduler Rules ─────────────────────────────────────────────────────
@@ -8956,10 +9014,32 @@ mod tests {
 
     #[test]
     fn test_rq_affinity_only_on_numa() {
+        // Driven through the path-injectable form with a plain command line and
+        // a non-RT banner. `evaluate()` reads the running host's `/proc`, so on
+        // a PREEMPT_RT or `threadirqs` host the forced-threading guard would
+        // suppress the recommendation below and fail this assertion for a
+        // reason that has nothing to do with NUMA.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_rq_affinity_numa_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmdline = dir.join("cmdline");
+        std::fs::write(&cmdline, "BOOT_IMAGE=/vmlinuz root=/dev/sda1\n").unwrap();
+        let version = dir.join("version");
+        std::fs::write(
+            &version,
+            "Linux version 6.6.0 (gcc) #1 SMP PREEMPT_DYNAMIC\n",
+        )
+        .unwrap();
+        let (cmdline, version) = (cmdline.to_str().unwrap(), version.to_str().unwrap());
+
         let mut info = make_test_info();
         info.numa_nodes = 1;
         info.disks[0].rq_affinity = 1;
-        let recs = evaluate(&info).unwrap().recommendations;
+        let mut recs = Vec::new();
+        eval_rq_affinity_at(&info, &mut recs, cmdline, version);
         let rec = recs.iter().find(|r| r.param.contains("rq_affinity"));
         assert!(
             rec.is_none(),
@@ -8967,13 +9047,84 @@ mod tests {
         );
 
         info.numa_nodes = 2;
-        let recs = evaluate(&info).unwrap().recommendations;
+        let mut recs = Vec::new();
+        eval_rq_affinity_at(&info, &mut recs, cmdline, version);
         let rec = recs.iter().find(|r| r.param.contains("rq_affinity"));
         assert!(
             rec.is_some(),
             "Should recommend rq_affinity=2 on multi-NUMA NVMe"
         );
         assert_eq!(rec.unwrap().recommended_value, "2");
+    }
+
+    #[test]
+    fn rq_affinity_skipped_when_irqs_are_forced_threaded() {
+        // With interrupts forced into threads the completion is never migrated
+        // to the submitting CPU: blk_mq_complete_need_ipi() returns false
+        // before it reads the SAME_COMP/SAME_FORCE bits the write sets (v6.6
+        // block/blk-mq.c:1163, 7.3-rc6 :1267), because the softirq it would
+        // raise from the SMP call only wakes ksoftirqd. The advice is inert
+        // there, and its reason promises exactly the migration the kernel
+        // opts out of. Both ways into that mode show up in one file each:
+        // `threadirqs` on the command line, `PREEMPT_RT` in the UTS banner.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_threaded_irqs_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let plain_cmdline = write("cmdline", "BOOT_IMAGE=/vmlinuz root=/dev/sda1\n");
+        let threaded_cmdline = write("cmdline_threadirqs", "root=/dev/sda1 threadirqs\n");
+        let plain_version = write(
+            "version",
+            "Linux version 6.6.0 (gcc) #1 SMP PREEMPT_DYNAMIC\n",
+        );
+        let rt_version = write(
+            "version_rt",
+            "Linux version 6.12.0 (gcc) #1 SMP PREEMPT_RT\n",
+        );
+
+        let mut info = make_test_info();
+        info.numa_nodes = 2;
+
+        // Baseline: completions are still migrated, so the advice stands.
+        let mut recs = Vec::new();
+        eval_rq_affinity_at(
+            &info,
+            &mut recs,
+            plain_cmdline.to_str().unwrap(),
+            plain_version.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param.contains("rq_affinity")),
+            "a migratable completion keeps the recommendation"
+        );
+
+        // Both forced-threading modes are inert.
+        let cases = [
+            (&threaded_cmdline, &plain_version, "threadirqs"),
+            (&plain_cmdline, &rt_version, "PREEMPT_RT"),
+        ];
+        for (cmdline, version, label) in cases {
+            let mut recs = Vec::new();
+            eval_rq_affinity_at(
+                &info,
+                &mut recs,
+                cmdline.to_str().unwrap(),
+                version.to_str().unwrap(),
+            );
+            assert!(
+                !recs.iter().any(|r| r.param.contains("rq_affinity")),
+                "{label} pins the completion, so rq_affinity changes nothing"
+            );
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
