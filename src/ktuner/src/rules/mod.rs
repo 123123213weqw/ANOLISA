@@ -732,12 +732,24 @@ fn eval_min_free_kbytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 // ─── Security Rules (zero performance cost) ───────────────────────────────────
 
 fn eval_aslr(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/randomize_va_space";
+    eval_aslr_at(info, recs, "/proc/sys/kernel/randomize_va_space")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so both ASLR rules can be
+/// driven against the same synthetic file.
+///
+/// Only 0 — ASLR fully off — is this rule's case. A partial setting (1: stack
+/// and libraries randomized, heap not) is [`eval_randomize_va_space_full`]'s,
+/// whose reason names what stays predictable. The two rules recommend the same
+/// value with the same confidence, and `dedupe_recommendations` keeps the first
+/// registration on a tie, so a `current < 2` test here shadows the specific
+/// rule on every `== 1` host and its reason can never reach a user.
+fn eval_aslr_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
-    if current < 2 {
+    if current == 0 {
         recs.push(Recommendation {
             param: "kernel.randomize_va_space".to_string(),
             current_value: current.to_string(),
@@ -6515,9 +6527,20 @@ fn eval_igmp_max_memberships(_info: &SystemInfo, recs: &mut Vec<Recommendation>)
     1
 }
 
-fn eval_randomize_va_space_full(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/randomize_va_space";
-    if !std::path::Path::new(path).exists() {
+fn eval_randomize_va_space_full(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_randomize_va_space_full_at(info, recs, "/proc/sys/kernel/randomize_va_space")
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the partial-ASLR reason is
+/// assertable against a synthetic file: on an `== 1` host it is the only
+/// `kernel.randomize_va_space` advice that reaches a user, because
+/// [`eval_aslr`] no longer claims that value.
+fn eval_randomize_va_space_full_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -8155,6 +8178,55 @@ mod tests {
         let out = dedupe_recommendations(input);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].confidence, Confidence::High);
+    }
+
+    #[test]
+    fn randomize_va_space_partial_keeps_the_heap_reason() {
+        // Both ASLR rules recommend 2 with the same confidence, so the advice a
+        // host actually receives is decided by dedupe's keep-first tie-break:
+        // whichever rule claims the value first supplies the reason. The two
+        // rules must therefore claim disjoint values — 0 for the generic one,
+        // 1 for the one that says what stays randomized.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_aslr_partial_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let off = dir.join("randomize_va_space.0");
+        std::fs::write(&off, b"0\n").unwrap();
+        let partial = dir.join("randomize_va_space.1");
+        std::fs::write(&partial, b"1\n").unwrap();
+        let full = dir.join("randomize_va_space.2");
+        std::fs::write(&full, b"2\n").unwrap();
+
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_aslr_at(&info, &mut recs, path.to_str().unwrap());
+            eval_randomize_va_space_full_at(&info, &mut recs, path.to_str().unwrap());
+            dedupe_recommendations(recs)
+        };
+
+        // ASLR off: the generic reason, naming what is not random at all.
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "one advice at 0: {recs:?}");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(!recs[0].reason.contains("堆"));
+
+        // Partial ASLR: the heap-address reason. A rule that also fires here is
+        // registered first and wins the tie, and then this reason is dead code.
+        let recs = advice(&partial);
+        assert_eq!(recs.len(), 1, "one advice at 1: {recs:?}");
+        assert_eq!(recs[0].recommended_value, "2");
+        assert!(
+            recs[0].reason.contains("堆"),
+            "the partial-ASLR reason must survive: {}",
+            recs[0].reason
+        );
+
+        // Fully randomized: nothing to advise.
+        assert!(advice(&full).is_empty());
     }
 
     /// Synthetic `/lib/modules/<release>/kernel/net/sched`-style directory
