@@ -5450,24 +5450,64 @@ fn eval_tcp_early_retrans(_info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
     1
 }
 
-fn eval_ip_no_pmtu_disc(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/ip_no_pmtu_disc";
-    if !std::path::Path::new(path).exists() {
+fn eval_ip_no_pmtu_disc(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_ip_no_pmtu_disc_at(info, recs, "/proc/sys/net/ipv4/ip_no_pmtu_disc")
+}
+
+/// Path-injectable form of [`eval_ip_no_pmtu_disc`] (the `eval_*_at` idiom) so
+/// the per-mode reason is assertable against a temp file.
+fn eval_ip_no_pmtu_disc_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current != 0 {
-        recs.push(Recommendation {
-            param: "net.ipv4.ip_no_pmtu_disc".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "PMTU 发现被禁用，可能导致大包被静默丢弃造成连接卡死（黑洞路由）".to_string(),
-            confidence: Confidence::High,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) = ip_no_pmtu_disc_recommendation(read_sysctl_u64(path)) {
+        recs.push(rec);
     }
     1
+}
+
+/// Emit the `net.ipv4.ip_no_pmtu_disc` recommendation for an already-read
+/// value; split out from the file probe so the mode split is testable on any
+/// host.
+///
+/// The slot has four documented values (Documentation/networking/
+/// ip-sysctl.rst, "Possible values: 0-3"), and only 1 and 2 do what the
+/// reason describes. Mode 1 is "Disable Path MTU Discovery. If enabled in
+/// mode 1 and a fragmentation-required ICMP is received, the PMTU to this
+/// destination will be set to the smallest of the old MTU to this destination
+/// and min_pmtu"; mode 2 goes further and discards the messages ("In mode 2
+/// incoming Path MTU Discovery messages will be discarded"). Mode 3 is the
+/// opposite: "Mode 3 is a hardened pmtu discover mode", intended "to secure
+/// e.g. name servers in namespaces where TCP path mtu must still work but path
+/// MTU information of other protocols should be discarded". The kernel honours
+/// the advertised MTU there for protocols that can verify the message —
+/// `icmp_unreach()` (net/ipv4/icmp.c) routes `ICMP_FRAG_NEEDED` through
+/// `case 3: if (!icmp_tag_validation(iph->protocol)) goto out; fallthrough;
+/// case 0: info = ntohs(icmph->un.frag.mtu);` — so a host on mode 3 is
+/// discovering the path MTU for TCP, not refusing to.
+///
+/// The recommendation stays 0 for mode 3, but for the case the documentation
+/// actually makes ("This mode should not be enabled globally ... If enabled
+/// globally this mode could break other protocols"), not for a black hole the
+/// mode does not have.
+fn ip_no_pmtu_disc_recommendation(current: u64) -> Option<Recommendation> {
+    if current == 0 {
+        return None;
+    }
+    let reason = if current == 3 {
+        "ip_no_pmtu_disc=3 是加固的 PMTU 模式：只采信能自校验协议（如 TCP/SCTP）的分片通告，其余协议的分片通告会被丢弃；内核文档不建议全局启用（可能破坏其它协议），普通主机应恢复为 0"
+    } else {
+        "PMTU 发现被禁用，可能导致大包被静默丢弃造成连接卡死（黑洞路由）"
+    };
+    Some(Recommendation {
+        param: "net.ipv4.ip_no_pmtu_disc".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: reason.to_string(),
+        confidence: Confidence::High,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_sched_wakeup_granularity(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -13488,5 +13528,45 @@ mod tests {
             recs.is_empty(),
             "absent param must not emit a recommendation"
         );
+    }
+
+    #[test]
+    fn ip_no_pmtu_disc_names_the_mode_the_host_is_in() {
+        // Only 1 and 2 stop path MTU discovery: mode 2 discards incoming
+        // fragmentation-needed messages outright and mode 1 clamps the
+        // destination to min_pmtu instead of the advertised MTU
+        // (Documentation/networking/ip-sysctl.rst). Mode 3 is "a hardened
+        // pmtu discover mode" that keeps the advertised MTU for protocols
+        // able to verify the message (net/ipv4/icmp.c routes ICMP_FRAG_NEEDED
+        // through `case 3: if (!icmp_tag_validation(...)) goto out;
+        // fallthrough; case 0:`), which the same section describes as
+        // securing "name servers ... where TCP path mtu must still work".
+        // The reason must not report a disabled discovery (and the black hole
+        // that follows from it) on that host.
+        for (mode, discovery_stopped) in [(1_u64, true), (2, true), (3, false)] {
+            let rec = ip_no_pmtu_disc_recommendation(mode)
+                .unwrap_or_else(|| panic!("mode {mode} is not the default"));
+            assert_eq!(rec.recommended_value, "0");
+            assert_eq!(rec.current_value, mode.to_string());
+            if discovery_stopped {
+                assert!(
+                    rec.reason.contains("被禁用"),
+                    "mode {mode} stops discovery: {}",
+                    rec.reason
+                );
+            } else {
+                assert!(
+                    !rec.reason.contains("被禁用"),
+                    "mode {mode} discovers for verifying protocols: {}",
+                    rec.reason
+                );
+                assert!(
+                    rec.reason.contains("自校验"),
+                    "mode {mode} keeps only verified messages: {}",
+                    rec.reason
+                );
+            }
+        }
+        assert!(ip_no_pmtu_disc_recommendation(0).is_none());
     }
 }
