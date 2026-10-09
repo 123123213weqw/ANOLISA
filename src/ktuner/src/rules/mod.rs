@@ -4503,12 +4503,37 @@ fn eval_dev_weight(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     1
 }
 
-fn eval_printk(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/printk";
-    if !std::path::Path::new(path).exists() {
+fn eval_printk(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_printk_at(info, recs, "/proc/sys/kernel/printk")
+}
+
+/// Path-injectable form of [`eval_printk`] (the `eval_*_at` idiom) so the
+/// published value is assertable against a synthetic file.
+///
+/// `kernel.printk` holds FOUR integers — console, default message, minimum
+/// console and default console log level — behind one `proc_dointvec` over
+/// `console_loglevel` with `maxlen = 4*sizeof(int)` (v6.6
+/// `kernel/printk/sysctl.c`:22-27, 7.3-rc6 the same table). The gate reads
+/// the first field, but `current_value` is a reading every other surface
+/// republishes verbatim: `why`'s fallback, the rollback ledger's `previous`
+/// (taken by `read_previous`) and `rollback --list` all publish the file's
+/// canonical content through `tuner::active_value`. Publishing the parsed
+/// field therefore gave this one knob two formats: `check` printed "7" for
+/// the very state the ledger records as its `previous` ("7 4 1 7"), and
+/// `why` prints whichever whole line the file holds. The whole canonical
+/// line is also what the sibling multi-field rules publish
+/// (`net.ipv4.tcp_rmem` via `read_sysctl_string`, `kernel.sem`,
+/// `net.ipv4.ip_local_port_range`).
+///
+/// The recommendation stays "4": a one-token write sets `console_loglevel`
+/// and leaves the other three slots alone — `__do_proc_dointvec` writes one
+/// slot per input value (v6.6 `kernel/sysctl.c`:508-521) — which is exactly
+/// the console level this rule asks to lower.
+fn eval_printk_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    let content = std::fs::read_to_string(path).unwrap_or_default();
+    let content = read_sysctl_string(path);
     let level: u64 = content
         .split_whitespace()
         .next()
@@ -4517,7 +4542,7 @@ fn eval_printk(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if level > 4 {
         recs.push(Recommendation {
             param: "kernel.printk".to_string(),
-            current_value: level.to_string(),
+            current_value: content,
             recommended_value: "4".to_string(),
             reason: "内核控制台日志级别过高，大量非关键消息输出到控制台影响性能".to_string(),
             confidence: Confidence::Medium,
@@ -8039,6 +8064,58 @@ mod tests {
             per_field_max(&[4096, 87380, 6291456], &[4096, 131072, 16777216]),
             "4096 131072 16777216"
         );
+    }
+
+    #[test]
+    fn printk_publishes_the_whole_file_like_every_other_surface() {
+        // kernel.printk holds FOUR integers in one proc_dointvec slot
+        // (maxlen = 4*sizeof(int), v6.6 kernel/printk/sysctl.c:22-27), and
+        // every other surface publishes the file's canonical content: why's
+        // fallback, the ledger's `previous` (read_previous) and
+        // `rollback --list` all go through tuner::active_value, and the
+        // sibling multi-field rules publish read_sysctl_string's collapsed
+        // line. Publishing the parsed first field here gave one knob two
+        // formats: check printed "7" for the very state the ledger records as
+        // its `previous` ("7 4 1 7").
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_printk_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let info = make_test_info();
+
+        // A raised console level is a finding, and `current` is the line the
+        // file holds, in the canonical single-space form the ledger renders.
+        let path = dir.join("printk");
+        std::fs::write(&path, b"7\t4\t1\t7\n").unwrap();
+        let mut recs = Vec::new();
+        let checked = eval_printk_at(&info, &mut recs, path.to_str().unwrap());
+        assert_eq!(checked, 1);
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "kernel.printk")
+            .expect("console level 7 is above the target of 4");
+        assert_eq!(
+            rec.current_value, "7 4 1 7",
+            "current must be the whole file, not its first field"
+        );
+        assert_eq!(rec.recommended_value, "4");
+
+        // The gate still reads the FIRST field: an already-low console level
+        // is not a finding, whatever the other slots hold.
+        let quiet = dir.join("printk.quiet");
+        std::fs::write(&quiet, b"4 7 1 7\n").unwrap();
+        let mut recs = Vec::new();
+        eval_printk_at(&info, &mut recs, quiet.to_str().unwrap());
+        assert!(recs.is_empty(), "console level 4 is the target: {recs:?}");
+
+        // A path that never exists stays silent: checked, nothing to report.
+        let mut recs = Vec::new();
+        eval_printk_at(&info, &mut recs, dir.join("absent").to_str().unwrap());
+        assert!(recs.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
