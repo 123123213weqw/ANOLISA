@@ -3,8 +3,6 @@
 Uses V2 binaries on PATH. SQLite reads are test assertions, not a product query API.
 """
 
-# isort: skip_file
-
 import concurrent.futures
 import json
 import os
@@ -17,7 +15,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
-
 from tests.v2.e2e.test_otel_e2e import OtelEnvironment
 
 ROOT = Path(__file__).resolve().parents[3]
