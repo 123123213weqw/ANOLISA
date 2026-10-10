@@ -1534,39 +1534,9 @@ fn rollback_params_at(
     // single record the restore will act on.
     heal_alias_duplicates(&mut data);
 
-    // Resolve every name before anything is written. A name the ledger does
-    // not record refuses the WHOLE command (the same command error a single
-    // parameter gets, reported for the first miss in the order given): a
-    // silently skipped miss would let one typo drop the rest of the batch while
-    // the run still reported success.
-    let mut keys: Vec<String> = Vec::new();
-    for param in params {
-        let key = ledger_key_for(&data.entries, param).ok_or_else(|| {
-            anyhow::anyhow!("parameter not recorded in the rollback ledger: {param}")
-        })?;
-        // Two spellings of one kernel path resolve to one key, so the second is
-        // the same record, not a second restore of it.
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
-    }
-
-    // The unit is the named entry plus the mutually exclusive twin the ledger
-    // records for it: the kernel zeroes either knob when the other is written,
-    // so restoring or retiring half the pair would leave this run's own side
-    // effect outside the ledger. Naming both halves covers one unit, so the
-    // pair is restored (and counted) once, not twice.
-    let mut units: Vec<BTreeMap<String, RollbackEntry>> = Vec::new();
-    for key in &keys {
-        let mut unit = BTreeMap::new();
-        unit.insert(key.clone(), data.entries[key].clone());
-        if let Some(twin) = paired_ledger_key(&data.entries, key) {
-            unit.insert(twin.clone(), data.entries[&twin].clone());
-        }
-        if !units.iter().any(|seen| seen.keys().eq(unit.keys())) {
-            units.push(unit);
-        }
-    }
+    // Resolve every name before anything is written.
+    let keys = resolve_ledger_keys(&data.entries, params)?;
+    let units = rollback_units(&data.entries, &keys);
 
     let mut outcome = RollbackOutcome {
         restored: 0,
@@ -1624,6 +1594,55 @@ fn rollback_params_at(
     save_ledger_at(ledger, &data)?;
     persist_from_rollback_at(&guard, sysctl_path, script_path, service_path, "systemctl")?;
     Ok((keys, outcome))
+}
+
+/// The ledger key each parameter names, in the order given and deduplicated.
+///
+/// A name the ledger does not record refuses the WHOLE command (the same
+/// command error a single parameter gets, reported for the first miss in the
+/// order given): a silently skipped miss would let one typo drop the rest of
+/// the batch while the run still reported success.
+fn resolve_ledger_keys(
+    entries: &BTreeMap<String, RollbackEntry>,
+    params: &[String],
+) -> Result<Vec<String>> {
+    let mut keys: Vec<String> = Vec::new();
+    for param in params {
+        let key = ledger_key_for(entries, param).ok_or_else(|| {
+            anyhow::anyhow!("parameter not recorded in the rollback ledger: {param}")
+        })?;
+        // Two spellings of one kernel path resolve to one key, so the second is
+        // the same record, not a second restore of it.
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    Ok(keys)
+}
+
+/// The restore units the resolved `keys` cover, in the order of `keys`.
+///
+/// The unit is the named entry plus the mutually exclusive twin the ledger
+/// records for it: the kernel zeroes either knob when the other is written,
+/// so restoring or retiring half the pair would leave this run's own side
+/// effect outside the ledger. Naming both halves covers one unit, so the
+/// pair is restored (and counted) once, not twice.
+fn rollback_units(
+    entries: &BTreeMap<String, RollbackEntry>,
+    keys: &[String],
+) -> Vec<BTreeMap<String, RollbackEntry>> {
+    let mut units: Vec<BTreeMap<String, RollbackEntry>> = Vec::new();
+    for key in keys {
+        let mut unit = BTreeMap::new();
+        unit.insert(key.clone(), entries[key].clone());
+        if let Some(twin) = paired_ledger_key(entries, key) {
+            unit.insert(twin.clone(), entries[&twin].clone());
+        }
+        if !units.iter().any(|seen| seen.keys().eq(unit.keys())) {
+            units.push(unit);
+        }
+    }
+    units
 }
 
 /// Replace the ledger with `data`, keeping the merge writer's contract: a
