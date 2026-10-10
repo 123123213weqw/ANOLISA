@@ -5,8 +5,9 @@
 This suite checks Policy Engine recovery after an abrupt daemon process exit.
 It runs the real CLI, UDS server, discovery, reconciliation runtime, and SQLite
 repository against a controlled AgentSight HTTP mock. Complementary Rust tests
-cover precise committed repository/reconciler boundaries without adding
-failpoints to production code.
+cover committed repository/reconciler boundaries and, with the optional
+`fault-injection` feature, uncommitted SQL transaction boundaries. Ordinary
+product builds exclude the fail-rs dependency and instrumentation.
 
 ## Goals and evidence boundaries
 
@@ -141,6 +142,61 @@ that neither a PID pin/Binding pair nor a 200-instance batch partially survives,
 then admits the same instances after reopening. Its gate is compiled only under
 `cfg(test)` and is absent from the daemon binary.
 
+### Optional white-box transaction matrix
+
+[`fault_points.rs`](../../../v2/crates/asc-policy-repository-sqlite/tests/crash_recovery/fault_points.rs)
+adds seven parent tests for eleven windows when `fault-injection` is enabled.
+It reuses the existing child process, SIGKILL, real repository/reconciler, and
+remote ledger. Only the child configures fail-rs callbacks: a callback confirms
+its boundary and parks while the parent kills the process. Panic, injected
+errors, and normal transaction rollback do not substitute for process death.
+
+Scope admission and instance synchronization are separate transactions. A
+committed Scope with no Bindings is valid; the pin and Binding changes within
+an individual synchronization transaction must commit together.
+
+| Window | Boundary before SIGKILL | Recovery requirement |
+| --- | --- | --- |
+| `sql_scope_inserted` | Scope inserted before admission commits. | No Scope or Binding survives; the earlier Policy commit remains. Recovery does not discover an unaccepted assignment. |
+| `sql_instances_pinned` | PID pin updated before Binding insertion. | Pin and Binding expansion roll back; the committed Active Scope remains. |
+| `sql_instances_binding_inserted` | First of two policy Bindings inserted. | No partial expansion survives. Recovery creates exactly two Ready Bindings; another restart preserves their identities without Apply. |
+| `sql_discovery_stopped` | Stop flag updated before Binding retirement. | Flag and retirement roll back; the previously committed Scope deletion survives and completes on recovery. |
+| `sql_discovery_binding_retired` | First of two Bindings retired. | Both original Binding snapshots and versions remain, stop flag is unset, and recovery deletes both without Apply. |
+| `sql_cas_state_saved` | Binding state saved before write receipt SQL. | State, version, Deployment, and receipt all roll back. Replaying the original write applies once. |
+| `sql_cas_after_transaction` | CAS committed before returning its result. | State and matching digest/receipt survive. Replaying the same write returns `AlreadyApplied` without another version increment. |
+| `sql_unknown_state_saved` | UNKNOWN written before its transaction commits; Apply claim already committed. | Applying survives without Deployment or remote Apply. Recovery completes one Apply; a second restart does not repeat it. |
+| `compound_sql_observation_saved` | Remote Apply, Scope deletion, and PendingDelete committed; old Present observation saved before commit. | PendingDelete and UNKNOWN survive. Recovery sends only Delete and removes local/remote state. |
+| `sql_binding_deleted` | Last Binding deleted before Scope finalization SQL. | Binding and Deleting Scope both survive rollback, including UNKNOWN cleanup responsibility. Recovery may repeat Delete. |
+| `sql_scope_finalized` | Last Binding and Scope deleted before transaction commit. | Both survive rollback with their cleanup responsibility; recovery removes both and the remote target. |
+
+Every reopened database is checked with `quick_check` and `foreign_key_check`.
+Failure retains the temporary directory and prints its path, including the DB,
+WAL/SHM files if present, and remote ledger. Callbacks inside transactions never
+reenter the repository. These tests do not inject faults inside SQLite's WAL
+write/fsync implementation or cover power loss.
+
+Final cleanup removes the Binding and finalizes its Scope in one transaction.
+There is no earlier committed empty-Deployment snapshot. Both removal windows
+therefore assert a Deleting Binding at status version 5 with one UNKNOWN
+Deployment and `lastConfirmed=PRESENT`, even though the remote target is already
+absent. Recovery repeats Delete, removes Binding and Scope together, and a second
+restart performs no further I/O. This tests retained cleanup responsibility
+rather than assuming exactly-once remote deletion.
+
+Parent scenarios share a standard-library mutex for their full lifetime,
+including repository setup and teardown. Without this serialization, a child
+spawned by another test can inherit a live database lease FD until exec, even
+with `CLOEXEC`, causing a false `AlreadyOpen` during immediate reopen. Scenario
+serialization preserves the internal Apply/delete interleaving. A failed
+scenario drops its resources before releasing the guard; subsequent scenarios
+recover the poisoned mutex and still run. No retry or lease relaxation is used.
+
+The complete feature-enabled suite passes all ten collected tests, including
+the seven new parent tests covering all eleven white-box windows. The remaining
+three tests are the two existing parent tests and the child helper. The complete
+suite also passes with child exec delayed by 100 ms and `--test-threads=8`,
+without excluding any case.
+
 ## Related contracts and known gap
 
 - [`contracts.rs`](../../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs)
@@ -197,6 +253,19 @@ checks from the same component directory:
 ```bash
 (cd v2 && cargo test --locked -p asc-policy-repository-sqlite)
 ```
+
+Run the white-box tests explicitly from the component directory. Keep their
+build artifacts separate from normal daemon/package artifacts; do not enable
+`fault-injection` or use `--all-features` in release builds:
+
+```bash
+(cd v2 && cargo test --locked -p asc-policy-repository-sqlite --features fault-injection --test crash_recovery --target-dir target/fault-injection -- --nocapture)
+```
+
+The Source Build workflow runs this command in a separate
+`Run V2 policy crash consistency tests` step on Ubuntu 22.04 and Alinux4. The
+Python V2 E2E command does not collect these Rust tests, and raw/RPM release
+builds leave fault injection disabled.
 
 Set `ASC_CRASH_DAEMON_LOG=debug` for daemon diagnostics; the fixture leaves CLI
 stderr behavior unchanged. Teardown saves `daemon-N.stderr.log` and
