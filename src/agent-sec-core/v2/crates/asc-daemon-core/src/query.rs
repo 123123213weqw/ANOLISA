@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use asc_security_events::SecurityEvent;
+use asc_security_events::CorrelationCandidate;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -201,15 +201,6 @@ pub struct QuerySecurityCounts {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>>,
 }
 
-/// Scoped security record needed by the correlation application service.
-#[derive(Debug, Clone)]
-pub struct QuerySecurityEvent {
-    /// Persisted event including details required for matching.
-    pub event: SecurityEvent,
-    /// Indexed timestamp used for deterministic match ranking.
-    pub timestamp_epoch: f64,
-}
-
 /// Observability read port; each operation must apply scope before pagination or aggregation.
 pub trait ObservabilityQueries: Send + Sync {
     /// Lists owner-qualified sessions; storage errors must propagate.
@@ -287,7 +278,7 @@ pub trait SecurityQueries: Send + Sync {
         scope: QueryScope,
         record: &QueryObservation,
         control: &QueryControl,
-    ) -> Result<Vec<QuerySecurityEvent>, QueryError>;
+    ) -> Result<Vec<CorrelationCandidate>, QueryError>;
 }
 
 /// Query use cases composed over authorized read ports, without `SQLite` dependencies.

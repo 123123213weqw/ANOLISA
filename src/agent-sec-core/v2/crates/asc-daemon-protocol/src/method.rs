@@ -34,6 +34,9 @@ pub const POLICY_BINDINGS_LIST: &str = "policy.bindings.list";
 /// Append one observability record using `OTel` attribution.
 pub const OBS_RECORD: &str = "obs.record";
 
+/// Check daemon responsiveness and process uptime.
+pub const DAEMON_HEALTH: &str = "daemon.health";
+
 /// Scan one Bash or Python snippet for pre-execution security issues.
 pub const ACTION_CODE_SCAN: &str = "action.code_scan";
 /// Detect personal information and credentials without authorizing an operation.
@@ -193,6 +196,8 @@ pub enum QueryMethod {
 /// Closed daemon method identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MethodId {
+    /// Process health for any authenticated local peer.
+    Health,
     /// Read-only owner-authorized observability query.
     ObservabilityQuery(ObservabilityQueryMethod),
     /// PAP administration method.
@@ -238,7 +243,8 @@ impl MethodId {
             // peer. The query family adds row-level owner scoping inside its
             // handler, derived from the transport-authenticated principal
             // rather than from the request.
-            Self::Action(_)
+            Self::Health
+            | Self::Action(_)
             | Self::ObservabilityRecord
             | Self::Query(_)
             | Self::ObservabilityQuery(_) => Metadata {
@@ -251,6 +257,7 @@ impl MethodId {
 /// Resolves an exact wire method without inspecting its parameters.
 pub fn resolve(method: &str) -> Option<MethodId> {
     match method {
+        DAEMON_HEALTH => Some(MethodId::Health),
         POLICY_TEMPLATES_CREATE => Some(MethodId::Pap(PapMethod::Policy(PolicyMethod::Create))),
         POLICY_TEMPLATES_UPDATE => Some(MethodId::Pap(PapMethod::Policy(PolicyMethod::Update))),
         POLICY_TEMPLATES_GET => Some(MethodId::Pap(PapMethod::Policy(PolicyMethod::Get))),

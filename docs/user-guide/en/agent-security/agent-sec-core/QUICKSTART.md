@@ -358,8 +358,10 @@ agent-sec-cli observability report --session-id <id> --format json
 
 Query the security event store. In the V2 CLI the query goes through the system
 daemon, which scopes every read to the kernel-authenticated caller: each user
-sees only its own events, while root sees every owner's events and may narrow
-with `--owner-uid` (a non-root caller can only name its own UID). Output shapes
+sees only its own events, while root sees events from all UIDs. Queries accept
+no UID parameter or flag. When session IDs collide across UIDs, root receives
+`UID_session_id` labels and can pass them back to `--session-id`; ordinary users
+keep the original labels. Ambiguous root locators are rejected. Output shapes
 are unchanged from V1: `--output json` is the event array with details,
 `jsonl` one event per line, `--count` a bare number, `--count-by` a JSON object.
 
@@ -389,8 +391,8 @@ agent-sec-cli events --offset 50 --limit 20
 # Security posture summary (last 24 hours by default)
 agent-sec-cli events --summary
 
-# Root only: read another owner's events
-agent-sec-cli events --owner-uid 1000
+# Root: follow a qualified session ID returned by a query
+agent-sec-cli events --session-id 1000_shared-session
 ```
 
 ### Agent Capability View

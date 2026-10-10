@@ -17,32 +17,30 @@
 use crate::timestamp::utc_iso_to_epoch;
 use crate::{SecurityEvent, SecurityEventsSummary, TimestampError};
 
-/// The owner whose rows one server query is authorized to read.
+/// The UID scope one server query is authorized to read.
 ///
 /// A scope is constructed only by trusted server code from
 /// kernel-authenticated peer credentials — it is never decoded from request
-/// parameters, and caller-supplied identity fields never influence it. The
-/// `owner_uid` request parameter is a *filter within* the authorized scope,
-/// not a way to name one (root may pick any UID, a non-root caller only
-/// itself).
+/// parameters, and caller-supplied identity fields never influence it.
+/// Root reads all UIDs; every other peer reads only its own UID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryScope {
     /// Rows whose producing peer was kernel-authenticated as this UID.
-    Owner(u32),
-    /// Every owner's rows.
+    Own(u32),
+    /// Every UID's rows.
     ///
     /// Reserved for the kernel-authenticated root peer. Non-root principals —
     /// including `PolicyAdministrator` — never read through this scope: the
-    /// v2 daemon assigns no cross-owner audit role (issue #6608).
+    /// v2 daemon assigns no cross-UID audit role (issue #6608).
     All,
 }
 
 impl QueryScope {
-    /// Returns the owner UID this scope may read, or `None` for [`All`].
+    /// Returns the UID this scope may read, or `None` for [`Self::All`].
     #[must_use]
-    pub const fn owner_uid(self) -> Option<u32> {
+    pub const fn uid(self) -> Option<u32> {
         match self {
-            Self::Owner(uid) => Some(uid),
+            Self::Own(uid) => Some(uid),
             Self::All => None,
         }
     }
@@ -65,6 +63,9 @@ pub struct EventFilters {
     pub trace_id: Option<String>,
     /// Exact `session_id`.
     pub session_id: Option<String>,
+    /// UID resolved from a root-visible session locator, never a wire parameter.
+    /// Applied together with the authenticated scope, so it cannot widen visibility.
+    pub session_uid: Option<u32>,
     /// Exact `run_id`.
     pub run_id: Option<String>,
     /// Exact `call_id`.
@@ -128,6 +129,9 @@ pub const VALID_GROUP_FIELDS: &[&str] = &[
 /// the caller's fault and maps to `invalid_argument` at the protocol edge.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
+    /// A root session locator is ambiguous or malformed.
+    #[error("invalid query parameters or session shared by multiple UIDs")]
+    InvalidArgument,
     /// The store cannot be read right now.
     #[error("security event store is unavailable: {0}")]
     Unavailable(String),
@@ -136,11 +140,16 @@ pub enum QueryError {
     InvalidGroupField(String),
 }
 
-/// Read-only security-event queries one daemon can serve, scoped per owner.
+/// Read-only security-event queries one daemon can serve, scoped per UID.
 ///
 /// The port keeps daemon handlers free of storage decisions; the daemon
 /// composition root binds it to the same database the writers use.
 pub trait SecurityEventQueries: Send + Sync {
+    /// Resolves a root-visible session locator to a persisted UID and raw label.
+    ///
+    /// # Errors
+    /// Rejects ambiguous locators and propagates storage failures.
+    fn resolve_session(&self, session: &str) -> Result<Option<(u32, String)>, QueryError>;
     /// Returns the aggregates and newest rows of one scope.
     ///
     /// # Errors
@@ -206,8 +215,8 @@ mod tests {
 
     #[test]
     fn an_owner_scope_carries_its_uid() {
-        assert_eq!(QueryScope::Owner(1000).owner_uid(), Some(1000));
-        assert_eq!(QueryScope::All.owner_uid(), None);
+        assert_eq!(QueryScope::Own(1000).uid(), Some(1000));
+        assert_eq!(QueryScope::All.uid(), None);
     }
 
     #[test]

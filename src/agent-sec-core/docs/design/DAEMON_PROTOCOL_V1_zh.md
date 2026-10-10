@@ -239,15 +239,20 @@ V1 parser 对 `ok` 与 `error` 的组合不做交叉字段强校验，但兼容�
 
 optional string 的空白值归一为未设置。
 
-#### Owner scope 与 owner 过滤
+#### V2 UID 范围与 session 定位
 
 四个 `sec.*` method 的读取范围由 transport 认证的 peer UID 决定（DPV1-018/019）：
 
-- root peer 默认读取全部 owner，也可以用 `owner_uid`（u32 integer）收窄到任意单个
-  UID；
-- 非 root peer（包括 `PolicyAdministrator`）只能读取自身 UID；`owner_uid` 只能等于
-  自身，指定其它 UID 返回 `invalid_argument`；
-- `owner_uid` 是已授权范围内的过滤器，不是身份 override，永远不会扩大 scope。
+- root peer 读取全部 UID；非 root peer（包括 `PolicyAdministrator`）只能读取自身 UID。
+- 请求不接受 `uid`、`owner_uid`（包括 null），返回 `invalid_request`；CLI 不提供
+  `--uid` 或 `--owner-uid`。此 V2 契约取代此前的 `owner_uid` 过滤扩展。
+- 跨 UID 的 `session_id` 碰撞时，root 的事件、latest_events 和 session 分组返回
+  `UID_session_id`；唯一 session 和普通用户返回原始 ID。碰撞判断覆盖完整 store，
+  不受当前分页、时间或其它筛选影响；`affected_sessions` 分别统计各 UID 的同名 session。
+- root 可将返回的组合 ID 用作 `session_id` 筛选；也接受 obs 返回的组合 ID，即使
+  security store 中只有该 UID 的记录。组合 ID 定位已获授权的数据，不是身份参数。
+  原始 ID 对应多个 UID，或组合 ID 与真实 ID 冲突时返回 `invalid_argument`。
+  普通用户不解析前缀，不能借此改变 UDS UID 范围。
 
 存储存在但不可读（页损坏、I/O 错误、查询被中断）时，四个 method 返回 `unavailable`
 错误而不是成功的空结果；数据库尚未创建时仍返回空结果（首次写入前的正常状态）。
@@ -853,7 +858,7 @@ agent-sec-cli 触发 PyO3、Python backend 或第二套本地业务执行。
 | DPV1-015 | 旧 daemon 返回 `unknown_method` 时返回稳定 version/capability mismatch；timeout/EOF 时同样不本地执行 |
 | DPV1-016 | envelope/wire-shape 错误与 action 领域输入错误稳定落入不同 response layer |
 | DPV1-017 | 八个 action method 的 timeout、queue/resource、access-log、blocking 和 cancellation metadata 已冻结并逐项验证 |
-| DPV1-018 | 多 UID 共用 system socket；trusted Principal/QueryScope 隔离 owner，`caller/trace_context` 不参与授权；root 默认 All 并可用 `owner_uid` 收窄，非 root（含 PolicyAdministrator）仅限自身且 `owner_uid` 只能等于自身 |
+| DPV1-018 | 多 UID 共用 system socket；trusted Principal/QueryScope 按 UID 隔离，`caller/trace_context` 不参与授权；root 为 All，非 root（含 PolicyAdministrator）仅限自身；拒绝 UID 参数，root 用服务端返回的 UID_session_id 定位同名 session |
 | DPV1-019 | CLI/TUI 不能用 RPC filter 绕过服务端 QueryScope，也不能直读 SQLite 替代授权查询 |
 | DPV1-020 | 15 个 PAP method 的 strict params、完整请求/响应 CRUD fixture、直接领域 result、错误投影、server-owned Principal；必跑 UDS integration 经 Dispatcher/PapHandler → PapService → Repository 执行完整 fixture，真实 `asc-daemon` 子进程通过启动管理员 UID 配置完成非 root 成功场景，同时验证默认拒绝；root 环境验证默认成功 |
 
@@ -1034,6 +1039,12 @@ Scope 来源和固定进程身份，不包含完整 Scope 或 scopeRevision。
 
 V2 已注册 `obs.sessions.list`、`obs.runs.list`、`obs.timeline.get`，使用 V2 信封；
 CLI report/TUI review 只通过 daemon 读取。`sec.summary`、`sec.events.list/get/count_by` 的契约见第 6 节。
+`agent-sec-cli events` 的 V1 诊断兼容范围：未知 `event_type`/`category` 输出
+`Warning: Unknown ...` 和排序后的已知值列表，仍执行原筛选查询；非法整数 `--limit`/`--offset`
+保留 `Invalid value for '...': '...' is not a valid integer.`，缺少 `--event-type`/`--category`
+值保留 `Option '...' requires an argument.`，均退出 2。非法 `--since`/`--until` 输出
+`Error: Invalid time format for ...: '...'. Expected ISO 8601 format.` 并退出 1。
+参数解析错误保留诊断正文与退出码，不复刻 Typer 的终端边框排版。
 obs 普通用户范围固定为内核认证的 UDS peer UID；root 可查询全部；obs 请求不接受 uid/owner_uid 或转发身份。
 参数、分页、关联与错误契约，以及 QRY-001..011 完整验收矩阵和当前证据见
 [V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)。

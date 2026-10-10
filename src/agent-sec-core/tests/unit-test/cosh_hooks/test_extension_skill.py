@@ -63,6 +63,9 @@ def test_security_observability_skill_documents_cli_and_output_contracts() -> No
     assert "category`、`event_type`、`trace_id`" in content
     assert "--limit '<matching_count_or_safe_page_size>'" in content
     assert "--count" in content
+    assert "UDS peer UID" in content
+    assert "不提供 `--uid` 或 `--owner-uid`" in content
+    assert "`UID_session_id`" in content
 
     event_fields = {
         "event_id",

@@ -18,6 +18,7 @@ const DEFAULT_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_s
 
 /// Protocol router composed over daemon application use cases.
 pub struct DaemonDispatcher {
+    started_at: std::time::Instant,
     pap: PapHandler,
     code_scan: CodeScanHandler,
     pii_scan: PiiScanHandler,
@@ -43,6 +44,7 @@ impl DaemonDispatcher {
         actions: Arc<ActionService>,
     ) -> Self {
         Self {
+            started_at: std::time::Instant::now(),
             pap: PapHandler::new(application),
             code_scan: CodeScanHandler::new(Arc::clone(&actions)),
             pii_scan: PiiScanHandler::new(Arc::clone(&actions)),
@@ -142,6 +144,14 @@ impl DaemonDispatcher {
             );
         }
         match method_id {
+            MethodId::Health => DaemonResponse::success(
+                request_id,
+                serde_json::json!({
+                    "status": "ok",
+                    "pid": std::process::id(),
+                    "uptime_seconds": self.started_at.elapsed().as_secs_f64(),
+                }),
+            ),
             MethodId::ObservabilityQuery(method) => crate::observability_query::handle(
                 request_id,
                 peer,
@@ -202,6 +212,14 @@ fn is_authorized(principal: &Principal, access: AccessPolicy) -> bool {
 
 impl RequestDispatcher for DaemonDispatcher {
     fn dispatch_timeout(&self, payload: &[u8]) -> Option<std::time::Duration> {
+        if let Ok(request) = serde_json::from_slice::<asc_daemon_protocol::V1Request>(payload)
+            && request.caller.as_deref() == Some("agentsight")
+        {
+            return request
+                .timeout_ms
+                .filter(|ms| (1..=300_000).contains(ms))
+                .map(std::time::Duration::from_millis);
+        }
         let request: DaemonRequest = serde_json::from_slice(payload).ok()?;
         // Prompt Scanner retains its existing fixed local-model budget.
         if request.method == method::ACTION_PROMPT_SCAN
@@ -235,6 +253,9 @@ impl RequestDispatcher for DaemonDispatcher {
         request: DispatchRequest,
         response: &mut dyn Write,
     ) -> Result<ResponseDisposition, DispatchError> {
+        if let Some(result) = crate::v1_compat::dispatch(self, &request, response) {
+            return result;
+        }
         let request_id = new_request_id();
         if request.control.is_cancelled() {
             return asc_observability::rejection_scope("deadline_exceeded", || {

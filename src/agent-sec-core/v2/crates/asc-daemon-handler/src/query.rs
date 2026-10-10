@@ -8,8 +8,7 @@
 //!   user over a 0600 socket and a per-user database; v2 serves many local
 //!   UIDs from one system store, so every read here carries a
 //!   [`QueryScope`] derived from the kernel-authenticated peer. A caller
-//!   cannot name, widen, or hint at a scope through request parameters — the
-//!   `owner_uid` field is a filter *within* the authorized scope.
+//!   cannot name, widen, or hint at a scope through request parameters.
 //! * **Cross-owner audit is absent on purpose.** Outside the kernel-derived
 //!   scope the server assigns no auditor role, so no non-root principal —
 //!   administrator or not — reads another owner's rows through these
@@ -92,13 +91,7 @@ impl SecurityQueryHandler {
                 );
             }
         };
-        // The owner scope is derived once, from transport-authenticated
-        // evidence only. The only request input that participates is the
-        // owner filter, and it may only narrow what the peer is already
-        // authorized to read.
-        let Ok(scope) = resolve_scope(principal, &params) else {
-            return invalid_owner_filter(request_id);
-        };
+        let scope = resolve_scope(principal);
         match query {
             method::QueryMethod::Summary => Self::summary(source, request_id, &params, scope),
             method::QueryMethod::EventsList => Self::list(source, request_id, &params, scope),
@@ -117,6 +110,10 @@ impl SecurityQueryHandler {
     ) -> DaemonResponse {
         let Ok((filters, latest_limit)) = summary_filters(params) else {
             return invalid_parameters(request_id);
+        };
+        let filters = match resolve_filters(source, filters, scope) {
+            Ok(filters) => filters,
+            Err(error) => return storage_failure(request_id, &error),
         };
         let summary = match source.summary(&filters, scope, latest_limit) {
             Ok(summary) => summary,
@@ -148,6 +145,10 @@ impl SecurityQueryHandler {
     ) -> DaemonResponse {
         let Ok((filters, limit, offset, include_details)) = list_filters(params) else {
             return invalid_parameters(request_id);
+        };
+        let filters = match resolve_filters(source, filters, scope) {
+            Ok(filters) => filters,
+            Err(error) => return storage_failure(request_id, &error),
         };
         let items = match source.list(&filters, scope, limit, offset) {
             Ok(items) => items,
@@ -221,6 +222,10 @@ impl SecurityQueryHandler {
         let Ok(filters) = event_filters(params) else {
             return invalid_parameters(request_id);
         };
+        let filters = match resolve_filters(source, filters, scope) {
+            Ok(filters) => filters,
+            Err(error) => return storage_failure(request_id, &error),
+        };
         match source.count_by(group_by, &filters, scope, offset) {
             Ok(groups) => DaemonResponse::success(
                 request_id,
@@ -237,23 +242,28 @@ impl SecurityQueryHandler {
 
 /// Derives the read scope from kernel-authenticated evidence.
 ///
-/// Root reads all owners by default and may narrow to any single UID through
-/// the `owner_uid` filter. Every non-root principal — including a
-/// `PolicyAdministrator` — reads exactly its own UID, and selecting any other
-/// UID is an authorization failure, not a silently narrowed result.
-fn resolve_scope(principal: &Principal, params: &SecQueryParams) -> Result<QueryScope, ()> {
-    let peer = principal.peer().uid();
-    if peer == 0 {
-        return Ok(match params.owner_uid {
-            Some(uid) => QueryScope::Owner(uid),
-            None => QueryScope::All,
-        });
+/// Root reads all UIDs. Every non-root peer, including a
+/// `PolicyAdministrator`, reads only its own UID.
+fn resolve_scope(principal: &Principal) -> QueryScope {
+    match principal.peer().uid() {
+        0 => QueryScope::All,
+        uid => QueryScope::Own(uid),
     }
-    match params.owner_uid {
-        None => Ok(QueryScope::Owner(peer)),
-        Some(uid) if uid == peer => Ok(QueryScope::Owner(peer)),
-        Some(_) => Err(()),
+}
+
+fn resolve_filters(
+    source: &dyn SecurityEventQueries,
+    mut filters: EventFilters,
+    scope: QueryScope,
+) -> Result<EventFilters, QueryError> {
+    if scope == QueryScope::All
+        && let Some(session) = filters.session_id.as_deref()
+        && let Some((uid, raw)) = source.resolve_session(session)?
+    {
+        filters.session_uid = Some(uid);
+        filters.session_id = Some(raw);
     }
+    Ok(filters)
 }
 
 /// Parses the `sec.summary` filter set.
@@ -308,6 +318,7 @@ fn event_filters(params: &SecQueryParams) -> Result<EventFilters, ()> {
         result: non_empty(params.result.as_deref()).map(str::to_owned),
         trace_id: non_empty(params.trace_id.as_deref()).map(str::to_owned),
         session_id: non_empty(params.session_id.as_deref()).map(str::to_owned),
+        session_uid: None,
         run_id: non_empty(params.run_id.as_deref()).map(str::to_owned),
         call_id: non_empty(params.call_id.as_deref()).map(str::to_owned),
         tool_call_id: non_empty(params.tool_call_id.as_deref()).map(str::to_owned),
@@ -503,18 +514,12 @@ fn invalid_parameters(request_id: RequestId) -> DaemonResponse {
     )
 }
 
-/// A non-root caller named an owner other than itself.
-fn invalid_owner_filter(request_id: RequestId) -> DaemonResponse {
-    DaemonResponse::error(
-        request_id,
-        error_code::INVALID_ARGUMENT,
-        "owner_uid may only select the caller's own UID unless the caller is root",
-    )
-}
-
 /// The store is present but cannot be read; this must not look like "no
 /// events".
 fn storage_failure(request_id: RequestId, error: &QueryError) -> DaemonResponse {
+    if matches!(error, QueryError::InvalidArgument) {
+        return invalid_parameters(request_id);
+    }
     DaemonResponse::error(
         request_id,
         error_code::UNAVAILABLE,
@@ -627,28 +632,28 @@ mod tests {
     }
 
     #[test]
-    fn root_reads_all_owners_and_may_narrow_with_the_owner_filter() {
+    fn root_reads_all_uids_and_resolves_qualified_sessions() {
         let (_dir, source) = two_owner_source();
         let handler = SecurityQueryHandler::new(source);
 
         let data = success_data(handle(&handler, 0, method::SEC_EVENTS_LIST, json!({})));
-        assert_eq!(
-            data["total"],
-            json!(3),
-            "root's default scope is all owners"
-        );
+        assert_eq!(data["total"], json!(3), "root's scope is all UIDs");
+        assert_eq!(data["items"][0]["session_id"], "2000_s-1");
 
         let data = success_data(handle(
             &handler,
             0,
             method::SEC_EVENTS_LIST,
-            json!({"owner_uid": 2000}),
+            json!({"session_id": "2000_s-1"}),
         ));
         assert_eq!(data["total"], json!(1));
         assert_eq!(data["items"][0]["event_id"], json!("b1"));
+        assert_eq!(data["items"][0]["session_id"], "2000_s-1");
 
         let data = success_data(handle(&handler, 0, method::SEC_SUMMARY, json!({})));
         assert_eq!(data["total"], json!(3));
+        assert_eq!(data["affected_sessions"], 2);
+        assert_eq!(data["latest_events"][0]["session_id"], "2000_s-1");
 
         let data = success_data(handle(
             &handler,
@@ -657,29 +662,72 @@ mod tests {
             json!({"event_id": "b1"}),
         ));
         assert_eq!(data["found"], json!(true));
+        assert_eq!(data["event"]["session_id"], "2000_s-1");
+
+        let groups = success_data(handle(
+            &handler,
+            0,
+            method::SEC_EVENTS_COUNT_BY,
+            json!({"group_by":"session_id"}),
+        ));
+        assert_eq!(
+            groups["items"],
+            json!([
+                {"value":"1000_s-1", "count":2}, {"value":"2000_s-1", "count":1}
+            ])
+        );
+        let page = success_data(handle(
+            &handler,
+            0,
+            method::SEC_EVENTS_LIST,
+            json!({"limit":1,"offset":1}),
+        ));
+        assert_eq!(page["items"][0]["session_id"], "1000_s-1");
+        assert_eq!(page["total"], 3);
+        let ambiguous = handle(
+            &handler,
+            0,
+            method::SEC_EVENTS_LIST,
+            json!({"session_id":"s-1"}),
+        );
+        assert_eq!(error_code_of(ambiguous), "invalid_argument");
     }
 
     #[test]
-    fn a_non_root_caller_cannot_select_another_owner() {
+    fn identity_parameters_are_rejected_for_every_peer() {
         let (_dir, source) = two_owner_source();
         let handler = SecurityQueryHandler::new(source);
 
-        let response = handle(
-            &handler,
-            1000,
-            method::SEC_EVENTS_LIST,
-            json!({"owner_uid": 2000}),
-        );
-        assert_eq!(error_code_of(response), "invalid_argument");
+        for uid in [0, 1000] {
+            for method in [
+                method::SEC_EVENTS_LIST,
+                method::SEC_SUMMARY,
+                method::SEC_EVENTS_GET,
+                method::SEC_EVENTS_COUNT_BY,
+            ] {
+                for params in [
+                    json!({"owner_uid":2000}),
+                    json!({"owner_uid":1000}),
+                    json!({"uid":uid}),
+                    json!({"uid":null}),
+                    json!({"owner_uid":null}),
+                ] {
+                    assert_eq!(
+                        error_code_of(handle(&handler, uid, method, params)),
+                        "invalid_request"
+                    );
+                }
+            }
+        }
 
-        // Selecting itself is the same as omitting the filter.
+        // Qualified locators never change a non-root peer's visibility.
         let data = success_data(handle(
             &handler,
             1000,
             method::SEC_EVENTS_LIST,
-            json!({"owner_uid": 1000}),
+            json!({"session_id": "2000_s-1"}),
         ));
-        assert_eq!(data["total"], json!(2));
+        assert_eq!(data["total"], json!(0));
     }
 
     #[test]
@@ -695,8 +743,10 @@ mod tests {
         let method::MethodId::Query(query) = query else {
             panic!("not a query method");
         };
+        let response = handler.handle(request_id(), &admin, query, json!({}));
+        assert_eq!(success_data(response)["total"], 0);
         let response = handler.handle(request_id(), &admin, query, json!({"owner_uid": 1000}));
-        assert_eq!(error_code_of(response), "invalid_argument");
+        assert_eq!(error_code_of(response), "invalid_request");
     }
 
     #[test]

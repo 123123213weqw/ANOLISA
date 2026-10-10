@@ -59,12 +59,6 @@ pub struct SecQueryParams {
     pub latest_limit: Option<u64>,
     /// Group field of `sec.events.count_by`; required by that method.
     pub group_by: Option<String>,
-    /// Owner filter within the authorized scope.
-    ///
-    /// Root may select any UID (or omit it to read all owners); a non-root
-    /// caller may only select its own UID. This filters inside the
-    /// kernel-derived scope — it never widens it.
-    pub owner_uid: Option<u32>,
 }
 
 /// Parameters for the three bounded observability query methods.
@@ -172,8 +166,10 @@ mod tests {
             json!({"uid":1000}),
             json!({"owner_uid":1000}),
             json!({"uid":null}),
+            json!({"owner_uid":null}),
         ] {
-            assert!(serde_json::from_value::<ObservabilityQueryParams>(input).is_err());
+            assert!(serde_json::from_value::<ObservabilityQueryParams>(input.clone()).is_err());
+            assert!(serde_json::from_value::<SecQueryParams>(input).is_err());
         }
         assert_eq!(
             serde_json::to_value(ObservabilityQueryParams::default()).unwrap(),

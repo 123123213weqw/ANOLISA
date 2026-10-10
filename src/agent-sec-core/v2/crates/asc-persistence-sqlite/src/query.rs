@@ -4,12 +4,14 @@ use std::path::{Path, PathBuf};
 
 use asc_daemon_core::query::{
     ObservabilityQueries, QueryControl, QueryError, QueryObservation, QueryPage, QueryResult,
-    QueryRun, QueryScope, QuerySecurityCounts, QuerySecurityEvent, QuerySession, QueryWindow,
-    SecurityQueries,
+    QueryRun, QueryScope, QuerySecurityCounts, QuerySession, QueryWindow, SecurityQueries,
 };
-use asc_security_events::{EventResult, SecurityEvent};
+use asc_security_events::CorrelationCandidate;
+use asc_sqlite_kernel::KernelError;
 use rusqlite::{Connection, OptionalExtension, Row, params_from_iter, types::Value as SqlValue};
 use serde_json::Value;
+
+use crate::security_events::repository::{CorrelationRequest, SecurityEventRepository};
 
 const ROW_BUDGET: i32 = 4 * 1024 * 1024;
 const PAGE_BUDGET: usize = 4 * 1024 * 1024;
@@ -172,7 +174,7 @@ impl ObservabilityQueries for SqliteObservabilityQueries {
         let resolved = if scope == QueryScope::All
             && session.is_some_and(|id| qualified_session(id).is_some())
         {
-            resolve_root_session(&conn, session.unwrap_or_default())?
+            resolve_root_session(&conn, session.unwrap_or_default(), "observability_events")?
         } else {
             None
         };
@@ -239,7 +241,7 @@ impl ObservabilityQueries for SqliteObservabilityQueries {
             asc_observability::OBSERVABILITY_SQLITE_SCHEMA_VERSION,
             control,
         )?;
-        resolve_root_session(&conn, session)
+        resolve_root_session(&conn, session, "observability_events")
     }
 
     fn runs(
@@ -431,7 +433,7 @@ impl SecurityQueries for SqliteSecurityQueries {
         scope: QueryScope,
         record: &QueryObservation,
         control: &QueryControl,
-    ) -> Result<Vec<QuerySecurityEvent>, QueryError> {
+    ) -> Result<Vec<CorrelationCandidate>, QueryError> {
         control.check()?;
         let Some(owner) = record.uid else {
             return Ok(Vec::new());
@@ -439,25 +441,22 @@ impl SecurityQueries for SqliteSecurityQueries {
         if scope != QueryScope::Own(owner) {
             return Err(QueryError::PermissionDenied);
         }
-        let categories = match record.hook.as_str() {
-            "before_tool_call" => "('code_scan','skill_ledger','pii_scan')",
-            "before_agent_run" => "('prompt_scan','pii_scan')",
-            "after_tool_call" => "('pii_scan')",
+        let categories: &[&str] = match record.hook.as_str() {
+            "before_tool_call" => &["code_scan", "skill_ledger", "pii_scan"],
+            "before_agent_run" => &["prompt_scan", "pii_scan"],
+            "after_tool_call" => &["pii_scan"],
             _ => return Ok(Vec::new()),
         };
+        let categories: Vec<String> = categories
+            .iter()
+            .map(|category| (*category).into())
+            .collect();
         let result = (|| {
             let conn = open(
                 &self.path,
                 asc_security_events::SECURITY_EVENTS_SQLITE_SCHEMA_VERSION,
                 control,
             )?;
-            let mut filter = Filter::new(
-                QueryScope::Own(owner),
-                "uid",
-                QueryWindow::default(),
-                "timestamp_epoch",
-            );
-            filter.text("session_id", &record.session_id);
             let real_run = !record.run_id.trim().is_empty()
                 && record.run_id != asc_daemon_core::query::ZERO_RUN_ID;
             let exact = real_run
@@ -465,46 +464,32 @@ impl SecurityQueries for SqliteSecurityQueries {
                     .tool_call_id
                     .as_deref()
                     .is_some_and(|s| !s.trim().is_empty());
-            if real_run {
-                filter.text("run_id", &record.run_id);
-            }
-            if exact {
-                if let Some(tool) = &record.tool_call_id {
-                    filter.text("tool_call_id", tool);
-                }
-            } else if !(real_run && record.hook == "before_agent_run") {
-                filter.add(
-                    "timestamp_epoch",
-                    ">=",
-                    SqlValue::Real(record.timestamp_epoch - 10.0),
-                );
-                filter.add(
-                    "timestamp_epoch",
-                    "<=",
-                    SqlValue::Real(record.timestamp_epoch + 10.0),
-                );
-            }
-            let sql = format!(
-                "SELECT event_id,event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,call_id,tool_call_id,details FROM security_events{} AND category IN {categories} ORDER BY timestamp_epoch,event_id LIMIT 1000",
-                filter.sql()
-            );
-            let rows = collect(&conn, &sql, &filter, |row| {
-                Ok(security_candidate(row)
-                    .inspect_err(|_| {
-                        tracing::warn!(target: "asc_process_diagnostic",
-                        "security correlation candidate skipped: malformed row");
-                    })
-                    .ok())
-            })?;
+            let tool_call_ids = record
+                .tool_call_id
+                .as_ref()
+                .filter(|_| exact)
+                .map(|tool| vec![tool.clone()]);
+            let timed = !(exact || real_run && record.hook == "before_agent_run");
+            let request = CorrelationRequest {
+                session_id: &record.session_id,
+                categories: &categories,
+                run_id: real_run.then_some(record.run_id.as_str()),
+                tool_call_ids: tool_call_ids.as_deref(),
+                since_epoch: timed.then_some(record.timestamp_epoch - 10.0),
+                until_epoch: timed.then_some(record.timestamp_epoch + 10.0),
+            };
+            let candidates = SecurityEventRepository
+                .query_correlation_candidates(
+                    &conn,
+                    &request,
+                    &asc_security_events::query::QueryScope::Own(owner),
+                )
+                .map_err(|error| match error {
+                    KernelError::Sqlite(error) => map_error(&error),
+                    _ => QueryError::Internal,
+                })?;
             control.check()?;
-            Ok(rows
-                .into_iter()
-                .flatten()
-                .map(|(event, timestamp_epoch)| QuerySecurityEvent {
-                    event,
-                    timestamp_epoch,
-                })
-                .collect())
+            Ok(candidates)
         })();
         match result {
             Err(QueryError::Unavailable | QueryError::Internal | QueryError::ResourceExhausted) => {
@@ -516,36 +501,6 @@ impl SecurityQueries for SqliteSecurityQueries {
             result => result,
         }
     }
-}
-
-fn security_candidate(row: &Row<'_>) -> rusqlite::Result<(SecurityEvent, f64)> {
-    let outcome: String = row.get(3)?;
-    let result = match outcome.as_str() {
-        "succeeded" => EventResult::Succeeded,
-        "failed" => EventResult::Failed,
-        _ => return Err(rusqlite::Error::InvalidQuery),
-    };
-    let Value::Object(details) = object(row, 13)? else {
-        return Err(rusqlite::Error::InvalidQuery);
-    };
-    Ok((
-        SecurityEvent {
-            event_id: row.get(0)?,
-            event_type: row.get(1)?,
-            category: row.get(2)?,
-            result,
-            timestamp: row.get(4)?,
-            trace_id: row.get(6)?,
-            pid: row.get(7)?,
-            uid: row.get(8)?,
-            session_id: row.get(9)?,
-            run_id: row.get(10)?,
-            call_id: row.get(11)?,
-            tool_call_id: row.get(12)?,
-            details,
-        },
-        row.get(5)?,
-    ))
 }
 
 // A qualified session is a root resource locator, never a caller identity.
@@ -563,10 +518,14 @@ fn qualified_session(session: &str) -> Option<(Option<u32>, &str)> {
     Some((uid, raw))
 }
 
-fn session_owners(conn: &Connection, session: &str) -> Result<Vec<Option<u32>>, QueryError> {
+fn session_uids(
+    conn: &Connection,
+    session: &str,
+    table: &str,
+) -> Result<Vec<Option<u32>>, QueryError> {
     collect(
         conn,
-        "SELECT DISTINCT uid FROM observability_events WHERE session_id=?1 LIMIT 2",
+        &format!("SELECT DISTINCT uid FROM {table} WHERE session_id=?1 LIMIT 2"),
         &Filter {
             clauses: Vec::new(),
             values: vec![SqlValue::Text(session.into())],
@@ -575,22 +534,29 @@ fn session_owners(conn: &Connection, session: &str) -> Result<Vec<Option<u32>>, 
     )
 }
 
-fn resolve_root_session(
+// Table names are trusted store constants, never request values.
+pub(crate) fn resolve_root_session(
     conn: &Connection,
     session: &str,
+    table: &str,
 ) -> Result<Option<(QueryScope, String)>, QueryError> {
-    let owners = session_owners(conn, session)?;
+    let uids = session_uids(conn, session, table)?;
     let qualified = if let Some((uid, raw)) = qualified_session(session) {
-        let shared = session_owners(conn, raw)?.len() > 1;
-        let exists: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM observability_events WHERE session_id=?1 AND uid IS ?2)",
-            rusqlite::params![raw, uid], |row| row.get(0),
-        ).map_err(|e| map_error(&e))?;
+        // Security queries also accept locators returned by the obs store,
+        // even when only one of those UIDs has emitted a security event.
+        let shared = table == "security_events" || session_uids(conn, raw, table)?.len() > 1;
+        let exists: bool = conn
+            .query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id=?1 AND uid IS ?2)"),
+                rusqlite::params![raw, uid],
+                |row| row.get(0),
+            )
+            .map_err(|e| map_error(&e))?;
         (shared && exists).then(|| (QueryScope::for_owner(uid), raw.to_owned()))
     } else {
         None
     };
-    match (owners.as_slice(), qualified) {
+    match (uids.as_slice(), qualified) {
         ([], selected) => Ok(selected),
         ([owner], None) => Ok(Some((QueryScope::for_owner(*owner), session.to_owned()))),
         _ => Err(QueryError::InvalidArgument),

@@ -211,7 +211,7 @@ fn read_all(path: &Path) -> Value {
     for uid in uids {
         events.extend(reader.query(
             &EventFilters::default(),
-            &QueryScope::Owner(uid),
+            &QueryScope::Own(uid),
             1_000_000,
             0,
         ));

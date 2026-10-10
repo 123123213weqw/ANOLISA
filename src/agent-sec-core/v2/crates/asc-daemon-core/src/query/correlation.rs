@@ -1,16 +1,16 @@
 //! V1 matching priorities over candidates already restricted to the observation owner.
 
-use asc_security_events::{SecurityEvent, extract_verdict};
+use asc_security_events::{CorrelationCandidate, SecurityEvent, extract_verdict};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use super::{QueryControl, QueryError, QueryObservation, QuerySecurityEvent};
+use super::{QueryControl, QueryError, QueryObservation};
 
 use super::ZERO_RUN_ID;
 
 pub(super) fn correlate(
     record: &QueryObservation,
-    candidates: &[QuerySecurityEvent],
+    candidates: &[CorrelationCandidate],
     control: &QueryControl,
 ) -> Result<Vec<Value>, QueryError> {
     if record.session_id.trim().is_empty() {
@@ -244,11 +244,11 @@ mod tests {
             let record: QueryObservation =
                 serde_json::from_value(with_defaults(&fixture["record_defaults"], &case["record"]))
                     .unwrap();
-            let mut candidates: Vec<QuerySecurityEvent> = case["candidates"]
+            let mut candidates: Vec<CorrelationCandidate> = case["candidates"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|row| QuerySecurityEvent {
+                .map(|row| CorrelationCandidate {
                     event: serde_json::from_value(with_defaults(
                         &fixture["event_defaults"],
                         &row["event"],

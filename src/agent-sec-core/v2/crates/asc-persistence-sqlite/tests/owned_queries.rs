@@ -617,12 +617,21 @@ fn correlation_candidates_keep_v1_order_and_limit_without_failing_timeline() {
         .unwrap()
         .items
         .remove(0);
-    let candidates = SqliteSecurityQueries::new(path)
+    let security = SqliteSecurityQueries::new(path);
+    let candidates = security
         .candidates(QueryScope::Own(1000), &record, &control())
         .unwrap();
     assert_eq!(candidates.len(), 1000);
     assert_eq!(candidates[0].event.event_id, "event-1000");
     assert_eq!(candidates.last().unwrap().event.event_id, "candidate-0998");
+    let checks = std::sync::atomic::AtomicUsize::new(0);
+    let cancelled = QueryControl::new(Instant::now() + Duration::from_secs(5), move || {
+        checks.fetch_add(1, Ordering::Relaxed) > 10
+    });
+    assert!(matches!(
+        security.candidates(QueryScope::Own(1000), &record, &cancelled),
+        Err(QueryError::DeadlineExceeded)
+    ));
     let timeline = service
         .timeline(
             QueryScope::Own(1000),
@@ -650,14 +659,16 @@ fn malformed_candidates_do_not_hide_valid_correlations_or_observations() {
     let (directory, service, _) = seed();
     let conn = Connection::open(directory.path().join("sec.db")).unwrap();
     conn.execute("INSERT INTO security_events(event_id,event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,call_id,tool_call_id,details) SELECT 'valid-event',event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,1000,session_id,run_id,call_id,tool_call_id,details FROM security_events WHERE event_id='event-2000'", []).unwrap();
-    for (details, result) in [
-        ("not json", "succeeded"),
-        ("[]", "succeeded"),
-        ("{}", "invalid"),
+    for (details, result, pid) in [
+        ("not json", "succeeded", 1_i64),
+        ("[]", "succeeded", 1),
+        ("{}", "invalid", 1),
+        ("{}", "succeeded", -1),
+        ("{}", "succeeded", i64::from(u32::MAX) + 1),
     ] {
         conn.execute(
-            "UPDATE security_events SET details=?1,result=?2 WHERE event_id='event-1000'",
-            [details, result],
+            "UPDATE security_events SET details=?1,result=?2,pid=?3 WHERE event_id='event-1000'",
+            rusqlite::params![details, result, pid],
         )
         .unwrap();
         let timeline = service
@@ -686,7 +697,13 @@ fn malformed_candidates_do_not_hide_valid_correlations_or_observations() {
 /// QRY-008/011: optional correlation storage faults preserve the observation page.
 #[test]
 fn candidate_storage_failures_do_not_fail_the_observation_page() {
-    for fault in ["missing", "corrupt", "future", "oversized"] {
+    for fault in [
+        "missing",
+        "corrupt",
+        "future",
+        "oversized",
+        "oversized-page",
+    ] {
         let (directory, service, _) = seed();
         let path = directory.path().join("sec.db");
         match fault {
@@ -696,7 +713,7 @@ fn candidate_storage_failures_do_not_fail_the_observation_page() {
                 .unwrap()
                 .pragma_update(None, "user_version", 99)
                 .unwrap(),
-            _ => {
+            "oversized" => {
                 Connection::open(&path)
                     .unwrap()
                     .execute(
@@ -704,6 +721,15 @@ fn candidate_storage_failures_do_not_fail_the_observation_page() {
                         [json!({"large":"x".repeat(4*1024*1024)}).to_string()],
                     )
                     .unwrap();
+            }
+            _ => {
+                let conn = Connection::open(&path).unwrap();
+                conn.execute(
+                    "UPDATE security_events SET details=?1 WHERE event_id='event-1000'",
+                    [json!({"large":"x".repeat(2*1024*1024)}).to_string()],
+                )
+                .unwrap();
+                conn.execute("INSERT INTO security_events(event_id,event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,tool_call_id,details) SELECT 'another-large-event',event_type,category,result,timestamp,timestamp_epoch,trace_id,pid,uid,session_id,run_id,tool_call_id,details FROM security_events WHERE event_id='event-1000'", []).unwrap();
             }
         }
         let timeline = service

@@ -3,7 +3,7 @@
 //! This is the acceptance the single-peer tests cannot give: two real UIDs
 //! connect to the same running daemon over the same socket, and each sees
 //! only its own rows while root — through the same production CLI — reads
-//! every owner and may narrow with `--owner-uid`. The per-UID children run
+//! every UID and can follow qualified session locators. The per-UID children run
 //! the real `agent-sec-cli` binary with the UID adopted before exec
 //! (`CommandExt::uid`), so the daemon's scope decision rides on
 //! kernel-authenticated peer credentials end to end.
@@ -197,6 +197,7 @@ async fn two_real_uids_share_one_system_socket_through_the_cli() {
         let mut event = SecurityEvent::new("sandbox_prehook", category, Map::new());
         id.clone_into(&mut event.event_id);
         event.uid = uid;
+        event.session_id = Some("shared-session".to_owned());
         writer.write(&event);
     }
     writer.close_at(1000.0);
@@ -222,20 +223,19 @@ async fn two_real_uids_share_one_system_socket_through_the_cli() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(stdout.trim(), "2", "count prints the bare number");
 
-    // A non-root caller cannot select another owner.
+    // UID selection is absent from the CLI for every peer.
     let (code, _stdout, stderr) = cli_as(
         1000,
         &daemon.socket_path,
         &["events", "--owner-uid", "2000"],
     );
-    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert_eq!(code, Some(2), "stderr: {stderr}");
     assert!(
-        stderr.contains("owner_uid"),
-        "the rejection names the unauthorized filter: {stderr}"
+        stderr.contains("--owner-uid"),
+        "the rejection names the unsupported flag: {stderr}"
     );
 
-    // Root, through the same CLI, reads every owner by default and may
-    // narrow with the filter.
+    // Root reads every UID and disambiguates colliding session labels.
     let (code, stdout, stderr) = cli_as(0, &daemon.socket_path, &["events", "--output", "jsonl"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(
@@ -243,14 +243,41 @@ async fn two_real_uids_share_one_system_socket_through_the_cli() {
         4,
         "root's default scope is all owners"
     );
+    for line in stdout.lines() {
+        let event: Value = serde_json::from_str(line).expect("event");
+        assert_eq!(
+            event["session_id"],
+            format!("{}_shared-session", event["uid"].as_u64().unwrap())
+        );
+    }
 
     let (code, stdout, stderr) = cli_as(
         0,
         &daemon.socket_path,
-        &["events", "--output", "json", "--owner-uid", "42424242"],
+        &[
+            "events",
+            "--output",
+            "json",
+            "--session-id",
+            "42424242_shared-session",
+        ],
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(event_ids(&stdout), vec!["foreign-1"], "{stdout}");
+
+    let (code, stdout, stderr) = cli_as(
+        1000,
+        &daemon.socket_path,
+        &[
+            "events",
+            "--output",
+            "json",
+            "--session-id",
+            "2000_shared-session",
+        ],
+    );
+    assert_eq!(code, Some(0), "stderr: {stderr}");
+    assert!(event_ids(&stdout).is_empty());
 
     daemon.stop().await;
     std::fs::remove_dir_all(&directory).ok();

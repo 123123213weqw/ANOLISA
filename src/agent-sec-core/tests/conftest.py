@@ -9,30 +9,32 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def v2_report_runtime(request, monkeypatch):
-    """Provide an isolated V2 daemon to the unchanged V1 report cases."""
-    report_tests = Path(__file__).parent / "e2e/cli/test_session_report_e2e.py"
-    if os.environ.get("OBS_E2E_RUNTIME") != "v2" or request.node.path != report_tests:
+def v2_cli_runtime(request, monkeypatch):
+    """Provide an isolated V2 daemon to the V1 event and report cases."""
+    runtime = {
+        "test_events_e2e.py": "SEC_EVENTS_E2E_RUNTIME",
+        "test_session_report_e2e.py": "OBS_E2E_RUNTIME",
+    }.get(request.node.path.name)
+    cli_tests = Path(__file__).parent / "e2e/cli"
+    if request.node.path.parent != cli_tests or os.environ.get(runtime or "") != "v2":
         yield
         return
 
     # V1's pytest entry does not expose the tests namespace during collection.
-    from tests.v2.e2e.conftest import (  # noqa: PLC0415
-        _require,
-        _start_daemon,
-        _terminate,
-    )
+    from tests.v2.e2e import conftest as v2_e2e  # noqa: PLC0415
 
     request.getfixturevalue("isolated_data_dir")
-    _require("agent-sec-cli")
-    with tempfile.TemporaryDirectory(prefix="asc-report-", dir="/tmp") as directory:
+    # V2's Policy repository requires private daemon-owned data directories.
+    Path(os.environ["AGENT_SEC_DATA_DIR"]).chmod(0o700)
+    v2_e2e._require("agent-sec-cli")
+    with tempfile.TemporaryDirectory(prefix="asc-cli-", dir="/tmp") as directory:
         socket_path = Path(directory) / "daemon.sock"
         monkeypatch.setenv("AGENT_SEC_DAEMON_SOCKET", str(socket_path))
-        process = _start_daemon(socket_path, [])
+        process = v2_e2e._start_daemon(socket_path, [])
         try:
             yield
         finally:
-            _terminate(process)
+            v2_e2e._terminate(process)
             assert process.returncode == 0
             assert not socket_path.exists()
 

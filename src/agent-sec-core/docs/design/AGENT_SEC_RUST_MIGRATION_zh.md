@@ -97,7 +97,7 @@ revision、搜索路径、已有测试和未自动验证项；不使用构建产
    不位于用户 HOME 或 XDG_RUNTIME_DIR。
 3. 同一 daemon 服务多个本地 UID/Agent。peer UID/GID/PID 来自内核，token 用于认证绑定；
    daemon 构造可信 Principal。客户端自报的 UID、role、scope 只能作为不可信输入。
-4. QueryScope 仅由服务端 UDS 身份生成，再应用业务过滤条件。非 root principal 只能访问 owner scope，
+4. QueryScope 仅由服务端 UDS 身份生成，再应用业务过滤条件。非 root principal 只能访问自身 UID 的数据，
    UID 0 的 root 默认可查询全部；非 root 的 PolicyAdministrator 无跨 UID 查询权限。
    非 root auditor 的显式授权留待后续工作包。
 5. CLI/TUI 不得直读 SQLite，不得绕过 daemon 直接调用 PCP 或 Repository。
@@ -346,7 +346,7 @@ Mock E2E、server-side admission 和真实内核执行是不同证据层级，�
 - 第二个 Host daemon 实例被拒绝；
 - 两个不同 UID/Agent 通过同一 system socket 访问且 owner scope 隔离；
 - caller 自报 UID/role/scope 不能提升权限；
-- 非 root principal（含 PolicyAdministrator）不能跨 owner 查询；root 可查询全部，查询请求不接受 UID 参数；
+- 非 root principal（含 PolicyAdministrator）不能跨 UID 查询；root 可查询全部，obs 查询请求不接受 UID 参数；
 - CLI/TUI 无直接 SQLite 或 PCP 绕过路径；
 - 外部 job 保留 owner principal，内置任务使用 System principal。
 

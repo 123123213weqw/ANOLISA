@@ -286,10 +286,10 @@ async fn a_policy_administrator_is_still_scoped_to_its_own_rows() {
     daemon.stop().await;
 }
 
-/// Root reads every owner and may narrow with the owner filter; this is the
-/// one widening the design grants. Skipped on single-UID runners.
+/// Root reads every UID and follows qualified session locators.
+/// Skipped on single-UID runners.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn root_reads_all_owners_and_narrows_with_the_owner_filter() {
+async fn root_reads_all_uids_and_follows_qualified_sessions() {
     if !is_root() {
         eprintln!("skipping: root acceptance requires root");
         return;
@@ -313,7 +313,7 @@ async fn root_reads_all_owners_and_narrows_with_the_owner_filter() {
 
     let narrowed = request_json(
         &daemon.socket_path,
-        &json!({"method": "sec.events.list", "params": {"owner_uid": FOREIGN_UID}}),
+        &json!({"method": "sec.events.list", "params": {"session_id": format!("{FOREIGN_UID}_session-shared")}}),
     )
     .await;
     assert_eq!(narrowed["result"]["total"], json!(1));
@@ -321,6 +321,33 @@ async fn root_reads_all_owners_and_narrows_with_the_owner_filter() {
         narrowed["result"]["items"][0]["event_id"],
         json!("foreign-1")
     );
+    assert_eq!(
+        narrowed["result"]["items"][0]["session_id"],
+        format!("{FOREIGN_UID}_session-shared")
+    );
+    let legacy = request_json(
+        &daemon.socket_path,
+        &json!({"method":"sec.events.list","caller":"agentsight",
+            "params":{"session_id":format!("{FOREIGN_UID}_session-shared")}}),
+    )
+    .await;
+    assert_eq!(legacy["ok"], true);
+    assert_eq!(legacy["data"], narrowed["result"]);
+    let summary = request_json(
+        &daemon.socket_path,
+        &json!({"method":"sec.summary","params":{}}),
+    )
+    .await;
+    assert_eq!(summary["result"]["affected_sessions"], 2);
+
+    for field in ["uid", "owner_uid"] {
+        let rejected = request_json(
+            &daemon.socket_path,
+            &json!({"method":"sec.events.list","params":{field:0}}),
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], "invalid_request");
+    }
 
     daemon.stop().await;
 }
@@ -339,6 +366,8 @@ async fn malformed_query_parameters_are_rejected_over_the_socket() {
         (json!({"since": "not a timestamp"}), "invalid_argument"),
         (json!({"event_id": "own-1"}), "invalid_argument"),
         (json!({"ownerUid": 0}), "invalid_request"),
+        (json!({"owner_uid": 0}), "invalid_request"),
+        (json!({"uid": 0}), "invalid_request"),
         (json!({"limit": true}), "invalid_request"),
     ] {
         let response = request_json(

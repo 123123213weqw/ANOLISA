@@ -14,6 +14,23 @@ fn main() -> ExitCode {
     let cli = match Cli::parse_from(std::env::args_os()) {
         Ok(cli) => cli,
         Err(error) => {
+            // Events diagnostics retain V1 wording and usage exit codes.
+            if let Some(input @ InputError::Events(_)) = std::error::Error::source(&error)
+                .and_then(|source| source.downcast_ref::<InputError>())
+            {
+                eprintln!("{input}");
+                return ExitCode::from(2);
+            }
+            if error.kind() == clap::error::ErrorKind::InvalidValue
+                && matches!(error.get(clap::error::ContextKind::InvalidValue), Some(clap::error::ContextValue::String(value)) if value.is_empty())
+                && let Some(clap::error::ContextValue::String(argument)) =
+                    error.get(clap::error::ContextKind::InvalidArg)
+                && let Some(option @ ("--event-type" | "--category")) =
+                    argument.split_whitespace().next()
+            {
+                eprintln!("Error: Option '{option}' requires an argument.");
+                return ExitCode::from(2);
+            }
             let code = if error.get(clap::error::ContextKind::Custom).is_some() {
                 1
             } else if error.use_stderr() {
