@@ -329,7 +329,7 @@ fn real_sinks_persist_private_events_and_fail_independently_of_scanning() {
             // The runtime stamps the invocation's caller uid (1201) on the event.
             let records = reader.query(
                 &EventFilters::default(),
-                &asc_persistence_sqlite::QueryScope::Own(caller().uid),
+                &asc_persistence_sqlite::QueryScope::Owner(caller().uid),
                 10,
                 0,
             );

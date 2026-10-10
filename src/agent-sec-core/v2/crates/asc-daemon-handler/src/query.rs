@@ -1,4 +1,4 @@
-//! Owner-scoped security-event query projection over the daemon's read store.
+//! Query configuration and owner-scoped security-event projection over the read store.
 //!
 //! This is the v2 restoration of v1's `sec.*` dashboard query family
 //! (`agent_sec_cli/daemon/handlers/security_query.py`). Two things changed
@@ -44,26 +44,29 @@ const MAX_LATEST_LIMIT: u64 = 50;
 /// v1's accepted `result` values.
 const EVENT_RESULTS: [&str; 2] = ["failed", "succeeded"];
 
-/// Protocol adapter for the `sec.*` query family.
-pub struct SecurityQueryHandler {
+/// Protocol adapters for security-event and observability queries.
+#[derive(Default)]
+pub struct QueryHandler {
     source: Option<Box<dyn SecurityEventQueries>>,
+    pub(super) observability: Option<asc_daemon_core::query::ObservabilityQueryService>,
 }
 
-impl SecurityQueryHandler {
-    /// Binds the handler to no store.
-    ///
-    /// Every `sec.*` method is then rejected with `unavailable`, so an
-    /// assembly that never binds a store fails closed instead of serving
-    /// queries from an arbitrary database.
-    pub fn unconfigured() -> Self {
-        Self { source: None }
+impl QueryHandler {
+    /// Binds the `sec.*` query family to its configured store.
+    #[must_use]
+    pub fn with_security_queries(mut self, source: impl SecurityEventQueries + 'static) -> Self {
+        self.source = Some(Box::new(source));
+        self
     }
 
-    /// Binds the handler to one query source.
-    pub fn new(source: impl SecurityEventQueries + 'static) -> Self {
-        Self {
-            source: Some(Box::new(source)),
-        }
+    /// Binds the `obs.*` query family independently of security-event reads.
+    #[must_use]
+    pub fn with_observability_queries(
+        mut self,
+        service: asc_daemon_core::query::ObservabilityQueryService,
+    ) -> Self {
+        self.observability = Some(service);
+        self
     }
 
     /// Serves one query method for one authenticated principal.
@@ -111,10 +114,6 @@ impl SecurityQueryHandler {
         let Ok((filters, latest_limit)) = summary_filters(params) else {
             return invalid_parameters(request_id);
         };
-        let filters = match resolve_filters(source, filters, scope) {
-            Ok(filters) => filters,
-            Err(error) => return storage_failure(request_id, &error),
-        };
         let summary = match source.summary(&filters, scope, latest_limit) {
             Ok(summary) => summary,
             Err(error) => return storage_failure(request_id, &error),
@@ -145,10 +144,6 @@ impl SecurityQueryHandler {
     ) -> DaemonResponse {
         let Ok((filters, limit, offset, include_details)) = list_filters(params) else {
             return invalid_parameters(request_id);
-        };
-        let filters = match resolve_filters(source, filters, scope) {
-            Ok(filters) => filters,
-            Err(error) => return storage_failure(request_id, &error),
         };
         let items = match source.list(&filters, scope, limit, offset) {
             Ok(items) => items,
@@ -222,10 +217,6 @@ impl SecurityQueryHandler {
         let Ok(filters) = event_filters(params) else {
             return invalid_parameters(request_id);
         };
-        let filters = match resolve_filters(source, filters, scope) {
-            Ok(filters) => filters,
-            Err(error) => return storage_failure(request_id, &error),
-        };
         match source.count_by(group_by, &filters, scope, offset) {
             Ok(groups) => DaemonResponse::success(
                 request_id,
@@ -247,23 +238,8 @@ impl SecurityQueryHandler {
 fn resolve_scope(principal: &Principal) -> QueryScope {
     match principal.peer().uid() {
         0 => QueryScope::All,
-        uid => QueryScope::Own(uid),
+        uid => QueryScope::Owner(uid),
     }
-}
-
-fn resolve_filters(
-    source: &dyn SecurityEventQueries,
-    mut filters: EventFilters,
-    scope: QueryScope,
-) -> Result<EventFilters, QueryError> {
-    if scope == QueryScope::All
-        && let Some(session) = filters.session_id.as_deref()
-        && let Some((uid, raw)) = source.resolve_session(session)?
-    {
-        filters.session_uid = Some(uid);
-        filters.session_id = Some(raw);
-    }
-    Ok(filters)
 }
 
 /// Parses the `sec.summary` filter set.
@@ -318,7 +294,6 @@ fn event_filters(params: &SecQueryParams) -> Result<EventFilters, ()> {
         result: non_empty(params.result.as_deref()).map(str::to_owned),
         trace_id: non_empty(params.trace_id.as_deref()).map(str::to_owned),
         session_id: non_empty(params.session_id.as_deref()).map(str::to_owned),
-        session_uid: None,
         run_id: non_empty(params.run_id.as_deref()).map(str::to_owned),
         call_id: non_empty(params.call_id.as_deref()).map(str::to_owned),
         tool_call_id: non_empty(params.tool_call_id.as_deref()).map(str::to_owned),
@@ -517,9 +492,6 @@ fn invalid_parameters(request_id: RequestId) -> DaemonResponse {
 /// The store is present but cannot be read; this must not look like "no
 /// events".
 fn storage_failure(request_id: RequestId, error: &QueryError) -> DaemonResponse {
-    if matches!(error, QueryError::InvalidArgument) {
-        return invalid_parameters(request_id);
-    }
     DaemonResponse::error(
         request_id,
         error_code::UNAVAILABLE,
@@ -587,7 +559,7 @@ mod tests {
     }
 
     fn handle(
-        handler: &SecurityQueryHandler,
+        handler: &QueryHandler,
         uid: u32,
         method_name: &str,
         params: Value,
@@ -614,11 +586,68 @@ mod tests {
     }
 
     #[test]
+    fn query_families_are_available_only_when_independently_configured() {
+        use asc_daemon_core::query::ObservabilityQueryService;
+        use asc_persistence_sqlite::observability::ObservabilitySqliteWriter;
+        use asc_persistence_sqlite::query::{SqliteObservabilityQueries, SqliteSecurityQueries};
+
+        for (security, observations) in [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (dir, source) = two_owner_source();
+            let mut handler = QueryHandler::default();
+            if observations {
+                let path = dir.path().join("observability.db");
+                ObservabilitySqliteWriter::new(&path)
+                    .unwrap()
+                    .probe()
+                    .unwrap();
+                handler = handler.with_observability_queries(ObservabilityQueryService::new(
+                    SqliteObservabilityQueries::new(path),
+                    SqliteSecurityQueries::new(dir.path().join("events.db")),
+                ));
+            }
+            if security {
+                handler = handler.with_security_queries(source);
+            }
+            let control = asc_daemon_service::DispatchControl::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            for (response, configured) in [
+                (
+                    handle(&handler, 1000, method::SEC_SUMMARY, json!({})),
+                    security,
+                ),
+                (
+                    handler.handle_observability(
+                        request_id(),
+                        PeerCredentials::new(1000, 100, 7),
+                        &control,
+                        method::ObservabilityQueryMethod::Sessions,
+                        json!({}),
+                    ),
+                    observations,
+                ),
+            ] {
+                if configured {
+                    success_data(response);
+                } else {
+                    assert_eq!(error_code_of(response), "unavailable");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn one_owner_never_sees_another_owners_rows() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
-        let data = success_data(handle(&handler, 1000, method::SEC_EVENTS_LIST, json!({})));
+        let data = success_data(handle(
+            &handler,
+            1000,
+            method::SEC_EVENTS_LIST,
+            json!({"session_id":"s-1"}),
+        ));
         let ids: Vec<&str> = data["items"]
             .as_array()
             .expect("items array")
@@ -627,76 +656,91 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["a2", "a1"], "newest first, own rows only");
 
-        let data = success_data(handle(&handler, 2000, method::SEC_EVENTS_LIST, json!({})));
+        let data = success_data(handle(
+            &handler,
+            2000,
+            method::SEC_EVENTS_LIST,
+            json!({"session_id":"s-1"}),
+        ));
         assert_eq!(data["items"].as_array().expect("items").len(), 1);
     }
 
     #[test]
-    fn root_reads_all_uids_and_resolves_qualified_sessions() {
+    fn root_filters_plain_session_ids_and_qualifies_only_returned_labels() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let data = success_data(handle(&handler, 0, method::SEC_EVENTS_LIST, json!({})));
-        assert_eq!(data["total"], json!(3), "root's scope is all UIDs");
-        assert_eq!(data["items"][0]["session_id"], "2000_s-1");
-
+        assert_eq!(data["total"], 3);
         let data = success_data(handle(
             &handler,
             0,
             method::SEC_EVENTS_LIST,
-            json!({"session_id": "2000_s-1"}),
+            json!({"session_id":"s-1"}),
         ));
-        assert_eq!(data["total"], json!(1));
-        assert_eq!(data["items"][0]["event_id"], json!("b1"));
-        assert_eq!(data["items"][0]["session_id"], "2000_s-1");
+        assert_eq!(data["total"], 3);
+        let items = data["items"].as_array().unwrap();
+        assert_eq!(
+            items
+                .iter()
+                .map(|event| event["uid"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![2000, 1000, 1000]
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|event| event["session_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["2000_s-1", "1000_s-1", "1000_s-1"]
+        );
 
-        let data = success_data(handle(&handler, 0, method::SEC_SUMMARY, json!({})));
-        assert_eq!(data["total"], json!(3));
-        assert_eq!(data["affected_sessions"], 2);
-        assert_eq!(data["latest_events"][0]["session_id"], "2000_s-1");
+        let summary = success_data(handle(
+            &handler,
+            0,
+            method::SEC_SUMMARY,
+            json!({"session_id":"s-1"}),
+        ));
+        assert_eq!(summary["total"], 3);
+        assert_eq!(summary["affected_sessions"], 2);
+        assert_eq!(summary["latest_events"][0]["session_id"], "2000_s-1");
 
-        let data = success_data(handle(
+        let event = success_data(handle(
             &handler,
             0,
             method::SEC_EVENTS_GET,
-            json!({"event_id": "b1"}),
+            json!({"event_id":"b1"}),
         ));
-        assert_eq!(data["found"], json!(true));
-        assert_eq!(data["event"]["session_id"], "2000_s-1");
+        assert_eq!(event["found"], true);
+        assert_eq!(event["event"]["uid"], 2000);
+        assert_eq!(event["event"]["session_id"], "2000_s-1");
 
         let groups = success_data(handle(
             &handler,
             0,
             method::SEC_EVENTS_COUNT_BY,
-            json!({"group_by":"session_id"}),
+            json!({"session_id":"s-1", "group_by":"session_id"}),
         ));
         assert_eq!(
             groups["items"],
-            json!([
-                {"value":"1000_s-1", "count":2}, {"value":"2000_s-1", "count":1}
-            ])
+            json!([{ "value":"1000_s-1", "count":2 }, { "value":"2000_s-1", "count":1 }])
         );
         let page = success_data(handle(
             &handler,
             0,
             method::SEC_EVENTS_LIST,
-            json!({"limit":1,"offset":1}),
+            json!({"session_id":"s-1", "limit":1, "offset":1}),
         ));
+        assert_eq!(page["items"][0]["event_id"], "a2");
         assert_eq!(page["items"][0]["session_id"], "1000_s-1");
         assert_eq!(page["total"], 3);
-        let ambiguous = handle(
-            &handler,
-            0,
-            method::SEC_EVENTS_LIST,
-            json!({"session_id":"s-1"}),
-        );
-        assert_eq!(error_code_of(ambiguous), "invalid_argument");
+        assert_eq!(page["next_offset"], 2);
     }
 
     #[test]
     fn identity_parameters_are_rejected_for_every_peer() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         for uid in [0, 1000] {
             for method in [
@@ -720,7 +764,7 @@ mod tests {
             }
         }
 
-        // Qualified locators never change a non-root peer's visibility.
+        // A numeric prefix is part of the literal session ID, never an owner selector.
         let data = success_data(handle(
             &handler,
             1000,
@@ -733,7 +777,7 @@ mod tests {
     #[test]
     fn a_policy_administrator_still_reads_only_its_own_rows() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let admin = Principal::from_authenticated_peer(
             PeerCredentials::new(3000, 100, 7),
@@ -752,7 +796,7 @@ mod tests {
     #[test]
     fn summary_counts_only_the_callers_rows() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let data = success_data(handle(&handler, 1000, method::SEC_SUMMARY, json!({})));
         assert_eq!(data["total"], json!(2));
@@ -774,7 +818,7 @@ mod tests {
     #[test]
     fn get_is_indistinguishable_between_foreign_and_missing() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let own = success_data(handle(
             &handler,
@@ -827,7 +871,7 @@ mod tests {
         }
         writer.close_at(1000.0);
         let source = SqliteEventQuerySource::new(&path).expect("source");
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let data = success_data(handle(
             &handler,
@@ -855,7 +899,7 @@ mod tests {
     #[test]
     fn count_by_groups_and_sorts_only_own_rows() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let data = success_data(handle(
             &handler,
@@ -876,7 +920,7 @@ mod tests {
     #[test]
     fn the_dashboard_projection_matches_v1() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         // The deny verdict is derived into the row payload, details are
         // dropped by default.
@@ -917,7 +961,7 @@ mod tests {
             })
             .collect();
         let (_dir, source) = seeded_source(&rows);
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         // The reviewer's scenario: five rows, limit 2, offset 2. The old code
         // folded the offset into the count and reported total=3 with no
@@ -974,7 +1018,7 @@ mod tests {
             ("a2", 1000, "network", None),
             ("b1", 2000, "exec", None),
         ]);
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let data = success_data(handle(
             &handler,
@@ -997,7 +1041,7 @@ mod tests {
     #[test]
     fn invalid_parameters_are_rejected_with_invalid_argument() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let cases: Vec<(&str, Value)> = vec![
             (method::SEC_EVENTS_GET, json!({})),
@@ -1043,7 +1087,7 @@ mod tests {
     #[test]
     fn the_full_v1_offset_range_is_accepted() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         // u32::MAX is a legal offset now; beyond i64::MAX is not.
         let data = success_data(handle(
@@ -1067,7 +1111,7 @@ mod tests {
     #[test]
     fn unknown_or_foreign_parameters_are_rejected_with_invalid_request() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         let response = handle(
             &handler,
@@ -1093,7 +1137,7 @@ mod tests {
     #[test]
     fn epoch_nanosecond_bounds_are_accepted() {
         let (_dir, source) = two_owner_source();
-        let handler = SecurityQueryHandler::new(source);
+        let handler = QueryHandler::default().with_security_queries(source);
 
         // 2026-01-01T00:00:00Z in epoch nanoseconds: everything is after it.
         let start_ns = 1_767_225_600_000_000_000_u64;
@@ -1110,7 +1154,7 @@ mod tests {
     fn a_missing_store_degrades_to_empty_results_not_errors() {
         let dir = TempDir::new().expect("temp dir");
         let path: std::path::PathBuf = dir.path().join("absent.db");
-        let handler = SecurityQueryHandler::new(
+        let handler = QueryHandler::default().with_security_queries(
             SqliteEventQuerySource::new(&path).expect("source over a missing store"),
         );
 
@@ -1130,7 +1174,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("events.db");
         std::fs::write(&path, b"definitely not a sqlite database").expect("seed bytes");
-        let handler = SecurityQueryHandler::new(
+        let handler = QueryHandler::default().with_security_queries(
             SqliteEventQuerySource::new(&path).expect("source opens lazily"),
         );
 

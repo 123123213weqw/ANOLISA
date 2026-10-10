@@ -540,7 +540,8 @@ agent-sec-cli observability schema
 安全事件会同时写入 JSONL 与 SQLite 存储。使用 `agent-sec-cli events` 查询该存储：
 
 V2 查询使用 UDS peer UID：普通用户读取自身事件，root 读取全部 UID。
-不提供 UID 选项；session ID 碰撞时，root 使用返回的 `UID_session_id` 继续查询。
+使用原始 session ID 筛选；root 返回所有 UID 下匹配该 ID 的事件。
+同名会话在 root 返回结果中显示为 `UID_session_id`，用于区分归属。
 
 ```bash
 agent-sec-cli events --last-hours 24

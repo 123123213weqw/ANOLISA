@@ -13,7 +13,7 @@ use std::time::Duration;
 use asc_action_runtime::Finalizer;
 use asc_daemon::{BootstrapConfig, scan_application, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
-use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
+use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_pap::PapService;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_persistence_sqlite::security_events::SqliteEventWriter;
@@ -67,9 +67,9 @@ impl RunningDaemon {
                     Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
                 ),
             )
-            .with_security_queries(
+            .with_queries(QueryHandler::default().with_security_queries(
                 SqliteEventQuerySource::new(database).expect("query source opens"),
-            ),
+            )),
         );
         let shutdown = asc_daemon_service::ShutdownToken::new();
         let service_shutdown = shutdown.clone();
@@ -286,10 +286,10 @@ async fn a_policy_administrator_is_still_scoped_to_its_own_rows() {
     daemon.stop().await;
 }
 
-/// Root reads every UID and follows qualified session locators.
+/// Root filters original session IDs and qualifies only response labels.
 /// Skipped on single-UID runners.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn root_reads_all_uids_and_follows_qualified_sessions() {
+async fn root_queries_plain_sessions_and_labels_all_matching_uids() {
     if !is_root() {
         eprintln!("skipping: root acceptance requires root");
         return;
@@ -313,10 +313,10 @@ async fn root_reads_all_uids_and_follows_qualified_sessions() {
 
     let narrowed = request_json(
         &daemon.socket_path,
-        &json!({"method": "sec.events.list", "params": {"session_id": format!("{FOREIGN_UID}_session-shared")}}),
+        &json!({"method": "sec.events.list", "params": {"session_id": "session-shared"}}),
     )
     .await;
-    assert_eq!(narrowed["result"]["total"], json!(1));
+    assert_eq!(narrowed["result"]["total"], json!(3));
     assert_eq!(
         narrowed["result"]["items"][0]["event_id"],
         json!("foreign-1")
@@ -325,10 +325,17 @@ async fn root_reads_all_uids_and_follows_qualified_sessions() {
         narrowed["result"]["items"][0]["session_id"],
         format!("{FOREIGN_UID}_session-shared")
     );
+    let display_label = request_json(
+        &daemon.socket_path,
+        &json!({"method":"sec.events.list",
+            "params":{"session_id":format!("{FOREIGN_UID}_session-shared")}}),
+    )
+    .await;
+    assert_eq!(display_label["result"]["total"], 0);
     let legacy = request_json(
         &daemon.socket_path,
         &json!({"method":"sec.events.list","caller":"agentsight",
-            "params":{"session_id":format!("{FOREIGN_UID}_session-shared")}}),
+            "params":{"session_id":"session-shared"}}),
     )
     .await;
     assert_eq!(legacy["ok"], true);
@@ -403,7 +410,7 @@ async fn an_unconfigured_query_store_fails_closed() {
     writer.write(&event);
     writer.close_at(1000.0);
 
-    // A dispatcher assembled without with_security_queries must reject every
+    // A dispatcher assembled without query storage must reject every
     // sec.* call rather than reading an arbitrary database.
     let socket_dir = tempfile::tempdir().expect("socket dir");
     let socket_path = socket_dir.path().join("daemon.sock");

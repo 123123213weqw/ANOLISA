@@ -482,7 +482,7 @@ impl SecurityQueries for SqliteSecurityQueries {
                 .query_correlation_candidates(
                     &conn,
                     &request,
-                    &asc_security_events::query::QueryScope::Own(owner),
+                    &asc_security_events::query::QueryScope::Owner(owner),
                 )
                 .map_err(|error| match error {
                     KernelError::Sqlite(error) => map_error(&error),
@@ -542,9 +542,7 @@ pub(crate) fn resolve_root_session(
 ) -> Result<Option<(QueryScope, String)>, QueryError> {
     let uids = session_uids(conn, session, table)?;
     let qualified = if let Some((uid, raw)) = qualified_session(session) {
-        // Security queries also accept locators returned by the obs store,
-        // even when only one of those UIDs has emitted a security event.
-        let shared = table == "security_events" || session_uids(conn, raw, table)?.len() > 1;
+        let shared = session_uids(conn, raw, table)?.len() > 1;
         let exists: bool = conn
             .query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE session_id=?1 AND uid IS ?2)"),

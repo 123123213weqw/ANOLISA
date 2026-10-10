@@ -12,7 +12,7 @@ use crate::action::CodeScanHandler;
 use crate::pap::PapHandler;
 use crate::pii::PiiScanHandler;
 use crate::prompt_scan::PromptScanHandler;
-use crate::query::SecurityQueryHandler;
+use crate::query::QueryHandler;
 
 const DEFAULT_DISPATCH_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -24,9 +24,8 @@ pub struct DaemonDispatcher {
     pii_scan: PiiScanHandler,
     skill_sec: crate::skill_sec::SkillSecHandler,
     prompt_scan: PromptScanHandler,
-    queries: SecurityQueryHandler,
+    queries: QueryHandler,
     principal_policy: Arc<dyn PrincipalPolicy>,
-    observability_queries: Option<asc_daemon_core::query::ObservabilityQueryService>,
     observability: Option<asc_daemon_core::ObservabilityService>,
 }
 
@@ -36,7 +35,7 @@ impl DaemonDispatcher {
     /// The role is process-owned configuration. It is never decoded from the
     /// request or inferred from caller-supplied attribution. The `sec.*`
     /// query family starts unbound and rejects every call until
-    /// [`Self::with_security_queries`] binds a store, so a composition root
+    /// [`Self::with_queries`] binds a store, so a composition root
     /// cannot accidentally serve queries from a wrong database.
     pub fn new(
         application: impl PolicyAdministration + 'static,
@@ -50,10 +49,9 @@ impl DaemonDispatcher {
             pii_scan: PiiScanHandler::new(Arc::clone(&actions)),
             skill_sec: crate::skill_sec::SkillSecHandler::new(Arc::clone(&actions)),
             prompt_scan: PromptScanHandler::new(actions),
-            queries: SecurityQueryHandler::unconfigured(),
+            queries: QueryHandler::default(),
             principal_policy,
             observability: None,
-            observability_queries: None,
         }
     }
 
@@ -64,23 +62,10 @@ impl DaemonDispatcher {
         self
     }
 
-    /// Binds the `sec.*` query family to one security-event query source.
+    /// Installs the configured security-event and observability query handlers.
     #[must_use]
-    pub fn with_security_queries(
-        mut self,
-        source: impl crate::SecurityEventQueries + 'static,
-    ) -> Self {
-        self.queries = SecurityQueryHandler::new(source);
-        self
-    }
-
-    /// Installs the owner-aware observability query application.
-    #[must_use]
-    pub fn with_observability_queries(
-        mut self,
-        service: asc_daemon_core::query::ObservabilityQueryService,
-    ) -> Self {
-        self.observability_queries = Some(service);
+    pub fn with_queries(mut self, queries: QueryHandler) -> Self {
+        self.queries = queries;
         self
     }
 
@@ -152,14 +137,10 @@ impl DaemonDispatcher {
                     "uptime_seconds": self.started_at.elapsed().as_secs_f64(),
                 }),
             ),
-            MethodId::ObservabilityQuery(method) => crate::observability_query::handle(
-                request_id,
-                peer,
-                control,
-                self.observability_queries.as_ref(),
-                method,
-                request.params,
-            ),
+            MethodId::ObservabilityQuery(method) => {
+                self.queries
+                    .handle_observability(request_id, peer, control, method, request.params)
+            }
             MethodId::ObservabilityRecord => crate::observability::handle(
                 request_id,
                 peer,

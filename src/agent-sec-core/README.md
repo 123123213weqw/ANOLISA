@@ -573,7 +573,8 @@ Security events are written both as JSONL and into a SQLite store. Query the sto
 with `agent-sec-cli events`:
 
 V2 queries use the UDS peer UID: ordinary users read their own events and root reads
-all UIDs. UID flags are unavailable; root follows `UID_session_id` labels when session IDs collide.
+all UIDs. Filter with the original session ID; root receives matching events from all UIDs.
+For colliding session IDs, root response labels use `UID_session_id` to distinguish owners.
 
 ```bash
 agent-sec-cli events --last-hours 24

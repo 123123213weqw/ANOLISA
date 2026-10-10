@@ -14,27 +14,30 @@ use asc_daemon_service::DispatchControl;
 use asc_security_events::timestamp::{NaivePolicy, normalize_iso_to_utc_iso, utc_iso_to_epoch};
 use serde_json::Value;
 
-pub(crate) fn handle(
-    id: RequestId,
-    peer: PeerCredentials,
-    control: &DispatchControl,
-    service: Option<&ObservabilityQueryService>,
-    method: ObservabilityQueryMethod,
-    raw: Value,
-) -> DaemonResponse {
-    let result = execute(peer, control, service, method, raw);
-    match result {
-        Ok(value) => DaemonResponse::success(id, value),
-        Err(error) => {
-            let code = match error {
-                QueryError::InvalidArgument => error_code::INVALID_ARGUMENT,
-                QueryError::PermissionDenied => error_code::PERMISSION_DENIED,
-                QueryError::Unavailable => error_code::UNAVAILABLE,
-                QueryError::DeadlineExceeded => error_code::DEADLINE_EXCEEDED,
-                QueryError::ResourceExhausted => error_code::RESOURCE_EXHAUSTED,
-                QueryError::Internal => error_code::INTERNAL,
-            };
-            DaemonResponse::error(id, code, &error.to_string())
+impl crate::QueryHandler {
+    /// Serves one observability query using authenticated peer credentials.
+    pub fn handle_observability(
+        &self,
+        id: RequestId,
+        peer: PeerCredentials,
+        control: &DispatchControl,
+        method: ObservabilityQueryMethod,
+        raw: Value,
+    ) -> DaemonResponse {
+        let result = execute(peer, control, self.observability.as_ref(), method, raw);
+        match result {
+            Ok(value) => DaemonResponse::success(id, value),
+            Err(error) => {
+                let code = match error {
+                    QueryError::InvalidArgument => error_code::INVALID_ARGUMENT,
+                    QueryError::PermissionDenied => error_code::PERMISSION_DENIED,
+                    QueryError::Unavailable => error_code::UNAVAILABLE,
+                    QueryError::DeadlineExceeded => error_code::DEADLINE_EXCEEDED,
+                    QueryError::ResourceExhausted => error_code::RESOURCE_EXHAUSTED,
+                    QueryError::Internal => error_code::INTERNAL,
+                };
+                DaemonResponse::error(id, code, &error.to_string())
+            }
         }
     }
 }

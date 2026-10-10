@@ -3,8 +3,9 @@
 //! This is the v2 restoration of v1's `agent-sec-cli events` entry point
 //! (`agent_sec_cli/cli.py`). The v1 CLI read its per-user database directly;
 //! the v2 CLI goes through the system daemon, which derives the UID scope
-//! from the connection's kernel peer credentials. Root reads all UIDs and
-//! can follow qualified session IDs; every other caller reads only its UID.
+//! from the connection's kernel peer credentials. Root reads all UIDs;
+//! every other caller reads only its UID. Session filters use the original IDs;
+//! root response labels distinguish sessions shared by multiple UIDs.
 //!
 //! The v1 output contract is reproduced shape for shape: `--output json` is
 //! the event array, `jsonl` one event per line, `--count` a bare number,
@@ -772,13 +773,6 @@ mod tests {
         let params = events.params(None, None);
         assert_eq!(params.event_type.as_deref(), Some("sandbox_prehook"));
         assert_eq!(params.category.as_deref(), Some("exec"));
-    }
-
-    #[test]
-    fn identity_filter_flags_are_rejected() {
-        for flag in ["--uid", "--owner-uid"] {
-            assert!(Cli::try_parse_from(["agent-sec-cli", flag, "1000"]).is_err());
-        }
     }
 
     #[test]

@@ -104,7 +104,7 @@ revision、搜索路径、已有测试和未自动验证项；不使用构建产
 6. 恢复完成后 daemon 才进入 READY；shutdown 先停止 admission，再 drain 或 checkpoint。
 
 查询首批实施范围见 [V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)
-（obs 三个 RPC 与 report/review 已实现，sec 查询待实现）：普通用户只查询 UDS peer UID 对应的数据，root 可查询全部，查询请求不接受 UID 参数；
+（obs 三个 RPC、report/review 与 sec 查询已实现）：普通用户只查询 UDS peer UID 对应的数据，root 可查询全部；
 非 root 的 PolicyAdministrator 无查询绕过，auditor 跨 UID 能力留待后续工作包。
 
 查询授权变更记录（本次 obs 查询工作包，决策方：本次需求提出者）：
@@ -346,7 +346,7 @@ Mock E2E、server-side admission 和真实内核执行是不同证据层级，�
 - 第二个 Host daemon 实例被拒绝；
 - 两个不同 UID/Agent 通过同一 system socket 访问且 owner scope 隔离；
 - caller 自报 UID/role/scope 不能提升权限；
-- 非 root principal（含 PolicyAdministrator）不能跨 UID 查询；root 可查询全部，obs 查询请求不接受 UID 参数；
+- 非 root principal（含 PolicyAdministrator）不能跨 UID 查询；root 可查询全部；
 - CLI/TUI 无直接 SQLite 或 PCP 绕过路径；
 - 外部 job 保留 owner principal，内置任务使用 System principal。
 

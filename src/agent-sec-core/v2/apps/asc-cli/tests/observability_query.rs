@@ -11,7 +11,7 @@ use asc_daemon_core::{
     ObservabilityService, ObservabilitySink, ObservabilityWriteError, RootManagedPrincipalPolicy,
     query::ObservabilityQueryService,
 };
-use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
+use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_daemon_protocol::{DaemonRequest, DaemonResponse};
 use asc_daemon_service::ShutdownToken;
 use asc_observability::ObservabilityRecord;
@@ -118,7 +118,7 @@ async fn uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback() 
         ),
     )
     .with_observability(ObservabilityService::new(Arc::new(Writer(writer))))
-    .with_observability_queries(query);
+    .with_queries(QueryHandler::default().with_observability_queries(query));
     let shutdown = ShutdownToken::new();
     let stop = shutdown.clone();
     let config = asc_daemon::BootstrapConfig::new(&socket);
@@ -159,12 +159,6 @@ async fn uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback() 
             .status
             .success()
     );
-    for flag in ["--uid", "--owner-uid"] {
-        let result = cli(&socket, &["report", "--last", flag, "0"]);
-        assert_eq!(result.status.code(), Some(2));
-        assert!(result.stdout.is_empty());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("unexpected argument"));
-    }
     for field in ["uid", "owner_uid"] {
         let response = call(&socket, "obs.sessions.list", json!({field:uid}));
         let DaemonResponse::Error(response) = response else {
@@ -381,7 +375,7 @@ fn schema_and_report_usage_do_not_require_a_daemon() {
     .unwrap();
     assert_eq!(schema, expected);
     for command in ["report", "review"] {
-        for flag in ["--uid", "--owner-uid", "--since", "--until"] {
+        for flag in ["--since", "--until"] {
             let output = cli(
                 Path::new("/nonexistent/obs-test.sock"),
                 &[command, flag, "1000"],

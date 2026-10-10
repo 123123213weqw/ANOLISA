@@ -64,8 +64,8 @@ def test_security_observability_skill_documents_cli_and_output_contracts() -> No
     assert "--limit '<matching_count_or_safe_page_size>'" in content
     assert "--count" in content
     assert "UDS peer UID" in content
-    assert "不提供 `--uid` 或 `--owner-uid`" in content
-    assert "`UID_session_id`" in content
+    assert "`events --session-id` 使用原始 session ID" in content
+    assert "root 返回所有 UID 下匹配该 ID 的事件" in content
 
     event_fields = {
         "event_id",

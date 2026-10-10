@@ -21,7 +21,7 @@ const LOG_PREFIX: &str = "[security_events]";
 
 /// The owner scope matching the uid `SecurityEvent::new` stamps in this process.
 fn owner() -> QueryScope {
-    QueryScope::Own(SecurityEvent::new("scope", "scope", Map::new()).uid)
+    QueryScope::Owner(SecurityEvent::new("scope", "scope", Map::new()).uid)
 }
 
 fn store(path: &Path, read_only: bool) -> Arc<SqliteStore> {
@@ -578,7 +578,13 @@ fn a_revision_one_database_is_lifted_by_generic_convergence() {
 
     let source = read(&path);
     let events = source.query_or_default(|repo, conn| {
-        repo.query(conn, &EventFilters::default(), &QueryScope::Own(1), 100, 0)
+        repo.query(
+            conn,
+            &EventFilters::default(),
+            &QueryScope::Owner(1),
+            100,
+            0,
+        )
     });
     assert_eq!(events.len(), 2, "the legacy row must survive convergence");
 
@@ -589,7 +595,7 @@ fn a_revision_one_database_is_lifted_by_generic_convergence() {
             conn,
             "verdict",
             &EventFilters::default(),
-            &QueryScope::Own(1),
+            &QueryScope::Owner(1),
             0,
         )
     });
@@ -605,7 +611,7 @@ fn a_revision_one_database_is_lifted_by_generic_convergence() {
     };
     assert_eq!(
         source.query_or(u64::MAX, |repo, conn| {
-            repo.count(conn, &filters, &QueryScope::Own(1), 0)
+            repo.count(conn, &filters, &QueryScope::Owner(1), 0)
         }),
         0,
         "the run_id column must exist for the filter to be applied in SQL"
@@ -651,7 +657,7 @@ fn a_revision_two_database_is_backfilled_by_the_migrator() {
             conn,
             "verdict",
             &EventFilters::default(),
-            &QueryScope::Own(1),
+            &QueryScope::Owner(1),
             0,
         )
     });

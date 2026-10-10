@@ -179,7 +179,7 @@ impl SecurityEventRepository {
         scope: &QueryScope,
     ) -> Result<Option<SecurityEvent>, KernelError> {
         let (sql, params): (String, Vec<SqlValue>) = match *scope {
-            QueryScope::Own(uid) => (
+            QueryScope::Owner(uid) => (
                 format!(
                     "SELECT {SELECT_COLUMNS} FROM security_events WHERE event_id = ?1 AND uid = ?2"
                 ),
@@ -224,7 +224,7 @@ impl SecurityEventRepository {
 
         let mut params: Vec<SqlValue> = vec![SqlValue::Text(request.session_id.to_owned())];
         let mut clauses = vec!["session_id = ?1".to_owned()];
-        if let QueryScope::Own(uid) = *scope {
+        if let QueryScope::Owner(uid) = *scope {
             params.push(SqlValue::Integer(i64::from(uid)));
             clauses.push(format!("uid = ?{}", params.len()));
         }
@@ -475,11 +475,7 @@ fn build_filters(filters: &EventFilters, scope: QueryScope) -> (String, Vec<SqlV
     let mut clauses: Vec<String> = Vec::new();
     let mut params: Vec<SqlValue> = Vec::new();
 
-    if let QueryScope::Own(uid) = scope {
-        params.push(SqlValue::Integer(i64::from(uid)));
-        clauses.push(format!("uid = ?{}", params.len()));
-    }
-    if let Some(uid) = filters.session_uid {
+    if let QueryScope::Owner(uid) = scope {
         params.push(SqlValue::Integer(i64::from(uid)));
         clauses.push(format!("uid = ?{}", params.len()));
     }
@@ -743,7 +739,7 @@ mod tests {
 
     #[test]
     fn a_bare_scope_renders_only_the_owner_clause() {
-        let (clause, params) = build_filters(&EventFilters::default(), QueryScope::Own(1000));
+        let (clause, params) = build_filters(&EventFilters::default(), QueryScope::Owner(1000));
         assert_eq!(clause, " WHERE uid = ?1");
         assert_eq!(params, vec![SqlValue::Integer(1000)]);
     }
@@ -771,7 +767,7 @@ mod tests {
             since_epoch: Some(1.0),
             ..EventFilters::default()
         };
-        let (clause, params) = build_filters(&filters, QueryScope::Own(1000));
+        let (clause, params) = build_filters(&filters, QueryScope::Owner(1000));
         assert_eq!(
             clause,
             " WHERE uid = ?1 AND category = ?2 AND verdict = ?3 AND timestamp_epoch >= ?4"

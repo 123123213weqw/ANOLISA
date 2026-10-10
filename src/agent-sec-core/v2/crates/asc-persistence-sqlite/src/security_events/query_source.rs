@@ -81,27 +81,6 @@ fn unavailable(error: &KernelError) -> QueryError {
 }
 
 impl SecurityEventQueries for SqliteEventQuerySource {
-    fn resolve_session(&self, session: &str) -> Result<Option<(u32, String)>, QueryError> {
-        let resolved = self
-            .guarded(|_, connection| {
-                Ok(crate::query::resolve_root_session(
-                    connection,
-                    session,
-                    "security_events",
-                ))
-            })
-            .map_err(|error| unavailable(&error))?
-            .unwrap_or(Ok(None))
-            .map_err(|error| match error {
-                asc_daemon_core::query::QueryError::InvalidArgument => QueryError::InvalidArgument,
-                error => QueryError::Unavailable(error.to_string()),
-            })?;
-        Ok(resolved.and_then(|(scope, session)| match scope {
-            asc_daemon_core::query::QueryScope::Own(uid) => Some((uid, session)),
-            _ => None,
-        }))
-    }
-
     fn summary(
         &self,
         filters: &EventFilters,
@@ -210,19 +189,19 @@ mod tests {
 
         assert!(
             source
-                .list(&EventFilters::default(), QueryScope::Own(1000), 100, 0)
+                .list(&EventFilters::default(), QueryScope::Owner(1000), 100, 0)
                 .expect("query")
                 .is_empty()
         );
         assert_eq!(
             source
-                .count(&EventFilters::default(), QueryScope::Own(1000), 0)
+                .count(&EventFilters::default(), QueryScope::Owner(1000), 0)
                 .expect("count"),
             0
         );
         assert!(
             source
-                .get("a1", QueryScope::Own(1000))
+                .get("a1", QueryScope::Owner(1000))
                 .expect("get")
                 .is_none()
         );
@@ -237,11 +216,11 @@ mod tests {
 
         let source = SqliteEventQuerySource::new(&path).expect("source opens lazily");
         let error = source
-            .list(&EventFilters::default(), QueryScope::Own(1000), 100, 0)
+            .list(&EventFilters::default(), QueryScope::Owner(1000), 100, 0)
             .expect_err("a corrupt store must not look empty");
         assert!(matches!(error, QueryError::Unavailable(_)), "{error}");
         let error = source
-            .count(&EventFilters::default(), QueryScope::Own(1000), 0)
+            .count(&EventFilters::default(), QueryScope::Owner(1000), 0)
             .expect_err("a corrupt store must not count as zero");
         assert!(matches!(error, QueryError::Unavailable(_)), "{error}");
     }
@@ -259,7 +238,7 @@ mod tests {
         assert_eq!(all.len(), 3, "the root scope sees every owner");
 
         let owner_a = source
-            .list(&EventFilters::default(), QueryScope::Own(1000), 100, 0)
+            .list(&EventFilters::default(), QueryScope::Owner(1000), 100, 0)
             .expect("owner scope");
         assert_eq!(owner_a.len(), 2);
         for event in owner_a {
@@ -269,53 +248,57 @@ mod tests {
     }
 
     #[test]
-    fn root_session_locators_round_trip_and_ambiguous_labels_fail_closed() {
+    fn plain_session_filters_keep_every_authorized_owner_and_numeric_prefixes_literal() {
         let directory = TempDir::new().expect("temp dir");
         let path = directory.path().join("events.db");
         seed_two_owners(&path);
         let source = SqliteEventQuerySource::new(&path).expect("source");
-        assert!(matches!(
-            source.resolve_session("s-1"),
-            Err(QueryError::InvalidArgument)
-        ));
-        assert_eq!(
-            source.resolve_session("1000_s-1").unwrap(),
-            Some((1000, "s-1".into()))
+        let filters = EventFilters {
+            session_id: Some("s-1".into()),
+            ..EventFilters::default()
+        };
+        let events = source.list(&filters, QueryScope::All, 100, 0).unwrap();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events
+                .iter()
+                .all(|event| event.session_id == Some(format!("{}_s-1", event.uid)))
         );
-        assert_eq!(source.resolve_session("01000_s-1").unwrap(), None);
-        assert_eq!(source.resolve_session("3000_s-1").unwrap(), None);
+        assert_eq!(source.count(&filters, QueryScope::All, 0).unwrap(), 3);
+        let own = source
+            .list(&filters, QueryScope::Owner(1000), 100, 0)
+            .unwrap();
+        assert_eq!(own.len(), 2);
+        assert!(own.iter().all(|event| event.uid == 1000));
 
+        let literal_filters = EventFilters {
+            session_id: Some("1000_s-1".into()),
+            ..EventFilters::default()
+        };
+        assert!(
+            source
+                .list(&literal_filters, QueryScope::All, 100, 0)
+                .unwrap()
+                .is_empty()
+        );
         let writer = SqliteEventWriter::new(&path).expect("writer");
         let mut literal = SecurityEvent::new("code_scan", "code_scan", Map::new());
         literal.uid = 3000;
         literal.session_id = Some("1000_s-1".into());
         writer.write(&literal);
-        let mut unique = SecurityEvent::new("code_scan", "code_scan", Map::new());
-        unique.uid = 1000;
-        unique.session_id = Some("unique-session".into());
-        writer.write(&unique);
         writer.close_at(1000.0);
-        assert!(matches!(
-            source.resolve_session("1000_s-1"),
-            Err(QueryError::InvalidArgument)
-        ));
-        // A locator returned by obs remains usable when only one UID has security rows.
-        assert_eq!(
-            source.resolve_session("1000_unique-session").unwrap(),
-            Some((1000, "unique-session".into()))
-        );
-        let unique = source
-            .list(
-                &EventFilters {
-                    session_id: Some("unique-session".into()),
-                    ..EventFilters::default()
-                },
-                QueryScope::All,
-                100,
-                0,
-            )
+        let events = source
+            .list(&literal_filters, QueryScope::All, 100, 0)
             .unwrap();
-        assert_eq!(unique[0].session_id.as_deref(), Some("unique-session"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].uid, 3000);
+        assert_eq!(events[0].session_id.as_deref(), Some("1000_s-1"));
+        assert!(
+            source
+                .list(&literal_filters, QueryScope::Owner(1000), 100, 0)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -326,7 +309,7 @@ mod tests {
             .count_by(
                 "details",
                 &EventFilters::default(),
-                QueryScope::Own(1000),
+                QueryScope::Owner(1000),
                 0,
             )
             .expect_err("rejected");
@@ -341,11 +324,11 @@ mod tests {
         let source = SqliteEventQuerySource::new(&path).expect("source");
 
         let total = source
-            .count(&EventFilters::default(), QueryScope::Own(1000), 0)
+            .count(&EventFilters::default(), QueryScope::Owner(1000), 0)
             .expect("total");
         assert_eq!(total, 2);
         let remaining = source
-            .count(&EventFilters::default(), QueryScope::Own(1000), 1)
+            .count(&EventFilters::default(), QueryScope::Owner(1000), 1)
             .expect("remaining");
         assert_eq!(remaining, 1, "offset counts what is left after skipping");
     }
@@ -368,7 +351,7 @@ mod tests {
         let source = SqliteEventQuerySource::new(&path).expect("source");
 
         let ids: Vec<String> = source
-            .list(&EventFilters::default(), QueryScope::Own(1000), 100, 0)
+            .list(&EventFilters::default(), QueryScope::Owner(1000), 100, 0)
             .expect("list")
             .into_iter()
             .map(|event| event.event_id)

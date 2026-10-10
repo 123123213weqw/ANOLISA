@@ -26,7 +26,7 @@ use crate::{SecurityEvent, SecurityEventsSummary, TimestampError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryScope {
     /// Rows whose producing peer was kernel-authenticated as this UID.
-    Own(u32),
+    Owner(u32),
     /// Every UID's rows.
     ///
     /// Reserved for the kernel-authenticated root peer. Non-root principals —
@@ -38,9 +38,9 @@ pub enum QueryScope {
 impl QueryScope {
     /// Returns the UID this scope may read, or `None` for [`Self::All`].
     #[must_use]
-    pub const fn uid(self) -> Option<u32> {
+    pub const fn owner_uid(self) -> Option<u32> {
         match self {
-            Self::Own(uid) => Some(uid),
+            Self::Owner(uid) => Some(uid),
             Self::All => None,
         }
     }
@@ -63,9 +63,6 @@ pub struct EventFilters {
     pub trace_id: Option<String>,
     /// Exact `session_id`.
     pub session_id: Option<String>,
-    /// UID resolved from a root-visible session locator, never a wire parameter.
-    /// Applied together with the authenticated scope, so it cannot widen visibility.
-    pub session_uid: Option<u32>,
     /// Exact `run_id`.
     pub run_id: Option<String>,
     /// Exact `call_id`.
@@ -129,9 +126,6 @@ pub const VALID_GROUP_FIELDS: &[&str] = &[
 /// the caller's fault and maps to `invalid_argument` at the protocol edge.
 #[derive(Debug, thiserror::Error)]
 pub enum QueryError {
-    /// A root session locator is ambiguous or malformed.
-    #[error("invalid query parameters or session shared by multiple UIDs")]
-    InvalidArgument,
     /// The store cannot be read right now.
     #[error("security event store is unavailable: {0}")]
     Unavailable(String),
@@ -145,11 +139,6 @@ pub enum QueryError {
 /// The port keeps daemon handlers free of storage decisions; the daemon
 /// composition root binds it to the same database the writers use.
 pub trait SecurityEventQueries: Send + Sync {
-    /// Resolves a root-visible session locator to a persisted UID and raw label.
-    ///
-    /// # Errors
-    /// Rejects ambiguous locators and propagates storage failures.
-    fn resolve_session(&self, session: &str) -> Result<Option<(u32, String)>, QueryError>;
     /// Returns the aggregates and newest rows of one scope.
     ///
     /// # Errors
@@ -215,8 +204,8 @@ mod tests {
 
     #[test]
     fn an_owner_scope_carries_its_uid() {
-        assert_eq!(QueryScope::Own(1000).uid(), Some(1000));
-        assert_eq!(QueryScope::All.uid(), None);
+        assert_eq!(QueryScope::Owner(1000).owner_uid(), Some(1000));
+        assert_eq!(QueryScope::All.owner_uid(), None);
     }
 
     #[test]

@@ -119,7 +119,8 @@ V1 Type=simple 的 active 不证明 socket 已 bind、Job 已启动或 daemon.he
   root 身份不等于开放全部特权；
 - systemd 负责 start/stop/restart、资源限制、目录准备和故障拉起；
 - V2 RPM 首次安装或检测到尚未卸载的 V1 user unit 时，在运行中的 system manager 上执行 `systemctl enable --now agent-sec-core.service`；这使 V1 升级切换到 system service，同时纯 V2 重装保留管理员已有的服务状态。启动失败不使 RPM 事务失败，部署者应查询 service 状态和 journal。没有 system manager 的镜像构建或容器安装只完成文件安装，不尝试启动 daemon；
-- daemon 不自行 daemonize，不在启动路径隐式执行不可逆 migration；
+- daemon 不自行 daemonize；安装、跨目录数据导入与 owner mapping 应由显式迁移入口负责；
+  当前 obs 启动期 schema 收敛见本文 DPROC-QRY-001；
 - runtime 目录由 systemd RuntimeDirectory 创建；state/log 路径按各自存储契约管理；
 - 两个不同 UID/Agent 通过同一 system socket 访问并保持 owner-scope 隔离。
 
@@ -127,7 +128,8 @@ V1 Type=simple 的 active 不证明 socket 已 bind、Job 已启动或 daemon.he
 
 - 默认 DaemonSet，每个目标 Node 恰有一个 Ready 实例；
 - Helm/manifest 明确 service account、security context、volume、resource 和 probe；
-- init job 或安装流程显式调用 asc-state-migrator；daemon 启动不偷偷升级状态；
+- 跨目录数据导入与 owner mapping 应由 init job 或安装流程显式调用 asc-state-migrator；
+  当前 obs 启动期 schema 1 → 2 收敛见本文 DPROC-QRY-001，不执行上述导入；
 - rollout、rollback、drain 和 Node replacement 分别留存证据。
 
 ### 4.3 CLI 与进程所有权
@@ -644,18 +646,25 @@ Scope update、Scope revision 参数及手动 Binding mutation 已移除，应�
 Client 组合验证自动 Binding 和清理；bootstrap SIGTERM 验证任务停止，CLI/UDS 验证权限与
 公开接口。本节不声明 RPM/systemd 实测、真实 AgentSight 或 kernel enforcement。
 
-## [TARGET V2 obs 已实现，安装态待验收] 当前用户查询范围（DPROC-QRY-001）
+## [TARGET V2 obs 已实现] 当前用户查询范围（DPROC-QRY-001）
 
 查询 reader 使用与 writer 一致的显式系统数据路径，由 daemon 装配；只读连接随每次查询结束关闭，writers 在请求 drain 后关闭。
 CLI/TUI 不直读数据库；普通用户按 UDS peer UID 过滤，root 可查询全部；非 root 的
 PolicyAdministrator 不获得跨 UID 查询权限。可观测数据在单次 INSERT 中持久化 peer UID，
-JSONL 同时写入可信顶层 `uid`。首版 obs schema revision 1 直接包含必填 UID 和归属索引；
-SQLite 与 JSONL writer 均强制携带 UID，不提供无 UID writer、旧 schema 自动升级或 V1 数据导入。
-初始化失败时 obs 查询不可用且采集显式报错。
+JSONL 同时写入可信顶层 `uid`。当前 obs schema revision 2 包含可空 UID 和归属索引；
+SQLite 与 JSONL writer 均强制携带可信 `uid: u32`，不提供无 UID writer。写入侧将所选数据库
+从 revision 1 升级到 2：缺少 UID 时添加可空列，历史记录保持 `NULL`，已有 UID 保持不变；
+列、索引与版本在同一事务收敛，失败回滚并可重试。非 root 的 UID 过滤不匹配历史 `NULL`；
+root 可查询这些记录，但不为其关联安全事件，不将未知归属当作 UID 0。
+该升级不执行 V1 per-user 数据发现、合并或 owner 推断，不替代 §6.2 的 state migrator。
+初始化或升级失败时 obs 查询不可用且采集显式报错。回退不支持 revision 2 的二进制前，
+须恢复升级前的配套数据库备份；不提供 schema 逆向迁移。
 存储失败边界和真实跨 UID 安装态验收见
 [V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)。
-三个 obs 查询和 CLI report/review 已接线。DPROC-QRY-001 安装态跨 UID 验收仍待执行，
-不能以库内 scope 测试或当前用户的 UDS 进程测试替代。
+三个 obs 查询和 CLI report/review 已接线，已有源码 CLI/daemon E2E 和 AgentSight 真实数据联调证据。
+2026-10-10 检查确认：宿主机运行 systemd，但当前账号无法免密 sudo，且未安装 V2 RPM；
+现有 root 调试容器的 PID 1 不是 systemd。因此本轮未执行安装态跨 UID/systemd 验证，
+已测范围及限制见查询设计 §9.2；库内 scope 测试和源码进程测试不作为安装态通过证据。
 
 启动边界：security SQLite 必要 schema 初始化失败仍阻止 READY；随后单独准备三项可选
 查询索引，失败记录具体原因并继续 admission，查询可能变慢。当前建索引仍在 READY 前同步
@@ -667,15 +676,15 @@ DPROC-QRY-001 源码 fixture：
 验证索引失败后仍可写安全事件；
 `v2/apps/asc-daemon/tests/bootstrap.rs::daemon_binds_when_optional_query_indexes_fail`
 在 root 分支验证真实二进制继续监听并输出诊断。非 root 执行仅验证 daemon 的启动身份拒绝，
-不算该启动场景通过。QRY-001..011 的逐项 fixture 映射见查询设计 §8；安装态仍未执行。
+不算该启动场景通过。QRY-001..011 的逐项 fixture 映射见查询设计 §8，验证范围见 §9.2。
 
 
-DPROC-QRY-001 查询身份补充：所有查询的授权范围仅由 UDS peer UID 决定；obs 和 sec 都不接受
-`uid/owner_uid` 参数，CLI 不提供对应选项。root 为 All，普通用户固定 Own(peer_uid)。
-root 列表只在跨 UID 同名时返回 `UID_SessionId`；组合名称由服务端解析到已有数据，
-不授予权限，普通用户不解析该前缀。组合名称仍有歧义时拒绝，不混合不同 UID。
-可执行 fixture：`v2/apps/asc-cli/tests/observability_query.rs` 验证真实 peer、UID 参数拒绝、
+DPROC-QRY-001 查询身份补充：所有查询的授权范围由 UDS peer UID 决定；
+root 为 All，普通用户固定 Own(peer_uid)。sec 按原始 session ID 筛选，root 返回所有
+UID 下的匹配记录；root 返回中的 `UID_session_id` 仅用于区分同名会话。
+obs 仍使用服务端解析的组合名称下钻；组合名称有歧义时拒绝。
+可执行 fixture：`v2/apps/asc-cli/tests/observability_query.rs` 验证真实 peer、
 无 UID 的 report/review；`v2/crates/asc-persistence-sqlite/tests/owned_queries.rs` 验证 root
 组合名称、普通用户隔离和歧义拒绝；`v2/apps/asc-daemon/tests/sec_query_protocol.rs` 与
-`v2/apps/asc-cli/tests/events_dual_uid.rs` 验证 sec 的真实 UDS UID、参数拒绝和组合 ID 回查。
+`v2/apps/asc-cli/tests/events_dual_uid.rs` 验证 sec 的真实 UDS UID、原始 session ID 查询与返回标签。
 以上不替代安装态不同 UID/systemd 验收。

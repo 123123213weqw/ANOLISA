@@ -20,7 +20,7 @@ use std::time::Duration;
 use asc_action_runtime::Finalizer;
 use asc_daemon::{BootstrapConfig, scan_application, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
-use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
+use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_pap::PapService;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_persistence_sqlite::security_events::SqliteEventWriter;
@@ -82,9 +82,9 @@ impl RunningDaemon {
                     Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
                 ),
             )
-            .with_security_queries(
+            .with_queries(QueryHandler::default().with_security_queries(
                 SqliteEventQuerySource::new(database).expect("query source opens"),
-            ),
+            )),
         );
         let shutdown = asc_daemon_service::ShutdownToken::new();
         let service_shutdown = shutdown.clone();
@@ -223,19 +223,7 @@ async fn two_real_uids_share_one_system_socket_through_the_cli() {
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(stdout.trim(), "2", "count prints the bare number");
 
-    // UID selection is absent from the CLI for every peer.
-    let (code, _stdout, stderr) = cli_as(
-        1000,
-        &daemon.socket_path,
-        &["events", "--owner-uid", "2000"],
-    );
-    assert_eq!(code, Some(2), "stderr: {stderr}");
-    assert!(
-        stderr.contains("--owner-uid"),
-        "the rejection names the unsupported flag: {stderr}"
-    );
-
-    // Root reads every UID and disambiguates colliding session labels.
+    // Root labels distinguish owners; the query uses the original session ID.
     let (code, stdout, stderr) = cli_as(0, &daemon.socket_path, &["events", "--output", "jsonl"]);
     assert_eq!(code, Some(0), "stderr: {stderr}");
     assert_eq!(
@@ -259,11 +247,15 @@ async fn two_real_uids_share_one_system_socket_through_the_cli() {
             "--output",
             "json",
             "--session-id",
-            "42424242_shared-session",
+            "shared-session",
         ],
     );
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert_eq!(event_ids(&stdout), vec!["foreign-1"], "{stdout}");
+    assert_eq!(
+        event_ids(&stdout),
+        vec!["foreign-1", "second-1", "first-2", "first-1"],
+        "{stdout}"
+    );
 
     let (code, stdout, stderr) = cli_as(
         1000,

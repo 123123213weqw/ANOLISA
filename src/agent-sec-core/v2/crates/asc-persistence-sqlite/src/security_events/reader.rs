@@ -229,7 +229,7 @@ mod tests {
         let dir = TempDir::new().expect("temp dir");
         let path = dir.path().join("absent.db");
         let reader = SqliteEventReader::new(&path).expect("reader");
-        let scope = QueryScope::Own(0);
+        let scope = QueryScope::Owner(0);
 
         assert!(
             reader
@@ -258,7 +258,7 @@ mod tests {
         seed(&path);
 
         let reader = SqliteEventReader::new(&path).expect("reader");
-        let scope = QueryScope::Own(0);
+        let scope = QueryScope::Owner(0);
         assert_eq!(reader.count(&EventFilters::default(), &scope, 0), 1);
         assert_eq!(
             reader.get("e1", &scope).map(|event| event.event_id),
@@ -280,7 +280,12 @@ mod tests {
 
         let reader = SqliteEventReader::new(&path).expect("reader");
         let error = reader
-            .count_by("details", &EventFilters::default(), &QueryScope::Own(0), 0)
+            .count_by(
+                "details",
+                &EventFilters::default(),
+                &QueryScope::Owner(0),
+                0,
+            )
             .expect_err("invalid group field must be rejected");
         assert!(matches!(error, KernelError::Malformed(_)));
     }
@@ -292,8 +297,8 @@ mod tests {
         seed_two_owners(&path);
 
         let reader = SqliteEventReader::new(&path).expect("reader");
-        let owner_a = QueryScope::Own(1000);
-        let owner_b = QueryScope::Own(2000);
+        let owner_a = QueryScope::Owner(1000);
+        let owner_b = QueryScope::Owner(2000);
 
         let a_ids: Vec<String> = reader
             .query_default_page(&EventFilters::default(), &owner_a)
@@ -337,7 +342,7 @@ mod tests {
         seed_two_owners(&path);
 
         let reader = SqliteEventReader::new(&path).expect("reader");
-        let owner_a = QueryScope::Own(1000);
+        let owner_a = QueryScope::Owner(1000);
         assert!(reader.get("a1", &owner_a).is_some());
         assert!(reader.get("b1", &owner_a).is_none(), "foreign owner");
         assert!(reader.get("missing", &owner_a).is_none(), "absent record");
@@ -355,8 +360,8 @@ mod tests {
             categories: &["exec".to_owned()],
             ..CorrelationRequest::default()
         };
-        let owner_a = reader.query_correlation_candidates(&request, &QueryScope::Own(1000));
-        let owner_b = reader.query_correlation_candidates(&request, &QueryScope::Own(2000));
+        let owner_a = reader.query_correlation_candidates(&request, &QueryScope::Owner(1000));
+        let owner_b = reader.query_correlation_candidates(&request, &QueryScope::Owner(2000));
         assert!(!owner_a.is_empty(), "owner A's exec rows are candidates");
         assert!(!owner_b.is_empty(), "owner B's exec rows are candidates");
         for candidate in owner_a {

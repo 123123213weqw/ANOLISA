@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
-use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
+use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_daemon_service::ShutdownToken;
 use asc_pap::PapService;
 use asc_pap_repository_memory::ProcessLocalPapRepository;
@@ -74,12 +74,15 @@ async fn v1_envelope_preserves_obs_queries_and_caller_selection() {
                 Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
             ),
         )
-        .with_security_queries(SqliteEventQuerySource::new(&database).unwrap())
-        .with_observability_queries(
-            asc_daemon_core::query::ObservabilityQueryService::new(
-                SqliteObservabilityQueries::new(observations),
-                SqliteSecurityQueries::new(database),
-            ),
+        .with_queries(
+            QueryHandler::default()
+                .with_security_queries(SqliteEventQuerySource::new(&database).unwrap())
+                .with_observability_queries(
+                    asc_daemon_core::query::ObservabilityQueryService::new(
+                        SqliteObservabilityQueries::new(observations),
+                        SqliteSecurityQueries::new(database),
+                    ),
+                ),
         ),
     );
     let shutdown = ShutdownToken::new();

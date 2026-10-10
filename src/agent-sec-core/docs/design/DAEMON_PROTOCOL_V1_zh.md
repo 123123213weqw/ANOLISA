@@ -244,15 +244,12 @@ optional string 的空白值归一为未设置。
 四个 `sec.*` method 的读取范围由 transport 认证的 peer UID 决定（DPV1-018/019）：
 
 - root peer 读取全部 UID；非 root peer（包括 `PolicyAdministrator`）只能读取自身 UID。
-- 请求不接受 `uid`、`owner_uid`（包括 null），返回 `invalid_request`；CLI 不提供
-  `--uid` 或 `--owner-uid`。此 V2 契约取代此前的 `owner_uid` 过滤扩展。
 - 跨 UID 的 `session_id` 碰撞时，root 的事件、latest_events 和 session 分组返回
   `UID_session_id`；唯一 session 和普通用户返回原始 ID。碰撞判断覆盖完整 store，
   不受当前分页、时间或其它筛选影响；`affected_sessions` 分别统计各 UID 的同名 session。
-- root 可将返回的组合 ID 用作 `session_id` 筛选；也接受 obs 返回的组合 ID，即使
-  security store 中只有该 UID 的记录。组合 ID 定位已获授权的数据，不是身份参数。
-  原始 ID 对应多个 UID，或组合 ID 与真实 ID 冲突时返回 `invalid_argument`。
-  普通用户不解析前缀，不能借此改变 UDS UID 范围。
+- `session_id` 筛选对所有调用者按原始存储 ID 匹配；root 返回所有 UID 下的匹配事件。
+  返回中的 `UID_session_id` 仅用于区分同名会话；查询不解析该展示前缀。
+  原始 ID 本身带数字前缀时，同样按字面值匹配。
 
 存储存在但不可读（页损坏、I/O 错误、查询被中断）时，四个 method 返回 `unavailable`
 错误而不是成功的空结果；数据库尚未创建时仍返回空结果（首次写入前的正常状态）。
@@ -858,7 +855,7 @@ agent-sec-cli 触发 PyO3、Python backend 或第二套本地业务执行。
 | DPV1-015 | 旧 daemon 返回 `unknown_method` 时返回稳定 version/capability mismatch；timeout/EOF 时同样不本地执行 |
 | DPV1-016 | envelope/wire-shape 错误与 action 领域输入错误稳定落入不同 response layer |
 | DPV1-017 | 八个 action method 的 timeout、queue/resource、access-log、blocking 和 cancellation metadata 已冻结并逐项验证 |
-| DPV1-018 | 多 UID 共用 system socket；trusted Principal/QueryScope 按 UID 隔离，`caller/trace_context` 不参与授权；root 为 All，非 root（含 PolicyAdministrator）仅限自身；拒绝 UID 参数，root 用服务端返回的 UID_session_id 定位同名 session |
+| DPV1-018 | 多 UID 共用 system socket；trusted Principal/QueryScope 按 UID 隔离，`caller/trace_context` 不参与授权；root 为 All，非 root（含 PolicyAdministrator）仅限自身；sec 按原始 session ID 查询，root 返回所有匹配 UID 的记录，返回标签区分同名 session |
 | DPV1-019 | CLI/TUI 不能用 RPC filter 绕过服务端 QueryScope，也不能直读 SQLite 替代授权查询 |
 | DPV1-020 | 15 个 PAP method 的 strict params、完整请求/响应 CRUD fixture、直接领域 result、错误投影、server-owned Principal；必跑 UDS integration 经 Dispatcher/PapHandler → PapService → Repository 执行完整 fixture，真实 `asc-daemon` 子进程通过启动管理员 UID 配置完成非 root 成功场景，同时验证默认拒绝；root 环境验证默认成功 |
 
@@ -1045,12 +1042,15 @@ CLI report/TUI review 只通过 daemon 读取。`sec.summary`、`sec.events.list
 值保留 `Option '...' requires an argument.`，均退出 2。非法 `--since`/`--until` 输出
 `Error: Invalid time format for ...: '...'. Expected ISO 8601 format.` 并退出 1。
 参数解析错误保留诊断正文与退出码，不复刻 Typer 的终端边框排版。
-obs 普通用户范围固定为内核认证的 UDS peer UID；root 可查询全部；obs 请求不接受 uid/owner_uid 或转发身份。
+obs 普通用户范围固定为内核认证的 UDS peer UID，SQL 按 `uid = peer_uid` 过滤；
+root 可查询全部，包含历史 `NULL` UID。响应的历史无归属 `uid` 为 `null`，不代表 UID 0；
+其安全计数为 0、分类聚合与关联为空，不推断安全事件归属。
+`obs.record` 的 writer 仍必须携带可信 `uid: u32`，客户端不能指定或覆盖 UID。
 参数、分页、关联与错误契约，以及 QRY-001..011 完整验收矩阵和当前证据见
 [V2 安全事件与 Observability 查询设计](V2_SECURITY_OBSERVABILITY_QUERY_zh.md)。
 obs 查询采用 LocalUser access policy 和服务端 QueryScope，不改变本文 CURRENT V1 事实。
 `obs.sessions.list` 接受可选精确 `session_id`，先应用 UID、session、时间过滤，再统计与分页；
 跨 owner 同名 session 仍返回独立条目；仅 root 的重名条目使用 `UID_SessionId` 作为下钻定位符，
-正常 ID 保持原样。组合名称仍有歧义时拒绝；原始存储 ID 和安全关联不变，详见查询设计 §4.1。
+历史未知归属使用 `unknown_SessionId`；未重名的 ID 保持原样。组合名称仍有歧义时拒绝；原始存储 ID 和安全关联不变，详见查询设计 §4.1。
 内部 `DaemonDispatcher::handle` 使用命名的 5 秒 convenience budget；真实 UDS dispatch
 使用 transport 配置生成的 `DispatchControl`，不受该默认值替代。

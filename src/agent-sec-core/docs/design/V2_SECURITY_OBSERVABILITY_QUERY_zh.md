@@ -1,6 +1,6 @@
 # V2 安全事件与 Observability 查询设计
 
-状态：**[TARGET V2：obs 功能缺口已补齐，安装态验收待完成]**。
+状态：**[TARGET V2：obs 已实现，已有源码 E2E 与 AgentSight 联调证据]**。验证范围见 §9.2。
 本分支在 `trace@ef4fa4029` 采集基线上实现三个 obs RPC、daemon-only report/review、
 可信 UID 写入和查询隔离。本地 schema CLI 已补齐；基线 PR #6745 提供四个 sec RPC 和 events CLI，
 其契约见 [daemon 协议](DAEMON_PROTOCOL_V1_zh.md#64-secsummary)。源码进程验收不代表已发布 RPM/systemd 安装态验收。
@@ -13,8 +13,9 @@ V1 是功能验收基线；接口可调用、基础下钻可用或已有测试�
    不可用时回退本地读取或自动启动 daemon。
 2. 普通用户仅查询当前连接 **UDS peer UID** 的数据；UID 0 的 root 默认查询所有数据。
    daemon 从内核认证身份构造 `QueryScope::Own(uid)` 或 `QueryScope::All`，不接受客户端授权声明。
-3. obs 查询不接受 `uid`、`owner_uid`、role 或 scope 参数，observability CLI 不提供 `--uid/--owner-uid`。
-   身份仅来自 UDS peer credentials。响应中的 `uid` 是数据归属，不是客户端授权声明。
+   `All` 包含历史 `NULL` UID；非 root 的 `uid = peer_uid` 过滤不会匹配这些记录。
+3. 身份来自 UDS peer credentials。响应中的 `uid` 是数据归属，历史无归属记录为 `null`，
+   不代表 UID 0，也不是客户端授权声明。
    非 root 的 `PolicyAdministrator` 不获得跨用户读取权限。
 4. 这是 OS 用户隔离。同一 UID 下的 Agent 共享可见范围；全部以 root 运行的 Agent
    不能靠 UID 相互隔离。经代理连接时归属为 daemon 实际看到的 peer UID，不信任转发字段。
@@ -43,7 +44,7 @@ V1 是功能验收基线；接口可调用、基础下钻可用或已有测试�
 V1 CLI 直接读本地 SQLite，V1 daemon 则另有查询 RPC；V2 保留业务能力，但统一经 daemon。
 当前 V2 的 [方法清单](../../v2/crates/asc-daemon-protocol/src/method.rs) 已注册三个 obs query 方法；
 [CLI 注册](../../v2/apps/asc-cli/src/commands.rs) 已提供 observability report/review。
-以下表格保留完整目标范围，sec 行仍待后续 PR 实现。
+以下表格保留完整迁移范围；四个 sec RPC 与 events CLI 已由基线 PR #6745 提供。
 
 ## 3. CLI 接口 [TARGET V2]
 
@@ -58,8 +59,7 @@ V1 CLI 直接读本地 SQLite，V1 daemon 则另有查询 RPC；V2 保留业务�
 | `observability review` | TUI：session → run → event，下钻详情与关联安全事件 | `obs.sessions.list`、`obs.runs.list`、`obs.timeline.get`（含完整关联详情） |
 
 Observability CLI 保持 V1 参数集合：`report` 仅提供 `--session-id`、`--last`、`--format`；
-`review` 无业务参数，从 session 列表开始下钻。不提供 `--uid/--owner-uid`、`--since/--until`，
-review 也不提供 `--session-id/--run-id`。daemon 的时间过滤参数保留供其他查询客户端使用。
+`review` 无业务参数，从 session 列表开始下钻。daemon 的时间过滤参数保留供其他查询客户端使用。
 Report JSON 与 V1 frozen fixture 完整对照，不新增顶层 `uid`；RPC 的归属字段仅用于内部隔离。
 
 `events` 保留 `--event-type/--category/--trace-id/--session-id/--run-id`、
@@ -91,35 +91,19 @@ V1 JSON 快照仅存放于 fixtures 中作完整输出对照，不参与运行�
 `request_id/ok/data/stdout/stderr/exit_code` 信封，不依赖 `trace_context`；obs 结果按冻结的
 V1 字段投影，sec 业务结果原样透传。授权仍只依赖 UDS peer UID。
 
-| 方法 | 主要参数 | result |
-|---|---|---|
-| `sec.summary` | 安全事件 filters、latest_limit | total、by_category/by_event_type/by_result、affected_sessions/affected_runs、latest_events |
-| `sec.events.list` | 安全事件 filters、limit/offset、include_details | items、total、limit、offset、next_offset |
-| `sec.events.get` | event_id | found、event；不属于授权范围与不存在均返回 found=false、event=null |
-| `sec.events.count_by` | 安全事件 filters、group_by、offset；拒绝 limit | group_by、items（value/count） |
-| `obs.sessions.list` | 可选精确 session_id、时间范围、limit/offset | items、total、limit、offset、next_offset；每项含 uid、会话起止时间、turn_count、两类事件数量及 security_by_category_result |
-| `obs.runs.list` | session_id、时间范围、limit/offset | session_id、items、total、limit、offset、next_offset；每项含 run 起止时间、输入预览、两类事件数量 |
-| `obs.timeline.get` | session_id、run_id、时间范围、limit/offset、include_security | uid、session_id、run_id、total、limit、offset、next_offset、items；包含 observability 项和可选 security 关联项 |
+七个查询方法的参数、返回字段及分页默认值统一见
+[daemon 协议 §6](DAEMON_PROTOCOL_V1_zh.md#6-method-catalogue)。本节仅说明迁移语义与安全边界。
 
 全部 7 个目标查询方法的授权范围均由 UDS peer 决定：root 使用 All，非 root 使用 Own(peer_uid)。
-不接受转发身份。三个 obs RPC 对 `uid/owner_uid`（包括 null）返回 invalid_argument；
-sec RPC 同样拒绝 `uid/owner_uid` 参数（返回 invalid_request），CLI 不提供 UID 选项；
-root 跨 UID 的同名 session 返回 `UID_session_id`，支持用该组合 ID 回查，普通用户保留原始 ID。
-分组及 affected_sessions 按各 UID 的 session 分开统计；原始 root session 有歧义时拒绝。
-sec 也接受 obs 返回的组合 ID，即使 security store 只有其中一个 UID 的记录。
+sec 按原始 session ID 筛选；root 返回所有 UID 下的匹配记录。
+root 返回中的同名 session 显示为 `UID_session_id`，仅用于区分归属；查询不解析展示前缀。
+分组及 affected_sessions 按各 UID 的 session 分开统计。obs 的组合 ID 下钻保持 §4.1 的现有行为。
 未知来源安全库须先按 §5.2 隔离。
 
 ### 4.1 过滤、分页与关联
 
-- 安全事件 filters：event_type、category、result、verdict、trace_id、session_id、run_id、
-  call_id、tool_call_id，以及时间范围。result 只接受 failed/succeeded。
-- group_by allowlist：category、event_type、result、trace_id、session_id、run_id、call_id、
-  tool_call_id、verdict。CLI 的三个分组选项是该集合的子集。
-- 时间兼容 since/until 与 start_ns/end_ns，同一边界的两种表示互斥；统一为 UTC，
-  左闭右开。保留 V1 时间解析与非法范围处理的 fixtures，不能静默改变时区解释。
-- RPC 默认 page limit 为 100，上限 1000；timeline 默认 1000。offset 为非负整数，
-  保留 V1 signed 64-bit 上界；内部 reader 当前 u32 分页参数需要调整或显式兼容处理，不能截断。
-  latest_limit 默认 5、上限 50；include_details 默认 false，include_security 默认 true。
+- 保留 V1 时间解析与非法范围处理的 fixtures，不能静默改变时区解释。
+  分页 offset 保留 V1 signed 64-bit 上界，内部 reader 不得截断。
 - 所有列表、total、分组、summary、详情和关联候选查询都先应用服务端授权范围，再执行
   业务过滤、排序、LIMIT/OFFSET 或聚合。禁止先取跨用户结果再在内存中过滤。
 - 安全事件按时间倒序；session 按最近活动倒序；run 和 run 内记录按时间正序。
@@ -131,13 +115,14 @@ sec 也接受 obs 返回的组合 ID，即使 security store 只有其中一个 
   单条与批量关联结果必须一致。安全事件计数按 session/run 归属统计，与匹配出的关联项数量不同。
 - Session、run、correlation 的完整内部 key 包含 UID；同名业务 ID 不能跨 UID 合并。
   正常 GUID 无随机碰撞时保持原 SessionId。root 全量范围内如果同一 SessionId 属于多个
-  UID，session 列表的 `session_id` 改为 `UID_SessionId`；
+  UID（含未知归属），session 列表的 `session_id` 改为 `UID_SessionId`，
+  未知归属使用 `unknown_SessionId`；
   普通用户仍只看到自己的原 SessionId，不能通过名称获知其他 UID 是否存在。
   碰撞判断覆盖整个库，不受分页或时间筛选影响。root 的 session 精确筛选、run/timeline
   接受列表返回的组合 ID，并在服务端还原原始 session 和数据 UID 后查询。
   组合 ID 是资源定位符，不是授权凭据；非 root 不解析其 UID 前缀。
   原始重名 ID 直接下钻仍报 invalid_argument；组合名若也与另一个真实 SessionId 重名，
-  同样报错，不猜测目标。不额外增加 UID 参数、映射表或改写数据库中的原 SessionId。
+  同样报错，不猜测目标。不增加映射表或改写数据库中的原 SessionId。
   Report/review 原样传递选中的 session_id；事件 metadata 和关联匹配仍使用原始 ID。
   新增/清理数据可能改变是否重名，客户端应刷新列表，不承诺跨请求的定位符快照。
 
@@ -163,29 +148,32 @@ SQL 执行也必须受有界等待/中断控制，不能只在 handler 入口检
 ### 5.1 可信归属
 
 `QueryScope` 是内部类型，不可从请求反序列化；由 daemon 从内核 peer UID 创建，贯穿
-query service、存储端口和 repository。查询参数中的 uid/role/scope override 应拒绝；
-obs 不保留 UID 筛选参数或别名；sec 的授权范围内过滤见 §4。授权不依赖 PolicyAdministrator，
+query service、存储端口和 repository。sec 的授权范围内过滤见 §4。授权不依赖 PolicyAdministrator，
 不从 metadata、OTel Baggage、trace/session/run ID 或客户端转发信息推导归属。
 
 | 数据 | 当前状态 | 必须补齐 |
 |---|---|---|
 | 安全事件 | 表有 uid，现有 ActionService 传递 peer 身份；EventFilters 无 UID 条件 | 确认写入来源可信，以 scope UID 强制 SQL uid 条件；后台事件不能套用查询者 UID |
-| Observability | 首版 schema revision 1 包含必填 uid | 已实现：handler/core/sink/writer 显式传递 peer UID，SQLite 和 JSONL 均写入 |
+| Observability | schema revision 2 包含可空 uid，历史未知归属保留 NULL | 已实现：handler/core/sink/writer 显式传递 peer UID，新 SQLite 和 JSONL 记录均写入可信 UID |
 
 Observability 的 UID 是存储侧归属，不加入客户端 `obs.record` params，也不改变原有
 record metrics/metadata 的业务含义。新记录必须有可信 UID，UID 与记录在同一次 SQLite
 插入中落盘；不能先写记录再异步补 UID。JSONL 同样写入由 daemon 提供的顶层 `uid`，
 不从客户端 record、session/metadata 或 Baggage 推导 UID。安全事件与可观测记录关联时按记录 UID 匹配；root 全量读取也不能跨 UID 关联。
 
-### 5.2 数据库初始化
+### 5.2 数据库初始化与升级
 
-- 首版 Observability schema revision 为 1，直接包含 `uid INTEGER NOT NULL`、有效 u32
-  范围约束及 UID/time、UID/session/run/time 索引；不提供无 UID schema 或自动升级路径。
+- 当前 Observability schema revision 为 2，`uid INTEGER CHECK(uid BETWEEN 0 AND 4294967295)`
+  允许历史 `NULL`，非空 UID 受 u32 范围约束；包含 UID/time、UID/session/run/time 索引。
+- 写入侧将 revision 1 升级到 2：为缺少 UID 的旧表添加可空列，历史记录保持 `NULL`；
+  已有 UID 原样保留。列、索引和版本在同一事务收敛，失败回滚，重复初始化可安全重试。
 - 现有 SQLite 和 JSONL writer 均要求显式传入可信 `uid: u32`，不默认使用 daemon 进程 UID，
-  不保留独立 owned writer。缺失、NULL 或越界 UID 的 SQLite 写入由约束拒绝。
+  不保留独立 owned writer。新写入必须携带 UID；数据库允许历史 `NULL`，不等于 writer 接受空 UID。
 - 安全事件与 Observability 关联必须使用同一可信 UID，root 全量读取也不能跨 UID 关联。
-- 数据库初始化由 daemon 写入侧负责，query reader 只读且不创建或修改 schema。
-  初始化失败时查询不可用，不得退回未过滤 reader 或 CLI 本地 fallback。
+  历史 `NULL` UID 仅对 root 可见，不推断为 UID 0；安全计数为 0、分类聚合与关联为空，
+  这表示无法归属安全事件，不能据此断言历史记录没有安全事件。
+- 数据库初始化与升级由 daemon 写入侧负责，query reader 只读且不创建或修改 schema。
+  初始化或升级失败时查询不可用，不得退回未过滤 reader 或 CLI 本地 fallback。
 - V1 per-user 数据导入不属于本阶段；不从 session/metadata 或恢复进程身份推导 UID。
   数据恢复使用配套数据库备份；JSONL 导入前仍须验证来源可信，本阶段不提供自动恢复机制。
 
@@ -219,7 +207,7 @@ CLI 的查询调用使用普通函数/闭包，不另设 Transport trait 或 Cli
 | 有意差异 | 系统 daemon 下 root 默认可见全部；存储故障不伪装空结果；拒绝身份 override。普通用户自身数据可见性是兼容要求，不是功能差异 |
 | 非本阶段 | 非 root 跨 UID 审计、独立 report RPC、自动历史导入、全局快照、独立查询进程/缓存 |
 
-本次实施：可信 UID 写入与初始 schema → scope 强制查询端口 → 三个 obs RPC、关联 → report/review。
+本次实施：可信 UID 写入与 schema 升级 → scope 强制查询端口 → 三个 obs RPC、关联 → report/review。
 安全事件 RPC/CLI 由基线 PR #6745 提供，保留其既有 UID 隔离和查询实现。
 本阶段 V2 查询文档仅维护在组件 README 与组件内设计文档，不新增仓库顶层用户指南或对其引用。
 
@@ -233,7 +221,7 @@ CLI 的查询调用使用普通函数/闭包，不另设 Transport trait 或 Cli
 | QRY-002 | 覆盖全部 7 RPC、get、total、group、summary、latest、分页；普通用户任一输出不得泄露另一 UID；root 全量结果不得错误合并 UID |
 | QRY-003 | 两用户使用相同 session/run/tool_call ID，列表、计数、report 与 timeline 仍隔离；UID 请求参数被拒绝；root 仅在重名时使用组合 session ID，普通用户不能借此前缀越权 |
 | QRY-004 | 采集 UID 取 peer，不能取 daemon UID/Baggage；SQLite UID 与记录原子插入；写入失败不产生可查询的无主记录 |
-| QRY-005 | 首版 schema 1 直接要求 UID；拒绝缺失、NULL 和越界 UID；重复初始化和重启保持归属；未知安全事件来源不被信任 |
+| QRY-005 | schema 1 → 2 保留历史 NULL 与已有 UID；writer 必须传可信 UID、非空列值拒绝越界；重复初始化与重开保持归属，升级失败回滚并可重试；未知安全事件来源不被信任 |
 | QRY-006 | V1 frozen fixtures 比较 CLI table/json/jsonl/count/count-by/summary、参数互斥、offset、时间边界与错误退出 |
 | QRY-007 | session/run 列表及双库计数、稳定排序、分页；timeline offset 按 observability 行推进，不丢页/重复计数 |
 | QRY-008 | V1 关联 fixtures：精确/回退、hook/category、时间边界、单条与批量等价；候选读取先按 UID 过滤 |
@@ -243,24 +231,24 @@ CLI 的查询调用使用普通函数/闭包，不另设 Transport trait 或 Cli
 | DPROC-QRY-001 | 安装态 CLI 只能通过 daemon 读系统数据；真实跨 UID 与重启验收，源码进程测试不替代 systemd/RPM 验收 |
 
 交付证据必须分别报告库内 fixtures、CLI/daemon 本地 E2E 和安装态跨 UID 验证，
-并记录有意兼容差异、新库初始化及必填 UID 约束验证结果。
+并记录有意兼容差异、新库初始化、旧库升级、历史 NULL 隔离与 writer 必传 UID 的验证结果。
 
-可执行 fixture 映射（路径以组件为根；表中未覆盖部分仍待验收）：
+可执行 fixture 映射（路径以组件为根；表中明确列出未覆盖范围）：
 
 | ID | Fixture / 当前边界 |
 |---|---|
-| QRY-001 | `v2/apps/asc-cli/tests/observability_query.rs::uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback` 验证当前真实 peer；两个真实 UID 的安装态验证未执行 |
+| QRY-001 | `v2/apps/asc-cli/tests/observability_query.rs::uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback` 验证当前真实 peer；不覆盖两个真实 UID 的安装态验证，环境限制见 §9.2 |
 | QRY-002 | `v2/crates/asc-daemon-protocol/tests/pap_contract.rs::observability_query_method_inventory_matches_dispatch` 覆盖 obs 三方法；sec 四方法由基线 `v2/apps/asc-daemon/tests/sec_query_protocol.rs` 覆盖 |
 | QRY-003 | `v2/crates/asc-persistence-sqlite/tests/owned_queries.rs::root_and_user_scopes_do_not_merge_colliding_sessions_or_correlations`；`v2/crates/asc-daemon-handler/src/observability_query.rs::tests::rejects_identity_overrides_and_invalid_filters_before_storage_access` |
 | QRY-004 | 上述 CLI UDS fixture；`v2/crates/asc-event-sink/src/configured.rs::observability_tests::both_paths_receive_the_record`；`owned_queries.rs::owned_write_rejects_future_revision_without_inserting` |
-| QRY-005 | `owned_queries.rs::initial_schema_requires_uid`、`schema_rejects_missing_null_and_invalid_uids`；覆盖本地初始化、必填 UID 约束和重开后归属，不替代安装态验收 |
+| QRY-005 | `owned_queries.rs::initial_schema_is_revision_two_with_uid`、`schema_allows_legacy_null_but_rejects_out_of_range_uids`、`unknown_rows_stay_isolated_after_reopen`、`legacy_schema_upgrade_preserves_unknown_rows_and_admits_owned_writes`、`upgrading_owned_revision_one_preserves_existing_owners`、`legacy_schema_upgrade_failure_rolls_back_and_can_be_retried`；覆盖本地建库、升级、归属隔离、回滚与重试，不替代安装态验收 |
 | QRY-006 | `v2/apps/asc-cli/src/commands/observability/query.rs::compatibility_tests::report_matches_frozen_v1_json_and_text` 覆盖 obs report；sec 输出由基线 events CLI fixtures 覆盖 |
 | QRY-007 | `owned_queries.rs::totals_and_half_open_time_windows_precede_pagination`、`exact_session_filter_preserves_scope_totals_and_time_window`；上述 CLI UDS fixture 覆盖多页 timeline |
 | QRY-008 | `v2/crates/asc-daemon-core/src/query/correlation.rs::tests::frozen_v1_single_and_batch_matches_agree_with_core`；`owned_queries.rs::correlation_candidates_keep_v1_order_and_limit_without_failing_timeline`、`malformed_candidates_do_not_hide_valid_correlations_or_observations`、`candidate_storage_failures_do_not_fail_the_observation_page`；QRY-003 fixture 验证候选 UID 隔离 |
 | QRY-009 | 上述 CLI UDS fixture（含 PTY 正常/信号退出）；`query.rs::tests::root_last_preserves_result_attribution_and_named_session_rejects_ambiguity`、`named_session_is_resolved_in_one_filtered_rpc` |
 | QRY-010 | `owned_queries.rs::missing_corrupt_unready_and_malformed_stores_are_not_empty_successes`；上述 CLI UDS fixture 覆盖 daemon 不可用与无本地回退 |
 | QRY-011 | `owned_queries.rs::live_cancellation_interrupts_sql_instead_of_only_checking_ingress`、`oversized_payloads_fail_without_partial_timeline_results`；`query.rs::tests::a_later_page_failure_emits_no_partial_report`；`owned_queries.rs::candidate_fault_tolerance_preserves_scope_and_deadline_errors`；不代表全部分组/传输边界已验收 |
-| DPROC-QRY-001 | 源码 fixture：`v2/apps/asc-daemon/tests/bootstrap.rs::daemon_binds_when_optional_query_indexes_fail`（root 分支验证 admission/诊断）；安装态跨 UID、systemd/RPM 与重启验收未执行 |
+| DPROC-QRY-001 | 源码 fixture：`v2/apps/asc-daemon/tests/bootstrap.rs::daemon_binds_when_optional_query_indexes_fail`（root 分支验证 admission/诊断）；不覆盖安装态跨 UID、systemd/RPM 与重启，环境限制见 §9.2 |
 
 ### 8.1 V1 功能对齐是完成条件
 
@@ -309,7 +297,7 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
 
 所有展示与关联遵循 §1、§4.1、§5 的 UID 约束。QRY-003 使用同名 session/run/tool_call
 验证 UID 隔离；QRY-001 与 DPROC-QRY-001 还要求真实不同 UID 的 UDS/安装态验证。
-库内构造身份的测试不能替代内核身份接入验收；当前安装态验证仍未完成。
+库内构造身份的测试不能替代内核身份接入验收；本轮验证范围与环境限制见 §9.2。
 
 ## 9. 本次 obs 交付及 sec 基线
 
@@ -317,7 +305,8 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
 
 - `asc-daemon-core::query` 定义 `QueryScope`、实时取消/截止信号、错误类型、两个存储端口
   和 `ObservabilityQueryService`；obs handler 只做严格参数校验及安全错误投影。
-  sec 查询保留基线 PR #6745 的 `SecurityQueryHandler`、存储端口和授权范围，本次不重构该路径。
+  `QueryHandler` 统一装配 sec 与 obs 查询，由 dispatcher 通过 `with_queries` 一次注入。
+  sec 保留原有存储端口和授权范围；两类查询独立绑定，单侧不可用不影响另一侧。
 - obs reader 使用独立只读连接，每个操作在事务中统计和分页；不调用容错返回空结果的旧 reader。
   SQL progress handler 和关联循环检查同一个实时取消信号。各 RPC 沿用 5 秒 dispatch 预算；
   SQL busy wait 上限 200 ms。单行与候选集约 4 MiB，最终响应预留信封预算；
@@ -329,7 +318,7 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
 - `obs.sessions.list` 增加 `security_by_category_result`：同 UID/session/时间窗口下六类
   report 安全事件的 category × result 计数。`security_event_count` 则包含全部类别。
   report 只需三个 obs RPC 即可完成完整统计，不依赖 sec RPC；timeline 的关联项
-  不能替代这项聚合。未知 UID 的聚合为空，并展示无法归属安全事件的提示。
+  不能替代这项聚合。未知 UID 的安全计数为 0、分类聚合为空，不进行安全关联。
 - TUI 使用分页交互而非一次加载全部数据；支持方向键/j/k、Enter 下钻、b 返回、n/p 翻页、
   r 刷新、q/Esc 逐级返回和 Ctrl-C 全局退出。恢复 V1 表格字段与集成安全详情，
   支持鼠标、窗口缩放、本地时间和 Unicode 换行；非交互终端退出码为 2，退出恢复 terminal 属性。
@@ -339,27 +328,26 @@ Review 验证必须检查列表内容、选中 observation 的关联详情和按
   SIGKILL 无法捕获，不属于终端清理保证。
   report 与 V1 一致，仅支持 --session-id、--last、--format text/json；逐页聚合，
   全部成功后才输出；不同工具名称超过 10,000 个时要求缩小时间范围，不输出部分统计。
-- 系统 obs writer 使用首版 schema revision 1，直接包含必填 `uid` 和归属索引，
-  不实现旧 schema 的升级、NULL owner 或历史数据导入。
-  测试覆盖首次建库、重复初始化、必填与有效范围约束、重开后的 UID 保留。
+- 系统 obs writer 使用 schema revision 2，以可空 `uid` 和归属索引支持 revision 1 升级；
+  历史无归属记录保留 `NULL`，已有 UID 保持不变，不自动发现或导入 V1 per-user 数据。
+  测试覆盖首次建库、重复初始化、旧库升级、NULL 隔离、有效范围约束、
+  重开后的 UID 保留和升级失败的回滚/重试。
   security row schema 保持 revision 3，daemon writer 额外创建 UID/time、UID/session/run/time
   和 UID/session/run/tool/category 复合索引，query reader 不创建索引。
-  必要 schema 初始化失败仍阻止 daemon 启动；可选 security 查询索引准备失败仅记录诊断，
+  必要 security schema 初始化失败仍阻止 daemon 启动；可选 security 查询索引准备失败仅记录诊断，
   不阻止 admission。建索引仍同步发生在 READY 前，大库耗时尚未测量，不宣称已有启动时限保证。
   复用 `ObservabilitySqliteWriter` 与 JSONL `ObservabilityWriter`，写入接口均强制提供 `uid: u32`；
   daemon sink 使用 `record(record, uid)`，不保留独立 owned writer 或无 UID 写入接口。
   写入时 schema 检查和 INSERT 使用同一次连接获取，仍拒绝不支持的 revision。
-- 启动时准备 obs schema，失败则 obs query 返回 unavailable；JSONL 保持惰性创建。
+- 启动时初始化或升级 obs schema，失败则 obs query 返回 unavailable；JSONL 保持惰性创建。
   UID 写入失败绝不产生一条可查询的无 UID 新记录；JSONL 先写成功后 SQLite 失败仍可能
   留下一条 JSONL，沿用采集错误契约且不自动重试。
 
-### 9.2 验证方式与未完成边界
+### 9.2 验证方式与已测范围
 
 逐项 fixture 入口见 §8。`v1-correlation.json` 保留 28 个 V1 单条/批量关联用例，
 公共 record/event 默认字段与各场景覆盖字段共同构成输入；Rust 测试额外注入另一 UID 的候选。
-`freeze_correlation.py` 读取这些输入，执行 V1 后更新冻结的 expected；不复制场景定义。
-`freeze_presentation.py` 从 `v1-reports.json` 读取报告输入，直接调用 V1 更新 report 与完整 schema 快照。
-生成器仅用于维护 oracle，不是 V2 测试或运行时依赖；重新生成后应检查 fixture 差异。
+这些 JSON 样例保存 V1 的预期结果，由 Rust 测试直接读取，不依赖 Python 或手动生成步骤。
 
 CLI/UDS/PTY fixture 验证 205 条记录的分页、报告与详情、鼠标/键盘、窗口缩放、
 非 UTC 时区、空状态、错误退出与信号后的终端恢复。视觉样式不要求与 Textual 像素一致。
@@ -372,22 +360,35 @@ cargo clippy -p asc-daemon-core -p asc-daemon-handler -p asc-daemon-protocol -p 
 cargo fmt --all -- --check
 ```
 
-真实不同 UID/root 系统进程、RPM/systemd 安装态、升级/回滚及 root 启动分支尚未验收。
+2026-10-10 在提交 `34433a3d9` 前执行的本地 Rust workspace 检查为 1461 passed、0 failed、3 ignored；
+fmt、Clippy 通过，rustdoc 构建成功，存在一条无关文件的既有私有链接警告。
+
+同日 AgentSight 联调以启动时基线 `2903e03bc3c70427b3e915f8df7e0a6ba8c2d523` 的
+运行中二进制为对象，62 项接口检查、24 项浏览器检查通过，覆盖 root AgentSight → UDS →
+V2 daemon 的 sec/obs 查询与页面展示。数据为真实数据库快照（22 条安全事件、8 条 obs，
+均属 UID 1000）；该快照属于此前验证记录，不作为当前 schema 升级的验证输入，未改原始数据库。
+该结果不覆盖后续源码变动、真实多 UID 隔离、同名 session 碰撞、生产认证或原库版本迁移。
+详细结果见 [AgentSight 与 AgentSecCore V2 联调测试报告](https://alidocs.dingtalk.com/i/nodes/QOG9lyrgJPPNL2rXIl4d9d7OJzN67Mw4)。
+
+本轮安装态环境检查：宿主机运行 systemd 255，但当前账号执行 `sudo -n true` 返回需要密码，
+`rpm -q agent-sec-core` 返回未安装；现有 root 调试容器的 PID 1 为 python3。
+因此本轮未执行安装态跨 UID、RPM/systemd、升级/回滚与服务重启验证；
+已有源码测试和容器联调结果不等同于上述部署路径通过。
 sec PR #6745 已作为本分支基线提供四个 sec RPC 和 events CLI；
 仍需结合 obs 与 sec 的功能、部署验证联合评估 #6608，本次 rebase 不声明完整关闭该 issue。
 
-### UID 仅来自 UDS 的变更记录
+### 查询身份与会话展示
 
-[SUPERSEDED] 此前设计允许 `uid/owner_uid` 筛选及 `--uid/--owner-uid` 选项。
-按本次需求方决定移除此接口：UDS 内核身份是唯一授权来源，root 全量权限保留；
-只对 root 的重名 session 返回可下钻的 `UID_SessionId`。这是本分支尚未发布接口的有意收窄，
-observability CLI 与 daemon 同步更新，不保留旧筛选别名。sec 同步移除 `owner_uid` 过滤，授权范围只从 UDS 提取，见 daemon 协议第 6 节。
+查询授权范围由 UDS peer UID 决定。sec 使用原始 session ID 查询，root 的同名返回标签
+仅用于展示归属；obs 的组合 ID 下钻保持不变。详见 daemon 协议第 6 节。
 
-SQLite 列和响应中的数据归属字段仍为必填 `uid`。系统 obs schema 首版为 revision 1，
-不提供无 UID writer 或 schema 升级路径；JSONL 记录携带可信顶层 UID。
+SQLite 和 JSONL writer 必须传入可信 `uid: u32`；系统 obs schema revision 2 的 `uid` 列
+允许历史 `NULL`，对应查询响应为 `uid: null`，只有 root 可见。revision 1 由写入侧事务升级，
+不将未知归属补为 UID 0；JSONL 新记录携带可信顶层 UID。
+升级不提供逆向迁移；回退不支持 revision 2 的二进制前须恢复升级前的配套数据库备份。
 Review 继续省略页面标题、查询归属和操作提示；查询通过 session_id 下钻。
 
 新增/调整的可执行证据：`owned_queries.rs::root_qualified_sessions_preserve_owner_isolation`、
 `unique_sessions_keep_their_ids_and_ambiguous_qualified_names_fail` 验证组合名称与实际 SQL 归属；
 `asc-daemon-protocol/src/query.rs::tests::ownership_parameters_are_rejected_even_for_root`
-及 CLI UDS/PTY fixture 验证 UID 参数/选项拒绝、无 UID 下钻；report JSON 直接与 V1 完整比较，不能先删除额外字段再比。源码测试不替代安装态跨 UID 验收。
+及 CLI UDS/PTY fixture 验证服务端范围隔离与下钻；report JSON 直接与 V1 完整比较，不能先删除额外字段再比。源码测试不替代安装态跨 UID 验收。
