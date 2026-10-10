@@ -15,6 +15,37 @@ use crate::rules::Recommendation;
 const ROLLBACK_PATH: &str = "/var/lib/ktuner/rollback.json";
 const SYSCTL_PERSIST_PATH: &str = "/etc/sysctl.d/99-ktuner.conf";
 
+/// Write one advisory line of engine output, dropping a failed write.
+///
+/// Everything the engine prints is advisory: the verdict is the value the
+/// command returns, and the CLI prints its own body from that. stdout can
+/// refuse the write, though — a consumer that stopped reading (`ktuner
+/// rollback | head -1`), or a stream redirected to a full device — and Rust's
+/// `println!` panics on the write error. The engine prints inside its
+/// transactions: between the live write and the ledger save in `apply_locked`,
+/// between the restores in `restore_entries_with`. A panic there abandons a
+/// half-done run — applied knobs stay live with no rollback record of the
+/// originals, a restore stops between entries — and replaces the command's
+/// documented exit status with the panic code. A consumer that left is a
+/// pipeline condition, not a reason to drop the work already started, so the
+/// error is swallowed here.
+fn emit(args: std::fmt::Arguments<'_>) {
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_fmt(args);
+    let _ = stdout.write_all(b"\n");
+}
+
+/// [`emit`] with `println!`-style formatting; the trailing newline keeps every
+/// engine line byte-identical to what `println!` produced.
+macro_rules! progress {
+    () => {
+        $crate::tuner::emit(format_args!(""))
+    };
+    ($($arg:tt)*) => {
+        $crate::tuner::emit(format_args!($($arg)*))
+    };
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 struct RollbackEntry {
     previous: String,
@@ -97,7 +128,7 @@ fn apply_locked(
         match apply_recordable(rec) {
             Ok((previous, outcome)) => {
                 if !quiet {
-                    println!(
+                    progress!(
                         "    {} [{}/{}] {} → {}",
                         "✓".green(),
                         i + 1,
@@ -109,7 +140,7 @@ fn apply_locked(
                         // The write landed but the kernel adjusted it; the
                         // effective value is what gets recorded, so the
                         // operator sees the delta here (#4160).
-                        println!(
+                        progress!(
                             "      {} 内核实际生效 {}（期望 {}，已被内核调整并按实际值记录）",
                             "⚠".yellow(),
                             outcome.effective,
@@ -150,7 +181,7 @@ fn apply_locked(
                     error: e.to_string(),
                 });
                 if !quiet {
-                    println!(
+                    progress!(
                         "    {} [{}/{}] {} : {}",
                         "✗".red(),
                         i + 1,
@@ -167,22 +198,22 @@ fn apply_locked(
         save_rollback(guard, &applied_recs)?;
         let boot_unit_enabled = persist_from_rollback(guard)?;
         if !quiet {
-            println!();
+            progress!();
             // Count writes, not ledger records: a *_bytes knob also records
             // the ratio sibling the kernel clears for it, and the batch's
             // progress and exit-code semantics stay per-write.
             if boot_unit_enabled {
-                println!("  {} 项配置已应用并持久化（重启后自动生效）", applied);
+                progress!("  {} 项配置已应用并持久化（重启后自动生效）", applied);
             } else {
-                println!(
+                progress!(
                     "  {} 项配置已应用，但 ktuner-nonsysctl.service 未能启用（systemctl enable 失败），块设备与 THP 等非 sysctl 配置重启后不会自动生效",
                     applied
                 );
             }
         }
     } else if applied == 0 && !quiet {
-        println!();
-        println!("  没有配置被成功应用");
+        progress!();
+        progress!("  没有配置被成功应用");
     }
     Ok(ApplyOutcome {
         applied,
@@ -1848,7 +1879,7 @@ fn restore_entries_with(
         // and restore runs as root.
         if is_forbidden_param(param) || is_forbidden_resolved_path(&entry.path) {
             if !quiet {
-                println!("  {} {} : 拒绝恢复（代码执行参数）", "✗".red(), param);
+                progress!("  {} {} : 拒绝恢复（代码执行参数）", "✗".red(), param);
             }
             failed += 1;
             continue;
@@ -1866,7 +1897,7 @@ fn restore_entries_with(
                     match readback_verdict(&entry.path, &entry.previous) {
                         ReadbackVerdict::Verified { .. } => {
                             if !quiet {
-                                println!(
+                                progress!(
                                     "  {} {} → {} (已恢复)",
                                     "✓".green(),
                                     param,
@@ -1877,7 +1908,7 @@ fn restore_entries_with(
                         }
                         ReadbackVerdict::Clamped { effective } => {
                             if !quiet {
-                                println!(
+                                progress!(
                                     "  {} {} : 回读为 {}（期望 {}），未恢复",
                                     "✗".red(),
                                     param,
@@ -1891,14 +1922,14 @@ fn restore_entries_with(
                 }
                 Err(e) => {
                     if !quiet {
-                        println!("  {} {} : {}", "✗".red(), param, e);
+                        progress!("  {} {} : {}", "✗".red(), param, e);
                     }
                     failed += 1;
                 }
             }
         } else {
             if !quiet {
-                println!("  {} {} : 路径不存在，跳过", "⊘".yellow(), param);
+                progress!("  {} {} : 路径不存在，跳过", "⊘".yellow(), param);
             }
             skipped += 1;
         }
@@ -1923,7 +1954,7 @@ fn restore_entries_with(
             readback_verdict(&entry.path, &entry.previous)
         {
             if !quiet {
-                println!(
+                progress!(
                     "  {} {} : 最终回读为 {effective}（期望 {}），已被后续写入覆盖，未恢复",
                     "✗".red(),
                     param,
@@ -1949,7 +1980,7 @@ fn remove_persisted(path: &str, quiet: bool) -> bool {
     match fs::remove_file(path) {
         Ok(()) => {
             if !quiet {
-                println!("  已清理 {path}");
+                progress!("  已清理 {path}");
             }
             true
         }
@@ -1961,7 +1992,7 @@ fn remove_persisted(path: &str, quiet: bool) -> bool {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
         Err(err) => {
             if !quiet {
-                println!("  {} {path} : {err}（未清理）", "✗".red());
+                progress!("  {} {path} : {err}（未清理）", "✗".red());
             }
             false
         }
@@ -2013,7 +2044,7 @@ fn finalize_rollback_at(
             // ledger already gone — is the state this call exists to reach.
             Err(error) if Path::new(ledger).exists() => {
                 if !quiet {
-                    println!("  {} {ledger} : {error}（未清理）", "✗".red());
+                    progress!("  {} {ledger} : {error}（未清理）", "✗".red());
                 }
                 failed += 1;
             }
@@ -2058,14 +2089,14 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
 
     if !quiet {
         if cleanup_failed > 0 {
-            println!(
+            progress!(
                 "  {} {} 项清理未能完成，已保留 {} 以便重试（未能删除的持久化配置会在下次启动时重新生效）",
                 "⚠".yellow(),
                 cleanup_failed,
                 ROLLBACK_PATH
             );
         } else if failed > 0 || skipped > 0 {
-            println!(
+            progress!(
                 "  {} {} 项恢复失败、{} 项路径缺失，已保留 {} 以便重试（未删除持久化配置）",
                 "⚠".yellow(),
                 failed,
@@ -2073,8 +2104,8 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
                 ROLLBACK_PATH
             );
         }
-        println!();
-        println!("  共恢复 {restored} 项配置。");
+        progress!();
+        progress!("  共恢复 {restored} 项配置。");
     }
     Ok(RollbackOutcome {
         restored,
@@ -2099,12 +2130,15 @@ pub struct VerifyResult {
 /// change that cannot be graded (`b.value <= 0.0`, non-finite `a.value`),
 /// counts as degraded: unverifiable is never silently clean.
 pub fn verify_and_report(before: &[BenchResult], after: &[BenchResult]) -> VerifyResult {
-    println!("  {}", "性能对比 (before → after)".bold());
-    println!(
+    progress!("  {}", "性能对比 (before → after)".bold());
+    progress!(
         "  {:<24} {:>16} {:>16} {:>8}",
-        "指标", "调前", "调后", "变化"
+        "指标",
+        "调前",
+        "调后",
+        "变化"
     );
-    println!("  {}", "─".repeat(66));
+    progress!("  {}", "─".repeat(66));
 
     let mut degraded = Vec::new();
 
@@ -2119,7 +2153,7 @@ pub fn verify_and_report(before: &[BenchResult], after: &[BenchResult]) -> Verif
             degraded.push(b.name.clone());
             let before_val = format!("{:>8.2} {:<10}", b.value, b.unit);
             let after_val = format!("{:>8} {:<10}", "—", "");
-            println!(
+            progress!(
                 "  {:<24} {}  {} {}",
                 b.name,
                 before_val,
@@ -2170,9 +2204,12 @@ pub fn verify_and_report(before: &[BenchResult], after: &[BenchResult]) -> Verif
 
         let before_val = format!("{:>8.2} {:<10}", b.value, b.unit);
         let after_val = format!("{:>8.2} {:<10}", a.value, a.unit);
-        println!(
+        progress!(
             "  {:<24} {}  {} {}",
-            b.name, before_val, after_val, change_display
+            b.name,
+            before_val,
+            after_val,
+            change_display
         );
     }
 
@@ -2188,13 +2225,13 @@ pub fn verify_and_report(before: &[BenchResult], after: &[BenchResult]) -> Verif
 pub fn auto_rollback_on_degradation(result: &VerifyResult) -> Result<Option<RollbackOutcome>> {
     if result.degraded.len() < ROLLBACK_MIN_DEGRADED {
         if result.degraded.len() == 1 {
-            println!();
-            println!(
+            progress!();
+            progress!(
                 "  {} {} 出现波动，可能是 benchmark 噪声，未自动回滚。",
                 "△".yellow(),
                 result.degraded[0]
             );
-            println!(
+            progress!(
                 "    建议重新运行确认，或手动回滚: {}",
                 "sudo ktuner rollback".bold()
             );
@@ -2202,17 +2239,17 @@ pub fn auto_rollback_on_degradation(result: &VerifyResult) -> Result<Option<Roll
         return Ok(None);
     }
 
-    println!();
-    println!(
+    progress!();
+    progress!(
         "  {} 检测到 {} 项指标恶化超过 {}%，执行自动回滚...",
         "⚠".yellow(),
         result.degraded.len(),
         DEGRADATION_THRESHOLD as u32
     );
     for name in &result.degraded {
-        println!("    - {}", name.red());
+        progress!("    - {}", name.red());
     }
-    println!();
+    progress!();
 
     let outcome = rollback()?;
     Ok(Some(outcome))
@@ -7350,5 +7387,158 @@ mod tests {
         ];
         let result = verify_and_report(&before, &after);
         assert_eq!(result.degraded, vec!["io_latency".to_string()]);
+    }
+
+    /// A stdout that fails every write: `/dev/full` answers ENOSPC, the same
+    /// way a pipe whose consumer left answers EPIPE.
+    fn full_stdout() -> Option<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .ok()
+    }
+
+    /// Point fd 1 at a stdout that fails every write until the guard drops,
+    /// including while a panic unwinds. The saved descriptor is restored, so
+    /// the harness still gets its own output afterwards.
+    struct BrokenStdout {
+        saved: i32,
+        _full: std::fs::File,
+    }
+
+    impl BrokenStdout {
+        fn take(full: std::fs::File) -> Self {
+            let _ = std::io::stdout().flush();
+            let saved = unsafe { libc::dup(libc::STDOUT_FILENO) };
+            assert!(saved >= 0, "dup(1) failed");
+            let rc = unsafe { libc::dup2(full.as_raw_fd(), libc::STDOUT_FILENO) };
+            assert!(rc >= 0, "dup2 onto fd 1 failed");
+            Self { saved, _full: full }
+        }
+    }
+
+    impl Drop for BrokenStdout {
+        fn drop(&mut self) {
+            unsafe {
+                libc::dup2(self.saved, libc::STDOUT_FILENO);
+                libc::close(self.saved);
+            }
+        }
+    }
+
+    /// The child half of [`a_failed_stdout_write_cannot_abort_a_transaction`],
+    /// run with `--nocapture` so the harness does not buffer the output these
+    /// calls produce: buffered bytes cannot fail a write, and the failure is
+    /// the whole subject. The restore and the report run under the replaced
+    /// fd 1, so their progress lines hit a stdout that refuses every byte.
+    fn broken_stdout_body() {
+        let full = full_stdout().expect("the parent checked /dev/full exists");
+        let broken = BrokenStdout::take(full);
+        // Precondition, not the assertion: a refused write is what makes the
+        // calls below exercise the failure at all.
+        assert!(
+            std::io::stdout()
+                .write_fmt(format_args!("probe\n"))
+                .is_err(),
+            "the redirected stdout must refuse a write"
+        );
+
+        // The restore loop prints each entry as it lands. A panic on the
+        // first line used to abandon the rest: the entry already restored
+        // stayed restored, the others kept their tuned values, and the
+        // caller's counts never came back.
+        let dir = AtomicTestDir::new("stdout-failure");
+        let swappiness = dir.0.join("swappiness");
+        let somaxconn = dir.0.join("somaxconn");
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&somaxconn, "4096").unwrap();
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::from([
+                (
+                    "net.core.somaxconn".to_string(),
+                    RollbackEntry {
+                        previous: "128".into(),
+                        applied: "4096".into(),
+                        path: somaxconn.to_str().unwrap().to_string(),
+                    },
+                ),
+                (
+                    "vm.swappiness".to_string(),
+                    RollbackEntry {
+                        previous: "60".into(),
+                        applied: "10".into(),
+                        path: swappiness.to_str().unwrap().to_string(),
+                    },
+                ),
+            ]),
+        };
+        let outcome = restore_entries(&data, false);
+        assert_eq!(
+            (outcome.restored, outcome.failed, outcome.skipped),
+            (2, 0, 0),
+            "every recorded entry must be restored despite the failed writes"
+        );
+        assert_eq!(fs::read_to_string(&somaxconn).unwrap(), "128");
+        assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
+
+        // The report surface: identical runs stay clean, which the caller can
+        // only learn if the table's writes cannot panic.
+        let before = vec![bench("seq_read", 100.0, "MB/s")];
+        let after = vec![bench("seq_read", 100.0, "MB/s")];
+        assert!(
+            verify_and_report(&before, &after).degraded.is_empty(),
+            "the comparison must still grade the metrics"
+        );
+
+        drop(broken);
+    }
+
+    /// The engine's output is advisory: its verdict is the values it returns
+    /// (and the CLI's own body), so a stdout that cannot take a write must
+    /// never abort the work it is part of. Rust's `println!` panics on a write
+    /// error, and the engine prints inside its transactions — between the live
+    /// write and the ledger save in `apply_locked`, between the restores in
+    /// `restore_entries_with` — so a consumer that stopped reading
+    /// (`ktuner rollback | head -1`) used to abandon a half-done transaction,
+    /// with the entries already restored standing and the rest never written,
+    /// and replaced the command's documented exit status with the panic code.
+    /// The same failure skips the automatic rollback, whose verdict
+    /// `verify_and_report` returns only after rendering its table.
+    ///
+    /// The work runs in a re-executed child: the harness buffers a test
+    /// thread's own output, and a buffered write cannot fail, so the child
+    /// disables that (`--nocapture`) and points fd 1 at `/dev/full`.
+    #[test]
+    fn a_failed_stdout_write_cannot_abort_a_transaction() {
+        const CHILD: &str = "KTUNER_BROKEN_STDOUT_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            broken_stdout_body();
+            return;
+        }
+        if full_stdout().is_none() {
+            eprintln!("skipping: /dev/full is not available on this host");
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tuner::tests::a_failed_stdout_write_cannot_abort_a_transaction",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "a failed stdout write must not abort the engine (child exited {:?}):\n{stdout}\n{stderr}",
+            output.status.code()
+        );
+        assert!(
+            !stderr.contains("panicked"),
+            "the engine panicked on a failed stdout write:\n{stderr}"
+        );
     }
 }
