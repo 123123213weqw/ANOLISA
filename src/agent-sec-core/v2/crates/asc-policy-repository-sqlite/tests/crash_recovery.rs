@@ -22,7 +22,6 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
-#[cfg(feature = "fault-injection")]
 #[path = "crash_recovery/fault_points.rs"]
 mod fault_points;
 
@@ -43,8 +42,11 @@ fn fixture() -> PreparedBinding {
     ))
     .unwrap()
 }
+fn crash_enabled() -> bool {
+    std::env::var("ASC_POLICY_CRASH_INJECT").as_deref() == Ok("1")
+}
 fn gate(name: &str) {
-    if std::env::var("ASC_POLICY_CRASH_STAGE").as_deref() == Ok(name) {
+    if crash_enabled() && std::env::var("ASC_POLICY_CRASH_STAGE").as_deref() == Ok(name) {
         println!("GATE:{name}");
         std::io::stdout().flush().unwrap();
         loop {
@@ -82,13 +84,7 @@ impl BindingStateRepository for FaultBoundary {
                             BindingStatus::PendingApply => gate("recovery_saved"),
                             _ => {}
                         }
-                    } else if let Some(deployments) = &patch.deployments {
-                        if deployments
-                            .iter()
-                            .any(|deployment| deployment.presence == Presence::Present)
-                        {
-                            gate("compound_observation_saved");
-                        }
+                    } else if patch.deployments.is_some() {
                         gate(
                             if expected.binding.status.phase == BindingStatus::Deleting {
                                 "delete_unknown_saved"
@@ -229,11 +225,15 @@ fn converge(repo: &Arc<SqlitePolicyRepository>, remote: &str) {
             return;
         }
         for candidate in pending {
-            core.reconcile(
-                &candidate.id,
-                schedules.entry(candidate.id.clone()).or_default(),
-            )
-            .unwrap();
+            let disposition = core
+                .reconcile(
+                    &candidate.id,
+                    schedules.entry(candidate.id.clone()).or_default(),
+                )
+                .unwrap();
+            if disposition == asc_pcp::Disposition::Superseded {
+                gate("compound_result_superseded");
+            }
         }
     }
     panic!("recovery did not converge");
@@ -251,7 +251,6 @@ fn crash_child() {
     let input = fixture();
     let scope_id = &input.scope.scope_id;
     let remote = std::env::var("ASC_POLICY_CRASH_REMOTE").unwrap();
-    #[cfg(feature = "fault-injection")]
     if fault_points::run_child(&repo, &remote) {
         return;
     }
@@ -293,12 +292,23 @@ impl Drop for ChildGuard {
     }
 }
 fn child(root: &Path, remote: &str, stage: &str, initialize: bool, delete: bool) {
+    child_with_crash(root, remote, stage, initialize, delete, stage != "none");
+}
+fn child_with_crash(
+    root: &Path,
+    remote: &str,
+    stage: &str,
+    initialize: bool,
+    delete: bool,
+    crash: bool,
+) {
     let mut child = ChildGuard(
         Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "crash_child", "--nocapture"])
             .env("ASC_POLICY_CRASH_DIR", root)
             .env("ASC_POLICY_CRASH_REMOTE", remote)
             .env("ASC_POLICY_CRASH_STAGE", stage)
+            .env("ASC_POLICY_CRASH_INJECT", if crash { "1" } else { "0" })
             .env("ASC_POLICY_CRASH_INIT", if initialize { "1" } else { "0" })
             .env("ASC_POLICY_CRASH_DELETE", if delete { "1" } else { "0" })
             .env_remove("FAILPOINTS")
@@ -317,7 +327,14 @@ fn child(root: &Path, remote: &str, stage: &str, initialize: bool, delete: bool)
             }
         }
     });
-    if stage == "none" {
+    if crash {
+        let reached = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("child never reached the requested crash window");
+        assert!(reached.contains(&format!("GATE:{stage}")));
+        child.0.kill().unwrap();
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+    } else {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if let Some(status) = child.0.try_wait().unwrap() {
@@ -327,13 +344,6 @@ fn child(root: &Path, remote: &str, stage: &str, initialize: bool, delete: bool)
             assert!(Instant::now() < deadline, "child recovery timed out");
             std::thread::sleep(Duration::from_millis(5));
         }
-    } else {
-        let reached = rx
-            .recv_timeout(Duration::from_secs(10))
-            .expect("child never reached the requested crash window");
-        assert!(reached.contains(&format!("GATE:{stage}")));
-        child.0.kill().unwrap();
-        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
     }
     reader.join().unwrap();
 }
@@ -503,7 +513,7 @@ fn sigkill_during_apply_and_scope_deletion_preserves_cleanup_intent() {
     for stage in [
         "compound_delete_intent",
         "compound_pending_delete",
-        "compound_observation_saved",
+        "compound_result_superseded",
     ] {
         let root = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -530,15 +540,7 @@ fn sigkill_during_apply_and_scope_deletion_preserves_cleanup_intent() {
             "an old Apply overwrote deletion at {stage}"
         );
         assert_eq!(saved.deployments.len(), 1, "{stage}");
-        assert_eq!(
-            saved.deployments[0].presence,
-            if stage == "compound_observation_saved" {
-                Presence::Present
-            } else {
-                Presence::Unknown
-            },
-            "{stage}"
-        );
+        assert_eq!(saved.deployments[0].presence, Presence::Unknown, "{stage}");
         assert_eq!(mock.present(), BTreeSet::from([id.to_string()]), "{stage}");
         drop(before);
         child(root.path(), &mock.address, "none", false, false);

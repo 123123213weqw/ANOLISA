@@ -16,7 +16,7 @@ product builds exclude the fail-rs dependency and instrumentation.
 | Recover accepted assignments without another user request | An in-memory notification or discovery worker disappears on crash; committed Scope state must remain authoritative. | Discovery recovery and `scope_saved`/`binding_saved` windows |
 | Preserve assignment identity and policy snapshots | Updating the current PolicyTemplate must not change an existing Scope's selected revision. | Black-box two-crash Scope scenario; repository reopen contracts |
 | Record cleanup responsibility before remote I/O | A remote Apply may succeed while its response or the local result is lost. `UNKNOWN` means cleanup may still be necessary. | `unknown_saved`, `applied_before_result`, and Apply/delete compound windows |
-| Preserve irreversible deletion despite an older Apply result | An old observation may be recorded, but must not replace `PendingDelete` with `Ready`. | Three compound windows; CAS contracts |
+| Preserve irreversible deletion despite an older Apply result | A stale result changes neither status nor deployments; previously registered UNKNOWN responsibility remains. | Three compound windows; CAS contracts |
 | Retain Scope until discovery stops and its last Binding is removed | Early parent deletion can lose cleanup responsibility; an Active Scope with no matches must remain available for discovery. | Partial cleanup across two crashes; repository lifecycle contracts |
 | Resume safely after another crash during recovery | Restart itself is not an atomic operation. | Two-crash black-box scenarios and `recovery_saved` |
 | Preserve SQLite's cross-process WAL locks | An external SQLite reader must not corrupt SHM coordination or cause SIGBUS. | WAL lock contract and black-box `saved()` queries using independent read-only connections |
@@ -128,12 +128,12 @@ deletion**, rather than testing creation and deletion only in isolation:
 | --- | --- | --- |
 | `compound_delete_intent` | Remote Apply committed; Scope `Deleting`; Binding still `Applying`; Deployment `UNKNOWN`. | Finish discovery stop and clean the target. |
 | `compound_pending_delete` | Remote Apply committed; Scope `Deleting`; Binding `PendingDelete`; Deployment `UNKNOWN`. | Continue deletion without another Apply. |
-| `compound_observation_saved` | Old Apply's `Present` observation committed while Binding remains `PendingDelete`. | Preserve deletion intent and clean the confirmed target. |
+| `compound_result_superseded` | Old Apply result rejected entirely; Binding remains `PendingDelete` and Deployment remains `UNKNOWN`. | Clean the registered target without another Apply. |
 
 Each compound case additionally asserts the remote operation sequence is exactly
-`apply, delete`. The file has two parent tests covering **12 + 3 windows**, plus
-the `crash_child` helper collected by Rust's test harness; “3 tests passed” does
-not mean only three crash windows were exercised.
+`apply, delete`. These wrapper scenarios use two parent tests covering
+**12 + 3 windows**. Rust also collects the `crash_child` helper and the SQL cases
+below, so the test count does not equal the number of crash windows.
 
 The unit test
 [`sigkill_before_discovery_commit_rolls_back_pin_and_all_bindings`](../../../v2/crates/asc-policy-repository-sqlite/src/tests.rs)
@@ -145,9 +145,16 @@ then admits the same instances after reopening. Its gate is compiled only under
 ### Optional white-box transaction matrix
 
 [`fault_points.rs`](../../../v2/crates/asc-policy-repository-sqlite/tests/crash_recovery/fault_points.rs)
-adds seven parent tests for eleven windows when `fault-injection` is enabled.
-It reuses the existing child process, SIGKILL, real repository/reconciler, and
-remote ledger. Only the child configures fail-rs callbacks: a callback confirms
+provides six paired scenarios covering ten transaction windows. Each scenario
+has a separately named `baseline_*` test that runs the same preparation and
+repository operation without configuring a failpoint or killing its child.
+Baselines run with default features and also with `fault-injection` enabled;
+the six crash variants require that feature. Both modes check their expected
+transaction state and share replay, convergence and cleanup assertions.
+
+The crash variants reuse the existing child process, SIGKILL, real
+repository/reconciler, and remote ledger. Only the child configures fail-rs
+callbacks: a callback confirms
 its boundary and parks while the parent kills the process. Panic, injected
 errors, and normal transaction rollback do not substitute for process death.
 
@@ -165,7 +172,6 @@ an individual synchronization transaction must commit together.
 | `sql_cas_state_saved` | Binding state saved before write receipt SQL. | State, version, Deployment, and receipt all roll back. Replaying the original write applies once. |
 | `sql_cas_after_transaction` | CAS committed before returning its result. | State and matching digest/receipt survive. Replaying the same write returns `AlreadyApplied` without another version increment. |
 | `sql_unknown_state_saved` | UNKNOWN written before its transaction commits; Apply claim already committed. | Applying survives without Deployment or remote Apply. Recovery completes one Apply; a second restart does not repeat it. |
-| `compound_sql_observation_saved` | Remote Apply, Scope deletion, and PendingDelete committed; old Present observation saved before commit. | PendingDelete and UNKNOWN survive. Recovery sends only Delete and removes local/remote state. |
 | `sql_binding_deleted` | Last Binding deleted before Scope finalization SQL. | Binding and Deleting Scope both survive rollback, including UNKNOWN cleanup responsibility. Recovery may repeat Delete. |
 | `sql_scope_finalized` | Last Binding and Scope deleted before transaction commit. | Both survive rollback with their cleanup responsibility; recovery removes both and the remote target. |
 
@@ -191,11 +197,35 @@ serialization preserves the internal Apply/delete interleaving. A failed
 scenario drops its resources before releasing the guard; subsequent scenarios
 recover the poisoned mutex and still run. No retry or lease relaxation is used.
 
-The complete feature-enabled suite passes all ten collected tests, including
-the seven new parent tests covering all eleven white-box windows. The remaining
-three tests are the two existing parent tests and the child helper. The complete
-suite also passes with child exec delayed by 100 ms and `--test-threads=8`,
-without excluding any case.
+The complete feature-enabled suite collects fifteen tests: six baselines, six
+crash variants covering ten white-box windows, the two existing parents and the
+child helper. Baseline failures point to normal-operation, fixture or environment
+problems. A passing baseline with a failing crash variant narrows investigation
+to interruption, recovery or injection; it does not by itself prove a product bug.
+Stale observation writes are now unreachable. Their transaction hook was removed;
+`compound_result_superseded` checks rejection retains UNKNOWN
+responsibility and deletion intent instead.
+
+## Storage failure and runtime composition regression
+
+[`storage_faults.rs`](../../../v2/apps/asc-daemon/tests/reconciliation/storage_faults.rs)
+uses real SQLite, PCP, Adapter and a multi-worker runtime. Its repository wrapper
+models pre-write I/O failure or post-commit `OutcomeUnknown`. This is a component
+fault test, not SIGKILL or a physical disk fault. Restart cases close the runtime,
+release the repository and reopen the same database.
+
+Four write boundaries (claim, UNKNOWN registration, Apply result, final removal),
+two commit outcomes and live/reopen recovery give sixteen cases. A blocked Binding
+fails six storage attempts while another must reach Ready. Scope deletion sends
+no enqueue notification. Recovery must remove its Binding and Scope, retain the
+original write ID through retries, avoid another Apply, and repeat DELETE only
+when restart loses an uncommitted deletion result.
+
+Four further cases use the default four automatic retries with shortened timers.
+Four retryable remote Apply failures precede result-storage failure and Scope
+deletion. Cases cover live recovery, reopen, normal notification, and a new Delete
+that must retry its first failure. Rejected old results leave UNKNOWN untouched;
+the new Delete must receive its own retry budget.
 
 ## Related contracts and known gap
 
@@ -254,7 +284,14 @@ checks from the same component directory:
 (cd v2 && cargo test --locked -p asc-policy-repository-sqlite)
 ```
 
-Run the white-box tests explicitly from the component directory. Keep their
+To isolate a baseline failure, run the same SQL scenarios without injection
+using default features:
+
+```bash
+(cd v2 && cargo test --locked -p asc-policy-repository-sqlite --test crash_recovery baseline_ -- --nocapture)
+```
+
+Run the paired baseline and crash tests together with instrumentation. Keep their
 build artifacts separate from normal daemon/package artifacts; do not enable
 `fault-injection` or use `--all-features` in release builds:
 
@@ -262,8 +299,10 @@ build artifacts separate from normal daemon/package artifacts; do not enable
 (cd v2 && cargo test --locked -p asc-policy-repository-sqlite --features fault-injection --test crash_recovery --target-dir target/fault-injection -- --nocapture)
 ```
 
-The Source Build workflow runs this command in a separate
-`Run V2 policy crash consistency tests` step on Ubuntu 22.04 and Alinux4. The
+The existing Source Build workflow runs both baseline and crash variants with
+this command in its `Run V2 policy crash consistency tests` step on Ubuntu 22.04
+and Alinux4. Rust reports each variant separately and still runs the other tests
+after an assertion failure. Either variant failing fails the suite. The
 Python V2 E2E command does not collect these Rust tests, and raw/RPM release
 builds leave fault injection disabled.
 
