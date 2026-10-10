@@ -54,6 +54,10 @@ enum Commands {
         /// with parameters, only the entries restoring them would touch
         #[arg(long)]
         list: bool,
+        /// With --list, list only the entries whose recorded value no longer
+        /// matches the kernel
+        #[arg(long)]
+        drifted: bool,
     },
 }
 
@@ -99,7 +103,11 @@ fn main() {
         } => cmd_tune(dry_run, conservative, cat, exclude, only),
         Commands::Fix { param, dry_run } => cmd_fix(&param, dry_run),
         Commands::Why { param } => cmd_why(&param),
-        Commands::Rollback { params, list } => cmd_rollback(&params, list),
+        Commands::Rollback {
+            params,
+            list,
+            drifted,
+        } => cmd_rollback(&params, list, drifted),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -901,6 +909,17 @@ fn why_with(
     }
 }
 
+/// The entries `rollback --list --drifted` keeps: the ones whose live value
+/// is known to differ from the recorded one. `drifted` is `Option<bool>` so an
+/// unreadable path publishes `null` instead of a guess, and that unknown state
+/// is not evidence of drift — the plain `--list` still shows those entries.
+fn drifted_entries(entries: Vec<tuner::RollbackPreview>) -> Vec<tuner::RollbackPreview> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.drifted == Some(true))
+        .collect()
+}
+
 /// JSON shape of `ktuner rollback --list`. Pure so the agent-facing contract
 /// (key names, count, entry fields, ordering) is unit-testable without a
 /// ledger on disk. Entries arrive as `rollback_preview` returns them, sorted
@@ -989,7 +1008,14 @@ fn normalize_params(params: &[String]) -> Vec<String> {
     params.iter().map(|param| normalize_param(param)).collect()
 }
 
-fn cmd_rollback(params: &[String], list: bool) -> Result<i32> {
+fn cmd_rollback(params: &[String], list: bool, drifted: bool) -> Result<i32> {
+    // `--drifted` filters the `--list` preview, so it means nothing without
+    // it: refusing is a usage error (the README's stderr JSON, exit 2), checked
+    // here so it fails as an argument error before the root gate rather than
+    // as a root complaint.
+    if drifted && !list {
+        anyhow::bail!("rollback --drifted requires --list");
+    }
     let is_root = unsafe { libc::geteuid() } == 0;
     if !is_root {
         anyhow::bail!("rollback requires root (sudo ktuner rollback)");
@@ -1002,10 +1028,16 @@ fn cmd_rollback(params: &[String], list: bool) -> Result<i32> {
         // narrow the preview to the entries `rollback <param>...` would
         // restore, named the way fix/why/rollback normalize them; a name the
         // ledger does not record is the same command error the restore gives.
+        // `--drifted` then filters what remains.
         let entries = if params.is_empty() {
             tuner::rollback_preview()?
         } else {
             tuner::rollback_preview_params(&normalize_params(params))?
+        };
+        let entries = if drifted {
+            drifted_entries(entries)
+        } else {
+            entries
         };
         let output = rollback_list_output(&entries);
         print_json(&output)?;
@@ -1225,6 +1257,44 @@ mod tests {
             rollback_list_output(&[]),
             json!({ "count": 0, "pending": [] })
         );
+    }
+
+    #[test]
+    fn drifted_entries_keep_only_known_drift() {
+        // `drifted` is `Option<bool>`: only a live value that is known to
+        // differ is drift. A matching value is not, and neither is an
+        // unreadable path (`None`) — an unreadable value is not evidence of
+        // drift and the plain `--list` still shows those entries.
+        let entries = vec![
+            preview_entry("vm.dirty_ratio", "0", "20", Some("20"), Some(true)),
+            preview_entry("vm.swappiness", "1", "60", Some("1"), Some(false)),
+            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
+        ];
+        let kept = drifted_entries(entries);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].param, "vm.dirty_ratio");
+        // The listing shape is the plain one; only the count moves.
+        assert_eq!(
+            rollback_list_output(&kept),
+            json!({ "count": 1, "pending": [
+                {"applied": "0", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"}
+            ]})
+        );
+        assert_eq!(
+            rollback_list_output(&drifted_entries(Vec::new())),
+            json!({ "count": 0, "pending": [] })
+        );
+    }
+
+    #[test]
+    fn drifted_without_list_is_refused_before_the_root_gate() {
+        // The filter means nothing without the preview, so the pair is a
+        // usage error, not a root complaint: an unprivileged host must see
+        // the argument message, and the call returns before any ledger read.
+        // (With --list the pair is accepted past this check and falls through
+        // to the root gate, which this test cannot assert without root.)
+        let err = cmd_rollback(&[], false, true).expect_err("--drifted alone must be refused");
+        assert_eq!(format!("{err:#}"), "rollback --drifted requires --list");
     }
 
     #[test]
