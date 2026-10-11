@@ -1687,8 +1687,14 @@ fn rollback_params_at(
         // caller exits 1 — the surviving file would re-apply the tuned values
         // at the next boot, and the kept ledger preserves the originals for a
         // retry.
-        let cleanup_failed =
-            finalize_rollback_at(ledger, sysctl_path, service_path, script_path, true);
+        let cleanup_failed = finalize_rollback_at(
+            ledger,
+            sysctl_path,
+            service_path,
+            script_path,
+            true,
+            "systemctl",
+        );
         outcome.failed += cleanup_failed;
         return Ok((keys, outcome));
     }
@@ -2042,23 +2048,33 @@ fn remove_persisted(path: &str, quiet: bool) -> bool {
 /// set `rollback --list` publishes, so a run that could not drop it and still
 /// returned 0 would keep reporting a pending rollback of values that are
 /// already restored. A ledger that is already gone is not a failure.
+///
+/// `systemctl` names the program the unit is disabled with — a parameter for
+/// the same reason [`persist_from_rollback_at`] takes one: this is the `_at`
+/// form, so a fixture lands a service file under a private path, and a
+/// hardcoded program would then run the HOST's systemctl against the
+/// PRODUCTION unit name — on a host that has ktuner installed, running the
+/// test suite would disable the unit that replays the non-sysctl values at
+/// boot. The fixture contract is that none of the generated files, nor a
+/// program acting on them, is the production one.
 fn finalize_rollback_at(
     ledger: &str,
     sysctl_path: &str,
     service_path: &str,
     script_path: &str,
     quiet: bool,
+    systemctl: &str,
 ) -> usize {
     let mut failed = 0;
     if !remove_persisted(sysctl_path, quiet) {
         failed += 1;
     }
     if Path::new(service_path).exists() {
-        systemctl_quiet("systemctl", &["disable", "ktuner-nonsysctl.service"]);
+        systemctl_quiet(systemctl, &["disable", "ktuner-nonsysctl.service"]);
         if !remove_persisted(service_path, quiet) {
             failed += 1;
         }
-        systemctl_quiet("systemctl", &["daemon-reload"]);
+        systemctl_quiet(systemctl, &["daemon-reload"]);
     }
     if !remove_persisted(script_path, quiet) {
         failed += 1;
@@ -2109,6 +2125,7 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
             NONSYSCTL_SERVICE_PATH,
             NONSYSCTL_SCRIPT_PATH,
             quiet,
+            "systemctl",
         );
         failed += cleanup_failed;
     }
@@ -3834,6 +3851,7 @@ mod tests {
             service.to_str().unwrap(),
             script.to_str().unwrap(),
             true,
+            "true",
         );
 
         assert_eq!(
@@ -3887,6 +3905,7 @@ mod tests {
             service.to_str().unwrap(),
             script.to_str().unwrap(),
             true,
+            "true",
         );
 
         assert_eq!(cleanup_failed, 0);
@@ -3894,6 +3913,67 @@ mod tests {
         assert!(
             !ledger.exists(),
             "a complete cleanup drops the ledger with the persisted config"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The `_at` form exists so a fixture touches neither the generated files
+    /// nor a program acting on them: the cleanup must run the program its
+    /// caller names. Before the program became a parameter, a fixture whose
+    /// service file existed reached the HOST's systemctl under the PRODUCTION
+    /// unit name — on a machine that has ktuner installed, one `cargo test`
+    /// run disabled the unit that replays the non-sysctl values at the next
+    /// boot.
+    #[test]
+    fn test_cleanup_runs_the_program_the_caller_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_cleanup_injection_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let ledger = dir.join("rollback.json");
+        fs::write(&ledger, b"{}").expect("write ledger");
+        let sysctl = dir.join("99-ktuner.conf");
+        fs::write(&sysctl, b"vm.swappiness = 10\n").expect("write sysctl file");
+        let service = dir.join("ktuner-nonsysctl.service");
+        fs::write(&service, b"[Unit]\n").expect("write unit file");
+        let script = dir.join("apply-nonsysctl.sh");
+        fs::write(&script, b"#!/bin/sh\n").expect("write script");
+        // The stand-in records its arguments: a run that reaches the host's
+        // systemctl instead writes nothing here.
+        let calls = dir.join("systemctl-calls");
+        let program = dir.join("systemctl");
+        fs::write(
+            &program,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .expect("write the stand-in program");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("make the stand-in executable");
+
+        let cleanup_failed = finalize_rollback_at(
+            ledger.to_str().unwrap(),
+            sysctl.to_str().unwrap(),
+            service.to_str().unwrap(),
+            script.to_str().unwrap(),
+            true,
+            program.to_str().unwrap(),
+        );
+
+        assert_eq!(cleanup_failed, 0);
+        assert!(
+            !service.exists(),
+            "the named program's work still completes"
+        );
+        assert_eq!(
+            fs::read_to_string(&calls).expect("the named program must be the one that ran"),
+            "disable ktuner-nonsysctl.service\ndaemon-reload\n"
         );
 
         fs::remove_dir_all(&dir).ok();
@@ -3932,6 +4012,7 @@ mod tests {
             service.to_str().unwrap(),
             script.to_str().unwrap(),
             true,
+            "true",
         );
 
         assert_eq!(
