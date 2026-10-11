@@ -71,8 +71,8 @@ sudo ktuner tune --only vm.swappiness       # apply only the named parameters
 sudo ktuner fix vm.swappiness
 sudo ktuner fix vm.swappiness --dry-run   # preview one parameter, no changes
 
-# Explain why a parameter should change
-ktuner why net.core.somaxconn
+# Explain why parameters should change — several share one diagnosis
+ktuner why net.core.somaxconn vm.swappiness
 
 # Undo all changes ktuner made, or the recorded parameters named
 sudo ktuner rollback          # destructive + terminal: restores and deletes the ledger
@@ -110,6 +110,20 @@ the same contract as a single one; a batch that restores only part of what it na
 retires the entries that landed, keeps the rest for a retry and exits `1`, and one
 name the ledger does not record refuses the whole command before anything is written
 (`2`), the same command error a single parameter gets.
+
+`ktuner why <param>…` explains one or several parameters. A single parameter keeps
+its flat body: a recommendation with the fields `check` publishes for it (`skip_reason`
+when no write path would take it), or `{"param": …, "current": …, "status": "optimal"}`
+for a parameter already at its recommended value. Two or more parameters are answered
+in one run, from one diagnosis — running the command once per parameter gathered the
+whole system each time. The body carries `count` and `params`: one entry per parameter,
+in the order given and deduplicated by the same alias policy `fix` uses
+(`vm/swappiness` and `vm.swappiness` are one parameter; sysfs identities such as
+`block/sda/scheduler` stay verbatim), and each entry is exactly the object that
+parameter answers alone. `why` exits `1` when at least one entry is a recommendation
+and `0` when every entry is optimal; a parameter that cannot be found or read refuses
+the whole command with its own error — exit `2`, stderr JSON naming the parameter,
+nothing on stdout — so a batch never answers half a question.
 
 `tune --exclude <param>` (repeatable) leaves a named recommendation out of the plan:
 nothing is written for it, nothing is recorded in the rollback ledger, and nothing is

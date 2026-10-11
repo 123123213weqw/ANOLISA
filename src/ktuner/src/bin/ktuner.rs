@@ -45,8 +45,13 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Explain why a parameter should be changed
-    Why { param: String },
+    /// Explain why one or more parameters should be changed
+    Why {
+        /// Required, so a bare `why` keeps answering with the parser's usage
+        /// error instead of a batch body of zero parameters
+        #[arg(required = true)]
+        params: Vec<String>,
+    },
     /// Roll back all applied changes, or one or more recorded parameters
     Rollback {
         /// Restore only these recorded parameters, leaving the other entries
@@ -104,7 +109,7 @@ fn main() {
             only,
         } => cmd_tune(dry_run, conservative, cats, exclude, only),
         Commands::Fix { param, dry_run } => cmd_fix(&param, dry_run),
-        Commands::Why { param } => cmd_why(&param),
+        Commands::Why { params } => cmd_why(&params),
         Commands::Rollback {
             params,
             list,
@@ -840,18 +845,67 @@ fn fix_dry_run_output(rec: &Recommendation) -> serde_json::Value {
     body
 }
 
-fn cmd_why(param: &str) -> Result<i32> {
-    let (_, eval) = gather()?;
-    let (output, code) = why_with(param, &eval, |path| {
-        let path = std::path::Path::new(path);
-        if !path.exists() {
-            return Ok(None);
+/// The reader `why` uses for a parameter without a recommendation: the
+/// sysfs/sysctl file behind the normalized name, read as-is. A path that does
+/// not exist is `None`; a failed read is an error, never a value — write-only
+/// sysctls (mode 0200, e.g. vm.compact_memory) and transient EIO must not
+/// collapse into an empty "current". One named reader so the single-parameter
+/// path and the batch read every file by the same policy.
+fn read_current_value(path: &str) -> Result<Option<String>, std::io::Error> {
+    let path = std::path::Path::new(path);
+    if !path.exists() {
+        return Ok(None);
+    }
+    std::fs::read_to_string(path).map(Some)
+}
+
+/// JSON body of `ktuner why` for two or more positionals: `count` and one
+/// entry per parameter, in the order given and deduplicated by the spelling
+/// the lookup uses ([`normalize_param`]), so two aliases of one parameter are
+/// not answered twice. Every entry is the exact object the same parameter
+/// answers alone — the batch adds no keys to it — and the caller reads each
+/// verdict from its element while the exit code aggregates them: any
+/// recommendation keeps `check`'s exit 1, all optimal exits 0.
+///
+/// The eval arrives as a parameter: `cmd_why` runs one diagnosis for the
+/// whole invocation and this renderer cannot start another. A parameter with
+/// no file, or an unreadable one, refuses the WHOLE command with
+/// [`why_with`]'s own error naming it — every entry is rendered into values
+/// before anything is printed, so a failed batch never leaves a partial
+/// document on stdout.
+fn why_params_output(
+    params: &[String],
+    eval: &rules::EvalResult,
+    read_current: &impl Fn(&str) -> Result<Option<String>, std::io::Error>,
+) -> Result<(serde_json::Value, i32)> {
+    let mut seen = std::collections::HashSet::new();
+    let mut entries = Vec::new();
+    let mut code = 0;
+    for param in params {
+        if !seen.insert(normalize_param(param)) {
+            continue;
         }
-        // A failed read is an error, never a value: write-only sysctls
-        // (mode 0200, e.g. vm.compact_memory) and transient EIO must not
-        // collapse into an empty "current".
-        std::fs::read_to_string(path).map(Some)
-    })?;
+        let (entry, entry_code) = why_with(param, eval, read_current)?;
+        code |= entry_code;
+        entries.push(entry);
+    }
+    Ok((json!({ "count": entries.len(), "params": entries }), code))
+}
+
+fn cmd_why(params: &[String]) -> Result<i32> {
+    let (_, eval) = gather()?;
+    // The shape follows the INVOCATION: one positional keeps the flat
+    // single-parameter object byte for byte, while two or more carry the
+    // batch body even when they name one parameter between them
+    // (`why vm/swappiness vm.swappiness` still answers as a batch), so a
+    // consumer that asked for several reads one shape whatever it named —
+    // the rule `rollback` follows.
+    if let [param] = params {
+        let (output, code) = why_with(param, &eval, read_current_value)?;
+        print_json(&output)?;
+        return Ok(code);
+    }
+    let (output, code) = why_params_output(params, &eval, &read_current_value)?;
     print_json(&output)?;
     Ok(code)
 }
@@ -1066,6 +1120,13 @@ fn rollback_exit_code(outcome: &tuner::RollbackOutcome) -> i32 {
 }
 
 fn gather() -> Result<(detect::SystemInfo, rules::EvalResult)> {
+    // Counted in test builds only: `why` shares one diagnosis across every
+    // parameter of an invocation, and the bytes an invocation prints look
+    // identical whether it gathered once or once per parameter — so the
+    // contract is pinned by counting calls, the way the rollback probes count
+    // ledger writes instead of inferring them from the end state.
+    #[cfg(test)]
+    tests::gather_probe();
     let info = detect::gather_system_info()?;
     let eval = evaluate(&info)?;
     Ok((info, eval))
@@ -1102,6 +1163,19 @@ fn rec_json(r: &Recommendation) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    /// Invocations of `gather()` in this test binary, advanced by the probe
+    /// `gather` itself calls and read by the test that pins the batch's
+    /// one-diagnosis contract. That test is the only writer (no other unit
+    /// test reaches `gather`), so the count is deterministic.
+    pub(super) static GATHER_CALLS: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
+
+    /// `gather`'s one-diagnosis probe: without it the property is invisible,
+    /// because gathering per parameter would print the same bytes.
+    pub(super) fn gather_probe() {
+        GATHER_CALLS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
     #[test]
     fn network_normalization_preserves_interface_identity() {
         for proto in ["ipv4", "ipv6"] {
@@ -3023,6 +3097,203 @@ mod tests {
             msg.contains("cannot read current value") && msg.contains("vm.compact_memory"),
             "error must name the parameter and the failed read: {msg}"
         );
+    }
+
+    #[test]
+    fn why_batch_entries_equal_the_single_param_bodies() {
+        // The batch wraps `count` and `params` around the entries and adds
+        // nothing inside them: each element is the object the same parameter
+        // answers alone, byte for byte, so one parser reads an entry whatever
+        // arity the caller asked for.
+        let eval = evaluation(vec![rec("vm.swappiness", true)]);
+        let current = CurrentFile::new("Linux\n");
+        let read = |path: &str| Ok(current.read_for(path, "/proc/sys/kernel/ostype"));
+        let params = vec!["vm.swappiness".to_string(), "kernel.ostype".to_string()];
+        let (batch, code) =
+            why_params_output(&params, &eval, &read).expect("both parameters must answer");
+        assert_eq!(code, 1, "one recommendation keeps the batch at exit 1");
+        assert_eq!(batch["count"], json!(2));
+        let (single_rec, single_rec_code) =
+            why_with("vm.swappiness", &eval, |_| Ok(None)).expect("the recommendation must answer");
+        assert_eq!(single_rec_code, 1);
+        let (single_optimal, single_optimal_code) = why_with("kernel.ostype", &eval, |path| {
+            Ok(current.read_for(path, "/proc/sys/kernel/ostype"))
+        })
+        .expect("the fallback must answer");
+        assert_eq!(single_optimal_code, 0);
+        assert_eq!(
+            serde_json::to_string_pretty(&batch["params"][0]).unwrap(),
+            serde_json::to_string_pretty(&single_rec).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_string_pretty(&batch["params"][1]).unwrap(),
+            serde_json::to_string_pretty(&single_optimal).unwrap()
+        );
+    }
+
+    #[test]
+    fn why_batch_renders_each_parameter_in_the_order_given() {
+        // The array follows the invocation, not a set order: entries keep the
+        // order the caller gave, and `count` is the array's length so a
+        // consumer can size the batch before parsing it.
+        let eval = evaluation(vec![rec("vm.swappiness", true)]);
+        let read = |path: &str| match path {
+            "/proc/sys/kernel/ostype" => Ok(Some("Linux\n".into())),
+            "/proc/sys/kernel/hostname" => Ok(Some("host\n".into())),
+            _ => Ok(None),
+        };
+        let params = vec![
+            "kernel.ostype".to_string(),
+            "vm.swappiness".to_string(),
+            "kernel.hostname".to_string(),
+        ];
+        let (batch, code) = why_params_output(&params, &eval, &read).expect("answers");
+        assert_eq!(code, 1);
+        assert_eq!(batch["count"], json!(3));
+        let entries = batch["params"].as_array().expect("an array");
+        assert_eq!(entries[0]["param"], json!("kernel.ostype"));
+        assert_eq!(entries[0]["status"], json!("optimal"));
+        assert_eq!(entries[1]["param"], json!("vm.swappiness"));
+        assert_eq!(entries[2]["param"], json!("kernel.hostname"));
+        assert_eq!(entries[2]["current"], json!("host"));
+    }
+
+    #[test]
+    fn why_batch_dedupes_the_normalized_aliases() {
+        // Two spellings of one parameter answer once, at the first position:
+        // dedup uses the same normalize_param policy the lookup does, so the
+        // entries and the count cannot drift from what each spelling answers
+        // alone. Sysfs names are filesystem identities — a case change there
+        // is a different parameter, exactly as the lookup treats it.
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("Linux\n");
+        let read = |path: &str| Ok(current.read_for(path, "/proc/sys/kernel/ostype"));
+        for aliases in [
+            vec!["kernel.ostype", "kernel/ostype", "KERNEL.OSTYPE"],
+            vec!["kernel.ostype", "KERNEL/OSTYPE"],
+        ] {
+            let params: Vec<String> = aliases.iter().map(|s| (*s).to_string()).collect();
+            let (batch, code) = why_params_output(&params, &eval, &read).expect("answers");
+            assert_eq!(code, 0);
+            assert_eq!(batch["count"], json!(1), "{aliases:?}");
+            assert_eq!(batch["params"].as_array().map(Vec::len), Some(1));
+            assert_eq!(batch["params"][0]["param"], json!("kernel.ostype"));
+            assert_eq!(batch["params"][0]["current"], json!("Linux"));
+        }
+        let sysfs = |path: &str| match path {
+            "/sys/block/Disk.0/queue/scheduler" | "/sys/block/disk.0/queue/scheduler" => {
+                Ok(Some("[none] mq-deadline\n".into()))
+            }
+            _ => Ok(None),
+        };
+        let params = vec![
+            "block/Disk.0/scheduler".to_string(),
+            "block/disk.0/scheduler".to_string(),
+        ];
+        let (batch, _) = why_params_output(&params, &eval, &sysfs).expect("answers");
+        assert_eq!(
+            batch["count"],
+            json!(2),
+            "sysfs identities stay verbatim: two parameters"
+        );
+    }
+
+    #[test]
+    fn why_batch_exit_code_aggregates_the_recommendations() {
+        // Any recommendation keeps `check`'s verdict for the batch (exit 1,
+        // attention needed) wherever it sits; a batch of optimal parameters
+        // exits 0 like the single-parameter command.
+        let eval = evaluation(vec![rec("vm.swappiness", true)]);
+        let read = |path: &str| match path {
+            "/proc/sys/kernel/ostype" => Ok(Some("Linux\n".into())),
+            "/proc/sys/kernel/hostname" => Ok(Some("host\n".into())),
+            _ => Ok(None),
+        };
+        let (batch, code) = why_params_output(
+            &["kernel.ostype".to_string(), "kernel.hostname".to_string()],
+            &eval,
+            &read,
+        )
+        .expect("answers");
+        assert_eq!(code, 0, "every entry optimal: {batch}");
+        for params in [
+            vec!["vm.swappiness", "kernel.ostype"],
+            vec!["kernel.ostype", "vm.swappiness"],
+            vec!["kernel.ostype", "kernel.hostname", "vm.swappiness"],
+        ] {
+            let params: Vec<String> = params.iter().map(|s| (*s).to_string()).collect();
+            let (batch, code) = why_params_output(&params, &eval, &read).expect("answers");
+            assert_eq!(code, 1, "{params:?}: {batch}");
+        }
+    }
+
+    #[test]
+    fn why_batch_refuses_the_whole_command_on_a_missing_parameter() {
+        // One miss refuses the batch with the same command error a single
+        // parameter gets, naming the parameter: the other entries were
+        // answerable, but a partial document would let the batch mean
+        // something other than what was asked. `cmd_why` prints only after
+        // this renderer returns, so the refusal leaves stdout empty.
+        let eval = evaluation(Vec::new());
+        let current = CurrentFile::new("Linux\n");
+        let read = |path: &str| Ok(current.read_for(path, "/proc/sys/kernel/ostype"));
+        let error = why_params_output(
+            &["kernel.ostype".to_string(), "no/such/param".to_string()],
+            &eval,
+            &read,
+        )
+        .expect_err("a miss must refuse the batch");
+        assert_eq!(
+            refusal_document(&error),
+            "{\n  \"error\": \"parameter not found: no/such/param\"\n}"
+        );
+        // An unreadable parameter refuses the same way, with the read error.
+        let unreadable = |path: &str| match path {
+            "/proc/sys/vm/drop_caches" => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "permission denied",
+            )),
+            _ => Ok(None),
+        };
+        let error = why_params_output(
+            &["vm.drop_caches".to_string(), "no/such/param".to_string()],
+            &eval,
+            &unreadable,
+        )
+        .expect_err("an unreadable parameter must refuse the batch");
+        let msg = error.to_string();
+        assert!(
+            msg.contains("cannot read current value of vm.drop_caches"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn why_gathers_one_diagnosis_for_the_whole_invocation() {
+        use std::sync::atomic::Ordering;
+        // The batch's reason to exist: several parameters, one diagnosis. The
+        // bodies would be identical if each parameter re-gathered, so the
+        // probe counts instead — exactly one `gather()` for one and for three
+        // parameters alike. The answers themselves are host-dependent, so
+        // only the count and the exit code's range are asserted.
+        for params in [
+            vec!["kernel.ostype".to_string()],
+            vec!["kernel.ostype".to_string(), "vm.swappiness".to_string()],
+            vec![
+                "kernel.ostype".to_string(),
+                "vm.swappiness".to_string(),
+                "kernel.hostname".to_string(),
+            ],
+        ] {
+            GATHER_CALLS.store(0, Ordering::SeqCst);
+            let code = cmd_why(&params).expect("a read-only why answers on a Linux host");
+            assert!(matches!(code, 0 | 1), "{params:?}");
+            assert_eq!(
+                GATHER_CALLS.load(Ordering::SeqCst),
+                1,
+                "{params:?}: one invocation must gather one diagnosis"
+            );
+        }
     }
 
     #[test]

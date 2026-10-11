@@ -27,8 +27,8 @@ sudo ktuner tune --only vm.swappiness   # apply only the named parameters
 sudo ktuner fix <param>        # e.g. sudo ktuner fix vm.swappiness
 sudo ktuner fix <param> --dry-run   # preview one parameter, no changes
 
-# Explain why a parameter should change
-ktuner why <param>             # e.g. ktuner why net.core.somaxconn
+# Explain why one or more parameters should change (one diagnosis per run)
+ktuner why <param> [<param>…]  # e.g. ktuner why net.core.somaxconn vm.swappiness
 
 # Undo changes (requires root)
 sudo ktuner rollback          # destructive + terminal (deletes the ledger)
@@ -106,6 +106,61 @@ categories, so `check --category net --category mem` is one run over both —
 and `tune --category net --category mem` plans the same union. Repeating the
 aliases of one category (`net`, `network`, `网络`) keeps each entry once, and
 a value that names no category is rejected (exit 2) instead of being ignored.
+
+### why output
+
+`ktuner why <param>` explains one parameter. A parameter the rules recommend
+carries the same fields `check` publishes for it, plus `skip_reason` when no
+write path would take it; one already at its recommended value — or outside the
+rules, read from its own sysfs/sysctl file — answers with its current value and
+exits `0`:
+
+```json
+{
+  "current": "Linux",
+  "param": "kernel.ostype",
+  "status": "optimal"
+}
+```
+
+Two or more parameters are answered in one run, from one diagnosis: running the
+command once per parameter gathered the whole system every time, and two
+diagnoses could disagree if the kernel moved between them. The body carries
+`count` and `params` — one entry per parameter, in the order given and
+deduplicated by the same alias policy `fix` and `tune --exclude/--only` use
+(`vm/swappiness` and `vm.swappiness` answer once; sysfs identities such as
+`block/sda/scheduler` stay verbatim). Each entry is exactly the object that
+parameter answers alone:
+
+```json
+{
+  "count": 2,
+  "params": [
+    {
+      "current": "60",
+      "param": "vm.swappiness",
+      "status": "optimal"
+    },
+    {
+      "category": "performance",
+      "confidence": "high",
+      "current": "4096 131072 6291456",
+      "param": "net.ipv4.tcp_rmem",
+      "reason": "万兆网卡场景下增大 TCP 接收缓冲区上限，充分利用带宽-延迟积",
+      "recommended": "4096 131072 16777216",
+      "subcategory": "network",
+      "writable": true
+    }
+  ]
+}
+```
+
+`why` exits `1` when at least one entry is a recommendation and `0` when every
+entry is optimal — the 0/1 vocabulary `check` uses on the same parameters. A
+parameter that cannot be found, or whose value cannot be read, refuses the
+whole command with the error a single parameter gets (`2`, stderr JSON naming
+the parameter, nothing on stdout): a batch never answers half a question, so a
+typo cannot drop the rest of the batch behind a successful exit.
 
 ### tune output
 

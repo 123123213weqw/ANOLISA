@@ -69,8 +69,8 @@ sudo ktuner tune --only vm.swappiness       # 只应用点名的参数
 sudo ktuner fix vm.swappiness
 sudo ktuner fix vm.swappiness --dry-run   # 预览单个参数，不做实际变更
 
-# 解释某个参数为何应该改
-ktuner why net.core.somaxconn
+# 解释参数为何应该改 —— 多个参数共用一份诊断
+ktuner why net.core.somaxconn vm.swappiness
 
 # 撤销 ktuner 做的所有改动，或点名的已记录参数
 sudo ktuner rollback          # 破坏性且终结：恢复并删除 ledger
@@ -99,6 +99,16 @@ sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记�
 `params`——每个参数解析出的账本 key，按输入顺序去重。每个名字都适用与单个参数相同的契约；
 只恢复了一部分的批退役已落地的条目、保留其余以便重试并退出 `1`，而任一名字不在账本里就在
 动任何东西之前拒绝整条命令（`2`），与单参数版本同一条命令错误。
+
+`ktuner why <param>…` 解释一个或多个参数。单个参数保持原有的平铺形态：推荐项携带
+`check` 对同一参数发布的字段（没有任何写路径会采纳时带 `skip_reason`），已达推荐值的
+参数输出 `{"param": …, "current": …, "status": "optimal"}`。两个及以上参数在一次运行里
+回答、共用一份诊断——逐参数单独调用会让每个进程各跑一遍完整的系统诊断。输出携带
+`count` 与 `params`：按命令行顺序每个参数一条，按 `fix` 相同的别名政策去重
+（`vm/swappiness` 与 `vm.swappiness` 是同一参数；`block/sda/scheduler` 这类 sysfs
+身份保持原样），每个元素与该参数单独调用时的对象完全相同。至少一条是推荐项时 `why`
+退出 `1`，全部 optimal 时退出 `0`；找不到或读不到的参数以自身错误拒绝整条命令——
+退出 `2`、stderr JSON 点名该参数、stdout 为空——批处理绝不回答半个问题。
 
 `tune --exclude <param>`（可重复）把点名的建议移出计划：不写入、不进回滚账本、
 不持久化。排除在 `--category` 与 `--conservative` 过滤之后生效；被排除项在输出中

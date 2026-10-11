@@ -27,8 +27,8 @@ sudo ktuner tune --only vm.swappiness   # 只应用点名的参数
 sudo ktuner fix <param>        # 例如 sudo ktuner fix vm.swappiness
 sudo ktuner fix <param> --dry-run   # 预览单个参数，不做实际变更
 
-# 解释某个参数为何需要修改
-ktuner why <param>             # 例如 ktuner why net.core.somaxconn
+# 解释一个或多个参数为何需要修改（一次运行共用一份诊断）
+ktuner why <param> [<param>…]  # 例如 ktuner why net.core.somaxconn vm.swappiness
 
 # 回滚变更（需要 root 权限）
 sudo ktuner rollback          # 破坏性且终结（删除 ledger）
@@ -102,6 +102,54 @@ sudo ktuner rollback <param> [<param>…]  # 回滚点名的已记录参数，�
 ——`tune --category net --category mem` 规划的是同一个并集。同一分类的别名
 （`net`、`network`、`网络`）重复给出时每个条目只保留一次；某个值不是已知
 分类时报错（exit 2）而不是被忽略。
+
+### why 输出
+
+`ktuner why <param>` 解释一个参数。规则给出推荐的参数携带 `check` 对同一参数发布的
+字段；没有任何写路径会采纳时另带 `skip_reason`；已达推荐值（或在规则之外、从自己的
+sysfs/sysctl 文件读值）的参数输出当前值并以 `0` 退出：
+
+```json
+{
+  "current": "Linux",
+  "param": "kernel.ostype",
+  "status": "optimal"
+}
+```
+
+两个及以上参数在一次运行里回答，共用一份诊断：逐参数单独调用会让每个进程都完整跑一遍
+系统诊断，两次诊断之间内核状态若变化，答案还可能互相矛盾。输出携带 `count` 与 `params`
+——按命令行顺序每个参数一条，按 `fix`、`tune --exclude/--only` 相同的别名政策去重
+（`vm/swappiness` 与 `vm.swappiness` 只回答一次；`block/sda/scheduler` 这类 sysfs
+身份保持原样）。每个元素与该参数单独调用时的对象完全相同：
+
+```json
+{
+  "count": 2,
+  "params": [
+    {
+      "current": "60",
+      "param": "vm.swappiness",
+      "status": "optimal"
+    },
+    {
+      "category": "performance",
+      "confidence": "high",
+      "current": "4096 131072 6291456",
+      "param": "net.ipv4.tcp_rmem",
+      "reason": "万兆网卡场景下增大 TCP 接收缓冲区上限，充分利用带宽-延迟积",
+      "recommended": "4096 131072 16777216",
+      "subcategory": "network",
+      "writable": true
+    }
+  ]
+}
+```
+
+至少一条是推荐项时 `why` 退出 `1`，全部 optimal 时退出 `0`——与 `check` 对同一批
+参数使用的 0/1 语义相同。找不到或读不到值的参数，以单参数相同的错误拒绝整条命令
+（`2`，stderr JSON 点名该参数，stdout 为空）：批处理绝不回答半个问题，拼错一个名字
+不会在退出码 0 的背后丢掉其余参数。
 
 ### tune 输出
 
