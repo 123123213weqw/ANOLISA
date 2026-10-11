@@ -55,6 +55,8 @@ ktuner check                   # 分数 + 所有建议
 ktuner check --category net    # 仅某一类别
 ktuner check --category net --category mem   # 可重复，取并集
 ktuner check --conservative    # 仅高置信度建议
+ktuner check --only vm.swappiness   # 只报告点名的参数
+ktuner check --exclude vm.dirty_ratio   # 报告其余全部、去掉这一项
 
 # 预览改动但不应用（dry-run）
 sudo ktuner tune --dry-run
@@ -100,6 +102,15 @@ sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记�
 只恢复了一部分的批退役已落地的条目、保留其余以便重试并退出 `1`，而任一名字不在账本里就在
 动任何东西之前拒绝整条命令（`2`），与单参数版本同一条命令错误。
 
+`check --only <param>`（可重复）只报告点名的建议，`check --exclude <param>`
+（可重复）报告其余全部。名字的解析与 `fix`/`why` 完全一致，选择在
+`--category`/`--conservative` 过滤之后生效。未命中范围内任何建议的名字不是
+错误：按给定拼写回显在 `unmatched_only`（或 `unmatched_exclude`）中——报告为空
+时所有给出的名字都会出现。`score` 与 `total_checked` 描述系统、保持不变；
+`predicted_score`、`counts` 与退出码跟随剩余的这份报告，与 `--category` 一直
+以来的做法一致，因此什么都没选中时输出空建议列表、退出 `0`（诊断没有 blocked
+状态）。两个参数互斥，同时给出是命令错误（`2`、stderr JSON），在读取系统信息
+之前就被拒绝。
 `ktuner why <param>…` 解释一个或多个参数。单个参数保持原有的平铺形态：推荐项携带
 `check` 对同一参数发布的字段（没有任何写路径会采纳时带 `skip_reason`），已达推荐值的
 参数输出 `{"param": …, "current": …, "status": "optimal"}`。两个及以上参数在一次运行里
@@ -109,7 +120,6 @@ sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记�
 身份保持原样），每个元素与该参数单独调用时的对象完全相同。至少一条是推荐项时 `why`
 退出 `1`，全部 optimal 时退出 `0`；找不到或读不到的参数以自身错误拒绝整条命令——
 退出 `2`、stderr JSON 点名该参数、stdout 为空——批处理绝不回答半个问题。
-
 `tune --exclude <param>`（可重复）把点名的建议移出计划：不写入、不进回滚账本、
 不持久化。排除在 `--category` 与 `--conservative` 过滤之后生效；被排除项在输出中
 以 `would_skip`（原因 `excluded`）列出，未命中范围内任何建议的名字则出现在

@@ -14,6 +14,8 @@ ktuner check
 ktuner check --category net
 ktuner check --category net --category mem   # 可重复：取并集
 ktuner check --conservative    # 仅高置信度
+ktuner check --only vm.swappiness   # 只报告点名的参数
+ktuner check --exclude vm.dirty_ratio   # 报告其余全部、去掉这一项
 
 # 应用建议（需要 root 权限）
 sudo ktuner tune --dry-run     # 预览，不做实际变更
@@ -103,6 +105,30 @@ sudo ktuner rollback <param> [<param>…]  # 回滚点名的已记录参数，�
 （`net`、`network`、`网络`）重复给出时每个条目只保留一次；某个值不是已知
 分类时报错（exit 2）而不是被忽略。
 
+`check --only <param>`（可重复）只报告点名的建议，`check --exclude <param>`
+（可重复）报告其余全部。两者接受与 `fix`/`why` 相同的拼写（斜杠/点号别名，
+字面点号的网卡名），在 `--category`/`--conservative` 过滤之后生效，收窄的是
+过滤后剩下的那份报告。未命中范围内任何建议的名字不是错误：按给定拼写、按
+给定顺序回显在 `unmatched_only`（或 `unmatched_exclude`）键里——报告为空时
+所有给出的名字都会出现。该键只在给出对应参数、且至少一个名字什么都没命中时
+出现，因此不带新参数时 key 集合与以往完全一致。两个参数互斥：同时给出是用法
+错误（退出码 2、stderr JSON），在读取系统信息之前就被拒绝。
+
+`score` 与 `total_checked` 描述系统、保持不变；`predicted_score`、`counts`
+与退出码跟随剩余的那份报告——与 `--category` 一直以来的做法相同——因此什么都
+没选中时输出空 `recommendations` 列表、退出 0（诊断没有 blocked 状态，这点与
+`tune` 不同）。收窄到一条建议时只报告该条：
+
+```json
+{"counts": {"high_confidence": 1, "performance": 1, "security": 0, "writable": 1}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [ ... ], "score": 30, "services": [], "system": {"cpu_cores": 12, "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "numa_nodes": 1}, "total_checked": 208, "workload": "mixed"}
+```
+
+未命中的名字被回显，而不是让命令失败：
+
+```json
+{"counts": {"high_confidence": 0, "performance": 0, "security": 0, "writable": 0}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [], "score": 30, "services": [], "system": {"cpu_cores": 12, "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "numa_nodes": 1}, "total_checked": 208, "unmatched_only": ["no_such_ktuner_param"], "workload": "mixed"}
+```
+
 ### why 输出
 
 `ktuner why <param>` 解释一个参数。规则给出推荐的参数携带 `check` 对同一参数发布的
@@ -150,7 +176,6 @@ sysfs/sysctl 文件读值）的参数输出当前值并以 `0` 退出：
 参数使用的 0/1 语义相同。找不到或读不到值的参数，以单参数相同的错误拒绝整条命令
 （`2`，stderr JSON 点名该参数，stdout 为空）：批处理绝不回答半个问题，拼错一个名字
 不会在退出码 0 的背后丢掉其余参数。
-
 ### tune 输出
 
 ```json

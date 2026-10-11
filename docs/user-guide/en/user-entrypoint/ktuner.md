@@ -57,6 +57,8 @@ ktuner check                   # score + all recommendations
 ktuner check --category net    # limit to one category
 ktuner check --category net --category mem   # categories may be repeated; the union is kept
 ktuner check --conservative    # high-confidence recommendations only
+ktuner check --only vm.swappiness   # report only the named parameters
+ktuner check --exclude vm.dirty_ratio   # report everything but this one
 
 # Preview changes without applying (dry-run)
 sudo ktuner tune --dry-run
@@ -111,6 +113,18 @@ retires the entries that landed, keeps the rest for a retry and exits `1`, and o
 name the ledger does not record refuses the whole command before anything is written
 (`2`), the same command error a single parameter gets.
 
+`check --only <param>` (repeatable) reports only the named recommendations and
+`check --exclude <param>` (repeatable) reports everything but them. The names
+resolve exactly as `fix`/`why` resolve them, and the selection applies after
+the `--category`/`--conservative` filters. A name that matches no
+recommendation in scope is not an error: it is echoed in `unmatched_only`
+(or `unmatched_exclude`) in the spelling given — an empty report echoes every
+given name. `score` and `total_checked` describe the system and do not move;
+`predicted_score`, `counts` and the exit code follow the report that is left,
+exactly as `--category` has always done, so a selection that leaves nothing to
+report answers with an empty list and exit `0` (the diagnosis has no blocked
+state). The two flags are mutually exclusive, and a run carrying both is a
+command error (`2`, stderr JSON), decided before the system is read.
 `ktuner why <param>…` explains one or several parameters. A single parameter keeps
 its flat body: a recommendation with the fields `check` publishes for it (`skip_reason`
 when no write path would take it), or `{"param": …, "current": …, "status": "optimal"}`
@@ -124,7 +138,6 @@ parameter answers alone. `why` exits `1` when at least one entry is a recommenda
 and `0` when every entry is optimal; a parameter that cannot be found or read refuses
 the whole command with its own error — exit `2`, stderr JSON naming the parameter,
 nothing on stdout — so a batch never answers half a question.
-
 `tune --exclude <param>` (repeatable) leaves a named recommendation out of the plan:
 nothing is written for it, nothing is recorded in the rollback ledger, and nothing is
 persisted. It applies after the `--category` and `--conservative` filters, and the

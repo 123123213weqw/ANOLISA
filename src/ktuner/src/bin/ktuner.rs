@@ -21,6 +21,12 @@ enum Commands {
         category: Vec<String>,
         #[arg(long)]
         conservative: bool,
+        /// Leave this parameter out of the report; may be repeated
+        #[arg(long)]
+        exclude: Vec<String>,
+        /// Report only this parameter; may be repeated
+        #[arg(long)]
+        only: Vec<String>,
     },
     /// Apply tuning recommendations
     Tune {
@@ -100,7 +106,9 @@ fn main() {
         Commands::Check {
             category: cats,
             conservative,
-        } => cmd_check(cats, conservative),
+            exclude,
+            only,
+        } => cmd_check(cats, conservative, exclude, only),
         Commands::Tune {
             dry_run,
             conservative,
@@ -172,7 +180,19 @@ fn print_error_json(body: &serde_json::Value) {
     let _ = std::io::Write::write_fmt(&mut stderr, format_args!("{rendered}\n"));
 }
 
-fn cmd_check(cats: Vec<String>, conservative: bool) -> Result<i32> {
+fn cmd_check(
+    cats: Vec<String>,
+    conservative: bool,
+    exclude: Vec<String>,
+    only: Vec<String>,
+) -> Result<i32> {
+    // The two flags are opposite directions of one instruction, so a run that
+    // carried both would have to guess which one wins; refusing is a usage
+    // error (the README's stderr JSON, exit 2), while ignoring one of them
+    // would silently answer a different question than the one asked. Checked
+    // before the category and before the system is read, so it fails as an
+    // argument error, like the parser's own.
+    let selection = check_selection(&exclude, &only)?;
     for cat in &cats {
         category::validate_category(cat)?;
     }
@@ -189,6 +209,11 @@ fn cmd_check(cats: Vec<String>, conservative: bool) -> Result<i32> {
     if conservative {
         recs.retain(|r| r.confidence == rules::Confidence::High);
     }
+    // The operator's selection narrows the in-scope list last, exactly like
+    // tune's: a name that addresses nothing here is reported in the
+    // selection's own key, and the entries the selection drops leave the
+    // report the way a `--category` miss does.
+    let (recs, unmatched) = apply_check_selection(recs, selection);
 
     let score = eval.score();
     let counts = category::RecCounts::from_recs(&recs);
@@ -196,7 +221,7 @@ fn cmd_check(cats: Vec<String>, conservative: bool) -> Result<i32> {
 
     let recs_json: Vec<serde_json::Value> = recs.iter().map(rec_json).collect();
 
-    let output = json!({
+    let mut output = json!({
         "score": score,
         "predicted_score": predicted_score,
         "total_checked": eval.total_checked,
@@ -217,10 +242,55 @@ fn cmd_check(cats: Vec<String>, conservative: bool) -> Result<i32> {
         "workload": format!("{workload}"),
         "services": detected_services,
     });
+    // The selection's inert-name report, and only when it has something to
+    // report: a run without the flag keeps the exact key set its consumers
+    // already read.
+    if let Some((key, names)) = unmatched {
+        output[key] = names;
+    }
     print_json(&output)?;
 
     let code = if recs.is_empty() { 0 } else { 1 };
     Ok(code)
+}
+
+/// The one place `check` reads `--only`/`--exclude`: `--only` names the
+/// recommendations to keep, `--exclude` the ones to leave out, and neither
+/// flag selects the whole report. The two flags are opposite directions of
+/// one instruction, so carrying both is refused as a usage error (the
+/// README's stderr JSON, exit 2) instead of guessing which one wins. Pure, so
+/// the guard is decided before the category is validated and before
+/// [`detect::gather_system_info`] reads the system.
+fn check_selection<'a>(exclude: &'a [String], only: &'a [String]) -> Result<Selection<'a>> {
+    if !exclude.is_empty() && !only.is_empty() {
+        anyhow::bail!("check takes either --only or --exclude, not both");
+    }
+    Ok(if !only.is_empty() {
+        Selection::Only(only)
+    } else if !exclude.is_empty() {
+        Selection::Except(exclude)
+    } else {
+        Selection::All
+    })
+}
+
+/// Narrow the in-scope recommendations to the operator's selection and
+/// return what the report keeps, plus the inert-name report the body owes:
+/// the selection's names that addressed nothing here, in the order given,
+/// under the selection's own key. The report is computed against the
+/// in-scope list before the drop, so a name that addressed a recommendation
+/// in scope is never called inert. `None` when no flag was given or every
+/// name matched, so a run without a selection cannot grow the key.
+fn apply_check_selection(
+    mut in_scope: Vec<Recommendation>,
+    selection: Selection<'_>,
+) -> (
+    Vec<Recommendation>,
+    Option<(&'static str, serde_json::Value)>,
+) {
+    let unmatched = selection.unmatched_report(&in_scope);
+    in_scope.retain(|rec| !selection.drops(&rec.param));
+    (in_scope, unmatched)
 }
 
 /// Why a real `tune` run leaves a recommendation out: the parameter is not
@@ -2565,6 +2635,127 @@ mod tests {
                 {"param": "net.core.somaxconn", "reason": "unwritable"},
                 {"param": "vm.swappiness", "reason": "unwritable"}
             ])
+        );
+    }
+
+    #[test]
+    fn check_selection_guards_the_two_flags_and_builds_the_enum() {
+        // The flags are two directions of one instruction, so both together
+        // are refused as a usage error; each alone becomes the selection the
+        // report is narrowed to, and no flag selects the whole report.
+        assert!(matches!(check_selection(&[], &[]), Ok(Selection::All)));
+        assert!(matches!(
+            check_selection(&[], &["vm.swappiness".to_string()]),
+            Ok(Selection::Only(_))
+        ));
+        assert!(matches!(
+            check_selection(&["vm.swappiness".to_string()], &[]),
+            Ok(Selection::Except(_))
+        ));
+        let err = match check_selection(
+            &["vm.dirty_ratio".to_string()],
+            &["vm.swappiness".to_string()],
+        ) {
+            Err(err) => err,
+            Ok(_) => panic!("both flags must be refused"),
+        };
+        assert_eq!(
+            format!("{err:#}"),
+            "check takes either --only or --exclude, not both"
+        );
+    }
+
+    #[test]
+    fn check_rejects_the_flag_pair_before_the_category_gate() {
+        // The guard is the first thing cmd_check does: with a category that
+        // is itself invalid, the usage error must win — which proves it runs
+        // before validate_category and hence before gather_system_info; the
+        // call returns before either, so it cannot touch the system. Without
+        // the pair the same call answers with the category's own error, so
+        // the assertion above cannot hold for the wrong reason.
+        let err = cmd_check(
+            vec!["no_such_category".to_string()],
+            false,
+            vec!["vm.dirty_ratio".to_string()],
+            vec!["vm.swappiness".to_string()],
+        )
+        .expect_err("both flags must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "check takes either --only or --exclude, not both"
+        );
+        let err = cmd_check(vec!["no_such_category".to_string()], false, vec![], vec![])
+            .expect_err("an unknown category is refused");
+        assert!(
+            format!("{err:#}").contains("no_such_category"),
+            "the category check must be the one that fires without the pair: {err:#}"
+        );
+    }
+
+    #[test]
+    fn check_selection_keeps_or_drops_named_recs_in_report_order() {
+        // `--only` keeps the named recommendations and `--exclude` drops
+        // them, both with the same aliases `fix`/`why` accept and in the
+        // report's own order; no flag is the identity. A matched name leaves
+        // no inert-name report behind.
+        let in_scope = vec![
+            rec("vm.swappiness", true),
+            rec("net.core.somaxconn", true),
+            rec("fs.file-max", true),
+        ];
+        let (kept, unmatched) = apply_check_selection(
+            in_scope.clone(),
+            Selection::Only(&["fs.file-max".to_string(), "vm/swappiness".to_string()]),
+        );
+        assert_eq!(
+            kept.iter().map(|r| r.param.as_str()).collect::<Vec<_>>(),
+            ["vm.swappiness", "fs.file-max"],
+            "only the named recs stay, in report order, aliases included"
+        );
+        assert!(unmatched.is_none(), "every name addressed an in-scope rec");
+
+        let (kept, unmatched) = apply_check_selection(
+            in_scope.clone(),
+            Selection::Except(&["net/core/somaxconn".to_string()]),
+        );
+        assert_eq!(
+            kept.iter().map(|r| r.param.as_str()).collect::<Vec<_>>(),
+            ["vm.swappiness", "fs.file-max"],
+            "the named rec is dropped through its slash spelling too"
+        );
+        assert!(unmatched.is_none());
+
+        let (kept, unmatched) = apply_check_selection(in_scope, Selection::All);
+        assert_eq!(kept.len(), 3, "no flag keeps the whole report");
+        assert!(unmatched.is_none(), "no flag owes no inert-name report");
+    }
+
+    #[test]
+    fn check_selection_reports_names_against_the_in_scope_list() {
+        // The inert-name report is computed on the list the selection could
+        // actually act on (after the category/conservative filters), so a
+        // name whose recommendation those filters removed is reported, in
+        // the spelling given. An empty in-scope list makes every name inert,
+        // under the flag's own key.
+        let (kept, unmatched) = apply_check_selection(
+            vec![rec("vm.swappiness", true)],
+            Selection::Only(&[
+                "net.core.somaxconn".to_string(),
+                "vm/swappiness".to_string(),
+            ]),
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            unmatched,
+            Some(("unmatched_only", json!(["net.core.somaxconn"])))
+        );
+
+        let (kept, unmatched) =
+            apply_check_selection(vec![], Selection::Except(&["vm.swappiness".to_string()]));
+        assert!(kept.is_empty());
+        assert_eq!(
+            unmatched,
+            Some(("unmatched_exclude", json!(["vm.swappiness"])))
         );
     }
 

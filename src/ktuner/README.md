@@ -14,6 +14,8 @@ ktuner check
 ktuner check --category net
 ktuner check --category net --category mem   # repeatable: keep the union
 ktuner check --conservative    # high-confidence only
+ktuner check --only vm.swappiness   # report only the named parameters
+ktuner check --exclude vm.dirty_ratio   # report everything but this one
 
 # Apply recommendations (requires root)
 sudo ktuner tune --dry-run     # preview, no changes
@@ -107,6 +109,36 @@ and `tune --category net --category mem` plans the same union. Repeating the
 aliases of one category (`net`, `network`, `网络`) keeps each entry once, and
 a value that names no category is rejected (exit 2) instead of being ignored.
 
+`check --only <param>` (repeatable) reports only the named recommendations and
+`check --exclude <param>` (repeatable) reports everything but them. Both
+accept the same spellings `fix`/`why` accept (slash/dot aliases, and the
+literal-dot interface names) and apply after the
+`--category`/`--conservative` filters, narrowing what those filters left. A
+name that matches no recommendation in scope is not an error: it is echoed in
+the `unmatched_only` (or `unmatched_exclude`) key, in the spelling given, in
+the order given — an empty report echoes every given name. The key appears
+only when that flag was given and at least one name addressed nothing, so a
+run without the flags keeps its exact key set. The two flags are mutually
+exclusive: a run carrying both is a usage error (exit 2, stderr JSON) decided
+before the system is read.
+
+`score` and `total_checked` describe the system and do not move;
+`predicted_score`, `counts` and the exit code follow the report that is left —
+the same rule `--category` has always followed — so a selection that leaves
+nothing to report answers with an empty `recommendations` list and exit 0
+(the diagnosis has no blocked state, unlike `tune`). Narrowing to one
+recommendation reports that recommendation alone:
+
+```json
+{"counts": {"high_confidence": 1, "performance": 1, "security": 0, "writable": 1}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [ ... ], "score": 30, "services": [], "system": {"cpu_cores": 12, "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "numa_nodes": 1}, "total_checked": 208, "workload": "mixed"}
+```
+
+An inert name is echoed instead of failing the run:
+
+```json
+{"counts": {"high_confidence": 0, "performance": 0, "security": 0, "writable": 0}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [], "score": 30, "services": [], "system": {"cpu_cores": 12, "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "numa_nodes": 1}, "total_checked": 208, "unmatched_only": ["no_such_ktuner_param"], "workload": "mixed"}
+```
+
 ### why output
 
 `ktuner why <param>` explains one parameter. A parameter the rules recommend
@@ -161,7 +193,6 @@ parameter that cannot be found, or whose value cannot be read, refuses the
 whole command with the error a single parameter gets (`2`, stderr JSON naming
 the parameter, nothing on stdout): a batch never answers half a question, so a
 typo cannot drop the rest of the batch behind a successful exit.
-
 ### tune output
 
 ```json
