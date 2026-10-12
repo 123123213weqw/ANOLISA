@@ -4509,7 +4509,27 @@ fn swap_configured(path: &str) -> bool {
 }
 
 fn eval_rmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/rmem_default";
+    eval_rmem_default_at(info, recs, "/proc/sys/net/core/rmem_default")
+}
+
+/// Path-injectable form of [`eval_rmem_default`] (the `eval_*_at` idiom) so the
+/// reason's claim is assertable against a temp file on any host.
+///
+/// The receive buffer this knob sizes belongs to the sockets that keep it.
+/// `sock_init_data_uid()` seeds `sk_rcvbuf` from `sysctl_rmem_default`
+/// (v6.6 `net/core/sock.c:3417`, 7.3.0-rc6 `:3761`), and the non-TCP protocols
+/// queue against that seed: UDP drops a datagram once `sk_rmem_alloc` passes
+/// `sk_rcvbuf` (`__udp_enqueue_schedule_skb()`, v6.6 `net/ipv4/udp.c:1499-1520`,
+/// 7.3.0-rc6 `:1691-1706`), and `__sock_queue_rcv_skb()` drops the same way for
+/// the other protocols (v6.6 `net/core/sock.c:487`, 7.3.0-rc6 `:494`). A TCP
+/// connection never uses the seed: `tcp_init_sock()` overwrites `sk_rcvbuf`
+/// with `tcp_rmem[1]` (v6.6 `net/ipv4/tcp.c:459`, 7.3.0-rc6 `:473`), which the
+/// sysctl documentation spells out -- "default: initial size of receive buffer
+/// used by TCP sockets. This value overrides net.core.rmem_default used by
+/// other protocols" (`Documentation/networking/ip-sysctl.rst`, v6.6:712-713,
+/// 7.3.0-rc6:865-866). The reason therefore names the non-TCP sockets instead of
+/// promising a smaller window for new connections.
+fn eval_rmem_default_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -4523,7 +4543,7 @@ fn eval_rmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
             param: "net.core.rmem_default".to_string(),
             current_value: current.to_string(),
             recommended_value: "262144".to_string(),
-            reason: "万兆网络默认 socket 接收缓冲区过小，新建连接可能需要动态扩展缓冲区增加延迟"
+            reason: "万兆网卡场景下，UDP 等非 TCP 套接字的默认接收缓冲区偏小，突发数据报会因队列满被丢弃；TCP 连接的接收缓冲区由 net.ipv4.tcp_rmem 的 default 单独决定，不受此值约束"
                 .to_string(),
             confidence: Confidence::Medium,
             category: Category::Performance,
@@ -4534,7 +4554,26 @@ fn eval_rmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 }
 
 fn eval_wmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/wmem_default";
+    eval_wmem_default_at(info, recs, "/proc/sys/net/core/wmem_default")
+}
+
+/// Path-injectable form of [`eval_wmem_default`] (the `eval_*_at` idiom) so the
+/// reason's claim is assertable against a temp file on any host.
+///
+/// The send-side twin of [`eval_rmem_default_at`]: `sock_init_data_uid()` seeds
+/// `sk_sndbuf` from `sysctl_wmem_default` (v6.6 `net/core/sock.c:3418`,
+/// 7.3.0-rc6 `:3762`), and the non-TCP send paths account against it -- the UDP
+/// `__ip_append_data()` fragment path gives up with `ENOBUFS` once the queued
+/// bytes pass twice `sk_sndbuf` (v6.6 `net/ipv4/ip_output.c:1124`,
+/// 7.3.0-rc6 `:1135`), and AF_UNIX refuses a datagram longer than
+/// `sk_sndbuf` (v6.6 `net/unix/af_unix.c:1941`, 7.3.0-rc6 `:2130`). TCP replaces
+/// the seed with `tcp_wmem[1]` in `tcp_init_sock()` (v6.6 `net/ipv4/tcp.c:458`,
+/// 7.3.0-rc6 `:472`): "default: initial size of send buffer used by TCP sockets.
+/// This value overrides net.core.wmem_default used by other protocols"
+/// (`Documentation/networking/ip-sysctl.rst`, v6.6:1006-1007, 7.3.0-rc6:1228-1229).
+/// The reason therefore names the non-TCP sockets instead of promising a faster
+/// first send for new connections.
+fn eval_wmem_default_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -4548,7 +4587,8 @@ fn eval_wmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
             param: "net.core.wmem_default".to_string(),
             current_value: current.to_string(),
             recommended_value: "262144".to_string(),
-            reason: "万兆网络默认 socket 发送缓冲区过小，新建连接初始发送性能受限".to_string(),
+            reason: "万兆网卡场景下，UDP 等非 TCP 套接字的默认发送缓冲区偏小，突发发送会因排队空间不足失败；TCP 连接的发送缓冲区由 net.ipv4.tcp_wmem 的 default 单独决定，不受此值约束"
+                .to_string(),
             confidence: Confidence::Medium,
             category: Category::Performance,
             writable: true,
@@ -14412,6 +14452,60 @@ mod tests {
             "{}",
             w.reason
         );
+    }
+
+    #[test]
+    fn test_core_mem_default_reasons_name_the_non_tcp_sockets() {
+        // net.core.rmem_default/wmem_default only seed sk_rcvbuf/sk_sndbuf in
+        // sock_init_data_uid(), and the non-TCP protocols queue against that
+        // seed (__udp_enqueue_schedule_skb drops past sk_rcvbuf; the
+        // __ip_append_data fragment path gives up past twice sk_sndbuf). A TCP
+        // connection raises the seed to tcp_rmem[1] / tcp_wmem[1] in
+        // tcp_init_sock(), so the reason must not describe a new connection's
+        // buffer growth.
+        let mut info = make_test_info();
+        info.network = vec![crate::detect::NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_core_mem_default_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rmem = dir.join("rmem_default");
+        let wmem = dir.join("wmem_default");
+        std::fs::write(&rmem, "212992\n").unwrap();
+        std::fs::write(&wmem, "212992\n").unwrap();
+
+        let mut recs = Vec::new();
+        eval_rmem_default_at(&info, &mut recs, rmem.to_str().unwrap());
+        eval_wmem_default_at(&info, &mut recs, wmem.to_str().unwrap());
+        let r = recs
+            .iter()
+            .find(|r| r.param == "net.core.rmem_default")
+            .expect("a 10G host under 256K gets the recommendation");
+        let w = recs
+            .iter()
+            .find(|r| r.param == "net.core.wmem_default")
+            .expect("a 10G host under 256K gets the recommendation");
+        assert!(r.reason.contains("非 TCP"), "{}", r.reason);
+        assert!(w.reason.contains("非 TCP"), "{}", w.reason);
+        assert!(r.reason.contains("tcp_rmem 的 default"), "{}", r.reason);
+        assert!(w.reason.contains("tcp_wmem 的 default"), "{}", w.reason);
+        assert!(
+            !r.reason.contains("新建连接"),
+            "a TCP connection never reads this knob: {}",
+            r.reason
+        );
+        assert!(
+            !w.reason.contains("新建连接"),
+            "a TCP connection never reads this knob: {}",
+            w.reason
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
