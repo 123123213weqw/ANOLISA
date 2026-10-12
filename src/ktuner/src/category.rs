@@ -102,38 +102,55 @@ pub fn validate_category(cat: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Whether `r` belongs to the category `cat_lower` names, already lowercased.
+/// Whether `param`, recorded under the rule layer's own `category`, belongs
+/// to the category `cat_lower` names, already lowercased.
 /// The mem/io/cpu retention predicates are derived from `param_subcategory` —
 /// the same classifier that labels every recommendation in `ktuner check`
 /// output and buckets `RecCounts::from_recs` — so a category never drops a
 /// recommendation the engine itself labels with it, nor keeps one it labels
 /// differently. The `Category::Security` guard mirrors `RecCounts::from_recs`:
 /// a security recommendation only ever surfaces under `security`.
-fn category_matches(r: &Recommendation, cat_lower: &str) -> bool {
+///
+/// Taking the parameter and its rule category instead of a whole
+/// [`Recommendation`] is what lets a stored record ask the same question: the
+/// rollback ledger keeps exactly these two facts per entry, and the answer
+/// must be the one the same parameter would get from the live plan.
+pub fn category_matches(param: &str, category: &Category, cat_lower: &str) -> bool {
     match cat_lower {
         "network" | "net" | "网络" => {
-            r.category != Category::Security
-                && (r.param.starts_with("net.") || r.param.contains("conntrack"))
+            *category != Category::Security
+                && (param.starts_with("net.") || param.contains("conntrack"))
         }
         "memory" | "mem" | "内存" => {
-            r.category != Category::Security && param_subcategory(&r.param) == "memory"
+            *category != Category::Security && param_subcategory(param) == "memory"
         }
         "io" | "disk" | "磁盘" => {
-            r.category != Category::Security && param_subcategory(&r.param) == "io"
+            *category != Category::Security && param_subcategory(param) == "io"
         }
-        "cpu" | "调度" => {
-            r.category != Category::Security && param_subcategory(&r.param) == "cpu"
-        }
-        "security" | "sec" | "安全" => r.category == Category::Security,
+        "cpu" | "调度" => *category != Category::Security && param_subcategory(param) == "cpu",
+        "security" | "sec" | "安全" => *category == Category::Security,
         _ => true,
     }
+}
+
+/// Whether `param`, recorded under the rule layer's own `category`, belongs
+/// to any of `cats` — the union a repeated `--category` asks for.
+///
+/// [`filter_by_categories`] and this function answer with the same
+/// [`category_matches`] predicate, so the set a command selects and the set a
+/// plan keeps cannot drift; that one lowers the names once for a whole plan,
+/// this one per recorded entry. Values are validated by
+/// [`validate_category`] before they get here.
+pub fn matches_any_category(param: &str, category: &Category, cats: &[String]) -> bool {
+    cats.iter()
+        .any(|cat| category_matches(param, category, &cat.to_lowercase()))
 }
 
 /// Keep only the recommendations whose parameter belongs to `cat`. See
 /// `category_matches` for the per-category predicates.
 pub fn filter_by_category(mut recs: Vec<Recommendation>, cat: &str) -> Vec<Recommendation> {
     let cat_lower = cat.to_lowercase();
-    recs.retain(|r| category_matches(r, &cat_lower));
+    recs.retain(|r| category_matches(&r.param, &r.category, &cat_lower));
     recs
 }
 
@@ -148,7 +165,11 @@ pub fn filter_by_categories(mut recs: Vec<Recommendation>, cats: &[String]) -> V
         return recs;
     }
     let lowered: Vec<String> = cats.iter().map(|cat| cat.to_lowercase()).collect();
-    recs.retain(|r| lowered.iter().any(|cat| category_matches(r, cat)));
+    recs.retain(|r| {
+        lowered
+            .iter()
+            .any(|cat| category_matches(&r.param, &r.category, cat))
+    });
     recs
 }
 

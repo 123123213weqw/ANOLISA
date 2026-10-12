@@ -1606,6 +1606,59 @@ fn rollback_preview_excluding_at(
     ))
 }
 
+/// What a category-scoped rollback previews: the entries the matching
+/// restore would retire, plus the two reports that restore answers with.
+pub struct CategoryPreview {
+    /// `--exclude` names that address no ledger entry, in the order given —
+    /// the inert-name report `rollback --exclude` publishes.
+    pub unmatched: Vec<String>,
+    /// Recorded entries without a category that this run leaves in place, in
+    /// param order: no named category can select one, so they are reported
+    /// by name instead of silently left behind.
+    pub unclassified: Vec<String>,
+    /// The entries the matching restore would retire, in the unfiltered
+    /// listing's param order.
+    pub entries: Vec<RollbackPreview>,
+}
+
+/// The entries a category-scoped rollback would restore, for
+/// `rollback --list --category <cat>`.
+pub fn rollback_preview_categories(
+    cats: &[String],
+    excluded: &[String],
+) -> Result<CategoryPreview> {
+    rollback_preview_categories_at(cats, excluded, ROLLBACK_PATH)
+}
+
+/// [`rollback_preview_categories`] with the ledger path injectable (the
+/// [`rollback_preview_at`] idiom).
+///
+/// The selection is the one [`rollback_categories`] runs, so the preview
+/// lists exactly the entries that command would restore, in the unfiltered
+/// `--list`'s param order. An absent ledger selects nothing — every
+/// `--exclude` name is unrecorded there and the listing is empty — and, like
+/// every preview, it creates neither the ledger directory nor its lock file.
+fn rollback_preview_categories_at(
+    cats: &[String],
+    excluded: &[String],
+    path: &str,
+) -> Result<CategoryPreview> {
+    let data = read_pending_at(path)?.unwrap_or(RollbackData {
+        version: 1,
+        entries: BTreeMap::new(),
+    });
+    let selection = category_selection(&data.entries, cats, excluded);
+    let entries = selection.units.into_iter().flatten().collect();
+    Ok(CategoryPreview {
+        unmatched: selection.unmatched,
+        unclassified: selection.unclassified,
+        entries: preview_entries(&RollbackData {
+            version: data.version,
+            entries,
+        }),
+    })
+}
+
 /// Parse rollback-ledger JSON into the healed entry map the preview walks.
 /// A corrupt ledger is an error, never an empty list —
 /// silently treating a corrupt ledger as empty is how the original values
@@ -1880,6 +1933,78 @@ fn rollback_excluding_at(
     Ok((unmatched, outcome))
 }
 
+/// What a category-scoped rollback did: the two reports its caller owes and
+/// the attempt's counters.
+pub struct CategoryRollback {
+    /// `--exclude` names that address no ledger entry, in the order given.
+    pub unmatched: Vec<String>,
+    /// Recorded entries without a category that stay in the ledger, in param
+    /// order.
+    pub unclassified: Vec<String>,
+    /// The restored/failed/skipped counters of the attempt, with the meaning
+    /// every other rollback form gives them.
+    pub outcome: RollbackOutcome,
+}
+
+/// Restore every recorded entry whose category one of `cats` names, minus
+/// the entries the `excluded` names address.
+///
+/// The category-scoped counterpart of [`rollback_params`] and
+/// [`rollback_excluding`]: the caller names the rule categories that wrote
+/// the entries, which is the one question about a recorded change that a
+/// listing cannot answer — the category belongs to the rule, and a `net.*`
+/// knob can carry a security finding. The selection runs through
+/// [`category_selection`] and the restore through the same one-transaction
+/// tail every other form uses.
+pub fn rollback_categories(cats: &[String], excluded: &[String]) -> Result<CategoryRollback> {
+    rollback_categories_at(
+        cats,
+        excluded,
+        ROLLBACK_PATH,
+        SYSCTL_PERSIST_PATH,
+        NONSYSCTL_SERVICE_PATH,
+        NONSYSCTL_SCRIPT_PATH,
+    )
+}
+
+/// [`rollback_categories`] with the ledger and generated-file paths
+/// injectable (the same idiom as [`rollback_params_at`]).
+fn rollback_categories_at(
+    cats: &[String],
+    excluded: &[String],
+    ledger: &str,
+    sysctl_path: &str,
+    service_path: &str,
+    script_path: &str,
+) -> Result<CategoryRollback> {
+    let guard = lock_ledger_at(ledger)?;
+    if !Path::new(ledger).exists() {
+        anyhow::bail!("没有找到 rollback 文件 ({ledger})，可能尚未执行过 tune");
+    }
+    let json = fs::read_to_string(ledger).context("读取 rollback 文件失败")?;
+    let mut data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
+    // Heal first for the same reason rollback_params_at does: a legacy ledger
+    // can hold two spellings of one kernel path, and the selection should act
+    // on the single record the restore will act on.
+    heal_alias_duplicates(&mut data);
+
+    let selection = category_selection(&data.entries, cats, excluded);
+    let outcome = restore_units_at(
+        &guard,
+        &mut data,
+        &selection.units,
+        ledger,
+        sysctl_path,
+        service_path,
+        script_path,
+    )?;
+    Ok(CategoryRollback {
+        unmatched: selection.unmatched,
+        unclassified: selection.unclassified,
+        outcome,
+    })
+}
+
 /// The restore units an exclusion keeps, and the excluded names that
 /// addressed no ledger entry (in the order given).
 ///
@@ -1905,6 +2030,89 @@ fn excluded_units(
         .filter(|unit| !unit.keys().any(|key| excluded_keys.contains(key)))
         .collect();
     (unmatched, units)
+}
+
+/// The outcome of [`category_selection`]: the restore units the named
+/// categories select, and the two name lists the caller reports.
+struct CategorySelection {
+    /// `--exclude` names that address no ledger entry, in the order given.
+    unmatched: Vec<String>,
+    /// Recorded entries without a category that this selection leaves in
+    /// place, in param order.
+    unclassified: Vec<String>,
+    /// The restore units to restore, in the ledger's param order.
+    units: Vec<BTreeMap<String, RollbackEntry>>,
+}
+
+/// The restore units a category-scoped rollback selects, and the reports its
+/// caller owes.
+///
+/// Selection order mirrors `tune --category … --exclude …`: every recorded
+/// entry whose category one of `cats` names is selected first, then the
+/// entries the `excluded` names address are dropped, so the exclusions
+/// narrow the categories' set rather than the other way around. The excluded
+/// names resolve through [`match_ledger_keys`], the lookup every rollback
+/// form shares, and a unit an excluded key belongs to is dropped whole
+/// exactly as [`excluded_units`] drops it — the second filter is what keeps
+/// the twin of an excluded entry out of the restore.
+///
+/// An entry with no category is selected by no value: the classification is
+/// the rule layer's own and is never guessed from the parameter name, so
+/// such records come back in `unclassified`, in param order, one name per
+/// entry this selection leaves in place. A record the selection restores as
+/// a unit member is not reported.
+fn category_selection(
+    entries: &BTreeMap<String, RollbackEntry>,
+    cats: &[String],
+    excluded: &[String],
+) -> CategorySelection {
+    let (excluded_keys, unmatched) = match_ledger_keys(entries, excluded);
+    let keys: Vec<String> = entries
+        .iter()
+        .filter(|(key, entry)| {
+            entry.category.as_ref().is_some_and(|category| {
+                category::matches_any_category(&category_spelling(key), category, cats)
+            })
+        })
+        .map(|(key, _)| key.to_string())
+        .filter(|key| !excluded_keys.contains(key))
+        .collect();
+    let units: Vec<BTreeMap<String, RollbackEntry>> = rollback_units(entries, &keys)
+        .into_iter()
+        .filter(|unit| !unit.keys().any(|key| excluded_keys.contains(key)))
+        .collect();
+    let unclassified = entries
+        .iter()
+        .filter(|(key, entry)| {
+            entry.category.is_none() && !units.iter().any(|unit| unit.contains_key(*key))
+        })
+        .map(|(key, _)| key.to_string())
+        .collect();
+    CategorySelection {
+        unmatched,
+        unclassified,
+        units,
+    }
+}
+
+/// The parameter spelling [`category::category_matches`] reads, derived from
+/// a ledger key.
+///
+/// A key is the first spelling a writer recorded, and a library import is
+/// free to leave a slashed or uppercased sysctl alias behind the record a
+/// rule later refreshed; [`category::param_subcategory`] reads such a name
+/// as "other" and the entry would silently leave its own category.
+/// Normalize the separators and the case the way the CLI resolves aliases,
+/// except for the two sysfs families, whose names are literal paths
+/// (`block/<device>/…`, `transparent_hugepage/…`). Every predicate is a
+/// prefix or substring test on the family, so the normalization cannot move
+/// an entry between categories.
+fn category_spelling(key: &str) -> String {
+    if key.starts_with("block/") || key.starts_with("transparent_hugepage/") {
+        key.to_string()
+    } else {
+        key.replace('/', ".").to_lowercase()
+    }
 }
 
 /// The ledger key each name addresses and the names that address none.
@@ -8378,6 +8586,528 @@ mod tests {
         let error = rollback_excluding_at(&["vm.typo".to_string()], path, &conf, &service, &script)
             .err()
             .expect("no ledger records nothing to restore");
+        assert!(
+            error.to_string().contains("没有找到 rollback 文件"),
+            "{error:#}"
+        );
+    }
+
+    /// A recommendation shaped the way the rules emit one: the parameter, a
+    /// value to write, and the rule layer's own category.
+    fn ruled_rec(param: &str, category: Category) -> Recommendation {
+        Recommendation {
+            param: param.to_string(),
+            current_value: "0".to_string(),
+            recommended_value: "1".to_string(),
+            category,
+            writable: true,
+            ..Default::default()
+        }
+    }
+
+    /// [`fixture_ledger`] with a recorded category per entry — the ledger the
+    /// category-scoped selection reads, written the way the production
+    /// merger writes one (a categorized entry carries the serde spelling of
+    /// the rule category, an unclassified one carries no key at all).
+    fn fixture_category_ledger(
+        dir: &AtomicTestDir,
+        entries: &[(&str, &str, &str, &str, Option<Category>)],
+    ) -> String {
+        let mut map = serde_json::Map::new();
+        for (param, previous, applied, path, category) in entries {
+            let mut entry = serde_json::json!({
+                "previous": previous, "applied": applied, "path": path,
+            });
+            if let Some(category) = category {
+                entry["category"] = serde_json::to_value(category).unwrap();
+            }
+            map.insert((*param).to_string(), entry);
+        }
+        let ledger = dir.0.join("rollback.json");
+        fs::write(
+            &ledger,
+            serde_json::json!({ "version": 1, "entries": map }).to_string(),
+        )
+        .unwrap();
+        ledger.to_str().unwrap().to_string()
+    }
+
+    /// The ledger keys a selection would restore, in unit order.
+    fn selected_keys(selection: &CategorySelection) -> Vec<String> {
+        selection
+            .units
+            .iter()
+            .flat_map(|unit| unit.keys().cloned())
+            .collect()
+    }
+
+    /// The contract of the whole feature: `rollback --category X` restores
+    /// exactly the entries `tune --category X` wrote. One ledger is recorded
+    /// from every finding of a mixed plan (the way the production merger
+    /// records one), and each named category must select the slice
+    /// `filter_by_categories` keeps from the live plan — for a single value
+    /// and for the union of several, through the aliases too. The plan
+    /// includes the two cases name-based guessing gets wrong: a security
+    /// finding on a `net.*` knob (never selected by `--category net`) and a
+    /// performance finding on a `kernel.*` knob (never selected by
+    /// `--category security`).
+    #[test]
+    fn category_selection_agrees_with_the_tune_category_filter() {
+        let recs = [
+            ruled_rec("net.core.bpf_jit_harden", Category::Security),
+            ruled_rec("net.core.somaxconn", Category::Performance),
+            ruled_rec("vm.swappiness", Category::Performance),
+            ruled_rec("kernel.dmesg_restrict", Category::Security),
+            ruled_rec("kernel.sched_latency_ns", Category::Performance),
+        ];
+        let data = merge_entries(
+            RollbackData {
+                version: 1,
+                entries: BTreeMap::new(),
+            },
+            recs.iter().map(|r| {
+                (
+                    r.param.clone(),
+                    r.current_value.clone(),
+                    r.recommended_value.clone(),
+                    Some(r.category.clone()),
+                )
+            }),
+        );
+        for names in [
+            vec!["net"],
+            vec!["mem"],
+            vec!["cpu"],
+            vec!["io"],
+            vec!["security"],
+            vec!["network"],
+            vec!["内存"],
+            vec!["net", "mem"],
+            vec!["内存", "安全"],
+        ] {
+            let cats: Vec<String> = names.iter().map(|cat| cat.to_string()).collect();
+            let mut plan: Vec<String> = category::filter_by_categories(recs.to_vec(), &cats)
+                .iter()
+                .map(|r| r.param.clone())
+                .collect();
+            plan.sort();
+            let selection = category_selection(&data.entries, &cats, &[]);
+            assert_eq!(selected_keys(&selection), plan, "categories {names:?}");
+            assert!(
+                selection.unclassified.is_empty(),
+                "{names:?}: every entry here was written by a rule"
+            );
+        }
+    }
+
+    /// Entries with no category — a ledger written before the field existed,
+    /// or one a library import wrote — are selected by no value at all, and
+    /// the classification is never guessed from the parameter name: a
+    /// `net.*` record stays put under `--category net`, and a record whose
+    /// name looks like a security knob stays put under `--category security`
+    /// too. They are echoed by name so the caller sees why they were left.
+    #[test]
+    fn category_selection_reports_unclassified_entries_instead_of_guessing() {
+        let dir = AtomicTestDir::new("category-unclassified");
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        let suid_dumpable = dir.0.join("suid_dumpable");
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    None,
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "fs.suid_dumpable",
+                    "0",
+                    "2",
+                    suid_dumpable.to_str().unwrap(),
+                    None,
+                ),
+            ],
+        );
+        let data = load_rollback_from(&ledger).unwrap();
+
+        // The net.* record is unclassified: its name does not select it.
+        let selection = category_selection(&data.entries, &["net".to_string()], &[]);
+        assert!(
+            selected_keys(&selection).is_empty(),
+            "selected {:?}",
+            selected_keys(&selection)
+        );
+        assert_eq!(
+            selection.unclassified,
+            ["fs.suid_dumpable", "net.core.somaxconn"]
+        );
+
+        // Nor does a name that looks like a security knob: the category is
+        // the rule layer's, and no rule recorded one for it.
+        let selection = category_selection(&data.entries, &["security".to_string()], &[]);
+        assert!(
+            selected_keys(&selection).is_empty(),
+            "selected {:?}",
+            selected_keys(&selection)
+        );
+        assert_eq!(
+            selection.unclassified,
+            ["fs.suid_dumpable", "net.core.somaxconn"]
+        );
+
+        // A classified entry of another category is not reported at all.
+        let selection = category_selection(&data.entries, &["mem".to_string()], &[]);
+        assert_eq!(selected_keys(&selection), ["vm.swappiness"]);
+        assert_eq!(
+            selection.unclassified,
+            ["fs.suid_dumpable", "net.core.somaxconn"]
+        );
+    }
+
+    /// `--category … --exclude …` narrows the way `tune` does: the categories
+    /// select first, then the exclusions drop. An excluded name that dresses
+    /// no entry is echoed like every other inert exclusion, and excluding one
+    /// half of a recorded mutually exclusive pair keeps the whole unit — the
+    /// selected half is dropped too, because restoring it would zero the
+    /// excluded one in the kernel.
+    #[test]
+    fn category_selection_stacks_exclusions_on_the_selection() {
+        let dir = AtomicTestDir::new("category-excluding");
+        let bytes = dir.0.join("dirty_bytes");
+        let ratio = dir.0.join("dirty_ratio");
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "vm.dirty_bytes",
+                    "0",
+                    "1073741824",
+                    bytes.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.dirty_ratio",
+                    "20",
+                    "0",
+                    ratio.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+            ],
+        );
+        let data = load_rollback_from(&ledger).unwrap();
+
+        let selection = category_selection(
+            &data.entries,
+            &["net".to_string(), "mem".to_string()],
+            &["vm.swappiness".to_string(), "vm.typo".to_string()],
+        );
+        // The categories keep somaxconn and the pair; swappiness matched the
+        // categories too and was dropped by the exclusion, while net.*
+        // bpf_jit_harden was never selected. The unmatched name is echoed.
+        assert_eq!(
+            selected_keys(&selection),
+            ["net.core.somaxconn", "vm.dirty_bytes", "vm.dirty_ratio"]
+        );
+        assert_eq!(selection.unmatched, ["vm.typo"]);
+        assert!(selection.unclassified.is_empty());
+
+        let selection = category_selection(
+            &data.entries,
+            &["mem".to_string()],
+            &["vm.dirty_bytes".to_string()],
+        );
+        // Only swappiness is left: excluding one half of the pair drops the
+        // whole unit, so the selected half is not restored either.
+        assert_eq!(selected_keys(&selection), ["vm.swappiness"]);
+        assert!(
+            selection.unmatched.is_empty(),
+            "the name addressed an entry, so it is not an inert exclusion"
+        );
+    }
+
+    /// The restore half: only the selected entries are written and retired,
+    /// the rest stay live and recorded, and the persisted file is regenerated
+    /// from what remains. The unclassified record is reported and untouched.
+    #[test]
+    fn rollback_categories_restores_only_the_selected_entries() {
+        let dir = AtomicTestDir::new("rollback-categories-restore");
+        let (conf, service, script) = fixture_paths(&dir);
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        let dmesg = dir.0.join("dmesg_restrict");
+        let unknown = dir.0.join("unknown_knob");
+        fs::write(&somaxconn, "4096").unwrap();
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&dmesg, "1").unwrap();
+        fs::write(&unknown, "7").unwrap();
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "kernel.dmesg_restrict",
+                    "0",
+                    "1",
+                    dmesg.to_str().unwrap(),
+                    Some(Category::Security),
+                ),
+                (
+                    "vm.ktuner_unknown_knob",
+                    "9",
+                    "7",
+                    unknown.to_str().unwrap(),
+                    None,
+                ),
+            ],
+        );
+        fs::write(
+            &conf,
+            "net.core.somaxconn = 4096\nvm.swappiness = 10\nkernel.dmesg_restrict = 1\n",
+        )
+        .unwrap();
+
+        let report =
+            rollback_categories_at(&["net".to_string()], &[], &ledger, &conf, &service, &script)
+                .unwrap();
+
+        assert!(report.unmatched.is_empty(), "{:?}", report.unmatched);
+        assert_eq!(
+            (
+                report.outcome.restored,
+                report.outcome.failed,
+                report.outcome.skipped
+            ),
+            (1, 0, 0)
+        );
+        assert!(report.outcome.is_complete());
+        assert_eq!(report.unclassified, ["vm.ktuner_unknown_knob"]);
+        assert_eq!(
+            fs::read_to_string(&somaxconn).unwrap(),
+            "128",
+            "the selected entry is restored"
+        );
+        assert_eq!(fs::read_to_string(&swappiness).unwrap(), "10");
+        assert_eq!(fs::read_to_string(&dmesg).unwrap(), "1");
+        assert_eq!(fs::read_to_string(&unknown).unwrap(), "7");
+        let data = load_rollback_from(&ledger).unwrap();
+        assert_eq!(
+            data.entries.keys().collect::<Vec<_>>(),
+            [
+                "kernel.dmesg_restrict",
+                "vm.ktuner_unknown_knob",
+                "vm.swappiness"
+            ],
+            "the untouched records stay"
+        );
+        let persisted = fs::read_to_string(&conf).unwrap();
+        assert!(!persisted.contains("somaxconn"), "{persisted}");
+        assert!(persisted.contains("vm.swappiness = 10"), "{persisted}");
+    }
+
+    /// A selection that comes up empty is the empty ledger's answer: the
+    /// counters stay zero, the attempt is complete, and neither the ledger
+    /// nor the persisted file is touched — whichever way the set came up
+    /// empty (no entry of that category, or every selected unit kept by an
+    /// exclusion).
+    #[test]
+    fn rollback_categories_selecting_nothing_touches_nothing() {
+        let dir = AtomicTestDir::new("rollback-categories-empty");
+        let (conf, service, script) = fixture_paths(&dir);
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        fs::write(&somaxconn, "4096").unwrap();
+        fs::write(&swappiness, "10").unwrap();
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    None,
+                ),
+            ],
+        );
+        fs::write(&conf, "net.core.somaxconn = 4096\n").unwrap();
+        let ledger_before = fs::read(&ledger).unwrap();
+        let persisted_before = fs::read(&conf).unwrap();
+
+        // No entry of the named category.
+        let report =
+            rollback_categories_at(&["io".to_string()], &[], &ledger, &conf, &service, &script)
+                .unwrap();
+        assert_eq!(
+            (
+                report.outcome.restored,
+                report.outcome.failed,
+                report.outcome.skipped
+            ),
+            (0, 0, 0)
+        );
+        assert!(report.outcome.is_complete(), "an empty attempt is complete");
+        assert_eq!(report.unclassified, ["vm.swappiness"]);
+        assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+        assert_eq!(fs::read(&conf).unwrap(), persisted_before);
+        assert_eq!(fs::read_to_string(&somaxconn).unwrap(), "4096");
+        assert_eq!(fs::read_to_string(&swappiness).unwrap(), "10");
+
+        // Every selected entry excluded.
+        let report = rollback_categories_at(
+            &["net".to_string()],
+            &["net.core.somaxconn".to_string()],
+            &ledger,
+            &conf,
+            &service,
+            &script,
+        )
+        .unwrap();
+        assert_eq!(
+            (
+                report.outcome.restored,
+                report.outcome.failed,
+                report.outcome.skipped
+            ),
+            (0, 0, 0)
+        );
+        assert!(report.outcome.is_complete());
+        assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+        assert_eq!(fs::read(&conf).unwrap(), persisted_before);
+    }
+
+    /// The preview lists exactly the entries the restore then retires, in the
+    /// unfiltered listing's shape, and answers the same two reports; it
+    /// writes nothing.
+    #[test]
+    fn preview_categories_lists_the_restore_set() {
+        let dir = AtomicTestDir::new("preview-categories-set");
+        let (conf, service, script) = fixture_paths(&dir);
+        let somaxconn = dir.0.join("somaxconn");
+        let swappiness = dir.0.join("swappiness");
+        fs::write(&somaxconn, "4096").unwrap();
+        fs::write(&swappiness, "10").unwrap();
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "vm.ktuner_unknown_knob",
+                    "9",
+                    "7",
+                    "/nonexistent/ktuner/knob",
+                    None,
+                ),
+            ],
+        );
+        let ledger_before = fs::read(&ledger).unwrap();
+
+        let preview =
+            rollback_preview_categories_at(&["net".to_string()], &["vm.typo".to_string()], &ledger)
+                .unwrap();
+        let params: Vec<&str> = preview.entries.iter().map(|e| e.param.as_str()).collect();
+        assert_eq!(params, ["net.core.somaxconn"]);
+        assert_eq!(preview.unmatched, ["vm.typo"]);
+        assert_eq!(preview.unclassified, ["vm.ktuner_unknown_knob"]);
+        assert_eq!(
+            fs::read(&ledger).unwrap(),
+            ledger_before,
+            "the preview is read-only"
+        );
+
+        // The listing is exactly the set the restore then retires.
+        let report =
+            rollback_categories_at(&["net".to_string()], &[], &ledger, &conf, &service, &script)
+                .unwrap();
+        assert_eq!(report.outcome.restored, 1);
+        let data = load_rollback_from(&ledger).unwrap();
+        assert!(!data.entries.contains_key("net.core.somaxconn"));
+        assert!(data.entries.contains_key("vm.swappiness"));
+    }
+
+    /// With no ledger there is nothing to select: the preview is the empty
+    /// listing and every excluded name comes back as unrecorded, without
+    /// creating the ledger directory or its lock file; the restore reports
+    /// the same command error every other rollback form reports.
+    #[test]
+    fn preview_categories_an_absent_ledger_selects_nothing() {
+        let dir = AtomicTestDir::new("preview-categories-absent");
+        let (conf, service, script) = fixture_paths(&dir);
+        let ledger = dir.0.join("nested").join("rollback.json");
+        let path = ledger.to_str().unwrap();
+
+        let preview =
+            rollback_preview_categories_at(&["net".to_string()], &["vm.typo".to_string()], path)
+                .unwrap();
+        assert!(preview.entries.is_empty());
+        assert_eq!(preview.unmatched, ["vm.typo"]);
+        assert!(preview.unclassified.is_empty());
+        assert!(!ledger.exists(), "the preview must not create the ledger");
+        assert!(!ledger.parent().unwrap().exists());
+        assert!(!Path::new(&format!("{}.lock", ledger.display())).exists());
+
+        let error =
+            rollback_categories_at(&["net".to_string()], &[], path, &conf, &service, &script)
+                .err()
+                .expect("no ledger records nothing to restore");
         assert!(
             error.to_string().contains("没有找到 rollback 文件"),
             "{error:#}"
