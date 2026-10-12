@@ -7715,17 +7715,15 @@ fn eval_bpf_jit_harden(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 /// `net.core.bpf_jit_harden` is created 0600 root-owned and its handler
 /// (`proc_dointvec_minmax_bpf_restricted`, net/core/sysctl_net_core.c)
 /// returns -EPERM unless the caller holds CAP_SYS_ADMIN, so the read fails
-/// for every unprivileged `ktuner check`. `read_sysctl_u64` maps a failed
-/// read to 0, which is this rule's firing value: the report claimed "BPF JIT
-/// 加固未启用" for a host whose value was never read, and the same run marks
-/// the parameter `"writable": false`. `why` already refuses to present a
-/// failed read as a value ("A failed read is an error, never a value"); the
-/// rule must not invent one either. A readable 0 is still a finding.
+/// for every unprivileged `ktuner check`. The value is read through
+/// [`read_switch`], so a failed read is not the 0 this rule fires on: the
+/// report claimed "BPF JIT 加固未启用" for a host whose value was never read,
+/// and the same run marks the parameter `"writable": false`. `why` already
+/// refuses to present a failed read as a value ("A failed read is an error,
+/// never a value"); the rule must not invent one either. A readable 0 is
+/// still a finding.
 fn eval_bpf_jit_harden_at(path: &str, recs: &mut Vec<Recommendation>) -> usize {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return 1;
-    };
-    let Ok(current) = raw.trim().parse::<u64>() else {
+    let Some(current) = read_switch(path) else {
         return 1;
     };
     if current == 0 {
@@ -8176,6 +8174,23 @@ fn read_sysctl_string(path: &str) -> String {
     std::fs::read_to_string(path)
         .map(|s| s.split_whitespace().collect::<Vec<_>>().join(" "))
         .unwrap_or_default()
+}
+
+/// A sysctl read whose failure is distinguishable from the value 0.
+///
+/// [`read_sysctl_u64`] maps an unreadable or unparseable file to 0, which a
+/// rule cannot tell apart from a real 0 — and 0 is the value the "switch is
+/// off" rules fire on, so that reader cannot gate anything. The bpf switches
+/// are the case in point: `net.core.bpf_jit_harden` is created 0600
+/// root-owned and its handler (`proc_dointvec_minmax_bpf_restricted`, v6.6
+/// net/core/sysctl_net_core.c:466) returns -EPERM unless the caller holds
+/// CAP_SYS_ADMIN. A rule that reads a switch through here keeps its advice
+/// when the read produced nothing: a missing or unreadable switch is not
+/// evidence that the switch is off.
+fn read_switch(path: &str) -> Option<u64> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
 }
 
 /// Whether a `uname -r`-style release string is at least `major.minor`.
