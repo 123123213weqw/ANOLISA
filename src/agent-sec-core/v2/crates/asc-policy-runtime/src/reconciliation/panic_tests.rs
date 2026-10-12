@@ -285,11 +285,13 @@ fn unconfirmed_panic_retains_result_while_other_bindings_progress() {
         pap.delete_scope(&record(1).binding.spec.scope.scope_id)
             .unwrap();
         wait_until(|| {
-            let state = queue.state.lock().unwrap();
-            if let Some(Entry::WaitingRetry { retry_at, .. }) = state.entries.get(&id(1)) {
-                clock.0.store(*retry_at, Ordering::SeqCst);
+            {
+                let state = queue.state.lock().unwrap();
+                if let Some(Entry::WaitingRetry { retry_at, .. }) = state.entries.get(&id(1)) {
+                    clock.0.store(*retry_at, Ordering::SeqCst);
+                }
             }
-            status(&inner, 1).is_none() && state.entries.is_empty()
+            status(&inner, 1).is_none() && queue.state.lock().unwrap().entries.is_empty()
         });
         assert_eq!(
             client.calls.lock().unwrap().last(),

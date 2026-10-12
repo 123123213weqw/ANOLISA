@@ -37,11 +37,13 @@ fn record(n: u32) -> BindingStateSnapshot {
         deployments: vec![],
     }
 }
+#[track_caller]
 fn wait_until(mut condition: impl FnMut() -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !condition() {
         assert!(Instant::now() < deadline, "condition did not converge");
-        thread::yield_now();
+        // Let workers and the scanner acquire shared locks between polls.
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
