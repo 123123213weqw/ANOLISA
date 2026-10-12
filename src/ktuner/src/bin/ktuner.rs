@@ -63,6 +63,9 @@ enum Commands {
         /// Restore only these recorded parameters, leaving the other entries
         /// in the ledger in place
         params: Vec<String>,
+        /// Restore everything but this recorded parameter; may be repeated
+        #[arg(long)]
+        exclude: Vec<String>,
         /// Show what a rollback would restore, without changing anything;
         /// with parameters, only the entries restoring them would touch
         #[arg(long)]
@@ -120,9 +123,10 @@ fn main() {
         Commands::Why { params } => cmd_why(&params),
         Commands::Rollback {
             params,
+            exclude,
             list,
             drifted,
-        } => cmd_rollback(&params, list, drifted),
+        } => cmd_rollback(&params, &exclude, list, drifted),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -1125,21 +1129,42 @@ fn rollback_body(
     }
 }
 
-/// The positional spellings `rollback` hands to the engine: every name goes
-/// through normalize_param, the policy fix/why share, so the spellings this
-/// command accepts cannot drift from those commands whichever position a name
-/// sits in.
+/// The spellings `rollback` hands to the engine: every name — a positional or
+/// an `--exclude` value — goes through normalize_param, the policy fix/why
+/// share, so the spellings this command accepts cannot drift from those
+/// commands whichever flag a name sits under.
 fn normalize_params(params: &[String]) -> Vec<String> {
     params.iter().map(|param| normalize_param(param)).collect()
 }
 
-fn cmd_rollback(params: &[String], list: bool, drifted: bool) -> Result<i32> {
+/// Attach the inert-name report to a body when there is one. Same key and
+/// shape `tune --exclude` uses, and it appears only when a name addressed no
+/// ledger entry, so a run whose exclusions all matched keeps exactly the keys
+/// the same invocation answers without the flag.
+fn with_unmatched_exclude(body: serde_json::Value, unmatched: &[String]) -> serde_json::Value {
+    let mut body = body;
+    if !unmatched.is_empty() {
+        body["unmatched_exclude"] = json!(unmatched);
+    }
+    body
+}
+
+fn cmd_rollback(params: &[String], exclude: &[String], list: bool, drifted: bool) -> Result<i32> {
     // `--drifted` filters the `--list` preview, so it means nothing without
     // it: refusing is a usage error (the README's stderr JSON, exit 2), checked
     // here so it fails as an argument error before the root gate rather than
     // as a root complaint.
     if drifted && !list {
         anyhow::bail!("rollback --drifted requires --list");
+    }
+    // Restoring named parameters and excluding named parameters are opposite
+    // instructions, so a run that carried both would have to guess which one
+    // wins; refusing is a usage error (the README's stderr JSON, exit 2),
+    // checked before the root gate like the parser's own errors. It holds for
+    // `--list` too: positionals narrow the preview to the named entries while
+    // `--exclude` narrows it to everything else.
+    if !params.is_empty() && !exclude.is_empty() {
+        anyhow::bail!("rollback takes either parameters or --exclude, not both");
     }
     let is_root = unsafe { libc::geteuid() } == 0;
     if !is_root {
@@ -1151,22 +1176,38 @@ fn cmd_rollback(params: &[String], list: bool, drifted: bool) -> Result<i32> {
         // rollback's root requirement; a corrupt ledger surfaces as an error
         // here WITHOUT the destructive path having run first. Positionals
         // narrow the preview to the entries `rollback <param>...` would
-        // restore, named the way fix/why/rollback normalize them; a name the
-        // ledger does not record is the same command error the restore gives.
+        // restore, `--exclude` to the entries a rollback of everything else
+        // would restore, both named the way fix/why/rollback normalize them;
+        // a name the ledger does not record is the restore's own command error
+        // with positionals, and an inert, reported exclusion with `--exclude`.
         // `--drifted` then filters what remains.
-        let entries = if params.is_empty() {
-            tuner::rollback_preview()?
+        let (unmatched, entries) = if !exclude.is_empty() {
+            tuner::rollback_preview_excluding(&normalize_params(exclude))?
+        } else if params.is_empty() {
+            (Vec::new(), tuner::rollback_preview()?)
         } else {
-            tuner::rollback_preview_params(&normalize_params(params))?
+            (
+                Vec::new(),
+                tuner::rollback_preview_params(&normalize_params(params))?,
+            )
         };
         let entries = if drifted {
             drifted_entries(entries)
         } else {
             entries
         };
-        let output = rollback_list_output(&entries);
+        let output = with_unmatched_exclude(rollback_list_output(&entries), &unmatched);
         print_json(&output)?;
         return Ok(0);
+    }
+    if !exclude.is_empty() {
+        // Restore everything else as one transaction; the body keeps the
+        // full-rollback keys and adds the inert-name report only when a name
+        // addressed no ledger entry.
+        let (unmatched, outcome) = tuner::rollback_excluding(&normalize_params(exclude))?;
+        let output = with_unmatched_exclude(rollback_body(0, &[], &outcome), &unmatched);
+        print_json(&output)?;
+        return Ok(rollback_exit_code(&outcome));
     }
     if params.is_empty() {
         let outcome = tuner::rollback_quiet()?;
@@ -1438,8 +1479,42 @@ mod tests {
         // the argument message, and the call returns before any ledger read.
         // (With --list the pair is accepted past this check and falls through
         // to the root gate, which this test cannot assert without root.)
-        let err = cmd_rollback(&[], false, true).expect_err("--drifted alone must be refused");
+        let err = cmd_rollback(&[], &[], false, true).expect_err("--drifted alone must be refused");
         assert_eq!(format!("{err:#}"), "rollback --drifted requires --list");
+    }
+
+    #[test]
+    fn parameters_and_exclude_are_refused_before_the_root_gate() {
+        // Restoring named parameters and excluding named parameters are
+        // opposite instructions, so carrying both is a usage error, not a
+        // root complaint: an unprivileged host must see the argument message,
+        // and the call returns before any ledger read. The same refusal
+        // covers the `--list` forms, before the preview reads anything.
+        let err = cmd_rollback(
+            &["vm.swappiness".to_string()],
+            &["vm.dirty_ratio".to_string()],
+            false,
+            false,
+        )
+        .expect_err("both forms must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "rollback takes either parameters or --exclude, not both"
+        );
+    }
+
+    #[test]
+    fn unmatched_exclude_extends_the_body_only_when_there_is_one() {
+        // The report is the only thing `--exclude` adds to a body, and it
+        // exists only when a name addressed no ledger entry: a run whose
+        // exclusions all matched keeps exactly the keys the invocation
+        // answers without the flag.
+        let body = json!({ "count": 0, "pending": [] });
+        assert_eq!(with_unmatched_exclude(body.clone(), &[]), body);
+        assert_eq!(
+            with_unmatched_exclude(body, &["vm.typo".to_string()]),
+            json!({ "count": 0, "pending": [], "unmatched_exclude": ["vm.typo"] })
+        );
     }
 
     #[test]

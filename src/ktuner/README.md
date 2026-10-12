@@ -37,6 +37,8 @@ sudo ktuner rollback          # destructive + terminal (deletes the ledger)
 sudo ktuner rollback --list   # read-only preview of what rollback would restore
 sudo ktuner rollback --list <param> [<param>…]  # preview only what rolling back these would restore
 sudo ktuner rollback <param> [<param>…]  # restore the recorded parameters named, e.g. vm.dirty_bytes
+sudo ktuner rollback --exclude vm.swappiness   # restore all recorded entries but this one
+sudo ktuner rollback --list --exclude vm.swappiness   # preview that same set
 ```
 
 ## JSON output
@@ -475,6 +477,34 @@ null`) is **not** listed: an unreadable value is not evidence of drift, and the 
 shows those entries. With names, the names narrow the preview first and the drift filter applies to
 what remains. `--drifted` without `--list` is a usage error (stderr JSON, exit 2), refused before
 the root gate like the other argument errors.
+
+### rollback --exclude output
+
+`sudo ktuner rollback --exclude <param> [<param>…]` (repeatable) restores every recorded entry except the
+named ones, in one transaction: one ledger lock, one regeneration of the persisted file from the entries
+that remain. The body keeps the full-rollback keys, and an `--exclude` name that addresses no ledger entry
+is not an error — it is echoed in `unmatched_exclude`, in the order given, so an inert exclusion is visible
+instead of silent (the same rule `tune --exclude` applies):
+
+```json
+{"failed": 0, "restored": 3, "skipped": 0, "status": "Full"}
+```
+
+An excluded entry stays in the ledger, exactly as the entries a `rollback <param>…` does not name stay in
+place. The mutually exclusive twin is the same restore unit it is everywhere else: an exclusion on either
+half keeps the whole unit — the excluded entry and the half the ledger recorded with it both stay in place —
+because writing the free half would zero the excluded one in the kernel (`v6.6 mm/page-writeback.c:518`,
+`v6.6 mm/util.c:810`) and leave the ledger describing a kernel it does not match. When nothing is left to
+restore — every entry excluded, or every remaining unit kept by an exclusion — the body is the one an empty
+ledger answers (`status: "Nothing"`, exit `0`), and the ledger, which still holds the excluded records, is
+not deleted.
+
+`sudo ktuner rollback --list --exclude <param>` previews that same set read-only in the `--list` shape,
+and `--drifted` still narrows what remains. A name that addresses no ledger entry is echoed there too; with
+no ledger every name is unrecorded, so the preview is the empty listing. Restoring named parameters and
+excluding named parameters are opposite instructions, so `rollback <param>…` with `--exclude` is a usage
+error (`2`, stderr JSON), refused before the root gate like the other argument errors. Plain
+`ktuner rollback`, `ktuner rollback --list` and `ktuner rollback <param>…` are unchanged.
 
 ### error output (stderr)
 

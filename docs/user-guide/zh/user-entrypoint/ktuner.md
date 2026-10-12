@@ -79,6 +79,8 @@ sudo ktuner rollback          # 破坏性且终结：恢复并删除 ledger
 sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 sudo ktuner rollback --list vm.swappiness   # 只预览回滚 vm.swappiness 将恢复的内容
 sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记录参数
+sudo ktuner rollback --exclude vm.swappiness   # 恢复其余全部已记录条目、跳过这一项
+sudo ktuner rollback --list --exclude vm.swappiness   # 预览同一集合
 ```
 
 `sudo ktuner fix <param> --dry-run` 以与 `tune --dry-run` 相同的形态预览这一次
@@ -141,6 +143,8 @@ sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记�
 `sudo ktuner rollback --list` 也会报告当前实际状态：每个待回滚条目新增 `live`（此刻从该条目路径读到的值；路径读不到时为 `null`——设备已消失、模块未加载）和 `drifted`（`live` 是否仍与记录的 `applied` 一致；没有可比较的 live 值时为 `null`）。两个字段都是对现有形态的新增——`count`、`pending` 以及记录的 `param`/`applied`/`previous` 取值都不变——读不到值不算错误，命令仍以 `0` 退出。取值的呈现与比较与 ktuner 其他输出一致，sysfs 选项列表或多值 sysctl 不会被误报为漂移。`sudo ktuner rollback --list --drifted` 把列表收窄到记录值与内核不再一致的条目——被别的写者改掉的那些；路径读不到的条目不在其中（不带 `--drifted` 的 `--list` 仍能看到），`--drifted` 不带 `--list` 是用法错误。
 
 `sudo ktuner rollback --list <param>…` 把这份预览收窄到 `rollback <param>…` 将恢复的内容：每个点名的条目，加上与它一起记录的互斥孪生，形态与顺序同完整列表。账本里没有的名字是与回滚相同的命令错误（`2`）。
+
+`sudo ktuner rollback --exclude <param>…` 在一次事务里恢复账本中除点名条目以外的全部条目，`sudo ktuner rollback --list --exclude <param>…` 以只读方式预览同一集合（`--drifted` 仍对剩余条目过滤）。被排除的条目留在账本里；与它一起记录的互斥孪生同样保留——写任一半都会在内核里把另一半清零（`v6.6 mm/page-writeback.c:518`、`v6.6 mm/util.c:810`），孪生对是一个恢复单元，排除任一半都保留整个单元。输出保留全量回滚的键；没有命中账本的名字回显在 `unmatched_exclude` 中而不是让命令失败，与 `tune --exclude` 报告惰性排除的方式一致。全部条目被排除时什么都不恢复，输出与空账本相同（`status "Nothing"`、退出码 `0`），账本保留这些被排除的记录。`rollback <param>…` 与 `--exclude` 是相反的指令，同时给出是用法错误（`2`，stderr JSON）。
 
 ## 权限边界
 

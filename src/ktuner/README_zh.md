@@ -37,6 +37,8 @@ sudo ktuner rollback          # 破坏性且终结（删除 ledger）
 sudo ktuner rollback --list   # 只读预览回滚将恢复的内容
 sudo ktuner rollback --list <param> [<param>…]  # 只预览回滚这些参数将恢复的内容
 sudo ktuner rollback <param> [<param>…]  # 回滚点名的已记录参数，例如 vm.dirty_bytes
+sudo ktuner rollback --exclude vm.swappiness   # 恢复其余全部已记录条目、跳过这一项
+sudo ktuner rollback --list --exclude vm.swappiness   # 预览同一集合
 ```
 
 ## JSON 输出
@@ -403,6 +405,29 @@ sysfs/sysctl 文件读值）的参数输出当前值并以 `0` 退出：
 带任何参数都是用法错误。
 
 `sudo ktuner rollback --list --drifted` 只列出 `drifted` 为 `true` 的条目——那些被别的写者改掉的调优。输出形态不变，`count` 是过滤后的条数，因此直接回答「我丢了哪些」。路径读不到（`drifted: null`）的条目**不在**其中：读不到值不能当作漂移的证据，用不带 `--drifted` 的 `--list` 仍能看到它们。同时点名参数时，先按名字收窄预览，再对剩下的条目按漂移过滤。`--drifted` 不带 `--list` 是用法错误（stderr JSON、退出码 2），与其他参数错误一样在 root 检查之前拒绝。
+
+### rollback --exclude 输出
+
+`sudo ktuner rollback --exclude <param> [<param>…]`（可重复）一次事务恢复账本中除点名条目以外的全部
+条目：一把账本锁，只在最后按剩余条目重新生成一次持久化文件。输出保留全量回滚的键；没有命中账本的
+`--exclude` 名字不算错误——按给出顺序回显在 `unmatched_exclude` 中，让没起作用的排除可见而不是静默
+（与 `tune --exclude` 同一条规则）：
+
+```json
+{"failed": 0, "restored": 3, "skipped": 0, "status": "Full"}
+```
+
+被排除的条目留在账本里，与 `rollback <param>…` 未点名的条目留在账本里同一语义。互斥孪生在任何地方都是
+同一个恢复单元：排除任一半都保留整个单元——被排除的条目与账本为它记录的另一半都不动——因为写入留下的
+一半会在内核里把被排除的一半清零（`v6.6 mm/page-writeback.c:518`、`v6.6 mm/util.c:810`），只恢复一半还会让
+账本描述的内核状态与实际不符。没有任何单元可恢复时（全部条目被排除，或剩余单元的孪生被排除），输出与空
+账本相同（`status: "Nothing"`、退出码 `0`），账本（仍保存被排除的记录）不删除。
+
+`sudo ktuner rollback --list --exclude <param>` 以 `--list` 的同形只读预览同一集合，`--drifted` 仍对剩余
+条目过滤。没有命中账本的名字同样回显；没有账本时所有名字都算未命中，预览是空清单。点名恢复与点名排除
+是方向相反的指令，`rollback <param>…` 与 `--exclude` 同时给出是用法错误（`2`，stderr JSON），与其他
+参数错误一样在 root 检查之前拒绝。普通 `ktuner rollback`、`ktuner rollback --list` 与
+`ktuner rollback <param>…` 不变。
 
 ### 错误输出（stderr）
 
