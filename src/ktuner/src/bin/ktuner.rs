@@ -58,11 +58,16 @@ enum Commands {
         #[arg(required = true)]
         params: Vec<String>,
     },
-    /// Roll back all applied changes, or one or more recorded parameters
+    /// Roll back all applied changes, one or more recorded parameters, or
+    /// the recorded entries of a category
     Rollback {
         /// Restore only these recorded parameters, leaving the other entries
         /// in the ledger in place
         params: Vec<String>,
+        /// Restore only the recorded entries of this category; may be
+        /// repeated (the union is kept)
+        #[arg(long)]
+        category: Vec<String>,
         /// Restore everything but this recorded parameter; may be repeated
         #[arg(long)]
         exclude: Vec<String>,
@@ -123,10 +128,11 @@ fn main() {
         Commands::Why { params } => cmd_why(&params),
         Commands::Rollback {
             params,
+            category,
             exclude,
             list,
             drifted,
-        } => cmd_rollback(&params, &exclude, list, drifted),
+        } => cmd_rollback(&params, &category, &exclude, list, drifted),
     };
     match result {
         Ok(code) => std::process::exit(code),
@@ -1149,7 +1155,25 @@ fn with_unmatched_exclude(body: serde_json::Value, unmatched: &[String]) -> serd
     body
 }
 
-fn cmd_rollback(params: &[String], exclude: &[String], list: bool, drifted: bool) -> Result<i32> {
+/// Attach the unclassified report to a body when there is one: the recorded
+/// entries no category could select, by name. Same non-empty-only rule as
+/// [`with_unmatched_exclude`], and only a `--category` invocation can have
+/// one, so every other form keeps exactly the keys it always answered.
+fn with_unclassified(body: serde_json::Value, unclassified: &[String]) -> serde_json::Value {
+    let mut body = body;
+    if !unclassified.is_empty() {
+        body["unclassified"] = json!(unclassified);
+    }
+    body
+}
+
+fn cmd_rollback(
+    params: &[String],
+    cats: &[String],
+    exclude: &[String],
+    list: bool,
+    drifted: bool,
+) -> Result<i32> {
     // `--drifted` filters the `--list` preview, so it means nothing without
     // it: refusing is a usage error (the README's stderr JSON, exit 2), checked
     // here so it fails as an argument error before the root gate rather than
@@ -1166,6 +1190,20 @@ fn cmd_rollback(params: &[String], exclude: &[String], list: bool, drifted: bool
     if !params.is_empty() && !exclude.is_empty() {
         anyhow::bail!("rollback takes either parameters or --exclude, not both");
     }
+    // Selecting named parameters and selecting the entries of a category are
+    // opposite instructions as well ("restore exactly these" / "restore the
+    // ones this rule category wrote"), and `--category` already selects a
+    // whole set — naming parameters on top of it would have to guess which
+    // one wins. Same usage error, refused before the root gate.
+    if !params.is_empty() && !cats.is_empty() {
+        anyhow::bail!("rollback takes either parameters or --category, not both");
+    }
+    // The same validator and the same message `check` and `tune` use: an
+    // unknown category is an argument error, so it is refused before the
+    // root gate and before any system read, like the checks above.
+    for cat in cats {
+        category::validate_category(cat)?;
+    }
     let is_root = unsafe { libc::geteuid() } == 0;
     if !is_root {
         anyhow::bail!("rollback requires root (sudo ktuner rollback)");
@@ -1177,16 +1215,24 @@ fn cmd_rollback(params: &[String], exclude: &[String], list: bool, drifted: bool
         // here WITHOUT the destructive path having run first. Positionals
         // narrow the preview to the entries `rollback <param>...` would
         // restore, `--exclude` to the entries a rollback of everything else
-        // would restore, both named the way fix/why/rollback normalize them;
-        // a name the ledger does not record is the restore's own command error
-        // with positionals, and an inert, reported exclusion with `--exclude`.
-        // `--drifted` then filters what remains.
-        let (unmatched, entries) = if !exclude.is_empty() {
-            tuner::rollback_preview_excluding(&normalize_params(exclude))?
+        // would restore, `--category` to the entries whose recorded category
+        // matches (with `--exclude` stacking on that selection), all named
+        // the way fix/why/rollback normalize them; a name the ledger does not
+        // record is the restore's own command error with positionals, and an
+        // inert, reported exclusion with `--exclude`. `--drifted` then
+        // filters what remains.
+        let (unmatched, unclassified, entries) = if !cats.is_empty() {
+            let preview = tuner::rollback_preview_categories(cats, &normalize_params(exclude))?;
+            (preview.unmatched, preview.unclassified, preview.entries)
+        } else if !exclude.is_empty() {
+            let (unmatched, entries) =
+                tuner::rollback_preview_excluding(&normalize_params(exclude))?;
+            (unmatched, Vec::new(), entries)
         } else if params.is_empty() {
-            (Vec::new(), tuner::rollback_preview()?)
+            (Vec::new(), Vec::new(), tuner::rollback_preview()?)
         } else {
             (
+                Vec::new(),
                 Vec::new(),
                 tuner::rollback_preview_params(&normalize_params(params))?,
             )
@@ -1196,9 +1242,28 @@ fn cmd_rollback(params: &[String], exclude: &[String], list: bool, drifted: bool
         } else {
             entries
         };
-        let output = with_unmatched_exclude(rollback_list_output(&entries), &unmatched);
+        let output = with_unclassified(
+            with_unmatched_exclude(rollback_list_output(&entries), &unmatched),
+            &unclassified,
+        );
         print_json(&output)?;
         return Ok(0);
+    }
+    if !cats.is_empty() {
+        // Restore the categories' entries as one transaction; the body keeps
+        // the full-rollback keys and adds the two reports only when they have
+        // something to say — the inert `--exclude` names, and the records no
+        // category could select.
+        let selection = tuner::rollback_categories(cats, &normalize_params(exclude))?;
+        let output = with_unclassified(
+            with_unmatched_exclude(
+                rollback_body(0, &[], &selection.outcome),
+                &selection.unmatched,
+            ),
+            &selection.unclassified,
+        );
+        print_json(&output)?;
+        return Ok(rollback_exit_code(&selection.outcome));
     }
     if !exclude.is_empty() {
         // Restore everything else as one transaction; the body keeps the
@@ -1479,7 +1544,8 @@ mod tests {
         // the argument message, and the call returns before any ledger read.
         // (With --list the pair is accepted past this check and falls through
         // to the root gate, which this test cannot assert without root.)
-        let err = cmd_rollback(&[], &[], false, true).expect_err("--drifted alone must be refused");
+        let err =
+            cmd_rollback(&[], &[], &[], false, true).expect_err("--drifted alone must be refused");
         assert_eq!(format!("{err:#}"), "rollback --drifted requires --list");
     }
 
@@ -1492,6 +1558,7 @@ mod tests {
         // covers the `--list` forms, before the preview reads anything.
         let err = cmd_rollback(
             &["vm.swappiness".to_string()],
+            &[],
             &["vm.dirty_ratio".to_string()],
             false,
             false,
@@ -1500,6 +1567,72 @@ mod tests {
         assert_eq!(
             format!("{err:#}"),
             "rollback takes either parameters or --exclude, not both"
+        );
+    }
+
+    #[test]
+    fn parameters_and_category_are_refused_before_the_root_gate() {
+        // Selecting named parameters and selecting the entries of a category
+        // are opposite instructions too: the refusal is the same argument
+        // error, returned before the root gate (this unprivileged call proves
+        // the order). The older `--exclude` refusal keeps its place when both
+        // misuses are present.
+        let err = cmd_rollback(
+            &["vm.swappiness".to_string()],
+            &["net".to_string()],
+            &[],
+            false,
+            false,
+        )
+        .expect_err("both forms must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "rollback takes either parameters or --category, not both"
+        );
+        let err = cmd_rollback(
+            &["vm.swappiness".to_string()],
+            &["net".to_string()],
+            &["vm.dirty_ratio".to_string()],
+            false,
+            false,
+        )
+        .expect_err("both forms must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "rollback takes either parameters or --exclude, not both"
+        );
+    }
+
+    #[test]
+    fn an_unknown_category_is_refused_before_the_root_gate() {
+        // The category is validated with the same function and the same
+        // message `check` and `tune` use, and before the root gate: an
+        // unprivileged call answers the argument error, not the root one.
+        let err = cmd_rollback(&[], &["garbage".to_string()], &[], false, false)
+            .expect_err("an unknown category must be refused");
+        assert_eq!(
+            format!("{err:#}"),
+            "未知分类: garbage（支持: net, mem, io, cpu, security）"
+        );
+    }
+
+    #[test]
+    fn unclassified_extends_the_body_only_when_there_is_one() {
+        // The report is the only thing `--category` adds to a body, and it
+        // exists only for records no category could select: an empty one
+        // leaves the body exactly as the same invocation without the flag
+        // answers, which is what the unchanged invocations rely on.
+        let body = json!({ "failed": 0, "restored": 0, "skipped": 0, "status": "Nothing" });
+        assert_eq!(with_unclassified(body.clone(), &[]), body);
+        assert_eq!(
+            with_unclassified(body, &["vm.swappiness".to_string()]),
+            json!({
+                "failed": 0,
+                "restored": 0,
+                "skipped": 0,
+                "status": "Nothing",
+                "unclassified": ["vm.swappiness"],
+            })
         );
     }
 

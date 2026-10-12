@@ -39,6 +39,8 @@ sudo ktuner rollback --list <param> [<param>…]  # preview only what rolling ba
 sudo ktuner rollback <param> [<param>…]  # restore the recorded parameters named, e.g. vm.dirty_bytes
 sudo ktuner rollback --exclude vm.swappiness   # restore all recorded entries but this one
 sudo ktuner rollback --list --exclude vm.swappiness   # preview that same set
+sudo ktuner rollback --category net   # restore only the recorded entries of this category
+sudo ktuner rollback --list --category net   # preview that same set
 ```
 
 ## JSON output
@@ -505,6 +507,57 @@ no ledger every name is unrecorded, so the preview is the empty listing. Restori
 excluding named parameters are opposite instructions, so `rollback <param>…` with `--exclude` is a usage
 error (`2`, stderr JSON), refused before the root gate like the other argument errors. Plain
 `ktuner rollback`, `ktuner rollback --list` and `ktuner rollback <param>…` are unchanged.
+
+### rollback --category output
+
+`sudo ktuner rollback --category <cat> [--category <cat>…]` restores only the recorded entries whose
+category matches, keeping every other record in the ledger, and `sudo ktuner rollback --list --category
+<cat>` previews that same set (`--drifted` narrows what remains). The values are the ones `check` and
+`tune` accept — repeatable, the union is kept — and the selection is the one `tune --category <cat>`
+would have written: the category is recorded with every entry a rule wrote, because a parameter name
+does not say which rule wrote the value. `net.core.bpf_jit_harden` is a security recommendation on a
+`net.*` knob, so `rollback --category net` must not touch it. `--exclude` stacks on the selection (the
+categories select first, then the exclusions drop, as in `tune --category … --exclude …`), and its
+inert-name report is the one `rollback --exclude` already answers:
+
+```json
+{"failed": 0, "restored": 1, "skipped": 0, "status": "Full", "unclassified": ["vm.vfs_cache_pressure"]}
+```
+
+A record with no category — a ledger written before categories existed, or one a library import wrote —
+is selected by no value, and the classification is never guessed from the parameter name. Those records
+are echoed by name in `unclassified`, in param order, and only when the list is not empty:
+
+```json
+{
+  "count": 1,
+  "pending": [
+    {
+      "applied": "1",
+      "drifted": false,
+      "live": "1",
+      "param": "vm.swappiness",
+      "previous": "60"
+    }
+  ],
+  "unclassified": [
+    "vm.vfs_cache_pressure"
+  ],
+  "unmatched_exclude": [
+    "vm.typo"
+  ]
+}
+```
+
+When the selection is empty — no recorded entry of the named categories, or every selected unit kept by
+an exclusion — the body is the one an empty ledger answers (`status: "Nothing"`, exit `0`), and the
+ledger, which still holds the other records, is not deleted. Selecting named parameters and selecting by
+category are opposite instructions, so `rollback <param>… --category <cat>` is a usage error (`2`, stderr
+JSON), refused before the root gate like the other argument errors; an unknown category is refused there
+too, with the message `check` and `tune` answer. Plain `ktuner rollback`, `ktuner rollback --list`,
+`ktuner rollback <param>…` and `ktuner rollback --exclude …` are unchanged, and a ledger read by this
+version keeps the bytes it always had: the category field is only ever written for entries a rule
+recorded.
 
 ### error output (stderr)
 

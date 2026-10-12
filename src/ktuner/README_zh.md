@@ -39,6 +39,8 @@ sudo ktuner rollback --list <param> [<param>…]  # 只预览回滚这些参数�
 sudo ktuner rollback <param> [<param>…]  # 回滚点名的已记录参数，例如 vm.dirty_bytes
 sudo ktuner rollback --exclude vm.swappiness   # 恢复其余全部已记录条目、跳过这一项
 sudo ktuner rollback --list --exclude vm.swappiness   # 预览同一集合
+sudo ktuner rollback --category net   # 只恢复账本中该分类的条目
+sudo ktuner rollback --list --category net   # 预览同一集合
 ```
 
 ## JSON 输出
@@ -428,6 +430,51 @@ sysfs/sysctl 文件读值）的参数输出当前值并以 `0` 退出：
 是方向相反的指令，`rollback <param>…` 与 `--exclude` 同时给出是用法错误（`2`，stderr JSON），与其他
 参数错误一样在 root 检查之前拒绝。普通 `ktuner rollback`、`ktuner rollback --list` 与
 `ktuner rollback <param>…` 不变。
+
+### rollback --category 输出
+
+`sudo ktuner rollback --category <cat> [--category <cat>…]` 只恢复账本中类别匹配的条目，其余记录留在
+账本里；`sudo ktuner rollback --list --category <cat>` 以只读方式预览同一集合（`--drifted` 仍对剩余
+条目过滤）。取值与 `check`、`tune` 相同——可重复，取并集——选中的正是 `tune --category <cat>` 会写的
+那些条目：类别随每条规则写入的记录一起保存，因为参数名说明不了它来自哪条规则。`net.core.bpf_jit_harden`
+是 `net.*` 参数上的安全建议，`rollback --category net` 不能碰它。`--exclude` 叠加在类别选择之上（先按
+类别选、再排除，与 `tune --category … --exclude …` 一致），未命中名字的回显与 `rollback --exclude`
+相同：
+
+```json
+{"failed": 0, "restored": 1, "skipped": 0, "status": "Full", "unclassified": ["vm.vfs_cache_pressure"]}
+```
+
+没有类别的记录——本字段出现之前写入的账本，或库导入写入的记录——任何类别都不选中，也**不按参数名猜**。
+这些记录按名字回显在 `unclassified` 中（param 序），只在非空时出现：
+
+```json
+{
+  "count": 1,
+  "pending": [
+    {
+      "applied": "1",
+      "drifted": false,
+      "live": "1",
+      "param": "vm.swappiness",
+      "previous": "60"
+    }
+  ],
+  "unclassified": [
+    "vm.vfs_cache_pressure"
+  ],
+  "unmatched_exclude": [
+    "vm.typo"
+  ]
+}
+```
+
+选中集合为空时（没有任何条目属于所给类别，或选中的单元都被 `--exclude` 挡住），输出与空账本相同
+（`status: "Nothing"`、退出码 `0`），账本（仍保存其余记录）不删除。点名恢复与按类别选择是方向相反的
+指令，`rollback <param>… --category <cat>` 是用法错误（`2`，stderr JSON），与其他参数错误一样在 root
+检查之前拒绝；未知类别也在那里被拒绝，报错文字与 `check`、`tune` 相同。普通 `ktuner rollback`、
+`ktuner rollback --list`、`ktuner rollback <param>…` 与 `ktuner rollback --exclude …` 不变；本版本
+读入的账本保持原有字节——类别字段只为规则写入的条目而写。
 
 ### 错误输出（stderr）
 

@@ -81,6 +81,8 @@ sudo ktuner rollback --list vm.swappiness   # 只预览回滚 vm.swappiness 将�
 sudo ktuner rollback vm.swappiness net.core.somaxconn   # 回滚点名的已记录参数
 sudo ktuner rollback --exclude vm.swappiness   # 恢复其余全部已记录条目、跳过这一项
 sudo ktuner rollback --list --exclude vm.swappiness   # 预览同一集合
+sudo ktuner rollback --category net   # 只恢复账本中该分类的条目
+sudo ktuner rollback --list --category net   # 预览同一集合
 ```
 
 `sudo ktuner fix <param> --dry-run` 以与 `tune --dry-run` 相同的形态预览这一次
@@ -145,6 +147,16 @@ sudo ktuner rollback --list --exclude vm.swappiness   # 预览同一集合
 `sudo ktuner rollback --list <param>…` 把这份预览收窄到 `rollback <param>…` 将恢复的内容：每个点名的条目，加上与它一起记录的互斥孪生，形态与顺序同完整列表。账本里没有的名字是与回滚相同的命令错误（`2`）。
 
 `sudo ktuner rollback --exclude <param>…` 在一次事务里恢复账本中除点名条目以外的全部条目，`sudo ktuner rollback --list --exclude <param>…` 以只读方式预览同一集合（`--drifted` 仍对剩余条目过滤）。被排除的条目留在账本里；与它一起记录的互斥孪生同样保留——写任一半都会在内核里把另一半清零（`v6.6 mm/page-writeback.c:518`、`v6.6 mm/util.c:810`），孪生对是一个恢复单元，排除任一半都保留整个单元。输出保留全量回滚的键；没有命中账本的名字回显在 `unmatched_exclude` 中而不是让命令失败，与 `tune --exclude` 报告惰性排除的方式一致。全部条目被排除时什么都不恢复，输出与空账本相同（`status "Nothing"`、退出码 `0`），账本保留这些被排除的记录。`rollback <param>…` 与 `--exclude` 是相反的指令，同时给出是用法错误（`2`，stderr JSON）。
+
+`sudo ktuner rollback --category <cat>…` 只恢复账本中类别匹配的条目（取值与 `check`、`tune` 相同，
+可重复、取并集），`sudo ktuner rollback --list --category <cat>` 只读预览同一集合，`--drifted` 仍对
+剩余条目过滤。选中的正是 `tune --category <cat>` 会写的条目——类别随规则写入的记录一起保存，因为参数名
+说明不了它背后的规则是不是安全规则（`net.core.bpf_jit_harden` 是 `net.*` 参数上的安全建议），选择
+从不按参数名猜。`--exclude` 叠加在类别选择之上：先按类别选、再排除，未命中名字的回显与
+`rollback --exclude` 一致。没有类别的记录（本字段出现之前写入的账本，或库导入）任何类别都不选中，
+按名字回显在 `unclassified` 中。选中为空时什么都不恢复，输出与空账本相同（`status "Nothing"`、
+退出码 `0`），账本保留；`rollback <param>…` 与 `--category` 同时给出是用法错误（`2`，stderr JSON），
+未知类别按 `check`、`tune` 的报错文字拒绝。
 
 ## 权限边界
 

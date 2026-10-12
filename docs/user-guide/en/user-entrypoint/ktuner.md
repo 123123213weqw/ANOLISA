@@ -83,6 +83,8 @@ sudo ktuner rollback --list vm.swappiness   # preview only what rolling back vm.
 sudo ktuner rollback vm.swappiness net.core.somaxconn   # restore the recorded parameters named
 sudo ktuner rollback --exclude vm.swappiness   # restore everything but this recorded parameter
 sudo ktuner rollback --list --exclude vm.swappiness   # preview that same set
+sudo ktuner rollback --category net   # restore only the recorded entries of this category
+sudo ktuner rollback --list --category net   # preview that same set
 ```
 
 `sudo ktuner fix <param> --dry-run` previews that one write in the same shape
@@ -167,6 +169,19 @@ For network conf parameters, interface identity is case-sensitive. Both `net/ipv
 `sudo ktuner rollback --list <param>…` narrows that preview to what `rollback <param>…` would restore: each named entry plus the mutually exclusive twin recorded with it, in the same shape and order as the full listing. A name the ledger does not record is the same command error (`2`) the restore reports.
 
 `sudo ktuner rollback --exclude <param>…` restores every recorded entry except the named ones in one transaction, and `sudo ktuner rollback --list --exclude <param>…` previews that same set (with `--drifted` narrowing what remains). An excluded entry stays in the ledger, and so does the half of a mutually exclusive pair recorded with it — writing either knob zeroes the other in the kernel (`v6.6 mm/page-writeback.c:518`, `v6.6 mm/util.c:810`), so the pair is one restore unit and an exclusion on either half keeps it whole. The body keeps the full-rollback keys; an `--exclude` name that addresses no ledger entry is echoed in `unmatched_exclude` instead of failing the run, exactly as `tune --exclude` reports an inert exclusion. With every entry excluded nothing is restored, the body reports the empty-ledger answer (`status "Nothing"`, exit `0`), and the ledger keeps the excluded records. `rollback <param>…` and `--exclude` are opposite instructions, so carrying both is a usage error (`2`, stderr JSON).
+
+`sudo ktuner rollback --category <cat>…` restores only the recorded entries whose category matches
+(the values `check` and `tune` accept, repeatable as a union), and `sudo ktuner rollback --list
+--category <cat>` previews that same set with `--drifted` narrowing what remains. The selection matches
+what `tune --category <cat>` would have written, because the category is recorded with each entry a rule
+wrote — a name cannot say whether the rule behind it was a security one (`net.core.bpf_jit_harden` is a
+security finding on a `net.*` knob), so the selection never guesses from the parameter. `--exclude`
+stacks on the selection, selecting by category first and dropping the exclusions after, and reports an
+inert name the way `rollback --exclude` does. A record with no category (a ledger written before the
+field existed, or a library import) is selected by no value at all and is echoed by name in
+`unclassified`. An empty selection restores nothing, answers the empty-ledger body (`status "Nothing"`,
+exit `0`), and leaves the ledger in place; `rollback <param>…` with `--category` is a usage error (`2`,
+stderr JSON), and an unknown category is refused with the message `check` and `tune` answer.
 
 ## Permission Boundary
 
