@@ -1524,6 +1524,43 @@ fn rollback_preview_params_at(params: &[String], path: &str) -> Result<Vec<Rollb
     }))
 }
 
+/// The pending entries a rollback of everything but `excluded` would restore,
+/// for `rollback --list --exclude <param>...`.
+pub fn rollback_preview_excluding(
+    excluded: &[String],
+) -> Result<(Vec<String>, Vec<RollbackPreview>)> {
+    rollback_preview_excluding_at(excluded, ROLLBACK_PATH)
+}
+
+/// [`rollback_preview_excluding`] with the ledger path injectable (the
+/// [`rollback_preview_at`] idiom).
+///
+/// The names resolve through the same [`excluded_units`] selection the restore
+/// runs, so the preview lists exactly the entries that command would restore —
+/// every recorded entry the names do not address, minus the units an excluded
+/// key touches — in the unfiltered `--list`'s param order. A name the ledger
+/// does not record is not an error here either: it comes back in the order
+/// given, and an absent ledger records nothing, so every name misses and the
+/// listing is empty, still without creating the ledger directory or lock file.
+fn rollback_preview_excluding_at(
+    excluded: &[String],
+    path: &str,
+) -> Result<(Vec<String>, Vec<RollbackPreview>)> {
+    let data = read_pending_at(path)?.unwrap_or(RollbackData {
+        version: 1,
+        entries: BTreeMap::new(),
+    });
+    let (unmatched, units) = excluded_units(&data.entries, excluded);
+    let entries = units.into_iter().flatten().collect();
+    Ok((
+        unmatched,
+        preview_entries(&RollbackData {
+            version: data.version,
+            entries,
+        }),
+    ))
+}
+
 /// Parse rollback-ledger JSON into the healed entry map the preview walks.
 /// A corrupt ledger is an error, never an empty list —
 /// silently treating a corrupt ledger as empty is how the original values
@@ -1743,6 +1780,86 @@ fn restore_units_at(
     )?;
     save_ledger_at(ledger, data)?;
     Ok(outcome)
+}
+
+/// Restore every recorded entry except the ones `excluded` names.
+///
+/// The complement of [`rollback_params`]: instead of naming what to restore,
+/// the caller names what to keep, so one tuning can be withdrawn without the
+/// caller subtracting its name from a listing that a concurrent run may have
+/// changed. The names resolve through the same lookup as every other rollback
+/// form, and everything the names do not address is restored as one
+/// transaction through the same tail [`rollback_params_at`] runs. A name the
+/// ledger does not record is not an error: it comes back (in the order given)
+/// so an exclusion that protected nothing is visible instead of silent.
+pub fn rollback_excluding(excluded: &[String]) -> Result<(Vec<String>, RollbackOutcome)> {
+    rollback_excluding_at(
+        excluded,
+        ROLLBACK_PATH,
+        SYSCTL_PERSIST_PATH,
+        NONSYSCTL_SERVICE_PATH,
+        NONSYSCTL_SCRIPT_PATH,
+    )
+}
+
+/// [`rollback_excluding`] with the ledger and generated-file paths injectable
+/// (the same idiom as [`rollback_params_at`]).
+fn rollback_excluding_at(
+    excluded: &[String],
+    ledger: &str,
+    sysctl_path: &str,
+    service_path: &str,
+    script_path: &str,
+) -> Result<(Vec<String>, RollbackOutcome)> {
+    let guard = lock_ledger_at(ledger)?;
+    if !Path::new(ledger).exists() {
+        anyhow::bail!("没有找到 rollback 文件 ({ledger})，可能尚未执行过 tune");
+    }
+    let json = fs::read_to_string(ledger).context("读取 rollback 文件失败")?;
+    let mut data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
+    // Heal first for the same reason rollback_params_at does: a legacy ledger
+    // can hold two spellings of one kernel path, and the selection should act
+    // on the single record the restore will act on.
+    heal_alias_duplicates(&mut data);
+
+    let (unmatched, units) = excluded_units(&data.entries, excluded);
+    let outcome = restore_units_at(
+        &guard,
+        &mut data,
+        &units,
+        ledger,
+        sysctl_path,
+        service_path,
+        script_path,
+    )?;
+    Ok((unmatched, outcome))
+}
+
+/// The restore units an exclusion keeps, and the excluded names that
+/// addressed no ledger entry (in the order given).
+///
+/// Every recorded key the names do not address is selected, so the units are
+/// the complement of the exclusion, in the ledger's own param order. A unit
+/// an excluded key belongs to is dropped whole: the unit is the entry plus
+/// the mutually exclusive twin the ledger recorded with it, and the kernel
+/// zeroes either knob when the other is written, so restoring the free half
+/// would both zero the excluded entry and leave the ledger describing a
+/// kernel it does not match.
+fn excluded_units(
+    entries: &BTreeMap<String, RollbackEntry>,
+    excluded: &[String],
+) -> (Vec<String>, Vec<BTreeMap<String, RollbackEntry>>) {
+    let (excluded_keys, unmatched) = match_ledger_keys(entries, excluded);
+    let keys: Vec<String> = entries
+        .keys()
+        .filter(|key| !excluded_keys.contains(key))
+        .cloned()
+        .collect();
+    let units = rollback_units(entries, &keys)
+        .into_iter()
+        .filter(|unit| !unit.keys().any(|key| excluded_keys.contains(key)))
+        .collect();
+    (unmatched, units)
 }
 
 /// The ledger key each name addresses and the names that address none.
@@ -7543,6 +7660,375 @@ mod tests {
         );
         assert_eq!(batch_writes("ledger", &ledger), 0);
         assert_eq!(batch_writes("persist", &ledger), 0);
+    }
+
+    /// `rollback --exclude` restores every recorded entry the names do not
+    /// address: each one back to its original, retired from the ledger and
+    /// gone from the regenerated persisted file, while the excluded entry
+    /// stays live and recorded. A slashed spelling addresses the same record
+    /// the CLI normalizes its arguments to.
+    #[test]
+    fn rollback_excluding_restores_every_entry_the_names_do_not_address() {
+        let dir = AtomicTestDir::new("rollback-excluding-three");
+        let (conf, service, script) = fixture_paths(&dir);
+        let swappiness = dir.0.join("swappiness");
+        let somaxconn = dir.0.join("somaxconn");
+        let cache_pressure = dir.0.join("vfs_cache_pressure");
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&somaxconn, "4096").unwrap();
+        fs::write(&cache_pressure, "50").unwrap();
+        let ledger = fixture_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                ),
+                ("vm.swappiness", "60", "10", swappiness.to_str().unwrap()),
+                (
+                    "vm.vfs_cache_pressure",
+                    "100",
+                    "50",
+                    cache_pressure.to_str().unwrap(),
+                ),
+            ],
+        );
+        fs::write(
+            &conf,
+            "net.core.somaxconn = 4096\nvm.swappiness = 10\nvm.vfs_cache_pressure = 50\n",
+        )
+        .unwrap();
+
+        let (unmatched, outcome) = rollback_excluding_at(
+            &["vm/swappiness".to_string()],
+            &ledger,
+            &conf,
+            &service,
+            &script,
+        )
+        .unwrap();
+
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert_eq!(
+            (outcome.restored, outcome.failed, outcome.skipped),
+            (2, 0, 0)
+        );
+        assert!(outcome.is_complete());
+        assert_eq!(
+            fs::read_to_string(&swappiness).unwrap(),
+            "10",
+            "the excluded entry is never written"
+        );
+        assert_eq!(fs::read_to_string(&somaxconn).unwrap(), "128");
+        assert_eq!(fs::read_to_string(&cache_pressure).unwrap(), "100");
+        let data: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&ledger).unwrap()).unwrap();
+        assert_eq!(data["entries"].as_object().unwrap().len(), 1, "{data}");
+        assert!(data["entries"].get("vm.swappiness").is_some(), "{data}");
+        let persisted = fs::read_to_string(&conf).unwrap();
+        assert!(persisted.contains("vm.swappiness = 10"), "{persisted}");
+        for gone in ["net.core.somaxconn", "vm.vfs_cache_pressure"] {
+            assert!(!persisted.contains(gone), "{gone} must leave {persisted}");
+        }
+    }
+
+    /// Excluding either half of a recorded mutually exclusive pair keeps the
+    /// whole unit in place: the kernel zeroes either knob when the other is
+    /// written (v6.6 mm/page-writeback.c dirty_ratio_handler and
+    /// dirty_bytes_handler), so restoring the free half would zero the
+    /// excluded entry and leave the ledger describing a kernel it does not
+    /// match. Neither half is written or retired; the entries outside the
+    /// pair are restored as usual.
+    #[test]
+    fn rollback_excluding_keeps_the_whole_unit_an_exclusion_touches() {
+        for excluded in ["vm.dirty_bytes", "vm.dirty_ratio"] {
+            let dir = AtomicTestDir::new("rollback-excluding-twin");
+            let (conf, service, script) = fixture_paths(&dir);
+            let bytes = dir.0.join("dirty_bytes");
+            let ratio = dir.0.join("dirty_ratio");
+            let somaxconn = dir.0.join("somaxconn");
+            fs::write(&bytes, "1073741824").unwrap();
+            fs::write(&ratio, "0").unwrap();
+            fs::write(&somaxconn, "4096").unwrap();
+            let ledger = fixture_ledger(
+                &dir,
+                &[
+                    ("vm.dirty_bytes", "0", "1073741824", bytes.to_str().unwrap()),
+                    ("vm.dirty_ratio", "20", "0", ratio.to_str().unwrap()),
+                    (
+                        "net.core.somaxconn",
+                        "128",
+                        "4096",
+                        somaxconn.to_str().unwrap(),
+                    ),
+                ],
+            );
+            fs::write(
+                &conf,
+                "vm.dirty_bytes = 1073741824\nnet.core.somaxconn = 4096\n",
+            )
+            .unwrap();
+
+            let (unmatched, outcome) =
+                rollback_excluding_at(&[excluded.to_string()], &ledger, &conf, &service, &script)
+                    .unwrap();
+
+            assert!(unmatched.is_empty(), "{unmatched:?}");
+            assert_eq!(
+                (outcome.restored, outcome.failed, outcome.skipped),
+                (1, 0, 0),
+                "only the entry outside the pair is restored ({excluded} excluded)"
+            );
+            assert_eq!(
+                fs::read_to_string(&bytes).unwrap(),
+                "1073741824",
+                "{excluded} excluded: the pair must not be written"
+            );
+            assert_eq!(
+                fs::read_to_string(&ratio).unwrap(),
+                "0",
+                "{excluded} excluded: the pair must not be written"
+            );
+            assert_eq!(fs::read_to_string(&somaxconn).unwrap(), "128");
+            let data: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&ledger).unwrap()).unwrap();
+            let entries = data["entries"].as_object().unwrap();
+            assert_eq!(entries.len(), 2, "{data}");
+            assert!(entries.get("vm.dirty_bytes").is_some(), "{data}");
+            assert!(entries.get("vm.dirty_ratio").is_some(), "{data}");
+            let persisted = fs::read_to_string(&conf).unwrap();
+            assert!(
+                persisted.contains("vm.dirty_bytes = 1073741824"),
+                "{persisted}"
+            );
+            assert!(!persisted.contains("net.core.somaxconn"), "{persisted}");
+        }
+    }
+
+    /// A name the ledger does not record is not an error for the exclusion:
+    /// it comes back in the order given (a repeated name stays repeated) so
+    /// an exclusion that protected nothing is visible, and the run restores
+    /// everything left exactly as a full rollback would.
+    #[test]
+    fn rollback_excluding_reports_unmatched_names_in_order() {
+        let dir = AtomicTestDir::new("rollback-excluding-unmatched");
+        let (conf, service, script) = fixture_paths(&dir);
+        let swappiness = dir.0.join("swappiness");
+        let somaxconn = dir.0.join("somaxconn");
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&somaxconn, "4096").unwrap();
+        let ledger = fixture_ledger(
+            &dir,
+            &[
+                ("vm.swappiness", "60", "10", swappiness.to_str().unwrap()),
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                ),
+            ],
+        );
+        fs::write(&conf, "vm.swappiness = 10\n").unwrap();
+
+        let (unmatched, outcome) = rollback_excluding_at(
+            &[
+                "vm.typo".to_string(),
+                "net.core.typo2".to_string(),
+                "vm.typo".to_string(),
+            ],
+            &ledger,
+            &conf,
+            &service,
+            &script,
+        )
+        .unwrap();
+
+        assert_eq!(unmatched, ["vm.typo", "net.core.typo2", "vm.typo"]);
+        assert_eq!(
+            (outcome.restored, outcome.failed, outcome.skipped),
+            (2, 0, 0)
+        );
+        assert!(outcome.is_complete());
+        assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
+        assert_eq!(fs::read_to_string(&somaxconn).unwrap(), "128");
+        assert!(
+            !Path::new(&ledger).exists(),
+            "an inert exclusion still restores everything, so the ledger empties and finalizes"
+        );
+        assert!(
+            !Path::new(&conf).exists(),
+            "the persisted file is cleaned up"
+        );
+    }
+
+    /// When no unit is left to restore — every entry excluded, or the one
+    /// remaining selection belonging to the excluded unit — the run attempts
+    /// nothing: the counters stay zero, the attempt is complete, and neither
+    /// the ledger nor the persisted file is touched.
+    #[test]
+    fn rollback_excluding_leaves_everything_alone_when_nothing_is_selected() {
+        for excluded in [
+            vec!["vm.dirty_bytes".to_string(), "vm.dirty_ratio".to_string()],
+            vec!["vm.dirty_ratio".to_string()],
+        ] {
+            let dir = AtomicTestDir::new("rollback-excluding-empty");
+            let (conf, service, script) = fixture_paths(&dir);
+            let bytes = dir.0.join("dirty_bytes");
+            let ratio = dir.0.join("dirty_ratio");
+            fs::write(&bytes, "1073741824").unwrap();
+            fs::write(&ratio, "0").unwrap();
+            let ledger = fixture_ledger(
+                &dir,
+                &[
+                    ("vm.dirty_bytes", "0", "1073741824", bytes.to_str().unwrap()),
+                    ("vm.dirty_ratio", "20", "0", ratio.to_str().unwrap()),
+                ],
+            );
+            fs::write(&conf, "vm.dirty_bytes = 1073741824\n").unwrap();
+            let ledger_before = fs::read(&ledger).unwrap();
+            let persisted_before = fs::read(&conf).unwrap();
+
+            let (unmatched, outcome) =
+                rollback_excluding_at(&excluded, &ledger, &conf, &service, &script).unwrap();
+
+            assert!(unmatched.is_empty(), "{excluded:?} names recorded entries");
+            assert_eq!(
+                (outcome.restored, outcome.failed, outcome.skipped),
+                (0, 0, 0),
+                "{excluded:?}: nothing is attempted"
+            );
+            assert!(outcome.is_complete(), "an empty attempt is complete");
+            assert_eq!(fs::read(&ledger).unwrap(), ledger_before, "{excluded:?}");
+            assert_eq!(fs::read(&conf).unwrap(), persisted_before, "{excluded:?}");
+            assert_eq!(
+                fs::read_to_string(&bytes).unwrap(),
+                "1073741824",
+                "{excluded:?}: the pair is never written"
+            );
+            assert_eq!(
+                fs::read_to_string(&ratio).unwrap(),
+                "0",
+                "{excluded:?}: the pair is never written"
+            );
+        }
+    }
+
+    /// `rollback --list --exclude` previews the set the restore would walk:
+    /// every recorded entry the names do not address, minus the unit an
+    /// excluded key touches, in the unfiltered listing's param order and
+    /// entry shape — with the live reading and drift comparison every entry
+    /// carries there. It writes nothing, and it reports unmatched names
+    /// instead of refusing.
+    #[test]
+    fn preview_excluding_lists_the_restore_set() {
+        let dir = AtomicTestDir::new("preview-excluding");
+        let swappiness = dir.0.join("swappiness");
+        let somaxconn = dir.0.join("somaxconn");
+        let bytes = dir.0.join("dirty_bytes");
+        let ratio = dir.0.join("dirty_ratio");
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&somaxconn, "1024").unwrap();
+        fs::write(&bytes, "1073741824").unwrap();
+        fs::write(&ratio, "0").unwrap();
+        let ledger = fixture_ledger(
+            &dir,
+            &[
+                ("vm.swappiness", "60", "10", swappiness.to_str().unwrap()),
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                ),
+                ("vm.dirty_bytes", "0", "1073741824", bytes.to_str().unwrap()),
+                ("vm.dirty_ratio", "20", "0", ratio.to_str().unwrap()),
+            ],
+        );
+        let ledger_before = fs::read_to_string(&ledger).unwrap();
+
+        let listed = |excluded: &[&str]| {
+            let excluded: Vec<String> = excluded.iter().map(|name| name.to_string()).collect();
+            let (unmatched, entries) = rollback_preview_excluding_at(&excluded, &ledger).unwrap();
+            (
+                unmatched,
+                entries
+                    .into_iter()
+                    .map(|entry| entry.param)
+                    .collect::<Vec<_>>(),
+            )
+        };
+
+        // One name excluded: its entry leaves the listing; the rest keep the
+        // live reading and drift comparison the unfiltered listing carries.
+        let (unmatched, params) = listed(&["vm/swappiness"]);
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert_eq!(
+            params,
+            ["net.core.somaxconn", "vm.dirty_bytes", "vm.dirty_ratio"]
+        );
+        let (_, entries) =
+            rollback_preview_excluding_at(&["vm.swappiness".to_string()], &ledger).unwrap();
+        assert_eq!(entries[0].live.as_deref(), Some("1024"));
+        assert_eq!(entries[0].drifted, Some(true));
+
+        // Excluding one half of the pair keeps the unit: both halves leave the
+        // preview, because the restore walks neither of them.
+        let (unmatched, params) = listed(&["vm.dirty_bytes"]);
+        assert!(unmatched.is_empty());
+        assert_eq!(params, ["net.core.somaxconn", "vm.swappiness"]);
+
+        // A name the ledger does not record comes back and excludes nothing.
+        let (unmatched, params) = listed(&["vm.typo"]);
+        assert_eq!(unmatched, ["vm.typo"]);
+        assert_eq!(
+            params,
+            [
+                "net.core.somaxconn",
+                "vm.dirty_bytes",
+                "vm.dirty_ratio",
+                "vm.swappiness"
+            ]
+        );
+
+        assert_eq!(
+            fs::read_to_string(&ledger).unwrap(),
+            ledger_before,
+            "the preview is read-only"
+        );
+    }
+
+    /// With no ledger there is nothing to restore and nothing to exclude: the
+    /// preview is the empty listing and every name comes back as unrecorded,
+    /// without creating the ledger directory or lock file; the restore is the
+    /// same command error every other rollback form reports.
+    #[test]
+    fn preview_excluding_an_absent_ledger_reports_every_name_and_creates_nothing() {
+        let dir = AtomicTestDir::new("preview-excluding-absent");
+        let (conf, service, script) = fixture_paths(&dir);
+        let ledger = dir.0.join("nested").join("rollback.json");
+        let path = ledger.to_str().unwrap();
+
+        let (unmatched, entries) = rollback_preview_excluding_at(
+            &["vm.typo".to_string(), "vm.swappiness".to_string()],
+            path,
+        )
+        .unwrap();
+        assert_eq!(unmatched, ["vm.typo", "vm.swappiness"]);
+        assert!(entries.is_empty());
+        assert!(!ledger.exists(), "the preview must not create the ledger");
+        assert!(!ledger.parent().unwrap().exists());
+        assert!(!Path::new(&format!("{}.lock", ledger.display())).exists());
+
+        let error = rollback_excluding_at(&["vm.typo".to_string()], path, &conf, &service, &script)
+            .err()
+            .expect("no ledger records nothing to restore");
+        assert!(
+            error.to_string().contains("没有找到 rollback 文件"),
+            "{error:#}"
+        );
     }
 
     fn bench(name: &str, value: f64, unit: &str) -> BenchResult {
