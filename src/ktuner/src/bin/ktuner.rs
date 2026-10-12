@@ -3168,7 +3168,7 @@ mod tests {
             (
                 "transparent_hugepage/enabled",
                 "transparent_hugepage/enabled",
-                "io",
+                "memory",
             ),
             ("block/Disk.0/scheduler", "block/Disk.0/scheduler", "io"),
             ("vm.swappiness", "vm.swappiness", "memory"),
