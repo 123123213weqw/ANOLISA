@@ -1413,11 +1413,36 @@ fn eval_tcp_tw_reuse(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
     if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    eval_tcp_tw_reuse_at(
+        recs,
+        path,
+        "/proc/sys/net/ipv4/tcp_timestamps",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_tw_reuse`] so the timestamp dependency
+/// can be tested without relying on the host's live sysctls or listeners.
+fn eval_tcp_tw_reuse_at(
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    timestamps_path: &str,
+    has_listen_sockets: bool,
+) -> usize {
+    if !has_listen_sockets {
         return 1;
     }
     let current = read_sysctl_u64(path);
-    if current == 0 {
+    // In v6.6, tcp_twsk_unique() only considers reuse when a TIME_WAIT entry
+    // has a nonzero tw_ts_recent_stamp, which new connections get when the
+    // timestamp option is negotiated. Disabling timestamps stops that steady-
+    // state path; existing entries may retain their timestamps until expiry.
+    // Missing or malformed sysctl data is inconclusive, so preserve the advice.
+    let timestamps_disabled = std::fs::read_to_string(timestamps_path)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        == Some(0);
+    if current == 0 && !timestamps_disabled {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_tw_reuse".to_string(),
             current_value: "0".to_string(),
@@ -10681,6 +10706,53 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_timestamps") {
             assert_eq!(rec.recommended_value, "1");
             assert_eq!(rec.confidence, Confidence::High);
+        }
+    }
+
+    #[test]
+    fn tcp_tw_reuse_advice_requires_enabled_or_unknown_timestamps() {
+        for (case, timestamps, has_listen_sockets, expects_recommendation) in [
+            ("disabled", Some("0"), true, false),
+            ("enabled", Some("1"), true, true),
+            ("legacy_truthy", Some("-1"), true, true),
+            ("missing", None, true, true),
+            ("unparsable", Some("unknown"), true, true),
+            ("no_listener", Some("0"), false, false),
+        ] {
+            let suffix = format!(
+                "{}_{:?}_{case}",
+                std::process::id(),
+                std::thread::current().id()
+            );
+            let reuse_path = std::env::temp_dir().join(format!("ktuner_tcp_tw_reuse_{suffix}"));
+            let timestamps_path =
+                std::env::temp_dir().join(format!("ktuner_tcp_timestamps_{suffix}"));
+            std::fs::write(&reuse_path, "0\n").unwrap();
+            if let Some(value) = timestamps {
+                std::fs::write(&timestamps_path, format!("{value}\n")).unwrap();
+            }
+
+            let mut recs = Vec::new();
+            let checked = eval_tcp_tw_reuse_at(
+                &mut recs,
+                reuse_path.to_str().unwrap(),
+                timestamps_path.to_str().unwrap(),
+                has_listen_sockets,
+            );
+
+            std::fs::remove_file(&reuse_path).ok();
+            std::fs::remove_file(&timestamps_path).ok();
+            assert_eq!(checked, 1);
+            assert_eq!(
+                recs.len(),
+                usize::from(expects_recommendation),
+                "timestamp value {timestamps:?}, listener={has_listen_sockets}"
+            );
+            if expects_recommendation {
+                assert_eq!(recs[0].param, "net.ipv4.tcp_tw_reuse");
+                assert_eq!(recs[0].current_value, "0");
+                assert_eq!(recs[0].recommended_value, "1");
+            }
         }
     }
 
