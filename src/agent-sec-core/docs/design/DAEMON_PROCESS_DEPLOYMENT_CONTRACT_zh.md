@@ -302,9 +302,21 @@ framework 不能证明具体 PAP/Repository 内部没有全局 mutex、长 trans
 它以 `root:root` 运行，不创建专用 UID，systemd 创建 `/run/agent-sec-core`（0755），socket
 为 0666。普通用户无需加入服务组即可连接；PAP 方法授权仍检查内核 peer UID，
 连接权限不授予 PAP 管理权限。
-**TODO（独立入口流量控制任务）**：当前全局 64 个连接名额可被单个普通 UID 占满，
-管理员请求也会被拒绝；方法授权不能解决该可用性问题。后续实现按身份隔离/管理员
-保留容量，并用跨 UID 饱和测试验收。本次仅记录缺口，不宣称已实现隔离。
+**[TARGET V2][IMPLEMENTED] DPROC-UDS-002**：连接准入在读取请求前使用内核 peer UID，
+通过 `PrincipalPolicy` 的专用接入查询判断 root 和配置的 Policy 管理员。该查询只使用
+内存中的管理员名单，不调用可能阻塞的业务授权；没有实现接入分类的替代 policy 默认
+使用普通连接额度。公共容量为 64，另加 16 个管理员保留名额，总容量为 80。
+保留容量由 root 和配置的 Policy 管理员共享；管理员先用公共容量，公共容量耗尽后才使用保留容量。
+单个普通 UID 的所有进程合计最多占用 16 个连接，不能占用管理员保留容量。
+16 是单 UID 上限，并非固定分配；不设置独立的 UID 数量上限，所有 UID 按实际连接占用共享公共容量。
+超出单 UID、公共或总容量时沿用 `Busy` transport rejection，wire error 为
+`resource_exhausted`，不排队；rejection 的独立
+8 个名额和编码 deadline 保持不变。额度覆盖 frame read、dispatch、response write，
+超时、断开、取消和 shutdown 释放额度；无活动连接的 UID 计数随之删除。
+请求 JSON 的 UID/role 不能影响接入分类，连接分类不替代方法授权。
+可执行 fixture 为 `tests/v2/e2e/test_daemon_ingress_e2e.py`：单 UID 饱和不阻塞另一个
+普通 UID；多个普通 UID 占满公共容量时 root 和配置管理员仍可请求；总容量占满时
+root 也返回容量耗尽错误，连接完成后恢复容量。该 fixture 需要隔离的 root 环境。
 `BootstrapConfig::new()` 保持私有 socket 默认值 0600，daemon CLI 装配显式改为 0666；
 使用固定授权策略的库测试将运行目录限制为 0700。
 目录不可由 group/other 写入，锁保持 0600。

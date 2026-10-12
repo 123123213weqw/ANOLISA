@@ -219,6 +219,10 @@ impl SkillFsDispatcher {
     }
 }
 impl RequestDispatcher for SkillFsDispatcher {
+    fn is_administrator(&self, peer: PeerCredentials) -> bool {
+        self.ordinary.is_administrator(peer)
+    }
+
     fn start_session(
         &self,
         peer: PeerCredentials,

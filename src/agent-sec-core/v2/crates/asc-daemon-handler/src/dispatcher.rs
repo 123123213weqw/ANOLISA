@@ -192,6 +192,15 @@ fn is_authorized(principal: &Principal, access: AccessPolicy) -> bool {
 }
 
 impl RequestDispatcher for DaemonDispatcher {
+    fn is_administrator(&self, peer: asc_daemon_service::PeerCredentials) -> bool {
+        self.principal_policy
+            .is_administrator_for_admission(PeerCredentials::new(
+                peer.uid(),
+                peer.gid(),
+                peer.pid(),
+            ))
+    }
+
     fn dispatch_timeout(&self, payload: &[u8]) -> Option<std::time::Duration> {
         if let Ok(request) = serde_json::from_slice::<asc_daemon_protocol::V1Request>(payload)
             && request.caller.as_deref() == Some("agentsight")

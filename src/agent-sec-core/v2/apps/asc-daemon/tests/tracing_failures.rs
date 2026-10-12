@@ -125,6 +125,7 @@ async fn uds_failures_preserve_business_and_context() {
     let path = directory.join("daemon.sock");
     let mut config = BootstrapConfig::new(&path);
     config.service.max_connections = 1;
+    config.service.reserved_administrator_connections = 0;
     config.service.request_read_timeout = Duration::from_millis(100);
     config.service.dispatch_timeout = WATCHDOG;
     let shutdown = asc_daemon_service::ShutdownToken::new();

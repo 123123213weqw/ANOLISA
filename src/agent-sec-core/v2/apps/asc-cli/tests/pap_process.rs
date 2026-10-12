@@ -30,6 +30,10 @@ struct RecordingDispatcher {
     requests: Arc<Mutex<Vec<Value>>>,
 }
 impl RequestDispatcher for RecordingDispatcher {
+    fn is_administrator(&self, peer: asc_daemon_service::PeerCredentials) -> bool {
+        self.inner.is_administrator(peer)
+    }
+
     fn dispatch(
         &self,
         request: DispatchRequest,

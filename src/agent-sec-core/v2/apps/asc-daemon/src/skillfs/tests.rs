@@ -669,6 +669,8 @@ fn transport_config() -> ServiceConfig {
         max_request_frame_bytes: 4 * 1024 * 1024,
         max_response_frame_bytes: 4 * 1024 * 1024,
         max_connections: 8,
+        reserved_administrator_connections: 0,
+        max_connections_per_uid: 8,
         max_rejection_connections: 2,
         rejection_encode_timeout: Duration::from_millis(250),
         request_read_timeout: Duration::from_secs(5),

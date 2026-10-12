@@ -10,6 +10,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{Instant, sleep, timeout, timeout_at};
 
+use crate::admission::{ConnectionAdmission, ConnectionPermit};
 use crate::config::{ConfigError, ServiceConfig};
 use crate::dispatcher::{
     DispatchControl, DispatchRequest, PeerCredentials, RejectedRequest, RejectionEncoder,
@@ -157,7 +158,7 @@ impl UnixService {
     /// # Errors
     /// Returns only for listener ownership or socket cleanup failures.
     pub async fn serve(mut self, shutdown: ShutdownToken) -> Result<ServeReport, ServeError> {
-        let normal_admission = Arc::new(Semaphore::new(self.config.max_connections));
+        let normal_admission = ConnectionAdmission::new(&self.config);
         let rejection_admission = Arc::new(Semaphore::new(self.config.max_rejection_connections));
         let runtime = ConnectionRuntime {
             config: self.config.clone(),
@@ -217,7 +218,7 @@ struct ConnectionRuntime {
     dispatcher: Arc<dyn RequestDispatcher>,
     rejection_encoder: Arc<dyn RejectionEncoder>,
     shutdown: ShutdownToken,
-    normal_admission: Arc<Semaphore>,
+    normal_admission: ConnectionAdmission,
     rejection_admission: Arc<Semaphore>,
 }
 
@@ -275,12 +276,12 @@ fn admit_connection(
         return;
     }
 
-    // TODO: isolate host-wide admission across peer UIDs and reserve administrator
-    // capacity. Public UDS access currently lets one UID exhaust the global budget;
-    // method authorization does not prevent this availability failure. Add a
-    // cross-UID saturation regression with the separate ingress-control work.
-    match Arc::clone(&runtime.normal_admission).try_acquire_owned() {
-        Ok(permit) => {
+    let administrator = runtime.dispatcher.is_administrator(peer);
+    match runtime
+        .normal_admission
+        .try_acquire(peer.uid(), administrator)
+    {
+        Some(permit) => {
             let config = runtime.config.clone();
             let dispatcher = Arc::clone(&runtime.dispatcher);
             let rejection_encoder = Arc::clone(&runtime.rejection_encoder);
@@ -289,7 +290,7 @@ fn admit_connection(
                     .await
             });
         }
-        Err(_) => spawn_rejection(stream, peer, RejectionReason::Busy, runtime, tasks, report),
+        None => spawn_rejection(stream, peer, RejectionReason::Busy, runtime, tasks, report),
     }
 }
 
@@ -318,7 +319,7 @@ async fn process_connection(
     config: &ServiceConfig,
     dispatcher: Arc<dyn RequestDispatcher>,
     rejection_encoder: Arc<dyn RejectionEncoder>,
-    permit: OwnedSemaphorePermit,
+    permit: ConnectionPermit,
 ) -> ConnectionOutcome {
     let outcome =
         process_admitted_connection(stream, peer, config, dispatcher, rejection_encoder).await;

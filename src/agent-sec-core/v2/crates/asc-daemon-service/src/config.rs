@@ -11,8 +11,12 @@ pub struct ServiceConfig {
     pub max_request_frame_bytes: usize,
     /// Maximum response wire-frame bytes, including the LF delimiter.
     pub max_response_frame_bytes: usize,
-    /// Maximum requests admitted for concurrent frame read or dispatch.
+    /// Maximum connections held from frame read through response completion.
     pub max_connections: usize,
+    /// Connections within the total limit reserved exclusively for administrators.
+    pub reserved_administrator_connections: usize,
+    /// Maximum concurrent connections from one ordinary kernel peer UID.
+    pub max_connections_per_uid: usize,
     /// Maximum overload/shutdown rejection responses served concurrently.
     pub max_rejection_connections: usize,
     /// Maximum time allowed for protocol-only transport rejection encoding.
@@ -48,6 +52,12 @@ impl ServiceConfig {
         }
         if self.max_connections == 0 {
             return Err(ConfigError::ZeroConnectionLimit);
+        }
+        if self.reserved_administrator_connections >= self.max_connections {
+            return Err(ConfigError::NoPublicConnectionCapacity);
+        }
+        if self.max_connections_per_uid == 0 {
+            return Err(ConfigError::ZeroUidConnectionLimit);
         }
         if self.max_rejection_connections == 0 {
             return Err(ConfigError::ZeroRejectionLimit);
@@ -89,6 +99,12 @@ pub enum ConfigError {
     /// No normal connection could be admitted.
     #[error("connection limit must be positive")]
     ZeroConnectionLimit,
+    /// The administrator reserve leaves no capacity for ordinary callers.
+    #[error("administrator reserve must be smaller than the connection limit")]
+    NoPublicConnectionCapacity,
+    /// No ordinary UID could be admitted.
+    #[error("per-UID connection limit must be positive")]
+    ZeroUidConnectionLimit,
     /// No bounded rejection response could be admitted.
     #[error("rejection connection limit must be positive")]
     ZeroRejectionLimit,
@@ -124,6 +140,8 @@ mod tests {
             max_request_frame_bytes: 1024,
             max_response_frame_bytes: 1024,
             max_connections: 4,
+            reserved_administrator_connections: 1,
+            max_connections_per_uid: 2,
             max_rejection_connections: 2,
             rejection_encode_timeout: Duration::from_millis(250),
             request_read_timeout: Duration::from_secs(1),
@@ -140,6 +158,17 @@ mod tests {
         let mut config = valid_config();
         config.max_connections = 0;
         assert_eq!(config.validate(), Err(ConfigError::ZeroConnectionLimit));
+
+        config = valid_config();
+        config.reserved_administrator_connections = config.max_connections;
+        assert_eq!(
+            config.validate(),
+            Err(ConfigError::NoPublicConnectionCapacity)
+        );
+
+        config = valid_config();
+        config.max_connections_per_uid = 0;
+        assert_eq!(config.validate(), Err(ConfigError::ZeroUidConnectionLimit));
 
         config = valid_config();
         config.rejection_encode_timeout = Duration::ZERO;
