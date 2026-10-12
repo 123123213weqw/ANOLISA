@@ -3910,6 +3910,18 @@ fn eval_secure_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
 /// interface runs the default (shared media on) the assignment cannot change
 /// how a redirect is judged. The rule stays quiet then, and only a host that
 /// already proved the knob reachable keeps the recommendation.
+///
+/// The shared-media branch is not the last test that stands in front of that
+/// line. `__ip_do_redirect()` first bails out on
+/// `!IN_DEV_RX_REDIRECTS(in_dev)` (v6.6 net/ipv4/route.c:768, 7.3-rc6 :803)
+/// several lines before `IN_DEV_SEC_REDIRECTS` is consulted (v6.6 :776,
+/// 7.3-rc6 :811), and `IN_DEV_RX_REDIRECTS`
+/// (include/linux/inetdevice.h:124 in v6.6, :126 in 7.3-rc6) is the interface
+/// `accept_redirects` slot. When every `accept_redirects` value under `conf/`
+/// reads a zero, no redirect ever reaches the secure-redirects test, so the
+/// write changes nothing and the rule stays quiet as well — see
+/// [`no_interface_accepts_redirects`] for what exactly is proven and why the
+/// unprovable cases keep the advice.
 fn eval_secure_redirects_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
@@ -3920,6 +3932,9 @@ fn eval_secure_redirects_at(
         return 1;
     }
     if !shared_media_disabled_somewhere(conf_root) {
+        return 1;
+    }
+    if no_interface_accepts_redirects(conf_root) {
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
@@ -3963,6 +3978,46 @@ fn shared_media_disabled_somewhere(conf_root: &std::path::Path) -> bool {
     entries
         .filter_map(|entry| entry.ok())
         .any(|entry| entry.file_name() != "all" && zero(&entry.path().join("shared_media")))
+}
+
+/// Whether every `accept_redirects` slot under `conf/` reads a zero, the only
+/// state this side can prove leaves the `IN_DEV_SEC_REDIRECTS` test of
+/// [`eval_secure_redirects_at`] unreachable: `__ip_do_redirect()`
+/// (net/ipv4/route.c) rejects the redirect on `!IN_DEV_RX_REDIRECTS(in_dev)`
+/// (v6.6 :768, 7.3-rc6 :803) several lines before that test (v6.6 :776,
+/// 7.3-rc6 :811), and `IN_DEV_RX_REDIRECTS`
+/// (include/linux/inetdevice.h:124 in v6.6, :126 in 7.3-rc6) is built from
+/// the same `accept_redirects` slots this predicate reads.
+///
+/// The predicate is deliberately narrower than the kernel one, and fails
+/// open:
+///
+/// - `all` and every other entry must read a zero, `default` included — the
+///   template seeds interfaces created later, so a zero only covers them all
+///   when it is zero too;
+/// - a slot that is missing or unparseable is not evidence of a zero, so the
+///   advice stays (the same fail-open rule the sibling switch gates follow);
+/// - the forwarding-dependent AND/OR combination is not modelled: on a
+///   forwarding interface with `all` at zero and the device slot nonzero the
+///   kernel also never reads the knob, but proving that needs the forwarding
+///   slot and the case is narrow enough to keep the advice for.
+fn no_interface_accepts_redirects(conf_root: &std::path::Path) -> bool {
+    let zero = |path: std::path::PathBuf| {
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            == Some(0)
+    };
+    if !zero(conf_root.join("all").join("accept_redirects")) {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(conf_root) else {
+        return false;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name() != "all")
+        .all(|entry| zero(entry.path().join("accept_redirects")))
 }
 
 fn eval_mmap_min_addr(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -15268,6 +15323,89 @@ mod tests {
         assert!(
             recs.is_empty(),
             "no interface reads secure_redirects once shared media is back on"
+        );
+    }
+
+    #[test]
+    fn secure_redirects_advice_needs_an_accepting_interface() {
+        // The knob has a second precondition in front of its consumer:
+        // __ip_do_redirect() (net/ipv4/route.c) rejects the redirect on
+        // !IN_DEV_RX_REDIRECTS(in_dev) (v6.6 :768, 7.3-rc6 :803) before its
+        // IN_DEV_SEC_REDIRECTS line (v6.6 :776, 7.3-rc6 :811) runs, and
+        // IN_DEV_RX_REDIRECTS (include/linux/inetdevice.h) is the interface
+        // accept_redirects slot. With every accept_redirects value at zero no
+        // redirect is ever judged, so the write cannot change anything and
+        // the rule must stay quiet.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_secure_redirects_accept_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let knob = write("all/secure_redirects", "1\n");
+        // The shared-media gate sits ahead of this one; both have to be open
+        // before the rule can speak at all.
+        for relative in ["all/shared_media", "eth0/shared_media"] {
+            write(relative, "0\n");
+        }
+
+        // Every accept_redirects slot at zero: nothing reaches the consumer.
+        write("all/accept_redirects", "0\n");
+        write("eth0/accept_redirects", "0\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert!(
+            recs.is_empty(),
+            "no redirect is judged by secure_redirects while accept_redirects is off everywhere"
+        );
+
+        // The interface's own slot back on: the redirect reaches the test.
+        write("eth0/accept_redirects", "1\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert_eq!(
+            recs.len(),
+            1,
+            "one interface accepting redirects keeps the write relevant"
+        );
+
+        // The `all` template alone is enough for a non-forwarding interface,
+        // where the kernel ORs the two slots.
+        write("eth0/accept_redirects", "0\n");
+        write("all/accept_redirects", "1\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert_eq!(recs.len(), 1, "conf/all accepting reaches every interface");
+
+        // `default` seeds interfaces created later, so the zero is only
+        // proven to cover them when it is zero there too.
+        write("all/accept_redirects", "0\n");
+        write("default/accept_redirects", "1\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert_eq!(
+            recs.len(),
+            1,
+            "the default template can accept on a future interface"
+        );
+
+        // A slot that cannot be read is not evidence of a zero.
+        write("default/accept_redirects", "0\n");
+        write("eth0/accept_redirects", "masked\n");
+        let mut recs = Vec::new();
+        eval_secure_redirects_at(&info, &mut recs, knob.to_str().unwrap(), &dir);
+        assert_eq!(
+            recs.len(),
+            1,
+            "an unreadable slot keeps the advice instead of guessing a zero"
         );
     }
 
