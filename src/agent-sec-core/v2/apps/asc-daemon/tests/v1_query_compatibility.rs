@@ -7,10 +7,10 @@ use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_daemon_service::ShutdownToken;
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_persistence_sqlite::observability::ObservabilitySqliteWriter;
 use asc_persistence_sqlite::query::{SqliteObservabilityQueries, SqliteSecurityQueries};
 use asc_persistence_sqlite::security_events::{SqliteEventQuerySource, SqliteEventWriter};
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use serde_json::{Value, json};
 
 mod support;
@@ -67,7 +67,7 @@ async fn v1_envelope_preserves_obs_queries_and_caller_selection() {
     }
     let dispatcher = Arc::new(
         DaemonDispatcher::new(
-            PapService::new(Arc::new(ProcessLocalPapRepository::default())),
+            PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap())),
             Arc::new(LocalUser),
             asc_daemon::scan_application(
                 asc_action_runtime::testing::discarding_finalizer(),

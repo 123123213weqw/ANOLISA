@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::*;
 use asc_foundation_types::ResourceId;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, PreparedBinding};
 use asc_policy_types::target::{AdapterFault, TargetBindingPlan, TranslationOutcome};
 
@@ -46,7 +46,7 @@ fn prepared() -> PreparedApply {
 }
 
 struct Rig {
-    repo: ProcessLocalPapRepository,
+    repo: SqlitePolicyRepository,
     panic_at: &'static str,
     fired: AtomicBool,
     fail_finish: AtomicBool,
@@ -185,7 +185,7 @@ fn rig(
     supersede: bool,
 ) -> Arc<Rig> {
     Arc::new(Rig {
-        repo: ProcessLocalPapRepository::with_binding_states(vec![record]).unwrap(),
+        repo: SqlitePolicyRepository::with_binding_states(vec![record]).unwrap(),
         panic_at,
         fired: AtomicBool::new(false),
         fail_finish: AtomicBool::new(fail_finish),

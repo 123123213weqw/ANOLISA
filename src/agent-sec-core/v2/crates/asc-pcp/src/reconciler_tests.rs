@@ -1,5 +1,5 @@
 use super::*;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::BindingView;
 
 #[test]
@@ -11,7 +11,7 @@ fn invalid_outcome_transitions_return_invalid_without_producing_a_write() {
         }
     }
     let core = BindingReconciler::new(
-        Arc::new(ProcessLocalPapRepository::default()),
+        Arc::new(SqlitePolicyRepository::temporary().unwrap()),
         Arc::new(|_: &asc_policy_types::binding::PreparedBinding| {
             panic!("outcome validation must not call the adapter")
         }),

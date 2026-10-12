@@ -453,38 +453,43 @@ DJOB-005/006 不进入 Rust 首版 no-regression 或 release gate；只有未来
 ### 11.4 **[TARGET V2]** Policy reconciliation 专用后台服务
 
 此服务由 `asc-policy-runtime` 实现，daemon 仅装配；它不依赖通用 periodic scheduler 或
-完整 JobSupervisor。PAP Binding 提交后通知、retry 到期和有界补扫是触发源。Runtime 与
-通知入口可用是 Binding 写准入条件，不是 daemon 启动条件，也不等待每个目标 READY。
-Policy/Scope CRUD 不依赖 reconciliation；实际存储错误由各自 Repository 操作返回。
+完整 JobSupervisor。Scope discovery 提交 Binding 后通知、retry 到期和有界补扫是触发源。
+生产 daemon 在 SQLite 打开、恢复装配及 Runtime 启动成功后开放 UDS，不等待每个目标 READY。
+Scope 创建检查 Runtime/discovery 准入；Policy CRUD 与查询不以 Binding Ready 为前提，
+实际存储错误由各自 Repository 操作返回。
 每次尝试才通过 factory 创建 Client，读取凭据；凭据或连接失败按 Binding 重试处理。
 每次执行重新读取和准备；退避释放 worker，
 同 Binding 互斥到实际调用退出。dirty 仅负责下一轮检查。
 
 自动重试必须等待：Superseded 和仓储错误默认等待 1 秒，RetryAt 按期限等待；
 若期限在收尾期间已过去，仍至少等待 1 毫秒。队列默认首次调用后最多自动重试 4 次，
-三类结果共用次数；耗尽后保留内存 Exhausted 条目，timer/补扫不能复活。
-新 Delete/Update 通知仍立即将等待或耗尽条目改为 Queued，Running 的 dirty 在退出后优先处理，
-并重置队列计数；核心已提交的业务预算不被队列重置。Exhausted 仍计入容量，
-不伪造业务失败落库或丢弃目标责任；计数不跨 Runtime 重建。
+纯存储等待不消耗自动预算，保留原 write_id/结果；预算耗尽先条件写 Failed 再释放 slot，
+只有终止无法确认时保留 Exhausted，timer/补扫不能复活。
+Scope 删除/显式 retry 的新通知仍立即将等待或耗尽条目改为 Queued，Running 的 dirty
+在退出后优先处理；旧失败不得覆盖新意图。Exhausted 仍计入容量，目标责任不丢失；
+队列计数、业务尝试次数及 deadline 均不跨 Runtime 重建，FAILED 仍需显式 retry。
 Runtime 直接从 reconciler 获取同一时钟实例，不另行注入 timer 时钟。每页补扫只加锁一次，
 不改变已有条目；tick 暂保留全 entries 扫描，不承诺满容量下的扫描延迟。
 
 业务 FAILED 与服务 health 分离。单 Binding 存储/数据错误及 CAS 竞争耗尽保留 WaitingRetry 或 Exhausted，
 不维护全局 storage_errors 集合，也不阻断其它请求。存储/数据错误输出 ID 与安全错误诊断，
 CAS 耗尽返回独立的 Contended；后续调用重读并恢复已有状态，不伪造失败落库或远端结果。
-补扫失败影响 health，但不关闭写准入。Runtime 初始化失败保留 Policy/Scope CRUD、查询及其它服务，
-注入不可用通知入口仅拒绝 Binding mutation。
+补扫失败影响 health，但不单独关闭写准入。测试中的不可用通知入口验证 Scope 创建拒绝及
+独立 Policy CRUD；生产 Runtime 初始化失败使 daemon 启动失败，不开放 UDS。
 单次 reconcile 的可展开 panic 由核心先尝试结果/失败记账，再由 worker 在调用边界捕获；
-最新记录已终结或删除时移除队列条目，否则保留 Exhausted 停止自动执行，避免补扫重放。
-查询结果也失败或 panic 时同样按未确认处理；新通知/dirty 仍优先，worker 继续处理其它 Binding。
+最新记录已终结或删除时移除队列条目；原结果或写回执尚待确认时定时继续存储步骤，
+不重复已完成的 Client 调用。只有终止无法确认且无原结果可继续时保留 Exhausted；
+新通知/dirty 仍优先，worker 继续处理其它 Binding。
 不覆盖已提交成功结果，不因 panic 清空 deployments，也不把旧尝试失败写到新 Delete/Update。
 timer/scanner 或 worker 调度代码自身 panic 才停止领取并标记 reconciliation 服务失败，关闭 Binding 写准入；
-daemon 仅记录健康变化，不因此请求全进程 shutdown，Policy/Scope CRUD 和读查询仍可用。
+daemon 仅记录健康变化，不因此请求全进程 shutdown；Scope 创建关闭，Policy CRUD 和查询
+仍按各自存储可用性处理。
 这遵循“单个 Job error 不自动等于顶层 daemon 不可用”的原则。首版不自动重建
 失败 Runtime，需进程重启。取消不会中断同步
 Client；shutdown 先关闭请求准入并 drain 请求，再停止领取/扫描并 join 实际调用。30s drain
-到期后只由进程退出结束剩余工作，不提前释放执行所有权。首版内存记录在重启后丢失；
-持久化后重启恢复须独立验收。服务不创建自定义 trace ID，OTel 集成沿用迁移架构的统一契约。
+到期后只由进程退出结束剩余工作，不提前释放执行所有权。SQLite 保存意图与部署责任，
+重启重建 discovery 和调度；恢复按 SQLite 契约独立验收。服务不创建自定义 trace ID，
+OTel 集成沿用迁移架构的统一契约。
 
 以下均映射到 `v2/crates/asc-policy-runtime/src/reconciliation/tests.rs` 的可执行测试：
 
@@ -497,13 +502,13 @@ Client；shutdown 先关闭请求准入并 drain 请求，再停止领取/扫描
 | DJOB-028 | 停机等待实际调用、旧 Apply 观察不覆盖 Delete | `shutdown_retains_actual_call_until_join_and_closes_write_admission`、`delete_admitted_during_apply_waits_for_exit_and_preserves_cleanup` |
 | DJOB-029 | 单 Binding 错误重试不阻断其它 Binding/PAP CRUD；扫描降级不关闭准入 | `binding_errors_retry_without_blocking_other_bindings_or_pap_writes`、`scan_failure_degrades_health_without_closing_binding_admission` |
 | DJOB-030 | 自动重试等待且有上限，补扫不复活；新通知立即触发并重置队列预算 | `automatic_retries_wait_and_stop_at_budget_without_blocking_other_bindings`、`new_notifications_reset_queue_budget_and_preempt_waiting_or_exhaustion`、`zero_retry_budget_stops_first_failure_and_submillisecond_delay_is_rejected` |
-| DJOB-031 | 单次 reconcile panic 隔离，保留完成事实/目标责任，worker 继续处理其它 Binding | `panic_tests.rs`：`attempt_panic_records_failure_and_same_worker_completes_next_binding`、`committed_success_survives_attempt_panic_without_replay`、`unconfirmed_panic_stops_only_that_binding_until_new_notification` |
+| DJOB-031 | 单次 reconcile panic 隔离，保留完成事实/目标责任，worker 继续处理其它 Binding | `panic_tests.rs`：`attempt_panic_records_failure_and_same_worker_completes_next_binding`、`committed_success_survives_attempt_panic_without_replay`、`unconfirmed_panic_retains_result_while_other_bindings_progress` |
 | DJOB-032 | panic 收尾与新通知竞争不丢工作、不重入，新 Delete 可继续清理 | `panic_tests.rs`：`delete_during_attempt_panic_keeps_dirty_and_cleans_registered_target`、`panic_completion_and_new_notification_race_never_loses_work` |
 | DJOB-033 | Runtime 沿用核心时钟；批量补扫保留既有任务、容量及到期语义 | `one_worker_serves_other_bindings_during_retry_and_reprepares_on_deadline`（非零起点）、`batch_discovery_preserves_existing_work_and_applies_capacity_and_deadlines` |
 
 运行入口：`cargo test -p asc-policy-runtime --locked --offline`。组件中的 scripted 错误不等于
-系统性 fault-injection 交付。完整 CLI/daemon E2E 单独 PR，SQLite/崩溃恢复和系统性注入等待
-persistent Repository；这些边界见 [Runtime 设计](BINDING_RECONCILER_RUNTIME_DESIGN_zh.md)。
+系统性 fault-injection 交付。真实 CLI/daemon、SQLite 故障及崩溃恢复入口见
+[SQLite 验收](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md#9-实施分期与验收)，分层结果不能互相替代。
 
 ### 11.5 **[TARGET V2]** security-event SQLite retention 周期服务
 
@@ -636,7 +641,7 @@ trace-ID 或第二套审计输出。worker 意外退出时关闭队列准入，`
 具体模块与验收边界见
 [SkillSec 第一阶段迁移](SKILL_SEC_PHASE_ONE_zh.md#第六批-skillfs-边界)。
 
-## 15. [TARGET V2][IMPLEMENTED, PROCESS-LOCAL] Scope 驱动进程发现
+## 15. [TARGET V2][IMPLEMENTED] Scope 驱动进程发现
 
 遵循 [生命周期契约](POLICY_SCOPE_BINDING_CONTRACT_zh.md)（SCOPE-CR-002）。Scope 无 revision，
 保存不可变 selector 和完整策略快照。`ScopeDiscovery::start(scope)` 创建一个专属 worker，
@@ -667,5 +672,5 @@ Reconciler 继续拥有调度、CAS、串行目标调用、UNKNOWN 记账及有�
 恢复流程见 [Policy SQLite 持久化设计](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md)。
 
 验收包括 name/path/exec/PID reuse/局部读失败单元测试、registry 容量/停止测试，以及
-`procfs_discovery_uses_saved_policy_and_scope_delete_cleans_all_instances` 的真实 procfs、
+`sqlite_procfs_discovery_cleans_exited_instances_and_scope` 的真实 procfs、
 PAP/runtime/Adapter/scripted Client 组合。mock 结果不证明真实 kernel enforcement。

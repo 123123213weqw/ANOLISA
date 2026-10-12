@@ -167,7 +167,7 @@ discovery 启动失败时，PAP 尝试按顺序补偿删除，但始终返回原
 已 shutdown 的 registry 不会因重复请求自行恢复。
 
 SQLite 使用实例/策略身份的唯一约束，准入事务在已保存集合中去重；32 个策略上限不限制
-进程或 Binding 总数。内存测试后端保留相同语义。
+进程或 Binding 总数。测试使用同一 SQLite 后端的隔离临时落盘库。
 
 源码入口：[Scope](../../v2/crates/asc-policy-types/src/scope.rs)、
 [PAP](../../v2/crates/asc-pap/src/service.rs)、
@@ -184,8 +184,11 @@ SQLite 使用实例/策略身份的唯一约束，准入事务在已保存集合
 - Runtime/PCP：保留串行、条件写、部分失败、UNKNOWN 目标和预算回归；Scope 删除在 Apply
   期间受理，旧调用退出后完成所有目标清理，不丢失责任；最后一条 Binding 删除时同时
   移除已停止 discovery 的 Deleting Scope，Active Scope 变空仍保留。
-- 组合：`procfs_discovery_uses_saved_policy_and_scope_delete_cleans_all_instances` 使用真实
-  procfs、PAP、runtime、Adapter 和 scripted Client，覆盖模板更新/删除后新增进程及最终回收。
+- 组合：[SQLite procfs 组合测试](../../v2/apps/asc-daemon/tests/reconciliation.rs)
+  （`sqlite_procfs_discovery_cleans_exited_instances_and_scope`）使用临时 SQLite 落盘库及真实
+  procfs、PAP、runtime、Adapter 和 scripted Client，通过公共 `procfs_assignment_lifecycle`
+  覆盖模板更新/删除后新增进程仍使用 Scope 保存的策略快照、退出实例的 Binding 清理、
+  Scope 删除后的全部 Binding/Scope 回收及重复删除幂等。
 - 协议/CLI：完整 method/错误/scenario fixtures、UDS、bootstrap、CLI process 和 Python
   `test_policy_assignment_snapshot_and_cleanup`；包括重复已完成删除、旧接口拒绝。
 - 完整下发链路：[HTTP mock E2E](../../tests/v2/e2e/test_policy_delivery_e2e.py) 经真实
@@ -199,12 +202,29 @@ SQLite 使用实例/策略身份的唯一约束，准入事务在已保存集合
 `cargo doc --workspace --no-deps`；Python E2E 使用本次构建的 CLI/daemon。
 持久化的 SIGKILL/故障注入证据见 SQLite 设计第 9 节；这些本地检查不代表远端 CI、
 RPM/systemd 部署、物理断电恢复或真实 kernel enforcement。
-旧验收记录保留其历史基线，不能把旧 PASS 改写为本次或持久化交付结果。
+每次验收需记录被测源码版本、实际命令及结果，不能复用旧版本的 PASS 作为当前证据。
 
-先前 process-local 阶段的本地记录：Rust workspace 共 802 项测试通过（0 failed/ignored），Python CLI/daemon
-流程 2 项通过；fmt、Clippy（deny warnings）、rustdoc、Python 格式/lint、文档命名与链接
-检查通过。Python 使用 3.11.6 和本次本地构建的二进制，socket 测试在允许本地 UDS 的环境
-执行。未运行远端 CI 或真实 AgentSight/kernel 验收。
+### 6.1 Repository 替换后的验收归属
+
+移除旧后端不移除业务断言。下表维护当前入口；“已有入口”不等于本次运行已通过。
+临时 SQLite 使用生产 schema、事务和校验，但单次运行不能替代新进程恢复验收。
+
+| 必须保留的要求 | 当前可执行入口 | 边界 |
+|---|---|---|
+| Policy CRUD、幂等、单调 revision、删除保留分配头 | [PAP 测试](../../v2/crates/asc-pap/tests/pap_service.rs) | 重开后的 head/快照另由 SQLite 契约验证 |
+| 精确快照准入、模板更新/删除竞争、Scope 容量 | [SQLite 契约](../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs) | 保存快照或明确失败，不能部分接受 |
+| 未来实例使用旧快照、退出及 Scope 删除回收 | [procfs 组合](../../v2/apps/asc-daemon/tests/reconciliation.rs) | 同一生命周期 helper 的 SQLite 入口保留全部断言 |
+| CAS、ABA、UNKNOWN、部分失败、完整输入输出及有序 trace | [核心验收](../../v2/fixtures/reconciliation/ACCEPTANCE.md)及 [Repository 回归](../../v2/crates/asc-pcp/tests/repository_contract.rs) | 合成 changed-spec 意图不表示开放 Binding mutation |
+| 队列容量、补扫、重试、panic、shutdown 与实际执行所有权 | [队列验收](BINDING_QUEUE_ADMISSION_ACCEPTANCE_zh.md) | 次数/deadline 重建；持久责任不得丢失 |
+| 当前 12 个方法、严格参数、授权、唯一 requestId、安全错误、CLI 输出/退出码 | [真实 UDS](../../v2/apps/asc-daemon/tests/pap_protocol.rs)、[CLI process](../../v2/apps/asc-cli/tests/pap_process.rs)、[CLI 参数](../../v2/apps/asc-cli/tests/commands.rs) | 普通 UID 的正向授权另见 [真实进程用例](../../tests/v2/e2e/test_policy_cli_errors_e2e.py) |
+| LF/EOF、frame 上限、共享 deadline、不重放、非 UTF-8 路径 | [transport](../../v2/crates/asc-daemon-client/tests/transport.rs)与 CLI 参数测试 | 与存储后端无关，继续回归，不复制数据库版本 |
+| 单记录上限、真实 SQL LIST 字节预算及分页前进 | SQLite `oversized_policy_and_assignment_are_rejected_before_commit`、`sql_list_byte_budget_preserves_total_and_advances_every_page` | 不保留旧后端 clone 次数断言 |
+| 独立 CLI binary 构建、普通依赖树无 Tokio | `cargo build -p asc-cli --bin agent-sec-cli --locked`；`cargo tree -p asc-cli --edges normal` | workspace feature 合并不能替代独立构建 |
+| durable 提交、严格打开、写故障、新进程恢复与备份 | [SQLite PSQL-01～18](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md#9-实施分期与验收) | 按该文分层验证，不从上述业务回归推导 |
+
+旧后端类型、内存 clone 次数及退出即丢状态的限制不再验收；Scope update 和手动 Binding
+CRUD 按当前接口明确拒绝。WorkQueue、AttemptSchedule 和启动管理员名单仍是进程内状态，
+不因 Repository 替换要求落库。过时的运行日志及 PASS 不作为当前证据保留。
 
 ## 7. 通用规则结构改造计划
 

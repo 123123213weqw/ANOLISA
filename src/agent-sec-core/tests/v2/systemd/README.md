@@ -32,7 +32,8 @@ sudo env PATH="$PWD/v2/target/debug:$PATH" "$PWD/agent-sec-cli/.venv/bin/python"
 | Unit 语法 | staging 后 `systemd-analyze verify` | PASS |
 | DPROC-V2-HARDENING-1 默认加固指令 | `packaging/test_systemd.py` | PASS；Alinux 4 systemd 255 下核心业务 45 项通过 |
 | DPROC-013 system restart、journal、stop timeout、start limit | `systemd/test_lifecycle.py` | PASS；真实 PID 1 systemd 255，含 75s timeout 与启动限流 |
-| PAP 持久化、readiness/持续健康检查 | 后续单独任务 | DEFERRED |
+| PAP 持久化与恢复 | [SQLite 验收](../../../docs/design/POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md)第 9 节 | 独立验收，不由本 gate 证明 |
+| readiness/持续健康检查 | 后续单独任务 | DEFERRED |
 
 SkillSec 与新主线对齐后，在 Alibaba Cloud Linux 4 x86_64 通过 812 项 Rust 测试、
 Clippy、fmt 和 rustdoc。源码安装套件 914 项通过、38 项跳过（其中 1 项无 systemd PID 1）；
@@ -87,7 +88,8 @@ SkillSec 需要访问用户 HOME、临时目录、系统 Skill 和共享卷，�
 正常停止上限预算为 2s UDS drain、30s SkillFS worker join、30s reconciliation join、
 1s Tokio shutdown；systemd
 在 75s 强制终止整个 control group。锁文件刻意保留，避免不同 inode 各持一个 flock。
-异常退出后仅在确认 socket 已失效时回收它。不会恢复已经丢失的内存 PAP 状态。
+异常退出后仅在确认 socket 已失效时回收它。PAP 状态保存在 SQLite，启动时恢复
+Scope discovery 及待执行或中断的 reconciliation；持久化恢复按 SQLite 设计独立验收。
 
 回滚：停止并禁用 V2 system service，恢复原 V1 包和 user service 配置；不要同时运行两代
 服务。本次未变更 V1 raw 发布路径，也未实施状态迁移。直接消费者为 daemon binary、

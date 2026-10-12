@@ -18,7 +18,7 @@ thiserror = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
-asc-pap-repository-memory = { workspace = true }
+asc-policy-repository-sqlite = { workspace = true, features = ["test-support"] }
 serde_json = { workspace = true }
 
 [lints]

@@ -81,7 +81,7 @@ fn bounded_cas_contention_is_distinct_from_storage_failure_and_preserves_state()
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct Conflicts {
-        inner: Arc<asc_pap_repository_memory::ProcessLocalPapRepository>,
+        inner: Arc<asc_policy_repository_sqlite::SqlitePolicyRepository>,
         calls: AtomicUsize,
     }
     impl BindingStateRepository for Conflicts {
@@ -294,7 +294,7 @@ fn repeated_admitted_intent_preserves_budget_and_new_revision_keeps_targets() {
     // Existing PAP repository writes and worker transactions share one store.
     next.spec.scope.process.start_time += 1;
     repository
-        .update_binding(Some(&(&ready).into()), &next)
+        .admit_binding_for_test(Some(&(&ready).into()), &next)
         .unwrap();
     let pending = repository.read(id).unwrap().unwrap();
     assert_eq!(pending.deployments, ready.deployments);
@@ -360,13 +360,13 @@ fn bounded_codes_and_backoff_reject_invalid_configuration() {
 }
 
 struct TestRepository {
-    inner: Arc<asc_pap_repository_memory::ProcessLocalPapRepository>,
+    inner: Arc<asc_policy_repository_sqlite::SqlitePolicyRepository>,
     state: ReconcileState,
     schedule: std::sync::Mutex<AttemptSchedule>,
     completion: std::sync::Mutex<Option<crate::model::PendingWrite>>,
 }
 impl std::ops::Deref for TestRepository {
-    type Target = asc_pap_repository_memory::ProcessLocalPapRepository;
+    type Target = asc_policy_repository_sqlite::SqlitePolicyRepository;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
@@ -374,7 +374,7 @@ impl std::ops::Deref for TestRepository {
 impl TestRepository {
     fn with_binding_states(records: Vec<ReconcileRecord>) -> Result<Self, StoreError> {
         let inner = Arc::new(
-            asc_pap_repository_memory::ProcessLocalPapRepository::with_binding_states(records)?,
+            asc_policy_repository_sqlite::SqlitePolicyRepository::with_binding_states(records)?,
         );
         Ok(Self {
             state: ReconcileState {
@@ -430,7 +430,7 @@ fn deployment_registration_rejects_a_changed_status_version() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct ConcurrentWrite {
-        inner: Arc<asc_pap_repository_memory::ProcessLocalPapRepository>,
+        inner: Arc<asc_policy_repository_sqlite::SqlitePolicyRepository>,
         calls: AtomicUsize,
     }
     impl BindingStateRepository for ConcurrentWrite {

@@ -1,11 +1,11 @@
-//! PAP + memory repository + reconciler integration; the target Client is scripted.
+//! PAP + `SQLite` repository + reconciler integration; the target Client is scripted.
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use asc_foundation_types::Revision;
 use asc_pap::{PapError, PapRepository, PapService};
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::*;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::target::{AdapterFault, TargetBindingPlan, TranslationOutcome};
 
@@ -87,8 +87,8 @@ impl TargetDeploymentClient for Client {
     }
 }
 struct Rig {
-    repo: Arc<ProcessLocalPapRepository>,
-    pap: PapService<ProcessLocalPapRepository>,
+    repo: Arc<SqlitePolicyRepository>,
+    pap: PapService<SqlitePolicyRepository>,
     client: Arc<Client>,
     core: BindingReconciler,
     binding: BindingView,
@@ -108,7 +108,7 @@ impl Rig {
             status: BindingStatus::PendingApply.into(),
         };
         let repo = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![ReconcileRecord {
+            SqlitePolicyRepository::with_binding_states(vec![ReconcileRecord {
                 status_version: 1,
                 binding: binding.clone(),
                 deployments: vec![],
@@ -306,7 +306,7 @@ fn spec_change_clears_prepared_but_keeps_previous_target_for_cleanup() {
     next.spec.scope.process.start_time += 1;
     next.status = BindingStatus::PendingApply.into();
     rig.repo
-        .update_binding(Some(&(&ready).into()), &next)
+        .admit_binding_for_test(Some(&(&ready).into()), &next)
         .unwrap();
     assert_eq!(next.spec.binding_revision.get(), 2);
     assert_eq!(rig.state().deployments, ready.deployments);
@@ -341,7 +341,8 @@ fn maximum_revision_allows_same_spec_retry_and_delete_but_rejects_spec_change() 
     let mut changed = before.binding.clone();
     changed.spec.scope.process.start_time += 1;
     assert_eq!(
-        rig.repo.update_binding(Some(&(&before).into()), &changed),
+        rig.repo
+            .admit_binding_for_test(Some(&(&before).into()), &changed),
         Err(PapError::Conflict)
     );
     assert_eq!(rig.delete().unwrap().spec, rig.binding.spec);

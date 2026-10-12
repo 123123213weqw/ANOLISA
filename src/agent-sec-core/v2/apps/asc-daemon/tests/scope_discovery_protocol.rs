@@ -11,7 +11,7 @@ use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::DaemonDispatcher;
 use asc_daemon_protocol::{DaemonRequest, RequestId};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use serde_json::{Value, json};
 
 struct Role(PrincipalRole);
@@ -23,7 +23,7 @@ impl PrincipalPolicy for Role {
 
 #[test]
 fn scope_assignment_protocol_creates_reads_and_deletes_discovery_intent() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository);
     let registry = Arc::new(ScopeDiscoveryRegistry::new(Arc::new(pap.clone())));
     let pap = pap.with_scope_discovery(registry.clone());

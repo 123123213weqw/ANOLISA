@@ -321,13 +321,13 @@ mod tests {
     use std::time::Instant;
 
     use asc_pap::PapService;
-    use asc_pap_repository_memory::ProcessLocalPapRepository;
+    use asc_policy_repository_sqlite::SqlitePolicyRepository;
 
     use super::*;
     use asc_policy_types::policy::PreparedPolicy;
 
-    fn policies() -> (Arc<ProcessLocalPapRepository>, PreparedPolicy) {
-        let repository = Arc::new(ProcessLocalPapRepository::default());
+    fn policies() -> (Arc<SqlitePolicyRepository>, PreparedPolicy) {
+        let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
         let pap = PapService::new(repository.clone());
         let policy = pap
             .create_policy("test", &file_policy(vec!["/protected".to_owned()]))

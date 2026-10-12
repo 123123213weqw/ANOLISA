@@ -29,7 +29,6 @@ members = [
     "crates/asc-agentsight-client",
     "crates/asc-policy-adapter-agentsight",
     "crates/asc-pap",
-    "crates/asc-pap-repository-memory",
     "crates/asc-pcp",
     "crates/asc-policy-runtime",
     "crates/asc-policy-target-contracts",
@@ -75,7 +74,6 @@ asc-foundation-types = { path = "crates/asc-foundation-types" }
 asc-model-client = { path = "crates/asc-model-client" }
 asc-observability = { path = "crates/asc-observability" }
 asc-pap = { path = "crates/asc-pap" }
-asc-pap-repository-memory = { path = "crates/asc-pap-repository-memory" }
 asc-pcp = { path = "crates/asc-pcp" }
 asc-persistence-sqlite = { path = "crates/asc-persistence-sqlite" }
 asc-policy-adapter-agentsight = { path = "crates/asc-policy-adapter-agentsight" }

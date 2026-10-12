@@ -3,8 +3,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::*;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::target::{TargetBindingPlan, TranslationOutcome};
 
@@ -95,9 +95,8 @@ fn initialization_failure_retries_apply_update_and_delete_without_losing_target_
             },
             deployments: if has_previous { vec![previous] } else { vec![] },
         };
-        let repo = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![initial.clone()]).unwrap(),
-        );
+        let repo =
+            Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial.clone()]).unwrap());
         let opens = Arc::new(AtomicU64::new(0));
         let factory: Arc<dyn TargetDeploymentClientFactory> = {
             let opens = opens.clone();

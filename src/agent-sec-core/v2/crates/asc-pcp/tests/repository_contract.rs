@@ -2,8 +2,8 @@
 use std::sync::{Arc, Barrier};
 
 use asc_pap::PapRepository;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::*;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, BindingView};
 
 fn initial() -> BindingStateSnapshot {
@@ -23,8 +23,7 @@ fn initial() -> BindingStateSnapshot {
 #[test]
 fn concurrent_writes_from_one_snapshot_have_exactly_one_winner() {
     let before = initial();
-    let repo =
-        Arc::new(ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap());
     let barrier = Arc::new(Barrier::new(3));
     let writers: Vec<_> = (1..=2)
         .map(|attempts| {
@@ -94,7 +93,7 @@ fn concurrent_writes_from_one_snapshot_have_exactly_one_winner() {
 fn status_error_and_deployment_changes_invalidate_stale_snapshot() {
     for deployments in [false, true] {
         let before = initial();
-        let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
+        let repo = SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap();
         let mut next = before.clone();
         if deployments {
             next.deployments.push(Deployment {
@@ -135,7 +134,7 @@ fn status_error_and_deployment_changes_invalidate_stale_snapshot() {
 #[test]
 fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
     let before = initial();
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
     next.binding.status.phase = BindingStatus::ApplyFailed;
     let write = BindingStateWrite::new(next);
@@ -145,7 +144,7 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
         WriteResult::Applied(_)
     ));
     let new_intent = before.binding.clone();
-    repo.update_binding(
+    repo.admit_binding_for_test(
         Some(
             &(&repo
                 .get_binding_state(&before.binding.spec.binding_id)
@@ -185,7 +184,7 @@ fn replay_after_pap_write_is_acknowledged_without_overwriting_new_intent() {
 #[test]
 fn reconciliation_patch_cannot_write_a_spec_or_change_identity() {
     let before = initial();
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
     next.binding.spec.binding_id =
         asc_foundation_types::ResourceId::new("10000000-0000-4000-8000-000000000002").unwrap();
@@ -211,7 +210,7 @@ fn removal_is_atomic_replayable_and_stale_writes_cannot_resurrect_revision_one()
     let mut before = initial();
     before.binding.spec.binding_revision = asc_foundation_types::Revision::new(1).unwrap();
     before.binding.status.phase = BindingStatus::Deleting;
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap();
     let write = BindingStateWrite::delete();
     assert!(matches!(
         repo.compare_exchange_binding_state(&before, &write)
@@ -233,7 +232,7 @@ fn removal_is_atomic_replayable_and_stale_writes_cannot_resurrect_revision_one()
         WriteResult::Conflict
     );
     assert_eq!(
-        repo.update_binding(
+        repo.admit_binding_for_test(
             Some(&(&before).into()),
             &BindingView {
                 spec: before.binding.spec.clone(),
@@ -248,7 +247,7 @@ fn removal_is_atomic_replayable_and_stale_writes_cannot_resurrect_revision_one()
 #[test]
 fn stale_removal_cannot_erase_a_newer_status_or_target_observation() {
     let before = initial();
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![before.clone()]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![before.clone()]).unwrap();
     let mut next = before.clone();
     next.binding.status.phase = BindingStatus::PendingDelete;
     next.status_version += 1;

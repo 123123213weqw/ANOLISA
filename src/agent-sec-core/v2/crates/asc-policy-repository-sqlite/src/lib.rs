@@ -6,6 +6,8 @@ mod path;
 mod reconciliation;
 mod records;
 mod table;
+#[cfg(feature = "test-support")]
+mod test_support;
 pub use path::DatabaseLease;
 
 use asc_pap::PapError;
@@ -81,6 +83,9 @@ struct Storage {
 pub struct SqlitePolicyRepository {
     storage: Mutex<Storage>,
     lease: Arc<DatabaseLease>,
+    // Declared last so the connection and lease close before temporary files are removed.
+    #[cfg(feature = "test-support")]
+    test_directory: Option<tempfile::TempDir>,
 }
 
 impl SqlitePolicyRepository {
@@ -96,6 +101,8 @@ impl SqlitePolicyRepository {
                 failure: None,
             }),
             lease,
+            #[cfg(feature = "test-support")]
+            test_directory: None,
         };
         repository.check_storage()?;
         repository.lease.sync_directory()?;

@@ -9,9 +9,9 @@ use asc_pap::{EnqueueError, PapError};
 use asc_policy_repository::{BindingStateWrite, ReconciliationPatch, WriteResult};
 
 fn pap_with(
-    repo: Arc<ProcessLocalPapRepository>,
+    repo: Arc<SqlitePolicyRepository>,
     queue: Arc<dyn BindingReconcileEnqueuer>,
-) -> PapService<ProcessLocalPapRepository> {
+) -> PapService<SqlitePolicyRepository> {
     PapService::new(repo)
         .with_reconcile_enqueuer(queue)
         .with_scope_discovery(Arc::new(Discovery))
@@ -35,9 +35,8 @@ fn admission_full_failed_snapshot_stale_wakeup_and_explicit_retry() {
                 last_confirmed: None,
             });
         }
-        let repo = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![initial.clone()]).unwrap(),
-        );
+        let repo =
+            Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial.clone()]).unwrap());
         let queue = Arc::new(WorkQueue::new(1, 4));
         queue.enqueue(&id(2)).unwrap();
         let pap = pap_with(repo.clone(), queue.clone());
@@ -107,7 +106,7 @@ fn admission_full_failed_snapshot_stale_wakeup_and_explicit_retry() {
 }
 
 struct InterleavingEnqueuer {
-    repo: Arc<ProcessLocalPapRepository>,
+    repo: Arc<SqlitePolicyRepository>,
     claim: bool,
 }
 impl BindingReconcileEnqueuer for InterleavingEnqueuer {
@@ -149,7 +148,7 @@ fn admission_worker_claim_wins_or_stopped_failure_is_recorded() {
             let mut initial = record(1);
             initial.binding.status.phase = BindingStatus::ApplyFailed;
             let repo = Arc::new(
-                ProcessLocalPapRepository::with_binding_states(vec![initial.clone()]).unwrap(),
+                SqlitePolicyRepository::with_binding_states(vec![initial.clone()]).unwrap(),
             );
             let pap = pap_with(
                 repo.clone(),
@@ -191,7 +190,7 @@ fn admission_worker_claim_wins_or_stopped_failure_is_recorded() {
 #[test]
 fn admission_pending_cas_preserves_state_and_fences_revision_and_status() {
     let initial = record(1);
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![initial.clone()]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![initial.clone()]).unwrap();
     let mut stale = initial.binding.clone();
     stale.spec.binding_revision = stale.spec.binding_revision.checked_next().unwrap();
     assert!(
@@ -269,7 +268,7 @@ fn admission_capacity_merges_every_existing_state_and_stop_is_explicit() {
 
 #[test]
 fn admission_create_reports_saved_identity_and_policy_scope_remain_available() {
-    let repo = Arc::new(ProcessLocalPapRepository::default());
+    let repo = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let queue = Arc::new(WorkQueue::new(1, 4));
     queue.enqueue(&id(2)).unwrap();
     let pap = pap_with(repo.clone(), queue);
@@ -311,7 +310,7 @@ fn admission_error_projection_sanitizes_untrusted_status_codes() {
         kind: FailureKind::Rejected,
         code: "secret remote body".into(),
     });
-    let repo = ProcessLocalPapRepository::with_binding_states(vec![initial]).unwrap();
+    let repo = SqlitePolicyRepository::with_binding_states(vec![initial]).unwrap();
     let expected = Some(Failure::new(
         FailureKind::Rejected,
         "RECONCILE_INTERNAL_ERROR",
@@ -325,7 +324,7 @@ fn admission_error_projection_sanitizes_untrusted_status_codes() {
 
 #[test]
 fn queue_retains_retry_progress_across_scan_and_duplicate_wakeup_but_restart_resets_it() {
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![record(1)]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![record(1)]).unwrap());
     let client = Arc::new(Client::default());
     client
         .failures
@@ -392,7 +391,7 @@ fn queue_retains_retry_progress_across_scan_and_duplicate_wakeup_but_restart_res
 
 #[test]
 fn claim_clears_previous_error_and_explicit_retry_resets_retained_progress() {
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![record(1)]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![record(1)]).unwrap());
     let client = Arc::new(Client::default());
     let clock = Arc::new(TestClock::default());
     let reconciler = core(repo.clone(), client.clone(), clock.clone());

@@ -86,7 +86,6 @@ v2/crates/asc-policy-runtime/
 | `v2/crates/asc-pcp/src/` | 单次认领、重新翻译/准备、远端执行、结果合并和退避计算；slot 保存异常收尾及未确认存储操作，不缓存 prepared；中断尝试的领域恢复决策也归此处 |
 | `v2/crates/asc-policy-repository/src/` | 持久化数据、一致读、局部条件写和显式事务端口；不含队列或 prepared 缓存 |
 | `v2/crates/asc-pap/src/` | CRUD 语义、原子接受意图；声明窄 `BindingReconcileEnqueuer` 输出端口，提交后通知 |
-| `v2/crates/asc-pap-repository-memory/src/` | 首阶段实现相同局部更新语义；不依赖核心实现，不承担执行缓存 |
 | `v2/crates/asc-policy-repository-sqlite/src/` | Policy、Scope、Binding 三表、事务、写回执、严格打开和恢复扫描 |
 | `v2/apps/asc-daemon/src/reconciliation.rs` | 接收共享 Repository，选择并构造具体 Adapter/Client、核心与 Runtime；main 接 PAP notifier、健康和生命周期 |
 | `v2/apps/asc-daemon/tests/` | Runtime 集成阶段验证装配与生命周期的直接消费者；完整 CLI/daemon 进程链路归独立 E2E PR |
@@ -516,8 +515,8 @@ Client 初始化边界由 `asc-pcp/tests/client_initialization.rs` 和
 | RRT-005 | Apply 中接受 Delete，调用不重叠、观察保存、旧状态不覆盖 Delete | PAP/Runtime/核心组件测试 | — |
 | RRT-006 | 未到期的 Skipped 恢复等待，缺失/终态不反复排队 | 组件测试 | — |
 | RRT-007 | 容量、补扫发现未通知意图、扫描与通知竞争、分页覆盖 | 有界队列与扫描组件测试 | 提交后通知丢失等系统性注入 |
-| RRT-008 | deployment 局部写不改 spec；spec 更新保留 deployment | 内存 Repository 契约测试 | SQL 局部写/事务验证 |
-| RRT-009 | 旧 revision/status 不推进新生命周期，合法观察可独立提交 | 内存 Repository/核心竞争测试 | SQL 事务竞争验证 |
+| RRT-008 | deployment 局部写不改 spec；spec 更新保留 deployment | SQLite Repository 契约测试 | SQL 局部写/事务验证 |
+| RRT-009 | 旧 revision/status 不推进新生命周期，合法观察可独立提交 | SQLite Repository/核心竞争测试 | SQL 事务竞争验证 |
 | RRT-010 | 登记先于 Client；确认全部目标不存在后原子删除；登记失败不调用远端 | 正常路径的顺序/删除原子性组件测试 | 登记失败、事务失败注入 |
 | RRT-011 | 无 dirty 的自动重试也重新读取并执行 translate/prepare，不复用上次对象；本次准备结果原样交给 Client | 重算次数、完整输入、身份校验、安全重放和调用顺序的组件测试 | — |
 | RRT-012 | SQL 无 plan/prepared/body/outcome；新远端尝试与新进程均重新计算，存储等待保留原 write/outcome | 数据模型、单次生命周期和内存写接口测试 | SQL schema 与真实新进程验证 |
@@ -540,7 +539,7 @@ Client 返回 RetryAt 所需结果，不引入完整进程链路的系统性 err
 ### 10.3 独立 E2E PR
 
 完整端到端测试单独提交，不作为 Runtime 集成 PR 的完成条件，也不要求
-先具备 persistent Repository：首版可使用内存 Repository 和可控 mock AgentSight。
+先以崩溃恢复验收通过为前提。当前使用 SQLite Repository 和可控 mock AgentSight。
 
 ```text
 真实 agent-sec-cli 进程 → 真实 asc-daemon 进程 → UDS/PAP
@@ -558,11 +557,11 @@ Client 返回 RetryAt 所需结果，不引入完整进程链路的系统性 err
 | PR / 阶段 | 交付与验收 |
 |---|---|
 | Runtime 集成 PR | 局部写接口、单次执行及跨调用缓存移除、Queue/worker/到期/补偿、daemon 接线；通过第 10.2 节分配的单元、组件、调度竞争及既有相关回归 |
-| 独立完整 E2E PR | 第 10.3 节的 CLI→daemon→Reconciler→mock AgentSight 完整链路；可基于内存 Repository |
+| 独立完整 E2E PR | 第 10.3 节的 CLI→daemon→Reconciler→mock AgentSight 完整链路；使用 SQLite Repository |
 | persistent Repository 工作包 | SQLite schema、耐久事务、启动恢复及其存储契约验证 |
 | 持久化就绪后的 error injection / 恢复测试 | 第 10.2 节后续列：远端/存储故障、部分完成、提交窗口、worker 异常、进程崩溃与重启；完成 Client 跨重启重新准备安全门禁 |
 
-Runtime 集成 PR 内先调整 `asc-policy-repository`、PAP、memory adapter、PCP 及直接消费者，再
+Runtime 集成 PR 内先调整 `asc-policy-repository`、PAP、SQLite adapter、PCP 及直接消费者，再
 实现 `asc-policy-runtime` 并由 daemon 装配。完整 E2E 与系统性 error injection 均不作为
 Runtime 集成 PR 的完成门禁；延期测试不改变第 4～9 节的目标行为。不能据 Runtime 集成测试通过宣称完整进程链路、
 SQL 崩溃恢复或真实 PEP 已验收。live target/enforcement 的证据另行记录。

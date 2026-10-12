@@ -8,12 +8,12 @@ include!(concat!(
 
 use asc_daemon::start_policy_reconciliation_with_client;
 use asc_pap::{PapRepository, PapService};
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::{
     DeploymentReport, Failure, Observation, PreparedApply, Presence, TargetDeploymentClient,
     TargetRef,
 };
 use asc_policy_repository::{BindingStateRepository, Deployment};
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, PreparedBinding};
 use asc_policy_types::target::TargetBindingPlan;
 use std::sync::{Arc, Mutex};
@@ -74,7 +74,7 @@ fn wait(mut predicate: impl FnMut() -> bool) {
 
 #[test]
 fn configured_composition_delivers_pap_intent_and_joins_its_workers() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let spec: PreparedBinding = serde_json::from_str(include_str!(
         "../../../crates/asc-policy-types/tests/fixtures/prepared-binding.json"
     ))
@@ -140,7 +140,7 @@ fn configured_composition_delivers_pap_intent_and_joins_its_workers() {
 
 #[test]
 fn unavailable_reconciliation_rejects_new_assignments_but_keeps_policy_crud() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository)
         .with_reconcile_enqueuer(Arc::new(asc_daemon::UnavailableReconciliation))
         .with_scope_discovery(Arc::new(Discovery));
@@ -182,11 +182,6 @@ impl Drop for Child {
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
-}
-
-#[test]
-fn procfs_discovery_uses_saved_policy_and_scope_delete_cleans_all_instances() {
-    procfs_assignment_lifecycle(Arc::new(ProcessLocalPapRepository::default()));
 }
 
 #[test]

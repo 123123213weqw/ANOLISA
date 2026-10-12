@@ -191,7 +191,7 @@ mod tests {
     fn skill_budget_does_not_change_ordinary_methods_or_embedding_defaults() {
         use asc_daemon_service::RequestDispatcher as _;
         let pap = asc_pap::PapService::new(Arc::new(
-            asc_pap_repository_memory::ProcessLocalPapRepository::default(),
+            asc_policy_repository_sqlite::SqlitePolicyRepository::temporary().unwrap(),
         ));
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();

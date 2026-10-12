@@ -365,7 +365,8 @@ Supervisor 或 OTel 已完成。
   [Telemetry 字段与门控](telemetry-security-event-sync.md)。
 - 本切片不声明完整 SMC-012/OTel、Prompt/PII 算法、observability 查询、RPM/systemd、
   uploader 交付或断电恢复已验收。`ActionOutcome` 仍是现有五字段模型；CLI stdout 由 wire
-  result 渲染，不新增 V1 `stdout` 字段。PAP 仍使用 process-local Repository。
+  result 渲染，不新增 V1 `stdout` 字段。该基线的 PAP 使用进程内 Repository；当前已使用
+  SQLite，存储恢复证据见 [SQLite 设计](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md)第 9 节。
 
 #### 装配与调用
 

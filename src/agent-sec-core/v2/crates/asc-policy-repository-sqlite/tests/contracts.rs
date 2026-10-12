@@ -1,6 +1,5 @@
 use asc_foundation_types::{ResourceId, Revision};
 use asc_pap::{PapError, PapRepository};
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_policy_repository::*;
 use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::{
@@ -66,7 +65,6 @@ trait Repository: PapRepository + BindingStateRepository + BindingReconcileCatal
 impl<T: PapRepository + BindingStateRepository + BindingReconcileCatalog> Repository for T {}
 
 fn each(test: impl Fn(&dyn Repository)) {
-    test(&ProcessLocalPapRepository::default());
     let dir = private_dir();
     test(&SqlitePolicyRepository::open(&dir.path().join("policy-state.db")).unwrap());
 }

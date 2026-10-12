@@ -220,8 +220,8 @@ dependencies = [
  "asc-model-client",
  "asc-observability",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-persistence-sqlite",
+ "asc-policy-repository-sqlite",
  "asc-policy-types",
  "asc-security-events",
  "asc-telemetry",
@@ -261,7 +261,6 @@ dependencies = [
  "asc-model-client",
  "asc-observability",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-pcp",
  "asc-persistence-sqlite",
  "asc-policy-adapter-agentsight",
@@ -340,8 +339,8 @@ dependencies = [
  "asc-model-client",
  "asc-observability",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-persistence-sqlite",
+ "asc-policy-repository-sqlite",
  "asc-security-events",
  "serde",
  "serde_json",
@@ -450,26 +449,13 @@ name = "asc-pap"
 version = "1.0.0"
 dependencies = [
  "asc-foundation-types",
- "asc-pap-repository-memory",
  "asc-policy-repository",
+ "asc-policy-repository-sqlite",
  "asc-policy-types",
  "serde",
  "serde_json",
  "thiserror",
  "tracing",
- "uuid",
-]
-
-[[package]]
-name = "asc-pap-repository-memory"
-version = "1.0.0"
-dependencies = [
- "asc-foundation-types",
- "asc-pap",
- "asc-policy-repository",
- "asc-policy-types",
- "serde",
- "serde_json",
  "uuid",
 ]
 
@@ -480,9 +466,9 @@ dependencies = [
  "asc-agentsight-client",
  "asc-foundation-types",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-policy-adapter-agentsight",
  "asc-policy-repository",
+ "asc-policy-repository-sqlite",
  "asc-policy-target-contracts",
  "asc-policy-types",
  "serde",
@@ -536,7 +522,6 @@ dependencies = [
  "asc-agentsight-client",
  "asc-foundation-types",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-pcp",
  "asc-policy-repository",
  "asc-policy-types",
@@ -557,9 +542,9 @@ version = "1.0.0"
 dependencies = [
  "asc-foundation-types",
  "asc-pap",
- "asc-pap-repository-memory",
  "asc-pcp",
  "asc-policy-repository",
+ "asc-policy-repository-sqlite",
  "asc-policy-types",
  "serde_json",
  "tracing",

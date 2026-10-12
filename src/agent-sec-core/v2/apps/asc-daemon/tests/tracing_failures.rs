@@ -3,7 +3,7 @@ use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_observability::AgentFieldProcessor;
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 
 use opentelemetry::trace::{Status, TracerProvider as _};
 use opentelemetry_sdk::trace::{InMemorySpanExporter, Sampler, SdkTracerProvider, SpanData};
@@ -107,7 +107,7 @@ async fn uds_failures_preserve_business_and_context() {
         release: Mutex::new(wait),
     });
     let dispatcher = Arc::new(DaemonDispatcher::new(
-        PapService::new(Arc::new(ProcessLocalPapRepository::default())),
+        PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap())),
         policy.clone(),
         asc_daemon::scan_application(
             asc_action_runtime::testing::discarding_finalizer(),

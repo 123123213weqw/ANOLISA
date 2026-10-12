@@ -16,7 +16,7 @@ pub trait TestAdmission {
         desired: &BindingView,
     ) -> Result<bool, StoreError>;
 }
-impl TestAdmission for asc_pap_repository_memory::ProcessLocalPapRepository {
+impl TestAdmission for asc_policy_repository_sqlite::SqlitePolicyRepository {
     fn compare_exchange_reconcile_intent(
         &self,
         expected: &ExpectedBinding,
@@ -57,7 +57,7 @@ impl TestAdmission for asc_pap_repository_memory::ProcessLocalPapRepository {
                 WriteResult::Applied(_)
             ));
         }
-        self.update_binding(Some(&(&before).into()), desired)
+        self.admit_binding_for_test(Some(&(&before).into()), desired)
             .map(|_| true)
             .map_err(|_| StoreError::Invalid)
     }

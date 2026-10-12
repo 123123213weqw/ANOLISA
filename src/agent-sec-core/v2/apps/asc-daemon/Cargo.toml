@@ -50,7 +50,7 @@ serde_json.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
-asc-pap-repository-memory.workspace = true
+asc-policy-repository-sqlite = { workspace = true, features = ["test-support"] }
 # The dual-UID sec.* acceptance forks per-UID children over the socket.
 libc = "0.2"
 rusqlite.workspace = true

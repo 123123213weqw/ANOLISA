@@ -14,9 +14,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use store::{TestAdmission, TestStore};
 
 use asc_agentsight_client::*;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_pcp::*;
 use asc_policy_adapter_agentsight::AgentSightAdapter;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::identifiers::{ResourceId, Revision};
 use common::*;
@@ -153,7 +153,7 @@ fn core(
     .unwrap()
 }
 
-fn inspect_registered(repo: &ProcessLocalPapRepository, request: &AgentSightHttpRequest) {
+fn inspect_registered(repo: &SqlitePolicyRepository, request: &AgentSightHttpRequest) {
     if request.method == AgentSightHttpMethod::Get {
         return;
     }
@@ -184,7 +184,7 @@ fn inspect_registered(repo: &ProcessLocalPapRepository, request: &AgentSightHttp
 #[test]
 fn real_http_apply_then_uncertain_delete_and_retry() {
     let mut schedule = AttemptSchedule::default();
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(
         vec![
@@ -249,7 +249,7 @@ fn real_http_apply_then_uncertain_delete_and_retry() {
 fn real_http_partial_update_retry_cleans_old_once_and_reuses_new_request() {
     let mut schedule = AttemptSchedule::default();
     let repo =
-        Arc::new(ProcessLocalPapRepository::with_binding_states(vec![ready(7, 1, false)]).unwrap());
+        Arc::new(SqlitePolicyRepository::with_binding_states(vec![ready(7, 1, false)]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(
         vec![
@@ -313,7 +313,7 @@ fn real_http_partial_update_retry_cleans_old_once_and_reuses_new_request() {
 #[test]
 fn same_revision_delete_during_real_http_apply_preserves_target_for_cleanup() {
     let mut schedule = AttemptSchedule::default();
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(
         vec![
@@ -368,7 +368,7 @@ fn same_revision_delete_during_real_http_apply_preserves_target_for_cleanup() {
 }
 
 struct FailFinishOnce {
-    repo: Arc<ProcessLocalPapRepository>,
+    repo: Arc<SqlitePolicyRepository>,
     fail: AtomicBool,
 }
 impl BindingStateRepository for FailFinishOnce {
@@ -395,7 +395,7 @@ impl BindingStateRepository for FailFinishOnce {
 #[test]
 fn result_storage_failure_retains_success_without_repeating_http() {
     let mut schedule = AttemptSchedule::default();
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial()]).unwrap());
     let inspect = repo.clone();
     let server = MockHttp::start(vec![health(), post(7, applied(7))], move |req| {
         inspect_registered(&inspect, req);
@@ -434,8 +434,7 @@ fn result_storage_failure_retains_success_without_repeating_http() {
 fn retry_rejects_reused_process_identity_and_retains_unknown_cleanup() {
     let mut schedule = AttemptSchedule::default();
     for change_boot in [false, true] {
-        let repo =
-            Arc::new(ProcessLocalPapRepository::with_binding_states(vec![initial()]).unwrap());
+        let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![initial()]).unwrap());
         let wire = Wire::new([
             Ok(response(200, HEALTH)),
             Err(AgentSightTransportError::Unavailable),

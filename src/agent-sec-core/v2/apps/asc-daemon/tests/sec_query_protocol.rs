@@ -15,9 +15,9 @@ use asc_daemon::{BootstrapConfig, scan_application, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_persistence_sqlite::security_events::SqliteEventWriter;
 use asc_persistence_sqlite::security_events::query_source::SqliteEventQuerySource;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_security_events::SecurityEvent;
 use serde_json::{Map, json};
 use tokio::net::UnixStream;
@@ -54,7 +54,7 @@ impl RunningDaemon {
         ));
         std::fs::create_dir(&directory).unwrap();
         let socket_path = directory.join("daemon.sock");
-        let application = PapService::new(Arc::new(ProcessLocalPapRepository::default()));
+        let application = PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap()));
         // The action runtime is not under test; a discarding finalizer keeps
         // the scan methods wired without writing into the query store.
         let outputs = Arc::new(DiscardingOutputs);
@@ -414,7 +414,7 @@ async fn an_unconfigured_query_store_fails_closed() {
     // sec.* call rather than reading an arbitrary database.
     let socket_dir = tempfile::tempdir().expect("socket dir");
     let socket_path = socket_dir.path().join("daemon.sock");
-    let application = PapService::new(Arc::new(ProcessLocalPapRepository::default()));
+    let application = PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap()));
     let outputs = Arc::new(DiscardingOutputs);
     let dispatcher = Arc::new(DaemonDispatcher::new(
         application,

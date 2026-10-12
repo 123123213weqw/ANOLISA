@@ -49,7 +49,7 @@ fn start_bridge(
 fn ordinary_dispatcher(application: Arc<ActionService>) -> DaemonDispatcher {
     DaemonDispatcher::new(
         asc_pap::PapService::new(Arc::new(
-            asc_pap_repository_memory::ProcessLocalPapRepository::default(),
+            asc_policy_repository_sqlite::SqlitePolicyRepository::temporary().unwrap(),
         )),
         Arc::new(RootManagedPrincipalPolicy::default()),
         application,

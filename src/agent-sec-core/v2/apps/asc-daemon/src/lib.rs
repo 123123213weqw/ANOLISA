@@ -1,7 +1,7 @@
 //! Process bootstrap and composition root for the `AgentSecCore` V2 daemon.
 //!
 //! The binary installs PAP handlers with a root-managed authorization policy
-//! and a replaceable process-local PAP Repository. Scan lifecycle output uses
+//! and the `SQLite` Policy Repository. Scan lifecycle output uses
 //! explicitly configured durable audit sinks and independent telemetry.
 
 #![forbid(unsafe_code)]

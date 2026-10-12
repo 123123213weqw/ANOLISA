@@ -1,7 +1,7 @@
 # Policy SQLite 持久化与崩溃恢复设计
 
 文档类型：`[TARGET V2][IMPLEMENTED]`。daemon 已使用 SQLite 保存 Policy、Scope、Binding
-和部署责任；内存后端仅用于契约测试。本地验收证据及未覆盖边界见第 9 节。
+和部署责任；契约测试使用同一 SQLite 后端的隔离临时落盘库。本地验收证据及未覆盖边界见第 9 节。
 本文承接 [Policy/Scope/Binding 契约](POLICY_SCOPE_BINDING_CONTRACT_zh.md) 与
 [Reconciler Runtime 设计](BINDING_RECONCILER_RUNTIME_DESIGN_zh.md)，替代后者关于 SQLite
 crate 归属、deployment 分表建议及状态 CAS 的早期提案；其余生命周期语义继续适用。
@@ -52,7 +52,6 @@ PCP reconcile 和 Runtime 扫描，不应叫 PAP 专属后端。
 | `asc-pap` | 管理操作、Scope 准入/删除/重试、`PapRepository`；内部通知携带提交版本回执 |
 | `asc-policy-repository` | `BindingStateSnapshot`、Deployment、CAS/写回执与扫描端口；保持 backend-neutral |
 | `asc-policy-repository-sqlite` | 实现上述端口，负责 schema、事务、编码、约束、严格打开与存储错误分类 |
-| `asc-pap-repository-memory` | 保留测试后端，与 SQLite 执行同一套契约；本次不顺带改名 |
 | `asc-pcp` | 状态转换、认领、UNKNOWN 登记、观察合并、中断恢复；不写 SQL |
 | `asc-policy-runtime` | 单 Binding 执行所有权、队列补扫、重试和异常收尾；不决定存储布局 |
 | `asc-policy-adapter-agentsight` | 从 Binding 的模板快照直接编译 AgentSight DSL；不读取模板库或数据库 |
@@ -61,7 +60,8 @@ PCP reconcile 和 Runtime 扫描，不应叫 PAP 专属后端。
 
 新后端依赖 `asc-pap`、`asc-policy-repository`、领域类型及 workspace 已有的 `rusqlite`、
 serde、uuid 等。业务层不反向依赖 SQLite；daemon 把同一个后端实例交给 PAP、PCP、Runtime。
-daemon reconciliation 装配接受满足三个端口的共享实现，生产注入 SQLite，测试可注入内存后端。
+daemon reconciliation 装配接受满足三个端口的共享实现，生产与测试均注入 SQLite。
+测试通过 `test-support` feature 创建隔离临时落盘库，复用生产连接、schema、事务和校验。
 
 `asc-persistence-sqlite` 当前面向事件/可观测性存储，不把控制状态塞进去。
 Policy 与 Security Event、Observability 共用 `asc-sqlite-kernel` 的
@@ -549,7 +549,7 @@ Runtime 负责暂停新调度、定时重试和恢复执行。两者都不能把
 | BUSY，且已确认未提交 | 单次等待最多使用既定 200 ms busy timeout；PAP 返回可重试 unavailable，Runtime 退避后重读/重试存储步骤 | 成功取得事务并确认结果；不在 Repository 内无限循环 |
 | FULL、只读、可恢复 I/O 错误 | 报告 Policy storage degraded，拒绝新 Policy 写入意图，暂停所有新的 Policy 远端调用；保留待完成工作 | 修复后由定时探测确认连接、schema/数据及真实可回滚写探针可用；先处理未确认写入，再恢复调度 |
 | 提交结果不确定（包括提交边界错误/panic） | 隔离连接，保留执行所有权和原 write_id/patch；确认前不开始下一次写入或远端调用 | 严格重开后先按第 5.5 节查原回执/权威状态；无法确认就继续暂停，不能换 write_id 重放旧结果 |
-| 损坏、schema/编码不兼容 | 停止 Policy 调度及写入，报告需人工处理；不自动删库、重建或切内存后端 | 管理员修复或从一致备份恢复后，重新启动并通过严格检查；不靠自动重试跳过错误 |
+| 损坏、schema/编码不兼容 | 停止 Policy 调度及写入，报告需人工处理；不自动删库、重建或切换后端 | 管理员修复或从一致备份恢复后，重新启动并通过严格检查；不靠自动重试跳过错误 |
 
 已发送的远端请求仍可能完成，暂停不等于取消成功。执行者保留观察、待提交 patch、write_id
 以及同 Binding 的逻辑 slot，恢复时先核实/提交结果；status 仍使用原 claim 版本，不能覆盖已提交的并发删除意图。
@@ -597,8 +597,8 @@ P1～P4 的实现已接入。下表保留设计验收项目；各项实际覆盖
 
 | 阶段 | 改动 | 完成条件 |
 |---|---|---|
-| P1：契约与 CAS | Snapshot 加 status_version；PAP intent receipt；PCP claim/观察结果分离；内存后端同步 | 所有 status 写路径携带版本；现有生命周期回归及 PSQL-01/02/03 通过 |
-| P2：SQLite 后端 | 新 crate、严格连接/schema、三表 CRUD/事务、回执、keyset scan、pin | 两后端共用契约；严格打开、事务及关闭重开验证 |
+| P1：契约与 CAS | Snapshot 加 status_version；PAP intent receipt；PCP claim/观察结果分离 | 所有 status 写路径携带版本；现有生命周期回归及 PSQL-01/02/03 通过 |
+| P2：SQLite 后端 | 新 crate、严格连接/schema、三表 CRUD/事务、回执、keyset scan、pin | Repository 契约；严格打开、事务及关闭重开验证 |
 | P3：daemon 恢复 | 数据库 lease、SQLite 装配、Scope seed/停止屏障恢复、存储暂停/恢复、Client endpoint 校验、shutdown | PSQL-09 至 12、17、18 通过；现有 PII/SkillSec/bootstrap 不回退 |
 | P4：崩溃与交付 | 外部 mock、测试进程内 gates、SIGKILL 重启、升级/回滚说明 | 同步 gate 确认提交窗口；独立记录未验证的部署环境与硬件边界 |
 
@@ -607,7 +607,7 @@ P1～P4 的实现已接入。下表保留设计验收项目；各项实际覆盖
 | PSQL-01 | snapshot 一致；每个真实 status/error 改动增版；no-op/Deployment-only 不增版；溢出明确失败 |
 | PSQL-02 | barrier 控制 Apply/Delete 竞争：旧 Ready CAS 拒绝，但 PRESENT 被保留并最终清理 |
 | PSQL-03 | admission 后 worker/显式 retry 造成 ABA：旧 enqueue failure 不污染新 Pending；panic 收尾也不能越权 |
-| PSQL-04 | memory/SQLite 共用 CRUD、去重、全局 byte 排序、分页及预算 fixtures；删除 Policy 保留 head，Scope 快照不变 |
+| PSQL-04 | SQLite 执行 CRUD、去重、全局 byte 排序、分页及预算 fixtures；删除 Policy 保留 head，Scope 快照不变 |
 | PSQL-05 | 并发 Policy update/delete 与 Scope create 只出现允许的两个结果；第 33 个 Active Scope 未写入 |
 | PSQL-06 | 事务多列原子性、invalid JSON/投影不一致/外键/版本不兼容 fail closed；deployment 数量/字节上限在 I/O 前拒绝；不自动删库 |
 | PSQL-07 | close/reopen 保留 Binding spec/status/version/deployments 与 Policy head、Scope pin/屏障；真实写探针覆盖只读/满盘 |
@@ -635,7 +635,7 @@ CLI/daemon E2E 使用 source-built 或 RPM 产物并注明身份/环境，不能
 
 ### 9.1 本地实现与验收证据
 
-生产入口已从内存后端切换到 SQLite。以下为分次本地验证记录，未运行远端 CI。
+生产入口使用 SQLite。以下为分次本地验证记录，未运行远端 CI。
 持久化接线时的全 workspace 回归为 **998 passed、0 failed、3 ignored**；忽略项是既有 SkillSec 的宿主
 root/CAP_CHOWN/mount 专用测试。随后新增批量事务、迁移入口及声明式 schema 约束测试，重跑 Policy SQLite crate：
 **29 passed、0 failed**，包含 19 个 repository 契约、4 个初始化/迁移测试、3 个真实 SQLite 故障测试、
@@ -658,13 +658,13 @@ debug 二进制及隔离的 user/mount/network namespace，使用私有 `/tmp`�
 
 | 覆盖 | 可执行证据及范围 |
 |---|---|
-| PSQL-01～05 | [共享契约](../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs) 在 memory/SQLite 两个后端验证 ABA、迟到入队失败、旧 Apply 观察合并、no-op 版本、去重/排序/分页、并发模板更新/删除与 Scope 准入、32 Scope 上限；PAP/PCP 的既有完整 fixtures 同步版本并回归 |
+| PSQL-01～05 | [Repository 契约](../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs) 使用 SQLite 验证 ABA、迟到入队失败、旧 Apply 观察合并、no-op 版本、去重/排序/分页、并发模板更新/删除与 Scope 准入、32 Scope 上限；PAP/PCP 的既有完整 fixtures 同步版本并回归 |
 | PSQL-06～08 | 同一契约覆盖版本溢出事务回滚、部署数量/字节限制、坏 JSON/投影/外键/回执、未知 schema、关闭重开和 write_id 重放/碰撞；[存储故障测试](../../v2/crates/asc-policy-repository-sqlite/src/tests.rs) 使用 query_only、max_page_count 产生真实 READONLY/FULL，另用独立 SQL 写锁产生 BUSY；IOERR/提交回执丢失在写边界注入，没有定制 VFS 或硬件掉盘实验 |
 | PSQL-09～11 | 私有权限、symlink/hardlink、独占 lease、lease 比 repository 活得更久；keyset 扫描中删行、停止屏障、最后 Binding/Scope 回收、Active 空 Scope、PID pin 关闭重开；[discovery seed](../../v2/crates/asc-daemon-core/src/scope_discovery.rs) 覆盖部分扫描不误退休和 PID reuse。外层 drain 持锁由 daemon 所有权结构保证，未新增卡死内核 I/O 的宿主演练 |
 | PSQL-12/17 | [Runtime 测试](../../v2/crates/asc-policy-runtime/src/reconciliation/tests.rs) 注入 BUSY/FULL/READONLY/IOERR/OutcomeUnknown，分别覆盖远端前及实际结果已返回后的写入；连续失败超过自动预算，仍保留原 write_id/结果，释放 worker 给其他 Binding，恢复后不重复已完成调用。原有终态、补扫、panic 和预算测试均回归 |
 | PSQL-13/14 | [crash harness](../../v2/crates/asc-policy-repository-sqlite/tests/crash_recovery.rs) 用父子同步 gate 确认 12 个窗口后 SIGKILL；外部 mock 维护独立 ledger，保留远端成功但结果未写入的副作用，重启后最终清空目标；Ready 不重复 Apply |
 | PSQL-15 | [真实 daemon bootstrap](../../v2/apps/asc-daemon/tests/bootstrap.rs) 通过 UDS 创建/更新、SIGKILL 重启、确认旧 Scope 快照/新模板、删除后再次重启，并验证不同 socket 不能共用 DB；[procfs 组合](../../v2/apps/asc-daemon/tests/reconciliation.rs) 使用真实子进程、SQLite、PAP、Runtime、Adapter 和 scripted Client，覆盖实例退出清理及新实例；[CLI 流程](../../tests/v2/e2e/test_policy_cli_e2e.py) 使用 source-built 二进制，2 项通过。三种证据分别覆盖入口、执行组合和进程恢复，不冒充完整 CLI→真实 AgentSight 链路 |
-| PSQL-16 | 未知 schema 保持原文件、坏数据拒绝打开、事务 panic 不泄漏未提交数据；关闭最后连接后复制主库并从备份恢复，核对 Deleting/UNKNOWN/回执。旧内存版本的安全回退依赖第 10 节运维步骤，不能靠新库阻止旧二进制忽略它 |
+| PSQL-16 | 未知 schema 保持原文件、坏数据拒绝打开、事务 panic 不泄漏未提交数据；关闭最后连接后复制主库并从备份恢复，核对 Deleting/UNKNOWN/回执。安全回退依赖第 10 节运维步骤，不能靠新库阻止旧二进制忽略它 |
 | PSQL-18 | [endpoint 恢复测试](../../v2/crates/asc-policy-repository-sqlite/tests/endpoint_recovery.rs) 保存 A 的责任、关闭重开、改配 B 后 DeleteFailed 且 A/B 均无 HTTP、cleanup 不变；恢复 A 并显式 retry，使用轮换 token 完成删除；[Client factory](../../v2/crates/asc-agentsight-client/tests/factory.rs) 另覆盖 create/update/delete 的调用前拒绝、等价 endpoint 和旧 cleanup 拒绝 |
 
 crash gates 包括 Scope/Binding 提交、claim、UNKNOWN、远端 Apply 后结果写入前、Ready 提交、
@@ -696,16 +696,15 @@ agent-sec-cli/.venv/bin/python -m pytest tests/v2/e2e/test_policy_cli_e2e.py -q
 
 ## 10. 兼容、升级与回滚
 
-首版是新 SQLite schema，不自动导入已经消失的进程内状态，也不导入 V1 数据。
-从当前内存 daemon 升级前，应先通过旧 daemon 删除 Scope 并确认目标清理完成；如果旧进程
-已经崩溃，需按旧版本运维流程核查远端孤儿。新库不能凭空恢复没有持久记录的历史责任。
+SQLite schema 不自动导入 V1 数据。升级需保留已有数据库与部署记录；
+新库不能凭空恢复没有持久记录的历史责任。
 
 公开 Policy/Scope/Binding JSON 和命令保留，内部 status_version、pin、回执不暴露。Schema、Client cleanup
 格式和 public wire 的版本是不同层次，不复用 Scope revision 来管理它们。
 
 回滚前停止 admission、排空必要操作并制作一致数据库备份。只能运行明确支持该 schema 与
-cleanup 编码的二进制。不能删除 policy-state.db、把 WAL 当缓存清理或切回内存后端后宣称
-恢复完成；这些动作会丢失责任。若确需回到旧内存版本，先由支持新库的版本清理全部 Scope/Binding
+cleanup 编码的二进制。不能删除 policy-state.db 或把 WAL 当缓存清理后宣称恢复完成；
+这些动作会丢失责任。若回退版本不支持现有状态，先由支持新库的版本清理全部 Scope/Binding
 并确认远端不存在，再由管理员执行迁移/回退。未知 schema 必须拒绝，不能悄悄降级。
 
 离线备份先停止 daemon 并确认数据库已正常关闭、WAL 已 checkpoint，再复制主库到私有目录。

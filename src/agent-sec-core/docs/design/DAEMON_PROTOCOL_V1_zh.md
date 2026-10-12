@@ -994,7 +994,7 @@ server frame proof。普通 V2 请求仍由原 closed envelope 解析，不接�
 [V2 可观测单条采集契约](V2_OBSERVABILITY_INGESTION_zh.md)。这不是 V1 新增 RPC，
 不改变本文 CURRENT V1 方法清单；后续 obs 查询扩展见第 17 节。
 
-## 16. [TARGET V2][IMPLEMENTED, PROCESS-LOCAL] Scope assignment（SCOPE-CR-002）
+## 16. [TARGET V2][IMPLEMENTED] Scope assignment（SCOPE-CR-002）
 
 对象与生命周期权威定义为
 [Policy/Scope/Binding 生命周期契约](POLICY_SCOPE_BINDING_CONTRACT_zh.md)。本节替代第 6.11

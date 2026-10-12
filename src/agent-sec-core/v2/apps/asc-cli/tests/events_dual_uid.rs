@@ -22,9 +22,9 @@ use asc_daemon::{BootstrapConfig, scan_application, serve};
 use asc_daemon_core::{PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder, QueryHandler};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_persistence_sqlite::security_events::SqliteEventWriter;
 use asc_persistence_sqlite::security_events::query_source::SqliteEventQuerySource;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_security_events::SecurityEvent;
 use serde_json::{Map, Value};
 use tokio::net::UnixStream;
@@ -71,7 +71,7 @@ impl RunningDaemon {
             std::env::temp_dir().join(format!("asc-cli-events-dual-uid-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
         let socket_path = directory.join("daemon.sock");
-        let application = PapService::new(Arc::new(ProcessLocalPapRepository::default()));
+        let application = PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap()));
         let outputs = Arc::new(DiscardingOutputs);
         let dispatcher = Arc::new(
             DaemonDispatcher::new(

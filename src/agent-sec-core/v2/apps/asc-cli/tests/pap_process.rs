@@ -11,7 +11,7 @@ use asc_daemon_service::{
     DispatchError, DispatchRequest, RequestDispatcher, ResponseDisposition, ShutdownToken,
 };
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 
 use serde_json::{Value, json};
 use uuid::Uuid;
@@ -55,7 +55,7 @@ async fn start(
     tokio::task::JoinHandle<()>,
     Arc<Mutex<Vec<Value>>>,
 ) {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let application = PapService::new(repository);
     let registry = Arc::new(asc_daemon::ScopeDiscoveryRegistry::new(Arc::new(
         application.clone(),

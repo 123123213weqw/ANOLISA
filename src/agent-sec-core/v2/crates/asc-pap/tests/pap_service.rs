@@ -8,10 +8,10 @@ use std::sync::{Arc, Mutex};
 
 use asc_foundation_types::{ResourceId, Revision};
 use asc_pap::{Page, PapError, PapRepository, PapService, PolicyRevisionState};
-use asc_pap_repository_memory::ProcessLocalPapRepository;
 use asc_policy_repository::{
     BindingStateRepository, BindingStateSnapshot, BindingStateWrite, WriteResult,
 };
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::authoring::PolicyTemplate;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::policy::PreparedPolicy;
@@ -20,13 +20,24 @@ use asc_policy_types::scope::{PreparedScope, ScopeSelector};
 const COMPLETE_BINDING: &str =
     include_str!("../../asc-policy-types/tests/fixtures/prepared-binding.json");
 
-#[derive(Default)]
 struct FakeRepository {
-    inner: ProcessLocalPapRepository,
+    inner: SqlitePolicyRepository,
     failure_write_mode: std::sync::atomic::AtomicUsize,
     policy_read_override: Mutex<Option<PolicyRevisionState>>,
     scope_cleanup_failure: std::sync::atomic::AtomicUsize,
     scope_commit_failure: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for FakeRepository {
+    fn default() -> Self {
+        Self {
+            inner: SqlitePolicyRepository::temporary().unwrap(),
+            failure_write_mode: std::sync::atomic::AtomicUsize::default(),
+            policy_read_override: Mutex::default(),
+            scope_cleanup_failure: std::sync::atomic::AtomicUsize::default(),
+            scope_commit_failure: std::sync::atomic::AtomicUsize::default(),
+        }
+    }
 }
 
 impl FakeRepository {

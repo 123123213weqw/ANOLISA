@@ -30,7 +30,7 @@ use asc_daemon::{BootstrapConfig, serve};
 use asc_daemon_core::{ActionService, PeerCredentials, PrincipalPolicy, PrincipalRole};
 use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 
 use serde_json::json;
 use tokio::net::UnixStream;
@@ -102,7 +102,7 @@ impl RunningDaemon {
         ));
         std::fs::create_dir(&directory).unwrap();
         let socket_path = directory.join("daemon.sock");
-        let application = PapService::new(Arc::new(ProcessLocalPapRepository::default()));
+        let application = PapService::new(Arc::new(SqlitePolicyRepository::temporary().unwrap()));
         let dispatcher = Arc::new(DaemonDispatcher::new(
             application,
             Arc::new(FixedRolePolicy(role)),

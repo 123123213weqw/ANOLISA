@@ -379,7 +379,9 @@ impl PapRepository for SqlitePolicyRepository {
     }
     fn get_binding(&self, key: &ResourceId) -> Result<BindingView, PapError> {
         self.access(false, |tx| {
-            Ok(read_binding(tx, key)?.ok_or(PapError::NotFound)?.binding)
+            Ok(public_binding(
+                read_binding(tx, key)?.ok_or(PapError::NotFound)?.binding,
+            ))
         })
         .map_err(RepositoryError::pap)
     }
@@ -393,14 +395,25 @@ impl PapRepository for SqlitePolicyRepository {
             page(
                 total,
                 keys.into_iter().map(|key| {
-                    Ok(read_binding(tx, &id(key)?)?
-                        .ok_or(StoreError::Corrupt)?
-                        .binding)
+                    Ok(public_binding(
+                        read_binding(tx, &id(key)?)?
+                            .ok_or(StoreError::Corrupt)?
+                            .binding,
+                    ))
                 }),
             )
         })
         .map_err(RepositoryError::pap)
     }
+}
+
+fn public_binding(mut binding: BindingView) -> BindingView {
+    binding.status.error = binding
+        .status
+        .error
+        .as_ref()
+        .map(|error| asc_policy_types::target::Failure::new(error.kind, &error.code));
+    binding
 }
 
 fn retire(binding: &mut BindingStateSnapshot) -> Result<bool, RepositoryError> {

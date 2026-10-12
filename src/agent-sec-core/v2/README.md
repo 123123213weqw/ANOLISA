@@ -52,7 +52,7 @@ Ready Bindings and terminal failures are not automatically reapplied.
 The Rust `agent-sec-cli` exposes 12 Policy, Scope and Binding administration commands through
 an explicit daemon socket. Its Cargo package and source directory remain `asc-cli`;
 the executable target is `agent-sec-cli`. See the [CLI reference](../../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md)
-and [CLI acceptance record](../docs/design/POLICY_CLI_ACCEPTANCE_zh.md).
+and [lifecycle acceptance criteria](../docs/design/POLICY_SCOPE_BINDING_CONTRACT_zh.md#6-可执行验收).
 
 The current crates are:
 
@@ -83,8 +83,7 @@ The current crates are:
   templates before saving them.
 - `asc-policy-repository-sqlite`: authoritative Policy, Scope and Binding storage,
   atomic lifecycle writes, status CAS, durable write receipts and recovery scans.
-- `asc-pap-repository-memory`: process-local test backend implementing the same
-  PAP and reconciliation contracts.
+  Tests use its `test-support` feature for isolated temporary on-disk databases.
 - `asc-daemon-protocol`: strict request/response contracts and an explicit
   allowlist for 12 Policy, Scope, and Binding administration methods.
 - `asc-daemon-handler`: inbound protocol adapter that decodes daemon requests,
@@ -119,9 +118,10 @@ The current crates are:
   conversation triple in `history`/`text`/`assistantResponse`; an optional
   `model` field overrides the L2 backend.
 
-The crate relationships, acceptance types, executable pass/fail matrix,
-compatibility report, direct-consumer evidence, and rollback boundary are recorded
-in [`PAP_DAEMON_API_ACCEPTANCE_zh.md`](../docs/design/PAP_DAEMON_API_ACCEPTANCE_zh.md).
+PAP semantics and executable acceptance criteria are defined in the
+[lifecycle contract](../docs/design/POLICY_SCOPE_BINDING_CONTRACT_zh.md).
+Storage, recovery and rollback boundaries are defined in the
+[SQLite design](../docs/design/POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md).
 
 The [scan capability development guide (Chinese)](../docs/design/V2_SCAN_CAPABILITY_DEVELOPMENT_GUIDE_zh.md)
 maps Prompt Scan and Code Scan migration work onto the repository architecture, including module
@@ -208,8 +208,9 @@ XDG_RUNTIME_DIR do not select a daemon namespace. The V2 RPM stages a system
 unit running as `root:root`, with a 0755 runtime directory and 0666
 socket. Ordinary users can connect; server-side peer-UID authorization still
 protects policy administration. Runtime directory validation, a retained flock and conservative stale
-socket recovery protect this namespace. Readiness and persistence remain separate
-work. See [systemd acceptance](../tests/v2/systemd/README.md) for deployment,
+socket recovery protect this namespace. Storage recovery has independent acceptance
+in the [SQLite design](../docs/design/POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md).
+See [systemd acceptance](../tests/v2/systemd/README.md) for deployment,
 validation and upgrade boundaries.
 
 UID 0 is always a Policy administrator. A deployment operator can add other UIDs

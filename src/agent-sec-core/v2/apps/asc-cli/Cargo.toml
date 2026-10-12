@@ -46,7 +46,7 @@ asc-daemon-core = { workspace = true }
 asc-daemon-handler = { workspace = true }
 asc-daemon-service = { workspace = true }
 asc-pap = { workspace = true }
-asc-pap-repository-memory = { workspace = true }
+asc-policy-repository-sqlite = { workspace = true, features = ["test-support"] }
 asc-telemetry = { workspace = true }
 uuid = { workspace = true }
 

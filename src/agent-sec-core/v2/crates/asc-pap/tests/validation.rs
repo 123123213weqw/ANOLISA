@@ -7,7 +7,7 @@ include!(concat!(
 use std::sync::Arc;
 
 use asc_pap::{PapError, PapRepository, PapService};
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::Validate;
 use asc_policy_types::authoring::{Category, Effect};
 use asc_policy_types::binding::PreparedBinding;
@@ -23,7 +23,7 @@ fn binding() -> PreparedBinding {
 
 #[test]
 fn shared_name_validation_preserves_pap_and_snapshot_errors() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository.clone());
     for (name, reason) in [
         (String::new(), "must contain a visible character"),
@@ -56,7 +56,7 @@ fn shared_name_validation_preserves_pap_and_snapshot_errors() {
 
 #[test]
 fn validated_construction_still_produces_valid_policy_and_scope_snapshots() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository);
     for name in ["a".repeat(256), "é".repeat(128), " visible name ".into()] {
         let policy = pap
@@ -90,7 +90,7 @@ fn validated_construction_still_produces_valid_policy_and_scope_snapshots() {
 
 #[test]
 fn invalid_template_rejects_create_and_update_without_writing() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository.clone());
     let saved = pap
         .create_policy("policy", &binding().policy.template)
@@ -126,7 +126,7 @@ fn invalid_template_rejects_create_and_update_without_writing() {
 
 #[test]
 fn valid_backend_unsupported_decisions_are_saved_as_reusable_policies() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository.clone());
     for effect in [Effect::Allow, Effect::RequireConfirmation] {
         let mut template = binding().policy.template;

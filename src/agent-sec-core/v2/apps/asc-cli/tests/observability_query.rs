@@ -108,7 +108,7 @@ async fn uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback() 
     );
     let dispatcher = DaemonDispatcher::new(
         asc_pap::PapService::new(Arc::new(
-            asc_pap_repository_memory::ProcessLocalPapRepository::default(),
+            asc_policy_repository_sqlite::SqlitePolicyRepository::temporary().unwrap(),
         )),
         // Policy administration must never widen a non-root query's owner scope.
         Arc::new(RootManagedPrincipalPolicy::with_admin_uids([uid])),

@@ -23,9 +23,8 @@ fn registered(client: &Client, failed: bool) -> BindingStateSnapshot {
 
 #[test]
 fn attempt_panic_records_failure_and_same_worker_completes_next_binding() {
-    let repo = Arc::new(
-        ProcessLocalPapRepository::with_binding_states(vec![record(1), record(2)]).unwrap(),
-    );
+    let repo =
+        Arc::new(SqlitePolicyRepository::with_binding_states(vec![record(1), record(2)]).unwrap());
     let client = Arc::new(Client::default());
     client.panic_on_create.store(true, Ordering::SeqCst);
     let service = start(
@@ -56,7 +55,7 @@ fn attempt_panic_records_failure_and_same_worker_completes_next_binding() {
 
 #[test]
 fn delete_during_attempt_panic_keeps_dirty_and_cleans_registered_target() {
-    let repo = Arc::new(ProcessLocalPapRepository::with_binding_states(vec![record(1)]).unwrap());
+    let repo = Arc::new(SqlitePolicyRepository::with_binding_states(vec![record(1)]).unwrap());
     let client = Arc::new(Client::default());
     client.panic_on_create.store(true, Ordering::SeqCst);
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -126,7 +125,7 @@ fn committed_success_survives_attempt_panic_without_replay() {
             initial.binding.status.phase = BindingStatus::PendingDelete;
         }
         let repo = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![initial, record(2)]).unwrap(),
+            SqlitePolicyRepository::with_binding_states(vec![initial, record(2)]).unwrap(),
         );
         let clock = Arc::new(TestClock::default());
         let client = Arc::new(Client::default());
@@ -174,7 +173,7 @@ fn committed_success_survives_attempt_panic_without_replay() {
 
 struct FailedBookkeeping {
     allow_finish: AtomicBool,
-    inner: Arc<ProcessLocalPapRepository>,
+    inner: Arc<SqlitePolicyRepository>,
     failed: AtomicBool,
     read_fault: u8,
 }
@@ -227,7 +226,7 @@ fn unconfirmed_panic_retains_result_while_other_bindings_progress() {
     // Verify readable Running state, read error, and a second port panic.
     for read_fault in 0..=2 {
         let inner = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![record(1), record(2)]).unwrap(),
+            SqlitePolicyRepository::with_binding_states(vec![record(1), record(2)]).unwrap(),
         );
         let repo = Arc::new(FailedBookkeeping {
             allow_finish: AtomicBool::new(false),

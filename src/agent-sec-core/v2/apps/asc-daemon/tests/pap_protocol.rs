@@ -19,7 +19,7 @@ use asc_daemon_handler::{DaemonDispatcher, JsonRejectionEncoder};
 use asc_daemon_protocol::{DaemonRequest, DaemonResponse, RequestId, error_code};
 use asc_foundation_types::{ResourceId, Revision};
 use asc_pap::PapService;
-use asc_pap_repository_memory::ProcessLocalPapRepository;
+use asc_policy_repository_sqlite::SqlitePolicyRepository;
 use asc_policy_types::authoring::PolicyTemplate;
 use asc_policy_types::binding::{BindingStatus, BindingView, PreparedBinding};
 use asc_policy_types::policy::PreparedPolicy;
@@ -49,7 +49,7 @@ impl RunningPapDaemon {
         Self::start_with_repository(
             role,
             max_request_frame_bytes,
-            Arc::new(ProcessLocalPapRepository::default()),
+            Arc::new(SqlitePolicyRepository::temporary().unwrap()),
         )
         .await
     }
@@ -57,7 +57,7 @@ impl RunningPapDaemon {
     async fn start_with_repository(
         role: PrincipalRole,
         max_request_frame_bytes: usize,
-        repository: Arc<ProcessLocalPapRepository>,
+        repository: Arc<SqlitePolicyRepository>,
     ) -> Self {
         let application = PapService::new(repository).with_scope_discovery(Arc::new(Discovery));
         Self::start_with_application(role, max_request_frame_bytes, application).await
@@ -1176,7 +1176,7 @@ async fn real_uds_accepts_domain_and_pagination_boundary_values() {
     reason = "the stateful CRUD error sequence must retain its captured resource identities"
 )]
 async fn real_uds_distinguishes_stale_references_and_closed_scope_admission() {
-    let repository = Arc::new(ProcessLocalPapRepository::default());
+    let repository = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repository.clone()).with_scope_discovery(Arc::new(Discovery));
     let original = pap
         .create_policy("v1", &file_policy(vec!["/a".into()]))
@@ -1262,7 +1262,7 @@ async fn real_uds_scheduling_rejection_and_get_list_match_frozen_wire() {
         binding.status.error = None;
         let spec = binding.spec.clone();
         let repo = Arc::new(
-            ProcessLocalPapRepository::with_binding_states(vec![
+            SqlitePolicyRepository::with_binding_states(vec![
                 asc_policy_repository::BindingStateSnapshot {
                     status_version: 1,
                     binding,
@@ -1315,7 +1315,7 @@ async fn real_uds_scheduling_rejection_and_get_list_match_frozen_wire() {
 
 #[tokio::test]
 async fn unavailable_preflight_returns_wire_error_without_creating_binding() {
-    let repo = Arc::new(ProcessLocalPapRepository::default());
+    let repo = Arc::new(SqlitePolicyRepository::temporary().unwrap());
     let pap = PapService::new(repo)
         .with_reconcile_enqueuer(Arc::new(asc_daemon::UnavailableReconciliation))
         .with_scope_discovery(Arc::new(Discovery));

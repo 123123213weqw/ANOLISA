@@ -18,8 +18,9 @@ asc-cli main → 同步 asc-daemon-client → UDS service
 ```
 
 两个产品 main 初始化 runtime；client、dispatcher 和 PAP 建立 span。
-service 保持 protocol-independent，不解析 tracing JSON。当前 PAP 使用 process-local repository；
-本次未实现 Action Runtime、Rust SecurityEvent sink 或 observability record RPC。
+service 保持 protocol-independent，不解析 tracing JSON。当前 PAP 使用 SQLite repository，
+存储边界见 [SQLite 设计](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md)。本 OTel 工作包的历史验收
+不包含 Action Runtime、Rust SecurityEvent sink 或 observability record RPC。
 
 基础设施按 `GREENFIELD_CONTRACT` 验收，已有输入适配按 `ADAPTER_CONFORMANCE` 验收，
 已迁移用户能力按 `MIGRATION_EQUIVALENCE` 验收。新增协议/部署行为需同步现有契约与 fixtures，
@@ -372,8 +373,9 @@ UF-007/008/009/012 的持久化、查询和重组验收不在当前工作包，�
 [执行架构](RUST_SECURITY_CORE_EXECUTION_ARCHITECTURE_zh.md)；原生 carrier、严格 schema、帧预算见
 [daemon 协议](DAEMON_PROTOCOL_V1_zh.md)，provider/日志/关闭见
 [进程部署契约](DAEMON_PROCESS_DEPLOYMENT_CONTRACT_zh.md)。
-[PAP 验收](PAP_DAEMON_API_ACCEPTANCE_zh.md) 与 [CLI 验收](POLICY_CLI_ACCEPTANCE_zh.md)
-继续约束业务响应、输出和授权；安全事件接入还需遵守 [中间件契约](SECURITY_MIDDLEWARE_CONTRACT_zh.md)。
+[PAP 生命周期契约](POLICY_SCOPE_BINDING_CONTRACT_zh.md) 与
+[CLI 使用参考](../../../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md)
+约束业务响应、输出和授权；安全事件接入还需遵守 [中间件契约](SECURITY_MIDDLEWARE_CONTRACT_zh.md)。
 
 OTEL-CR-001…008 的已采纳决策、直接消费者证据及部署/回滚顺序统一记录于
 [OTel 验收记录](V2_OTEL_ACCEPTANCE_zh.md)，不在设计中维护第二份同编号清单。

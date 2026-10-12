@@ -3,6 +3,24 @@ use super::*;
 use asc_policy_repository::BindingStateRepository;
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(feature = "test-support")]
+#[test]
+fn temporary_databases_are_isolated_and_removed_after_repository_drop() {
+    let first = SqlitePolicyRepository::temporary().unwrap();
+    let second = SqlitePolicyRepository::temporary().unwrap();
+    let first_path = first.lease.path.clone();
+    let second_path = second.lease.path.clone();
+    assert_ne!(first_path, second_path);
+    assert!(first_path.is_file());
+    assert!(second_path.is_file());
+    drop(first);
+    assert!(!first_path.parent().unwrap().exists());
+    assert!(second_path.is_file());
+    second.check_writable().unwrap();
+    drop(second);
+    assert!(!second_path.parent().unwrap().exists());
+}
+
 fn directory() -> tempfile::TempDir {
     tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
@@ -119,4 +137,110 @@ fn transaction_panic_rolls_back_without_poisoning_repository() {
         Ok(())
     })
     .unwrap();
+}
+
+include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../fixtures/policy.rs"
+));
+
+use asc_foundation_types::ResourceId;
+use asc_pap::{PapRepository, PapService};
+use asc_policy_types::{
+    binding::BindingStatus,
+    process_discovery::ProcessIdentity,
+    scope::{PreparedScope, ScopeSelector, ScopeStatus},
+};
+use std::sync::Arc;
+
+#[test]
+fn oversized_policy_and_assignment_are_rejected_before_commit() {
+    let dir = directory();
+    let repository =
+        Arc::new(SqlitePolicyRepository::open(&dir.path().join("policy-state.db")).unwrap());
+    let pap = PapService::new(repository.clone());
+    let huge = file_policy(
+        (0..400)
+            .map(|n| format!("/{n}{}", "x".repeat(3000)))
+            .collect(),
+    );
+    assert!(matches!(
+        pap.create_policy("large", &huge),
+        Err(PapError::InvalidPolicy(_))
+    ));
+    assert_eq!(pap.list_policies(10, 0).unwrap().total, 0);
+    let medium = file_policy(
+        (0..200)
+            .map(|n| format!("/{n}{}", "x".repeat(3000)))
+            .collect(),
+    );
+    let a = pap.create_policy("a", &medium).unwrap();
+    let b = pap.create_policy("b", &medium).unwrap();
+    let scope = PreparedScope {
+        scope_id: ResourceId::new("oversized").unwrap(),
+        selector: ScopeSelector::Pid { pid: 42 },
+        policy_snapshots: vec![a, b],
+        status: ScopeStatus::Active,
+    };
+    assert!(matches!(
+        repository.put_scope(&scope),
+        Err(PapError::InvalidScope(_))
+    ));
+    assert_eq!(pap.list_scopes(10, 0).unwrap().total, 0);
+}
+
+#[test]
+fn repository_runs_the_current_pap_request_slice_without_a_reconciler() {
+    let dir = directory();
+    let repository =
+        Arc::new(SqlitePolicyRepository::open(&dir.path().join("policy-state.db")).unwrap());
+    let pap = PapService::new(Arc::clone(&repository));
+    let policy = pap
+        .create_policy(
+            "protect files",
+            &file_policy(vec!["/workspace/important".to_owned()]),
+        )
+        .unwrap();
+    let scope = PreparedScope {
+        scope_id: ResourceId::new("scope").unwrap(),
+        selector: ScopeSelector::Pid { pid: 4242 },
+        policy_snapshots: vec![policy],
+        status: ScopeStatus::Active,
+    };
+    repository.put_scope(&scope).unwrap();
+    let binding = repository
+        .sync_scope_instances(
+            &scope.scope_id,
+            &[ProcessIdentity {
+                boot_id: "boot".into(),
+                pid_namespace: "pid:[42]".into(),
+                pid: 4242,
+                start_time: 99,
+            }],
+        )
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(binding.status, BindingStatus::PendingApply);
+    assert_eq!(pap.list_policies(10, 0).unwrap().total, 1);
+    assert_eq!(pap.list_scopes(10, 0).unwrap().total, 1);
+    assert_eq!(pap.list_bindings(10, 0).unwrap().items, [binding.binding]);
+    drop(pap);
+    drop(repository);
+    let reopened = SqlitePolicyRepository::open(&dir.path().join("policy-state.db")).unwrap();
+    assert_eq!(reopened.list_policies(10, 0).unwrap().total, 1);
+    assert_eq!(reopened.list_scopes(10, 0).unwrap().total, 1);
+    assert_eq!(reopened.list_bindings(10, 0).unwrap().total, 1);
+}
+
+#[test]
+fn page_byte_budget_preserves_count_and_allows_progress() {
+    let records = vec!["x".repeat(1024 * 1024); 4];
+    let first = records::page(4, records.iter().take(2).cloned().map(Ok)).unwrap();
+    assert_eq!(first.total, 4);
+    assert_eq!(first.items.len(), 2);
+    let bounded = records::page(4, records.iter().cloned().map(Ok)).unwrap();
+    assert_eq!(bounded.items, first.items);
+    let second = records::page(4, records.into_iter().skip(2).map(Ok)).unwrap();
+    assert_eq!(second.items.len(), 2);
 }

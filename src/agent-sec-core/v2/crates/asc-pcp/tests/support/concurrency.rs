@@ -94,7 +94,7 @@ pub(super) fn run(objects: &BTreeMap<String, Value>) -> BTreeSet<String> {
 fn run_case(case: ThreadCase) {
     let id = case.initial.binding.spec.binding_id.clone();
     let harness = Arc::new(Harness {
-        repository: ProcessLocalPapRepository::with_binding_states(vec![case.initial]).unwrap(),
+        repository: SqlitePolicyRepository::with_binding_states(vec![case.initial]).unwrap(),
         script: Mutex::new(Script {
             calls: case.calls.into(),
             ..Script::default()

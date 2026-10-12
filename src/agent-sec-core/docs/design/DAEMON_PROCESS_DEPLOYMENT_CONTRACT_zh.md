@@ -433,7 +433,7 @@ DPROC-011 和 DPROC-018 的 focused evidence 为 `asc-cli/tests/commands.rs` 的
 测试注入独立配置、状态及审计目录，不创建或覆盖宿主凭据，不向宿主 AgentSight 下发策略。
 完整 PAP CRUD 保留在 `asc-daemon/tests/pap_protocol.rs` 的进程内 UDS fixture 中；后台下发
 装配由 DPROC-021 验证，CLI/daemon 进程链路由上述 pytest E2E 验证。完整范围与命令见
-[`POLICY_CLI_ACCEPTANCE_zh.md`](POLICY_CLI_ACCEPTANCE_zh.md)，不扩大其它 DPROC gate。
+[生命周期契约的可执行验收](POLICY_SCOPE_BINDING_CONTRACT_zh.md#6-可执行验收)，不扩大其它 DPROC gate。
 
 ## 9. 验收矩阵
 
@@ -492,7 +492,8 @@ READY 或暂时不可连接也不阻止 daemon 启动。shutdown 先停止 UDS �
 但不会主动关闭 daemon。首版不自动重建失败 Runtime，需要进程重启；普通 Binding
 重试或终态失败不影响服务健康。单 Binding 存储/数据错误及 CAS 竞争耗尽只安排该 ID 重试；
 存储/数据错误输出安全诊断，不能伪造已落库的失败状态。补扫失败影响 health，但不关闭写准入。
-实际 Repository 错误由每次 CRUD 操作返回。Memory Repository 无跨重启恢复保证。
+实际 Repository 错误由每次 CRUD 操作返回。当前使用 SQLite Repository，存储恢复边界见
+[Policy SQLite 持久化设计](POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md)。
 
 | ID | 必须验证 | 可执行 fixture |
 |---|---|---|
@@ -636,7 +637,7 @@ DPROC-022 的 executable fixture 为
 `tests/v2/e2e/test_observability_record_e2e.py::test_v1_cli_records_persist_and_survive_restart`；
 验证源码二进制的目录权限、双落盘与进程重启，不替代 RPM/systemd 或跨 UID 验收。
 
-## 13. [TARGET V2][IMPLEMENTED, PROCESS-LOCAL] 通过 Scope 启动 discovery
+## 13. [TARGET V2][IMPLEMENTED] 通过 Scope 启动 discovery
 
 对象语义见 [生命周期契约](POLICY_SCOPE_BINDING_CONTRACT_zh.md)（SCOPE-CR-002）：Policy
 保留 revision；Scope 无 revision，保存所选版本完整快照；系统自动创建并清理子 Binding。
