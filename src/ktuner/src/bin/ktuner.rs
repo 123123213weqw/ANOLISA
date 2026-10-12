@@ -242,12 +242,7 @@ fn cmd_check(
             "high_confidence": counts.high,
             "writable": counts.writable,
         },
-        "system": {
-            "kernel": info.kernel_version,
-            "cpu_cores": info.cpu_cores,
-            "memory_gb": info.memory_total_gb,
-            "numa_nodes": info.numa_nodes,
-        },
+        "system": system_json(&info),
         "environment": format!("{runtime_env}"),
         "workload": format!("{workload}"),
         "services": detected_services,
@@ -262,6 +257,18 @@ fn cmd_check(
 
     let code = if recs.is_empty() { 0 } else { 1 };
     Ok(code)
+}
+
+/// The `system` section of the check report: the machine as the engine saw
+/// it, so a caller can identify the host behind the findings without
+/// re-reading it.
+fn system_json(info: &detect::SystemInfo) -> serde_json::Value {
+    json!({
+        "kernel": info.kernel_version,
+        "cpu_cores": info.cpu_cores,
+        "memory_gb": info.memory_total_gb,
+        "numa_nodes": info.numa_nodes,
+    })
 }
 
 /// The one place `check` reads `--only`/`--exclude`: `--only` names the
@@ -3975,5 +3982,23 @@ mod tests {
             ]
         );
         assert!(normalize_params(&[]).is_empty());
+    }
+
+    #[test]
+    fn system_json_reports_the_collected_system_identity() {
+        // The `system` section is the report's host identity, read from the
+        // same `SystemInfo` the rules diagnosed. This pins the shape it has
+        // always had, so the fields added next are provably an addition and
+        // no existing key can change or disappear.
+        let info = detect::gather_system_info().expect("read this host's system info");
+        let system = system_json(&info);
+        let mut keys: Vec<&str> = system
+            .as_object()
+            .expect("system_json builds an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["cpu_cores", "kernel", "memory_gb", "numa_nodes"]);
     }
 }
