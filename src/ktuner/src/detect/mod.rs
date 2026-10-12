@@ -469,8 +469,23 @@ fn read_cpu_info() -> Result<(String, usize)> {
 
 /// Path-injectable form of [`read_cpu_info`] (the `eval_*_at` idiom) so the
 /// per-line parse is assertable against a synthetic /proc/cpuinfo.
+///
+/// Read lossily: the model-name line is the kernel's verbatim copy of the CPU
+/// brand string — `get_model_name()` memcpy's 48 bytes out of the CPUID leaves
+/// and only trims spaces, with no encoding check (v6.6
+/// `arch/x86/kernel/cpu/common.c:788-792`, 7.3.0-rc6:835-839) — and under a
+/// hypervisor those bytes are whatever VMM userspace put in the guest's CPUID
+/// (`KVM_SET_CPUID2`, `Documentation/virt/kvm/api.rst`). A strict read rejected
+/// the whole file on one byte outside UTF-8, which made
+/// [`gather_system_info`] fail and took every command with it, although the
+/// model string is never reported and the processor count from the same file
+/// is what the engine consumes. The lossy decode keeps that count and the
+/// ASCII prefix of the model — the treatment [`read_comm_from`] and
+/// [`read_cmdline_from`] already give the raw bytes the kernel stores in
+/// `/proc/<pid>/*`.
 fn read_cpu_info_from(path: &str) -> Result<(String, usize)> {
-    let cpuinfo = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
+    let bytes = fs::read(path).with_context(|| format!("failed to read {path}"))?;
+    let cpuinfo = String::from_utf8_lossy(&bytes);
     let mut model = "Unknown CPU".to_string();
     let mut cores = 0usize;
     for line in cpuinfo.lines() {
@@ -1983,6 +1998,38 @@ mod tests {
         // No huge page support, or garbage -> 0, not a panic.
         assert_eq!(parse_meminfo_hugepagesize_kb("MemTotal: 1 kB\n"), 0);
         assert_eq!(parse_meminfo_hugepagesize_kb("Hugepagesize: big kB\n"), 0);
+    }
+
+    #[test]
+    fn read_cpu_info_survives_non_utf8_bytes() {
+        // `/proc/cpuinfo`'s model-name line is the kernel's verbatim copy of
+        // the CPU brand string: `get_model_name()` memcpy's 48 bytes out of
+        // the CPUID leaves and only trims spaces, with no encoding check
+        // (v6.6 arch/x86/kernel/cpu/common.c:788-792,
+        // 7.3.0-rc6:835-839), and under a hypervisor those bytes are whatever
+        // the VMM put in the guest's CPUID. One byte outside UTF-8 used to
+        // make the read fail,
+        // which aborted `gather_system_info()` and every command with it --
+        // although the model string is never reported and the processor count
+        // from the same file is what the engine consumes.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_cpuinfo_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cpuinfo");
+        let mut content = Vec::new();
+        content.extend_from_slice(b"processor\t: 0\nmodel name\t: Test CPU \xff\xfe\n\n");
+        content.extend_from_slice(b"processor\t: 1\nmodel name\t: Test CPU \xff\xfe\n\n");
+        fs::write(&path, &content).unwrap();
+
+        let (model, cores) = read_cpu_info_from(path.to_str().unwrap())
+            .expect("a non-UTF-8 model name must not hide the processors");
+        assert_eq!(cores, 2);
+        assert!(model.starts_with("Test CPU "), "{model}");
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
