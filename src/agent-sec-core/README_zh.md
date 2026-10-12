@@ -57,6 +57,8 @@ Rust V2 核心通过现有 `skill-ledger` 命令提供 **SkillSec**：本地扫�
 
 Cosh-NG 为同一次 SkillSec Hook 调用中的初始化和查询共预留 10 秒。
 
+Rust V2 客户端在发送请求前校验连接对端的内核 peer UID 为 0。
+
 源码构建的 Rust `agent-sec-cli` 经 `asc-daemon` 提供12 条 Policy、Scope、Binding 管理命令。参阅[命令参考](../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md)
 和 [V2 workspace](v2/README.md)。PAP 状态保存在 SQLite 中，Binding 受理不代表策略已生效。
 PolicyTemplate 是包含通用规则的可复用策略；AgentSight Adapter 当前仅执行文件删除 block 规则。

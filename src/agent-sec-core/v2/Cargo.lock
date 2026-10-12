@@ -297,6 +297,7 @@ dependencies = [
  "asc-observability",
  "opentelemetry",
  "opentelemetry_sdk",
+ "rustix",
  "serde_json",
  "socket2",
  "thiserror",

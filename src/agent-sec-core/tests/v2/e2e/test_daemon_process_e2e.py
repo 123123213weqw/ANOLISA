@@ -24,6 +24,67 @@ def test_bound_socket_allows_ordinary_users(daemon):
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="cross-UID UDS test requires root")
+def test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket(cli):
+    untrusted = pwd.getpwnam("nobody")
+    with tempfile.TemporaryDirectory(prefix="asc-fake-peer-") as directory:
+        runtime = Path(directory)
+        runtime.chmod(0o777)
+        endpoint = runtime / "daemon.sock"
+        server = subprocess.Popen(
+            [
+                "/usr/bin/python3",
+                "-c",
+                """import os, socket, sys
+with socket.socket(socket.AF_UNIX) as listener:
+    listener.settimeout(5)
+    listener.bind(sys.argv[1])
+    listener.listen(1)
+    os.chmod(sys.argv[1], 0o666)
+    connection, _ = listener.accept()
+    with connection:
+        connection.settimeout(5)
+        request = connection.recv(65536)
+        if request:
+            connection.sendall(b'{"requestId":"forged","result":{"status":"ok"}}\\n')
+        assert not request, "client sent request bytes before authenticating server"
+""",
+                str(endpoint),
+            ],
+            user=untrusted.pw_uid,
+            group=untrusted.pw_gid,
+            extra_groups=[],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while (
+                not endpoint.exists() or stat.S_IMODE(endpoint.stat().st_mode) != 0o666
+            ):
+                assert server.poll() is None, "fake server exited during startup"
+                assert time.monotonic() < deadline, "fake server did not bind"
+                time.sleep(0.02)
+            # A file-owner check would accept this endpoint; its listener remains nobody.
+            os.chown(endpoint, 0, 0)
+            result = cli(
+                "--socket", str(endpoint), "policy", "list", "--timeout-ms", "1000"
+            )
+            assert result.returncode == 1, result.stderr
+            assert result.stdout == ""
+            assert (
+                "server identity verification failed; request not sent" in result.stderr
+            )
+            assert f"expected daemon UID 0, got {untrusted.pw_uid}" in result.stderr
+            _, stderr = server.communicate(timeout=5)
+            assert server.returncode == 0, stderr
+        finally:
+            if server.poll() is None:
+                server.kill()
+                server.communicate(timeout=5)
+
+
+@pytest.mark.skipif(os.geteuid() != 0, reason="cross-UID UDS test requires root")
 def test_ordinary_uid_connects_but_cannot_administer_or_replace_socket(
     daemon_bin, daemon_settings
 ):

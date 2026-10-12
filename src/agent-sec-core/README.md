@@ -63,6 +63,8 @@ validated `check`/`show` results while retaining host policies; see the
 
 Cosh-NG reserves 10 seconds for SkillSec initialization and querying in one Hook invocation.
 
+Rust V2 clients verify the connected daemon's kernel peer UID is 0 before sending requests.
+
 The source-built Rust `agent-sec-cli` provides 12 Policy, Scope and Binding administration
 commands through `asc-daemon`. See the [command reference](../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md)
 and [V2 workspace](v2/README.md). PAP state persists in SQLite; Binding acceptance does not imply enforcement.

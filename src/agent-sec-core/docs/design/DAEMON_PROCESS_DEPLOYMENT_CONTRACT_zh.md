@@ -352,6 +352,20 @@ runner 工作目录的 owner、权限和 umask。
 服务 UID 与 root 是可信边界；客户端不得拥有目录写权限。显式 `--socket` 允许在另一
 安全目录建立隔离开发实例，不代表防止特权操作者故意创建第二个 namespace。
 
+**[TARGET V2][IMPLEMENTED] DPROC-UDS-002 服务端身份认证**：
+`asc-daemon-client` 在 connect 成功后、首次 write 前，对同一连接 fd 读取 Linux
+`SO_PEERCRED`，要求服务端 UID 为 0。凭据读取失败或 UID 不符返回独立的
+`ServerIdentity` 错误，关闭连接，不发送请求、不重试、不回退本地实现；非 Linux
+返回不支持认证的错误。期望 UID 不从 socket 文件属主、客户端 UID 或响应 JSON 推导。
+服务 UID 是信任域；该检查不区分其它 root 进程，也不能保护同 UID 的不可信 Agent。
+
+可执行 fixture：`tests/v2/e2e/test_daemon_process_e2e.py::test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket`
+验证 socket 文件属主改为 root 的非 root 伪服务仍被真实 Rust CLI 拒绝，
+服务端不得收到请求字节；该用例需要 root 的跨 UID 进程环境，编译或单元测试不替代该验收。
+包含成功模拟服务的 transport 和 CLI 进程测试要求 listener 由 UID 0 的进程创建。
+非 root 开发环境可运行 `asc-daemon-client/tests/transport.rs::untrusted_server_is_rejected_before_request_bytes_are_sent`，
+验证本 UID 模拟服务被拒绝且未收到请求；该用例在 root 环境交由上述跨 UID E2E 覆盖。
+
 当前正常退出的停机预算：UDS drain 2s，随后 retention terminal join（65s）与 SkillFS
 worker join（65s）、reconciliation join（30s）并行等待、共享同一 65s stop deadline，再加
 Tokio shutdown 1s 与 telemetry shutdown 2s，合计约 70s；unit 另设 `TimeoutStopSec=75`（为
