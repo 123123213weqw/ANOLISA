@@ -7354,27 +7354,41 @@ fn eval_neigh_default_gc_stale_time(_info: &SystemInfo, recs: &mut Vec<Recommend
     1
 }
 
+/// Bit 0x1 of `net.ipv4.tcp_fastopen`: the client may open a connection with
+/// fast open (v6.6 include/net/tcp.h:235).
+const TFO_CLIENT_ENABLE: i64 = 0x1;
+
 fn eval_tcp_fastopen_blackhole_timeout(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     eval_tcp_fastopen_blackhole_timeout_at(
         info,
         recs,
         "/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec",
+        "/proc/sys/net/ipv4/tcp_fastopen",
     )
 }
 
-/// Path-injectable form (the `eval_*_at` idiom) so the timeout is assertable
-/// against a fixture instead of the live /proc.
+/// Path-injectable form (the `eval_*_at` idiom) so the timeout and the flag
+/// word are assertable against fixtures instead of the live /proc.
 fn eval_tcp_fastopen_blackhole_timeout_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    fastopen_path: &str,
 ) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if let Some(rec) =
-        blackhole_timeout_recommendation(read_sysctl_u64(path), info.has_listen_sockets())
-    {
+    // Read signed: the sysctl is a plain proc_dointvec int and -1 is the legal
+    // "every flag set" value, which an unsigned parse would drop — exactly the
+    // host where every connection can try fast open.
+    let tcp_fastopen = std::fs::read_to_string(fastopen_path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<i64>().ok());
+    if let Some(rec) = blackhole_timeout_recommendation(
+        read_sysctl_u64(path),
+        info.has_listen_sockets(),
+        tcp_fastopen,
+    ) {
         recs.push(rec);
     }
     1
@@ -7383,11 +7397,35 @@ fn eval_tcp_fastopen_blackhole_timeout_at(
 /// The advice itself, split from the probe the way [`syn_backlog_recommendation`]
 /// is, so the decision is assertable on every host (whether this host listens
 /// on a TCP socket is not).
+///
+/// The timeout is read by the fast-open blackhole logic alone
+/// (`tcp_fastopen_active_disable()`, v6.6 net/ipv4/tcp_fastopen.c:491, and
+/// `tcp_fastopen_active_should_disable()`, :514), and every path into it
+/// starts from a fast open that already happened: the cookie check on a SYN
+/// (`tcp_fastopen_cookie_check()`, :414, calls the latter at :422), the
+/// out-of-order symptoms on the receive side
+/// (`tcp_fastopen_active_disable_ofo_check()`, :554, which returns unless
+/// `tp->syn_fastopen`), or the retransmission timeouts of a SYN that carried
+/// data (`tcp_fastopen_active_detect_blackhole()`, :580). Opening a connection
+/// with fast open at all needs bit 0x1 of `net.ipv4.tcp_fastopen`:
+/// `tcp_sendmsg_fastopen()` returns -EOPNOTSUPP without it (v6.6
+/// net/ipv4/tcp.c:998-999). A listening socket never consults the timeout, so
+/// with the bit clear the recommended 0 is a value nothing reads, while the
+/// reason promises that every connection will now try fast open.
+///
+/// A word that cannot be read leaves the advice: the per-netns default has the
+/// client bit set (`net->ipv4.sysctl_tcp_fastopen = TFO_CLIENT_ENABLE`, v6.6
+/// net/ipv4/tcp_ipv4.c:3267), so a failed read is not evidence that the client
+/// is off.
 fn blackhole_timeout_recommendation(
     current: u64,
     has_listen_sockets: bool,
+    tcp_fastopen: Option<i64>,
 ) -> Option<Recommendation> {
     if !has_listen_sockets || current <= 3600 {
+        return None;
+    }
+    if tcp_fastopen.is_some_and(|flags| (flags & TFO_CLIENT_ENABLE) == 0) {
         return None;
     }
     Some(Recommendation {
@@ -10011,6 +10049,48 @@ mod tests {
         assert!(
             rec.is_none(),
             "Should not recommend read_ahead_kb without streaming process"
+        );
+    }
+
+    /// The timeout only matters to a client that can open a fast open
+    /// connection, so a readable flag word without bit 0x1 (or with only the
+    /// server bit, 0x2) must silence the advice; a word that cannot be read
+    /// must not.
+    #[test]
+    fn tfo_blackhole_advice_needs_the_client_bit() {
+        let rec = blackhole_timeout_recommendation(7200, true, Some(1));
+        assert!(rec.is_some(), "the client bit is set: the advice stands");
+        let rec = blackhole_timeout_recommendation(7200, true, Some(3));
+        assert!(rec.is_some(), "client and server bits together");
+        // -1 is the legal "every flag set" value; an unsigned parse would
+        // drop exactly this host.
+        let rec = blackhole_timeout_recommendation(7200, true, Some(-1));
+        assert!(rec.is_some(), "every bit set includes the client bit");
+
+        for flags in [0, 2, 4, 6] {
+            assert!(
+                blackhole_timeout_recommendation(7200, true, Some(flags)).is_none(),
+                "no client bit in {flags}: the recommended 0 is a value nothing reads"
+            );
+        }
+
+        assert!(
+            blackhole_timeout_recommendation(7200, true, None).is_some(),
+            "an unreadable flag word is not the client bit being off"
+        );
+
+        // The gates the rule has always had are untouched.
+        assert!(
+            blackhole_timeout_recommendation(3600, true, Some(1)).is_none(),
+            "the documented default is not a finding"
+        );
+        assert!(
+            blackhole_timeout_recommendation(3601, true, Some(0)).is_none(),
+            "silenced by the client bit first"
+        );
+        assert!(
+            blackhole_timeout_recommendation(7200, false, Some(1)).is_none(),
+            "a host without a listening socket is not advised"
         );
     }
 
