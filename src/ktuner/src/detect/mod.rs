@@ -464,7 +464,13 @@ fn parse_os_release(content: &str) -> String {
 }
 
 fn read_cpu_info() -> Result<(String, usize)> {
-    let cpuinfo = fs::read_to_string("/proc/cpuinfo").context("failed to read /proc/cpuinfo")?;
+    read_cpu_info_from("/proc/cpuinfo")
+}
+
+/// Path-injectable form of [`read_cpu_info`] (the `eval_*_at` idiom) so the
+/// per-line parse is assertable against a synthetic /proc/cpuinfo.
+fn read_cpu_info_from(path: &str) -> Result<(String, usize)> {
+    let cpuinfo = fs::read_to_string(path).with_context(|| format!("failed to read {path}"))?;
     let mut model = "Unknown CPU".to_string();
     let mut cores = 0usize;
     for line in cpuinfo.lines() {
