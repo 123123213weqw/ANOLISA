@@ -1643,13 +1643,45 @@ fn rollback_params_at(
     let keys = resolve_ledger_keys(&data.entries, params)?;
     let units = rollback_units(&data.entries, &keys);
 
+    let outcome = restore_units_at(
+        &guard,
+        &mut data,
+        &units,
+        ledger,
+        sysctl_path,
+        service_path,
+        script_path,
+    )?;
+    Ok((keys, outcome))
+}
+
+/// Restore `units` as one transaction, retiring the entries that landed.
+///
+/// The step both rollback forms share: the caller selects its units (named
+/// parameters, or every entry an exclusion leaves), takes the lock, reads the
+/// ledger and heals it, and this runs the same restore -> retire -> persist
+/// sequence against that selection. One unit at a time, and a unit that did
+/// not fully restore keeps its whole record (a retry restores the values that
+/// did not land, and until then the persisted file still replays those
+/// entries — the same contract a partial full rollback has). When nothing
+/// lands, neither the ledger nor the persisted file is touched; when the
+/// ledger empties, the terminal cleanup runs.
+fn restore_units_at(
+    guard: &LedgerLock,
+    data: &mut RollbackData,
+    units: &[BTreeMap<String, RollbackEntry>],
+    ledger: &str,
+    sysctl_path: &str,
+    service_path: &str,
+    script_path: &str,
+) -> Result<RollbackOutcome> {
     let mut outcome = RollbackOutcome {
         restored: 0,
         failed: 0,
         skipped: 0,
     };
     let mut retired = false;
-    for unit in &units {
+    for unit in units {
         let subset = RollbackData {
             version: data.version,
             entries: unit.clone(),
@@ -1678,7 +1710,7 @@ fn rollback_params_at(
         // the live kernel exactly as they did and neither is touched: no
         // half-batch state is written, the same contract a single parameter
         // keeps when its unit does not restore.
-        return Ok((keys, outcome));
+        return Ok(outcome);
     }
 
     if data.entries.is_empty() {
@@ -1696,21 +1728,49 @@ fn rollback_params_at(
             "systemctl",
         );
         outcome.failed += cleanup_failed;
-        return Ok((keys, outcome));
+        return Ok(outcome);
     }
     // A failed regenerate can leave the old boot config replaying the value
     // just restored. Keep its original in the ledger until every persisted
     // file is updated, so the same parameter can be retried after the failure.
     persist_rollback_data_at(
-        &guard,
-        &data,
+        guard,
+        data,
         sysctl_path,
         script_path,
         service_path,
         "systemctl",
     )?;
-    save_ledger_at(ledger, &data)?;
-    Ok((keys, outcome))
+    save_ledger_at(ledger, data)?;
+    Ok(outcome)
+}
+
+/// The ledger key each name addresses and the names that address none.
+///
+/// One pass, so every consumer of a name list resolves entries through the
+/// same lookup ([`ledger_key_for`]) with the same deduplication: two spellings
+/// of one kernel path resolve to one key, so the second is the same record,
+/// not a second restore of it. `unmatched` keeps the order the names were
+/// given in.
+fn match_ledger_keys(
+    entries: &BTreeMap<String, RollbackEntry>,
+    names: &[String],
+) -> (Vec<String>, Vec<String>) {
+    let mut keys: Vec<String> = Vec::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    for name in names {
+        match ledger_key_for(entries, name) {
+            // Two spellings of one kernel path resolve to one key, so the
+            // second is the same record, not a second restore of it.
+            Some(key) => {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            None => unmatched.push(name.clone()),
+        }
+    }
+    (keys, unmatched)
 }
 
 /// The ledger key each parameter names, in the order given and deduplicated.
@@ -1723,16 +1783,9 @@ fn resolve_ledger_keys(
     entries: &BTreeMap<String, RollbackEntry>,
     params: &[String],
 ) -> Result<Vec<String>> {
-    let mut keys: Vec<String> = Vec::new();
-    for param in params {
-        let key = ledger_key_for(entries, param).ok_or_else(|| {
-            anyhow::anyhow!("parameter not recorded in the rollback ledger: {param}")
-        })?;
-        // Two spellings of one kernel path resolve to one key, so the second is
-        // the same record, not a second restore of it.
-        if !keys.contains(&key) {
-            keys.push(key);
-        }
+    let (keys, unmatched) = match_ledger_keys(entries, params);
+    if let Some(param) = unmatched.first() {
+        anyhow::bail!("parameter not recorded in the rollback ledger: {param}");
     }
     Ok(keys)
 }
