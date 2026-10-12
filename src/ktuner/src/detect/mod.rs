@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
+use std::ffi::OsStr;
 use std::fs;
-use std::path::Path;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 mod java_application_argument_regressions {
@@ -560,8 +562,15 @@ fn read_cgroup_memory_limit_kb() -> u64 {
 /// Path-injectable form of [`read_cgroup_memory_limit_kb`]: `root` is the
 /// cgroup filesystem root and `self_cgroup_path` the process's membership
 /// file, both parameters so the read is assertable against a synthetic tree.
+///
+/// Read as bytes: a cgroup directory name may be any byte except '/' and
+/// '\0' (kernfs names; `cgroup_mkdir` additionally rejects '\n'), so a name
+/// outside UTF-8 is legal. A strict `read_to_string` rejected the whole
+/// file on such a name, which left the membership empty and silently
+/// answered from the mount-root approximation instead of the chain that
+/// binds the process.
 fn read_cgroup_memory_limit_kb_at(root: &Path, self_cgroup_path: &Path) -> u64 {
-    let self_cgroup = fs::read_to_string(self_cgroup_path).unwrap_or_default();
+    let self_cgroup = fs::read(self_cgroup_path).unwrap_or_default();
     cgroup_memory_limit_kb_from(root, &self_cgroup)
 }
 
@@ -580,9 +589,13 @@ fn read_cgroup_memory_limit_kb_at(root: &Path, self_cgroup_path: &Path) -> u64 {
 /// sizing all mis-scaled.
 ///
 /// `root` is the cgroup filesystem root (`/sys/fs/cgroup`) and
-/// `self_cgroup` the process's `/proc/self/cgroup` content; both are
-/// parameters so the navigation is testable against a synthetic tree.
-fn cgroup_memory_limit_kb_from(root: &Path, self_cgroup: &str) -> u64 {
+/// `self_cgroup` the raw bytes of the process's `/proc/self/cgroup`; both
+/// are parameters so the navigation is testable against a synthetic tree.
+/// The membership is never decoded: a cgroup name is an arbitrary byte
+/// string (kernfs names), and a path rebuilt from a lossy decode would name
+/// a directory that does not exist — the walk would fail on every level and
+/// the approximation below would silently answer instead.
+fn cgroup_memory_limit_kb_from(root: &Path, self_cgroup: &[u8]) -> u64 {
     // cgroup v2: the "0::<path>" line. Preferred over v1, mirroring the
     // root-file order, but only when the chain actually offers memory.max —
     // a hybrid host delegates the memory controller to v1, so the v2 walk
@@ -607,25 +620,48 @@ fn cgroup_memory_limit_kb_from(root: &Path, self_cgroup: &str) -> u64 {
     // No navigable /proc/self/cgroup (unreadable, or a layout the walks
     // cannot follow): the root files remain the best approximation — the
     // pre-existing behaviour.
-    if let Some(kb) = chain_min_value(root, "/", "memory.max", cgroup_v2_limit_kb) {
+    if let Some(kb) = chain_min_value(root, Path::new("/"), "memory.max", cgroup_v2_limit_kb) {
         return kb;
     }
     chain_min_value(
         &root.join("memory"),
-        "/",
+        Path::new("/"),
         "memory.limit_in_bytes",
         cgroup_v1_limit_kb_from_content,
     )
     .unwrap_or(0)
 }
 
-/// Pure /proc/self/cgroup parsing: the relative cgroup path of the unified
-/// (v2) hierarchy line `0::<path>`, when present.
-fn cgroup_v2_relative_path(content: &str) -> Option<String> {
+/// `/proc/self/cgroup` lines as raw byte slices: split on '\n' with one
+/// trailing '\r' removed, the byte-level counterpart of `str::lines`.
+fn cgroup_lines(content: &[u8]) -> impl Iterator<Item = &[u8]> {
     content
-        .lines()
-        .find_map(|line| line.strip_prefix("0::"))
-        .map(str::to_string)
+        .split(|&b| b == b'\n')
+        .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+}
+
+/// A parsed path's raw bytes as a filesystem path: no UTF-8 decode, so the
+/// path names the directory the kernel has, byte for byte.
+fn path_from_bytes(bytes: &[u8]) -> PathBuf {
+    PathBuf::from(OsStr::from_bytes(bytes))
+}
+
+/// A membership path as the directory to join under a mount root: the path
+/// is absolute within its hierarchy, so leading separators are dropped
+/// before the join (`Path::join` would otherwise let the absolute path
+/// replace the mount root entirely).
+fn cgroup_membership_dir(rel: &Path) -> PathBuf {
+    let bytes = rel.as_os_str().as_bytes();
+    let start = bytes.iter().position(|&b| b != b'/').unwrap_or(bytes.len());
+    path_from_bytes(&bytes[start..])
+}
+
+/// Pure /proc/self/cgroup parsing: the relative cgroup path of the unified
+/// (v2) hierarchy line `0::<path>`, when present, as raw bytes.
+fn cgroup_v2_relative_path(content: &[u8]) -> Option<PathBuf> {
+    cgroup_lines(content)
+        .find_map(|line| line.strip_prefix(b"0::"))
+        .map(path_from_bytes)
 }
 
 /// Pure /proc/self/cgroup parsing: the relative cgroup path of the v1 line
@@ -636,15 +672,19 @@ fn cgroup_v2_relative_path(content: &str) -> Option<String> {
 /// be named with a colon (kernfs only forbids '/' and '\0' in names), so an
 /// unbounded split truncates the membership at the colon inside the name — the
 /// same idiom the CPU membership reader already uses (`splitn(3, ':')`,
-/// cpu_hierarchy).
-fn cgroup_v1_controller_relative_path(content: &str, controller: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
+/// cpu_hierarchy). Names are kept as bytes.
+fn cgroup_v1_controller_relative_path(content: &[u8], controller: &str) -> Option<PathBuf> {
+    cgroup_lines(content).find_map(|line| {
+        let mut fields = line.splitn(3, |&b| b == b':');
         let hierarchy = fields.next()?;
         let controllers = fields.next()?;
         let path = fields.next()?;
-        if !hierarchy.is_empty() && controllers.split(',').any(|c| c == controller) {
-            Some(path.to_string())
+        if !hierarchy.is_empty()
+            && controllers
+                .split(|&b| b == b',')
+                .any(|c| c == controller.as_bytes())
+        {
+            Some(path_from_bytes(path))
         } else {
             None
         }
@@ -654,7 +694,7 @@ fn cgroup_v1_controller_relative_path(content: &str, controller: &str) -> Option
 /// The memory controller's membership line
 /// ([`cgroup_v1_controller_relative_path`], kept for the callers that only ever
 /// need memory).
-fn cgroup_v1_relative_path(content: &str) -> Option<String> {
+fn cgroup_v1_relative_path(content: &[u8]) -> Option<PathBuf> {
     cgroup_v1_controller_relative_path(content, "memory")
 }
 
@@ -666,10 +706,10 @@ fn cgroup_v1_relative_path(content: &str) -> Option<String> {
 /// `None` when no level of the chain offers the file at all, so the caller
 /// can fall back to the next hierarchy. `parse` sets the unit: the memory
 /// walks read kilobytes, the cpuset walk reads the CPUs in a mask.
-fn chain_min_value(root: &Path, rel: &str, file: &str, parse: fn(&str) -> u64) -> Option<u64> {
+fn chain_min_value(root: &Path, rel: &Path, file: &str, parse: fn(&str) -> u64) -> Option<u64> {
     // Namespace-relative parent components must never walk above this mount
     // — the same guard cpu_chain_limit carries for the CPU walk.
-    let rel = Path::new(rel.trim_start_matches('/'));
+    let rel = cgroup_membership_dir(rel);
     if rel
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -743,8 +783,13 @@ fn read_cgroup_cpu_limit_cores() -> u64 {
 /// Path-injectable form of [`read_cgroup_cpu_limit_cores`]: `root` is the
 /// cgroup filesystem root and `self_cgroup_path` the process's membership
 /// file, both parameters so the read is assertable against a synthetic tree.
+///
+/// Read as bytes for the same reason as
+/// [`read_cgroup_memory_limit_kb_at`]: a non-UTF-8 cgroup name is legal,
+/// and a strict read turned the whole membership file into the empty string,
+/// silently answering from the mount-root approximation.
 fn read_cgroup_cpu_limit_cores_at(root: &Path, self_cgroup_path: &Path) -> u64 {
-    let self_cgroup = fs::read_to_string(self_cgroup_path).unwrap_or_default();
+    let self_cgroup = fs::read(self_cgroup_path).unwrap_or_default();
     cgroup_cpu_limit_cores_from(root, &self_cgroup)
 }
 
@@ -759,7 +804,7 @@ fn read_cgroup_cpu_limit_cores_at(root: &Path, self_cgroup_path: &Path) -> u64 {
 // two CPUs' worth of work in parallel. Sizing cpu-scaled rules for the host's
 // sixty-four is the same mis-scaling the bandwidth quota is read to prevent,
 // so the effective count is the smaller of the two limits.
-fn cgroup_cpu_limit_cores_from(root: &Path, self_cgroup: &str) -> u64 {
+fn cgroup_cpu_limit_cores_from(root: &Path, self_cgroup: &[u8]) -> u64 {
     let quota = cgroup_cpu_quota_cores_from(root, self_cgroup);
     let cpuset = cgroup_cpuset_core_count_from(root, self_cgroup);
     match (quota, cpuset) {
@@ -768,18 +813,21 @@ fn cgroup_cpu_limit_cores_from(root: &Path, self_cgroup: &str) -> u64 {
     }
 }
 
-fn cgroup_cpu_quota_cores_from(root: &Path, self_cgroup: &str) -> u64 {
+fn cgroup_cpu_quota_cores_from(root: &Path, self_cgroup: &[u8]) -> u64 {
     if let Some(rel) = cgroup_v2_relative_path(self_cgroup) {
         if let Some(cores) = cpu_chain_limit(root, &rel, true) {
             return cores;
         }
     }
-    let cpu_rel = self_cgroup.lines().find_map(|line| {
-        let mut fields = line.splitn(3, ':');
+    let cpu_rel = cgroup_lines(self_cgroup).find_map(|line| {
+        let mut fields = line.splitn(3, |&b| b == b':');
         fields.next()?;
         let controllers = fields.next()?;
         let rel = fields.next()?;
-        controllers.split(',').any(|c| c == "cpu").then_some(rel)
+        controllers
+            .split(|&b| b == b',')
+            .any(|c| c == b"cpu")
+            .then(|| path_from_bytes(rel))
     });
     // The common v1 layouts mount cpu alone or together with cpuacct.
     let v1_roots = [
@@ -789,18 +837,18 @@ fn cgroup_cpu_quota_cores_from(root: &Path, self_cgroup: &str) -> u64 {
     ];
     if let Some(rel) = cpu_rel {
         for cpu_root in &v1_roots {
-            if let Some(cores) = cpu_chain_limit(cpu_root, rel, false) {
+            if let Some(cores) = cpu_chain_limit(cpu_root, &rel, false) {
                 return cores;
             }
         }
     }
     // Preserve the root approximation when membership cannot be followed.
-    if let Some(cores) = cpu_chain_limit(root, "/", true) {
+    if let Some(cores) = cpu_chain_limit(root, Path::new("/"), true) {
         return cores;
     }
     v1_roots
         .iter()
-        .find_map(|r| cpu_chain_limit(r, "/", false))
+        .find_map(|r| cpu_chain_limit(r, Path::new("/"), false))
         .unwrap_or(0)
 }
 
@@ -816,7 +864,7 @@ fn cgroup_cpu_quota_cores_from(root: &Path, self_cgroup: &str) -> u64 {
 /// process's own cgroup (rather than the root file) is what makes a container
 /// or a unit with a narrower mask bind: the effective file of every ancestor
 /// above it is wider.
-fn cgroup_cpuset_core_count_from(root: &Path, self_cgroup: &str) -> u64 {
+fn cgroup_cpuset_core_count_from(root: &Path, self_cgroup: &[u8]) -> u64 {
     if let Some(rel) = cgroup_v2_relative_path(self_cgroup) {
         if let Some(cpus) = chain_min_value(root, &rel, "cpuset.cpus.effective", cpuset_mask_cpus) {
             return cpus;
@@ -835,12 +883,17 @@ fn cgroup_cpuset_core_count_from(root: &Path, self_cgroup: &str) -> u64 {
     // Membership that cannot be followed: the mount root's own mask still
     // bounds what the process may use — the container root in the common
     // private-cgroup-namespace case.
-    if let Some(cpus) = chain_min_value(root, "/", "cpuset.cpus.effective", cpuset_mask_cpus) {
+    if let Some(cpus) = chain_min_value(
+        root,
+        Path::new("/"),
+        "cpuset.cpus.effective",
+        cpuset_mask_cpus,
+    ) {
         return cpus;
     }
     chain_min_value(
         &root.join("cpuset"),
-        "/",
+        Path::new("/"),
         "cpuset.effective_cpus",
         cpuset_mask_cpus,
     )
@@ -873,9 +926,9 @@ fn cpuset_mask_cpus(raw: &str) -> u64 {
     cpus
 }
 
-fn cpu_chain_limit(root: &Path, rel: &str, v2: bool) -> Option<u64> {
+fn cpu_chain_limit(root: &Path, rel: &Path, v2: bool) -> Option<u64> {
     // Namespace-relative parent components must never walk above this mount.
-    let rel = Path::new(rel.trim_start_matches('/'));
+    let rel = cgroup_membership_dir(rel);
     if rel
         .components()
         .any(|c| matches!(c, std::path::Component::ParentDir))
@@ -2016,33 +2069,36 @@ mod tests {
         // The v2 line may sit among v1 lines; the path after "0::" is the
         // process's own cgroup, relative to the mount root.
         assert_eq!(
-            cgroup_v2_relative_path("11:blkio:/init.scope\n0::/system.slice/ktuner.service\n")
+            cgroup_v2_relative_path(b"11:blkio:/init.scope\n0::/system.slice/ktuner.service\n")
                 .as_deref(),
-            Some("/system.slice/ktuner.service")
+            Some(Path::new("/system.slice/ktuner.service"))
         );
         // A container with a private cgroup namespace sits at the root.
-        assert_eq!(cgroup_v2_relative_path("0::/\n").as_deref(), Some("/"));
+        assert_eq!(
+            cgroup_v2_relative_path(b"0::/\n").as_deref(),
+            Some(Path::new("/"))
+        );
         // No unified line -> None.
-        assert_eq!(cgroup_v2_relative_path("11:memory:/init.scope\n"), None);
-        assert_eq!(cgroup_v2_relative_path(""), None);
+        assert_eq!(cgroup_v2_relative_path(b"11:memory:/init.scope\n"), None);
+        assert_eq!(cgroup_v2_relative_path(b""), None);
     }
 
     #[test]
     fn cgroup_v1_relative_path_reads_the_memory_controller_line() {
         let content =
-            "10:cpu,cpuacct:/user.slice\n11:memory:/system.slice/db.service\n0::/init.scope\n";
+            b"10:cpu,cpuacct:/user.slice\n11:memory:/system.slice/db.service\n0::/init.scope\n";
         assert_eq!(
             cgroup_v1_relative_path(content).as_deref(),
-            Some("/system.slice/db.service")
+            Some(Path::new("/system.slice/db.service"))
         );
         // The controller list decides: other controllers' lines and the v2
         // line (empty controller field) are not the memory line.
         assert_eq!(
-            cgroup_v1_relative_path("10:cpu,cpuacct:/user.slice\n"),
+            cgroup_v1_relative_path(b"10:cpu,cpuacct:/user.slice\n"),
             None
         );
-        assert_eq!(cgroup_v1_relative_path("0::/init.scope\n"), None);
-        assert_eq!(cgroup_v1_relative_path(""), None);
+        assert_eq!(cgroup_v1_relative_path(b"0::/init.scope\n"), None);
+        assert_eq!(cgroup_v1_relative_path(b""), None);
     }
 
     /// A synthetic cgroup filesystem: one `memory.max` per relative path.
@@ -2072,13 +2128,13 @@ mod tests {
             ("system.slice/ktuner.service", "4294967296\n"),
         ]);
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "0::/system.slice/ktuner.service\n"),
+            cgroup_memory_limit_kb_from(&root, b"0::/system.slice/ktuner.service\n"),
             4 * 1024 * 1024,
             "the unit's own 4 GB limit must bind, not the root's max"
         );
         // A container with a private cgroup namespace sits at the root and
         // keeps seeing exactly the root's value (no limit here).
-        assert_eq!(cgroup_memory_limit_kb_from(&root, "0::/\n"), 0);
+        assert_eq!(cgroup_memory_limit_kb_from(&root, b"0::/\n"), 0);
         fs::remove_dir_all(&root).ok();
     }
 
@@ -2095,18 +2151,18 @@ mod tests {
             ("kubepods/pod123/abc", "max\n"),
         ]);
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "0::/system.slice/app.service\n"),
+            cgroup_memory_limit_kb_from(&root, b"0::/system.slice/app.service\n"),
             2 * 1024 * 1024
         );
         // Deeper than the sandbox limit, with no own limit: the walk stops at
         // the first real limit on the way up.
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "0::/kubepods/pod123/abc\n"),
+            cgroup_memory_limit_kb_from(&root, b"0::/kubepods/pod123/abc\n"),
             4 * 1024 * 1024
         );
         // A cgroup path deeper than anything in the tree still walks up.
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "0::/system.slice/app.service/child\n"),
+            cgroup_memory_limit_kb_from(&root, b"0::/system.slice/app.service/child\n"),
             2 * 1024 * 1024
         );
         fs::remove_dir_all(&root).ok();
@@ -2132,7 +2188,7 @@ mod tests {
         )
         .expect("write root limit");
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "11:memory:/system.slice/db.service\n"),
+            cgroup_memory_limit_kb_from(&root, b"11:memory:/system.slice/db.service\n"),
             2 * 1024 * 1024,
             "the v1 memory line must navigate to its own cgroup's limit"
         );
@@ -2140,12 +2196,12 @@ mod tests {
         // No /proc/self/cgroup information at all: the root files decide,
         // exactly as before the chain walk existed.
         fs::write(root.join("memory.max"), b"4294967296\n").expect("write v2 root limit");
-        assert_eq!(cgroup_memory_limit_kb_from(&root, ""), 4 * 1024 * 1024);
+        assert_eq!(cgroup_memory_limit_kb_from(&root, b""), 4 * 1024 * 1024);
 
         // Nothing readable anywhere -> 0 (no limit known).
         let empty = cgroup_tree(&[]);
-        assert_eq!(cgroup_memory_limit_kb_from(&empty, "0::/deep/chain\n"), 0);
-        assert_eq!(cgroup_memory_limit_kb_from(&empty, ""), 0);
+        assert_eq!(cgroup_memory_limit_kb_from(&empty, b"0::/deep/chain\n"), 0);
+        assert_eq!(cgroup_memory_limit_kb_from(&empty, b""), 0);
         fs::remove_dir_all(&root).ok();
         fs::remove_dir_all(&empty).ok();
     }
@@ -2158,16 +2214,16 @@ mod tests {
         // the first colon inside the name, so the walk navigated to an
         // unrelated directory.
         assert_eq!(
-            cgroup_v1_relative_path("11:memory:/lxc:web/db\n").as_deref(),
-            Some("/lxc:web/db")
+            cgroup_v1_relative_path(b"11:memory:/lxc:web/db\n").as_deref(),
+            Some(Path::new("/lxc:web/db"))
         );
         // Multiple colons in the name survive whole as well.
         assert_eq!(
-            cgroup_v1_relative_path("11:memory:/a:b:c\n").as_deref(),
-            Some("/a:b:c")
+            cgroup_v1_relative_path(b"11:memory:/a:b:c\n").as_deref(),
+            Some(Path::new("/a:b:c"))
         );
         // The controller list still decides, colons notwithstanding.
-        assert_eq!(cgroup_v1_relative_path("10:cpu,cpuacct:/lxc:web\n"), None);
+        assert_eq!(cgroup_v1_relative_path(b"10:cpu,cpuacct:/lxc:web\n"), None);
     }
 
     #[test]
@@ -2195,11 +2251,83 @@ mod tests {
         )
         .expect("write root limit");
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "11:memory:/lxc:web\n"),
+            cgroup_memory_limit_kb_from(&root, b"11:memory:/lxc:web\n"),
             2 * 1024 * 1024,
             "the colon-named cgroup's own 2 GB limit must bind"
         );
         fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cgroup directory name is a byte string — `cgroup_mkdir` rejects
+    /// only '\n' on top of the '/' and '\0' that paths and C strings already
+    /// exclude — so a name outside UTF-8 is legal, and the membership line
+    /// carrying it is not valid UTF-8 either. Reading /proc/self/cgroup as a
+    /// str rejected the whole file on such a name: the membership came out
+    /// empty and the readers answered from the mount-root approximation,
+    /// reporting the host's RAM and processors for a process whose own
+    /// cgroup carries the real limits.
+    #[test]
+    fn non_utf8_v2_cgroup_name_binds_memory_and_cpu() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "ktuner_cgroup_bytes_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let leaf = root.join(std::ffi::OsStr::from_bytes(b"unit-\xff\xfe"));
+        fs::create_dir_all(&leaf).expect("create non-UTF-8 cgroup directory");
+        fs::write(leaf.join("memory.max"), b"2147483648\n").expect("write memory.max");
+        fs::write(leaf.join("cpu.max"), b"200000 100000\n").expect("write cpu.max");
+        // The mount-root files carry different limits, so the approximation
+        // the failed read used to fall back to is visibly not the answer.
+        fs::write(root.join("memory.max"), b"8589934592\n").expect("write root memory.max");
+        fs::write(root.join("cpu.max"), b"800000 100000\n").expect("write root cpu.max");
+        let membership = base.join("self-cgroup");
+        fs::write(&membership, b"0::/unit-\xff\xfe\n").expect("write the membership file");
+
+        assert_eq!(
+            read_cgroup_memory_limit_kb_at(&root, &membership),
+            2 * 1024 * 1024,
+            "the non-UTF-8 cgroup's own 2 GB limit must bind, not the root's 8 GB"
+        );
+        assert_eq!(
+            read_cgroup_cpu_limit_cores_at(&root, &membership),
+            2,
+            "the non-UTF-8 cgroup's own two-core quota must bind, not the root's eight"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    #[test]
+    fn non_utf8_v1_cgroup_name_binds_the_memory_chain() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "ktuner_cgroup_bytes_v1_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let leaf = root
+            .join("memory")
+            .join(std::ffi::OsStr::from_bytes(b"unit-\xff\xfe"));
+        fs::create_dir_all(&leaf).expect("create non-UTF-8 v1 cgroup directory");
+        fs::write(leaf.join("memory.limit_in_bytes"), b"4294967296\n").expect("write leaf limit");
+        fs::write(root.join("memory/memory.limit_in_bytes"), b"8589934592\n")
+            .expect("write root limit");
+        let membership = base.join("self-cgroup");
+        fs::write(&membership, b"11:memory:/unit-\xff\xfe\n").expect("write the membership file");
+
+        assert_eq!(
+            read_cgroup_memory_limit_kb_at(&root, &membership),
+            4 * 1024 * 1024,
+            "the non-UTF-8 v1 cgroup's own 4 GB limit must bind, not the root's 8 GB"
+        );
+        fs::remove_dir_all(&base).ok();
     }
 
     #[test]
@@ -2221,14 +2349,19 @@ mod tests {
         fs::write(outside.join("memory.max"), b"4294967296\n").expect("write outside limit");
 
         assert_eq!(
-            chain_min_value(&root, "/../escape", "memory.max", cgroup_v2_limit_kb),
+            chain_min_value(
+                &root,
+                Path::new("/../escape"),
+                "memory.max",
+                cgroup_v2_limit_kb
+            ),
             None,
             "a parent component must not escape the mount"
         );
         // End to end: the v2 walk refuses, no v1 line exists, and the root
         // approximation answers from the mount root itself.
         assert_eq!(
-            cgroup_memory_limit_kb_from(&root, "0::/../escape\n"),
+            cgroup_memory_limit_kb_from(&root, b"0::/../escape\n"),
             0,
             "the escapee file outside the mount must not become the limit"
         );

@@ -22,7 +22,7 @@ impl Tree {
         self.write(&format!("{dir}/cpu.cfs_period_us"), period);
     }
     fn read(&self, membership: &str) -> u64 {
-        cgroup_cpu_limit_cores_from(&self.0, membership)
+        cgroup_cpu_limit_cores_from(&self.0, membership.as_bytes())
     }
 }
 impl Drop for Tree {

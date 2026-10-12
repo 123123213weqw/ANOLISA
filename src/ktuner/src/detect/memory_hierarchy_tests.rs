@@ -32,7 +32,7 @@ impl Tree {
     }
 
     fn read(&self, membership: &str) -> u64 {
-        cgroup_memory_limit_kb_from(&self.0, membership)
+        cgroup_memory_limit_kb_from(&self.0, membership.as_bytes())
     }
 }
 
