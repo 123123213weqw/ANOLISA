@@ -554,8 +554,15 @@ fn effective_memory_gb(host_kb: u64, cgroup_kb: u64) -> u64 {
 }
 
 fn read_cgroup_memory_limit_kb() -> u64 {
-    let self_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    cgroup_memory_limit_kb_from(Path::new("/sys/fs/cgroup"), &self_cgroup)
+    read_cgroup_memory_limit_kb_at(Path::new("/sys/fs/cgroup"), Path::new("/proc/self/cgroup"))
+}
+
+/// Path-injectable form of [`read_cgroup_memory_limit_kb`]: `root` is the
+/// cgroup filesystem root and `self_cgroup_path` the process's membership
+/// file, both parameters so the read is assertable against a synthetic tree.
+fn read_cgroup_memory_limit_kb_at(root: &Path, self_cgroup_path: &Path) -> u64 {
+    let self_cgroup = fs::read_to_string(self_cgroup_path).unwrap_or_default();
+    cgroup_memory_limit_kb_from(root, &self_cgroup)
 }
 
 /// The memory limit that binds a process: the smallest real limit from its
@@ -730,8 +737,15 @@ fn cgroup_v1_limit_kb_from_content(raw: &str) -> u64 {
 }
 
 fn read_cgroup_cpu_limit_cores() -> u64 {
-    let self_cgroup = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    cgroup_cpu_limit_cores_from(Path::new("/sys/fs/cgroup"), &self_cgroup)
+    read_cgroup_cpu_limit_cores_at(Path::new("/sys/fs/cgroup"), Path::new("/proc/self/cgroup"))
+}
+
+/// Path-injectable form of [`read_cgroup_cpu_limit_cores`]: `root` is the
+/// cgroup filesystem root and `self_cgroup_path` the process's membership
+/// file, both parameters so the read is assertable against a synthetic tree.
+fn read_cgroup_cpu_limit_cores_at(root: &Path, self_cgroup_path: &Path) -> u64 {
+    let self_cgroup = fs::read_to_string(self_cgroup_path).unwrap_or_default();
+    cgroup_cpu_limit_cores_from(root, &self_cgroup)
 }
 
 // CPU bandwidth is constrained by both the process's cgroup and its ancestors.
