@@ -261,13 +261,41 @@ fn cmd_check(
 
 /// The `system` section of the check report: the machine as the engine saw
 /// it, so a caller can identify the host behind the findings without
-/// re-reading it.
+/// re-reading it. The disk entries carry the fields the disk rules gate on
+/// (`hidden`, `holders`, `available_schedulers`), so a suggestion those
+/// rules did not make can be explained from the report alone.
 fn system_json(info: &detect::SystemInfo) -> serde_json::Value {
+    let disks: Vec<serde_json::Value> = info
+        .disks
+        .iter()
+        .map(|disk| {
+            json!({
+                "name": disk.name,
+                "type": disk.disk_type.to_string(),
+                "scheduler": disk.scheduler,
+                "available_schedulers": disk.available_schedulers,
+                "nr_requests": disk.nr_requests,
+                "read_ahead_kb": disk.read_ahead_kb,
+                "rq_affinity": disk.rq_affinity,
+                "hidden": disk.hidden,
+                "holders": disk.holders,
+            })
+        })
+        .collect();
+    let network: Vec<serde_json::Value> = info
+        .network
+        .iter()
+        .map(|link| json!({"name": link.name, "speed_mbps": link.speed_mbps}))
+        .collect();
     json!({
         "kernel": info.kernel_version,
         "cpu_cores": info.cpu_cores,
         "memory_gb": info.memory_total_gb,
         "numa_nodes": info.numa_nodes,
+        "os_distro": info.os_distro,
+        "cpu_model": info.cpu_model,
+        "disks": disks,
+        "network": network,
     })
 }
 
@@ -3987,9 +4015,11 @@ mod tests {
     #[test]
     fn system_json_reports_the_collected_system_identity() {
         // The `system` section is the report's host identity, read from the
-        // same `SystemInfo` the rules diagnosed. This pins the shape it has
-        // always had, so the fields added next are provably an addition and
-        // no existing key can change or disappear.
+        // same `SystemInfo` the rules diagnosed: a caller can identify the
+        // host and explain a disk or link suggestion the rules did not make
+        // without re-reading it. Every assertion compares a key against the
+        // gathered value, so the section cannot drift from what the rules
+        // saw, and the key sets pin the exact shape each entry publishes.
         let info = detect::gather_system_info().expect("read this host's system info");
         let system = system_json(&info);
         let mut keys: Vec<&str> = system
@@ -3999,6 +4029,71 @@ mod tests {
             .map(String::as_str)
             .collect();
         keys.sort_unstable();
-        assert_eq!(keys, ["cpu_cores", "kernel", "memory_gb", "numa_nodes"]);
+        assert_eq!(
+            keys,
+            [
+                "cpu_cores",
+                "cpu_model",
+                "disks",
+                "kernel",
+                "memory_gb",
+                "network",
+                "numa_nodes",
+                "os_distro",
+            ]
+        );
+        assert_eq!(system["kernel"], json!(info.kernel_version.as_str()));
+        assert_eq!(system["cpu_cores"], json!(info.cpu_cores));
+        assert_eq!(system["memory_gb"], json!(info.memory_total_gb));
+        assert_eq!(system["numa_nodes"], json!(info.numa_nodes));
+        assert_eq!(system["os_distro"], json!(info.os_distro.as_str()));
+        assert_eq!(system["cpu_model"], json!(info.cpu_model.as_str()));
+
+        let disks = system["disks"].as_array().expect("disks is an array");
+        assert_eq!(disks.len(), info.disks.len());
+        for (entry, disk) in disks.iter().zip(&info.disks) {
+            let mut keys: Vec<&str> = entry
+                .as_object()
+                .expect("a disk entry is an object")
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                [
+                    "available_schedulers",
+                    "hidden",
+                    "holders",
+                    "name",
+                    "nr_requests",
+                    "read_ahead_kb",
+                    "rq_affinity",
+                    "scheduler",
+                    "type",
+                ]
+            );
+            assert_eq!(entry["name"], json!(disk.name.as_str()));
+            assert_eq!(entry["type"], json!(disk.disk_type.to_string()));
+            assert_eq!(entry["scheduler"], json!(disk.scheduler.as_str()));
+            assert_eq!(
+                entry["available_schedulers"],
+                json!(disk.available_schedulers)
+            );
+            assert_eq!(entry["nr_requests"], json!(disk.nr_requests));
+            assert_eq!(entry["read_ahead_kb"], json!(disk.read_ahead_kb));
+            assert_eq!(entry["rq_affinity"], json!(disk.rq_affinity));
+            assert_eq!(entry["hidden"], json!(disk.hidden));
+            assert_eq!(entry["holders"], json!(disk.holders));
+        }
+
+        let network = system["network"].as_array().expect("network is an array");
+        assert_eq!(network.len(), info.network.len());
+        for (entry, link) in network.iter().zip(&info.network) {
+            assert_eq!(
+                entry,
+                &json!({"name": link.name.as_str(), "speed_mbps": link.speed_mbps})
+            );
+        }
     }
 }

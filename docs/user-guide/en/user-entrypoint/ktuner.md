@@ -129,6 +129,12 @@ exactly as `--category` has always done, so a selection that leaves nothing to
 report answers with an empty list and exit `0` (the diagnosis has no blocked
 state). The two flags are mutually exclusive, and a run carrying both is a
 command error (`2`, stderr JSON), decided before the system is read.
+The report's `system` object describes the machine itself: `kernel`,
+`cpu_cores`, `memory_gb` and `numa_nodes` as before, plus `os_distro`,
+`cpu_model`, the `disks` inventory (one entry per disk, carrying the fields
+the disk rules gate on — `hidden`, `holders`, `available_schedulers`) and
+the `network` inventory (`name`/`speed_mbps` per interface, where
+`speed_mbps: 0` means the speed is unknown, not zero).
 `ktuner why <param>…` explains one or several parameters. A single parameter keeps
 its flat body: a recommendation with the fields `check` publishes for it (`skip_reason`
 when no write path would take it), or `{"param": …, "current": …, "status": "optimal"}`

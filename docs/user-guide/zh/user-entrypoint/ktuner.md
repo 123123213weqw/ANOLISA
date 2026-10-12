@@ -115,6 +115,11 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 以来的做法一致，因此什么都没选中时输出空建议列表、退出 `0`（诊断没有 blocked
 状态）。两个参数互斥，同时给出是命令错误（`2`、stderr JSON），在读取系统信息
 之前就被拒绝。
+报告中的 `system` 对象描述这台机器本身：原有的 `kernel`、`cpu_cores`、
+`memory_gb`、`numa_nodes` 之外，新增 `os_distro`、`cpu_model`、`disks`
+清单（每块磁盘一条，携带磁盘规则的门槛字段 `hidden`、`holders`、
+`available_schedulers`）与 `network` 清单（每个网卡 `name`/`speed_mbps`，
+`speed_mbps: 0` 表示速率未知，不是零）。
 `ktuner why <param>…` 解释一个或多个参数。单个参数保持原有的平铺形态：推荐项携带
 `check` 对同一参数发布的字段（没有任何写路径会采纳时带 `skip_reason`），已达推荐值的
 参数输出 `{"param": …, "current": …, "status": "optimal"}`。两个及以上参数在一次运行里
