@@ -7355,26 +7355,50 @@ fn eval_neigh_default_gc_stale_time(_info: &SystemInfo, recs: &mut Vec<Recommend
 }
 
 fn eval_tcp_fastopen_blackhole_timeout(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec";
+    eval_tcp_fastopen_blackhole_timeout_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/tcp_fastopen_blackhole_timeout_sec",
+    )
+}
+
+/// Path-injectable form (the `eval_*_at` idiom) so the timeout is assertable
+/// against a fixture instead of the live /proc.
+fn eval_tcp_fastopen_blackhole_timeout_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if !info.has_listen_sockets() {
-        return 1;
-    }
-    let current = read_sysctl_u64(path);
-    if current > 3600 {
-        recs.push(Recommendation {
-            param: "net.ipv4.tcp_fastopen_blackhole_timeout_sec".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "0".to_string(),
-            reason: "TFO 黑洞超时过长，禁用超时可让每次连接都尝试 TFO 以获得最佳延迟".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
+    if let Some(rec) =
+        blackhole_timeout_recommendation(read_sysctl_u64(path), info.has_listen_sockets())
+    {
+        recs.push(rec);
     }
     1
+}
+
+/// The advice itself, split from the probe the way [`syn_backlog_recommendation`]
+/// is, so the decision is assertable on every host (whether this host listens
+/// on a TCP socket is not).
+fn blackhole_timeout_recommendation(
+    current: u64,
+    has_listen_sockets: bool,
+) -> Option<Recommendation> {
+    if !has_listen_sockets || current <= 3600 {
+        return None;
+    }
+    Some(Recommendation {
+        param: "net.ipv4.tcp_fastopen_blackhole_timeout_sec".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: "TFO 黑洞超时过长，禁用超时可让每次连接都尝试 TFO 以获得最佳延迟".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    })
 }
 
 fn eval_max_queued_signals(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
