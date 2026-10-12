@@ -10,7 +10,7 @@ use std::path::Path;
 
 use crate::bench::BenchResult;
 use crate::category;
-use crate::rules::Recommendation;
+use crate::rules::{Category, Recommendation};
 
 const ROLLBACK_PATH: &str = "/var/lib/ktuner/rollback.json";
 const SYSCTL_PERSIST_PATH: &str = "/etc/sysctl.d/99-ktuner.conf";
@@ -51,6 +51,20 @@ struct RollbackEntry {
     previous: String,
     applied: String,
     path: String,
+    /// The rule-layer category of the recommendation that recorded this
+    /// entry, so a later `rollback --category` can select the entries a
+    /// `tune --category` wrote without re-deriving the category from the
+    /// parameter name: the category is a property of the rule, and a
+    /// `net.*` knob can carry a security finding. `None` for an entry no
+    /// rule recorded — a library import, or a ledger written before this
+    /// field existed — and such an entry is selected by no category ever.
+    ///
+    /// Additive: a reader that does not know the field ignores it (serde
+    /// drops unknown keys), and `skip_serializing_if` keeps a `None` out of
+    /// the file, so re-serializing an older ledger does not add a key to
+    /// entries that never had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    category: Option<Category>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -172,7 +186,7 @@ fn apply_locked(
                 // live change of the pair even when the knob itself was
                 // unrecordable, so it lands outside the branch.
                 if let Some(entry) = sibling {
-                    applied_recs.push(sibling_rec(entry));
+                    applied_recs.push(sibling_rec(entry, rec.category.clone()));
                 }
             }
             Err(e) => {
@@ -262,8 +276,9 @@ pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
     }
     // The disabled twin is a live change of the pair even when the knob
     // itself was unrecordable (no readable pristine value), so it extends
-    // the batch regardless.
-    batch.extend(sibling.map(sibling_rec));
+    // the batch regardless. It records the knob's own category: the pair is
+    // one unit for every later selection.
+    batch.extend(sibling.map(|entry| sibling_rec(entry, rec.category.clone())));
     if !batch.is_empty() {
         save_rollback(&guard, &batch)?;
         persist_from_rollback(&guard)?;
@@ -395,12 +410,17 @@ fn sibling_cleared_record(sibling: &str, live: &str) -> Option<(String, String, 
 
 /// A synthetic ledger record from a [`cleared_sibling_entry`] tuple. It
 /// documents a side effect the kernel performs, not a write ktuner made, so
-/// every field beyond the ledger triple is default.
-fn sibling_rec(entry: (String, String, String)) -> Recommendation {
+/// every field beyond the ledger triple is default — except the category,
+/// which the record inherits from the knob whose write cleared the twin:
+/// the pair is one unit everywhere else (restore, exclusion), and a
+/// `--category` rollback that selects one half takes the other along, so the
+/// two records must classify alike.
+fn sibling_rec(entry: (String, String, String), category: Category) -> Recommendation {
     Recommendation {
         param: entry.0,
         current_value: entry.1,
         recommended_value: entry.2,
+        category,
         ..Default::default()
     }
 }
@@ -851,16 +871,30 @@ fn save_rollback(guard: &LedgerLock, recommendations: &[Recommendation]) -> Resu
                 r.param.clone(),
                 r.current_value.clone(),
                 r.recommended_value.clone(),
+                // Every write that comes from a rule carries the rule's own
+                // category (a cleared twin inherits its clearer's), so the
+                // ledger can answer `rollback --category` without guessing
+                // from the parameter name.
+                Some(r.category.clone()),
             )
         }),
     )
 }
 
-/// Merge `(param, previous, applied)` entries into a cumulative rollback record.
-/// For a kernel path already recorded, keep the ORIGINAL `previous` (the true
-/// pre-ktuner value) so rollback always restores pristine state even across
-/// multiple tune/fix/import runs; only refresh `applied`. New params are added.
-/// Pure (no I/O) so the keep-original-previous invariant is unit-testable.
+/// Merge `(param, previous, applied, category)` entries into a cumulative
+/// rollback record. For a kernel path already recorded, keep the ORIGINAL
+/// `previous` (the true pre-ktuner value) so rollback always restores
+/// pristine state even across multiple tune/fix/import runs; refresh
+/// `applied` and `category`, which describe the latest write. New params are
+/// added. Pure (no I/O) so the keep-original-previous invariant is
+/// unit-testable.
+///
+/// The category follows the same "latest write wins" rule as `applied`: an
+/// entry refreshed by a rule write is classified by that rule, and one
+/// refreshed by a library import — which carries no rule category — loses
+/// its classification, because the record then describes a value the rules
+/// did not write. An unclassified entry is selected by no category: the
+/// classification is never guessed from the parameter name.
 ///
 /// Ledgers written before the alias dedup may already hold two spellings of
 /// one kernel path (e.g. `vm.swappiness` from tune and `vm/swappiness` from
@@ -870,10 +904,10 @@ fn save_rollback(guard: &LedgerLock, recommendations: &[Recommendation]) -> Resu
 /// original and double-render the knob in sysctl.d.
 fn merge_entries<I>(mut data: RollbackData, entries: I) -> RollbackData
 where
-    I: IntoIterator<Item = (String, String, String)>,
+    I: IntoIterator<Item = (String, String, String, Option<Category>)>,
 {
     heal_alias_duplicates(&mut data);
-    for (param, previous, applied) in entries {
+    for (param, previous, applied, category) in entries {
         let path = param_to_path(&param);
         let identity = canonicalize_path(&path);
         // Equivalent spellings must share the first rollback record, or a
@@ -884,6 +918,7 @@ where
             .find(|entry| canonicalize_path(&entry.path) == identity)
         {
             entry.applied = applied;
+            entry.category = category;
             continue;
         }
         // The key may already exist under a path an older `param_to_path`
@@ -899,11 +934,13 @@ where
             .and_modify(|e| {
                 e.applied = applied.clone();
                 e.path = current_path.clone();
+                e.category = category.clone();
             })
             .or_insert_with(|| RollbackEntry {
                 previous: previous.clone(),
                 applied: applied.clone(),
                 path,
+                category,
             });
     }
     data
@@ -920,8 +957,9 @@ where
 ///
 /// Chain rule: when `x.applied == y.previous`, `y` was recorded while the
 /// value `x` had applied was live, so `x` is the earlier record and the pair
-/// collapses to `x.previous` (the pristine original) with `y.applied` (the
-/// newest value), under `x`'s key. A pair where the reverse relation also
+/// collapses to `x.previous` (the pristine original), `y.applied` (the
+/// newest value) and `y.category` (the latest classification), under `x`'s
+/// key. A pair where the reverse relation also
 /// holds (`y.applied == x.previous`) proves nothing: both readings of the
 /// pair are internally consistent (60 -> 10 -> 60 and 10 -> 60 -> 10), so the
 /// values alone cannot order the records; the pair falls through to the
@@ -967,7 +1005,10 @@ fn heal_alias_duplicates(data: &mut RollbackData) {
             }
             let Some((x, y)) = chain else { break };
             let newest = data.entries[&y].applied.clone();
-            data.entries.get_mut(&x).unwrap().applied = newest;
+            let latest_category = data.entries[&y].category.clone();
+            let survivor = data.entries.get_mut(&x).unwrap();
+            survivor.applied = newest;
+            survivor.category = latest_category;
             data.entries.remove(&y);
             keys.retain(|k| *k != y);
         }
@@ -1046,7 +1087,7 @@ fn lock_ledger_with(path: &str, operation: i32) -> Result<LedgerLock> {
 #[cfg(test)]
 fn merge_rollback_at<I>(path: &str, entries: I) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, String)>,
+    I: IntoIterator<Item = (String, String, String, Option<Category>)>,
 {
     let guard = lock_ledger_at(path)?;
     merge_rollback_locked(&guard, path, entries)
@@ -1056,7 +1097,7 @@ where
 // Opening a second descriptor here would deadlock against their own flock.
 fn merge_rollback_locked<I>(_guard: &LedgerLock, path: &str, entries: I) -> Result<()>
 where
-    I: IntoIterator<Item = (String, String, String)>,
+    I: IntoIterator<Item = (String, String, String, Option<Category>)>,
 {
     let data = merge_entries(load_rollback_from(path)?, entries);
     let dir = Path::new(path)
@@ -1131,10 +1172,14 @@ pub fn apply_import(param: &str, value: &str, current: Option<&str>) -> Result<(
     let sibling = cleared_sibling_entry(param);
     let outcome = write_and_verify(param, value)?;
     if let Some(previous) = previous {
+        // No category: the value came from an imported file, not from a rule
+        // recommendation, and a later `rollback --category` must not pretend
+        // otherwise (the ledger's classification is the rule layer's own).
         merge_rollback_locked(
             &guard,
             ROLLBACK_PATH,
-            std::iter::once((param.to_string(), previous, outcome.effective)).chain(sibling),
+            std::iter::once((param.to_string(), previous, outcome.effective, None))
+                .chain(sibling.map(|(param, previous, applied)| (param, previous, applied, None))),
         )?;
         persist_from_rollback(&guard)?;
     }
@@ -2582,6 +2627,7 @@ mod tests {
                         previous: "0".into(),
                         applied: "1".into(),
                         path,
+                        category: None,
                     },
                 )]);
                 let (config, script) = render_persistence(&entries);
@@ -2611,6 +2657,7 @@ mod tests {
                         previous: "4096".into(),
                         applied: "8192".into(),
                         path,
+                        category: None,
                     },
                 )]);
                 let (config, script) = render_persistence(&entries);
@@ -2638,6 +2685,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "1073741824".into(),
                     path: "/proc/sys/vm/dirty_bytes".into(),
+                    category: None,
                 },
             ),
             (
@@ -2646,6 +2694,7 @@ mod tests {
                     previous: "20".into(),
                     applied: "0".into(),
                     path: "/proc/sys/vm/dirty_ratio".into(),
+                    category: None,
                 },
             ),
         ]);
@@ -2664,6 +2713,7 @@ mod tests {
                 previous: "20".into(),
                 applied: "5".into(),
                 path: "/proc/sys/vm/dirty_ratio".into(),
+                category: None,
             },
         )]);
         let (config, _) = render_persistence(&ratio_only);
@@ -2677,6 +2727,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "1073741824".into(),
                     path: "/proc/sys/vm/dirty_bytes".into(),
+                    category: None,
                 },
             ),
             (
@@ -2685,6 +2736,7 @@ mod tests {
                     previous: "20".into(),
                     applied: "5".into(),
                     path: "/proc/sys/vm/dirty_ratio".into(),
+                    category: None,
                 },
             ),
         ]);
@@ -2746,8 +2798,10 @@ mod tests {
                     "vm.overcommit_ratio".to_string(),
                     "0".to_string(),
                     "80".to_string(),
+                    None,
                 ),
                 sibling_cleared_record("vm.overcommit_kbytes", "8589934592")
+                    .map(|(param, previous, applied)| (param, previous, applied, None))
                     .expect("the fixed limit is recorded before the write"),
             ],
         );
@@ -2774,6 +2828,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "8589934592".into(),
                     path: "/proc/sys/vm/overcommit_kbytes".into(),
+                    category: None,
                 },
             ),
             (
@@ -2782,6 +2837,7 @@ mod tests {
                     previous: "80".into(),
                     applied: "0".into(),
                     path: "/proc/sys/vm/overcommit_ratio".into(),
+                    category: None,
                 },
             ),
         ]);
@@ -2846,6 +2902,7 @@ mod tests {
                     previous: "4194304".to_string(),
                     applied: "0".to_string(),
                     path: "/proc/sys/vm/overcommit_kbytes".to_string(),
+                    category: None,
                 },
             ),
             (
@@ -2854,6 +2911,7 @@ mod tests {
                     previous: "50".to_string(),
                     applied: "100".to_string(),
                     path: "/proc/sys/vm/overcommit_ratio".to_string(),
+                    category: None,
                 },
             ),
         ]);
@@ -2901,6 +2959,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "1073741824".into(),
                     path: bytes.to_str().unwrap().into(),
+                    category: None,
                 },
             ),
             (
@@ -2909,6 +2968,7 @@ mod tests {
                     previous: "20".into(),
                     applied: "0".into(),
                     path: ratio.to_str().unwrap().into(),
+                    category: None,
                 },
             ),
         ]);
@@ -2940,6 +3000,7 @@ mod tests {
                 previous: "1".to_string(),
                 applied: "176".to_string(),
                 path: "/proc/sys/kernel/sysrq".to_string(),
+                category: None,
             },
         );
         entries.insert(
@@ -2948,6 +3009,7 @@ mod tests {
                 previous: "none".to_string(),
                 applied: "mq-deadline".to_string(),
                 path: "/sys/block/sda/queue/scheduler".to_string(),
+                category: None,
             },
         );
         let (sysctl, nonsysctl) = render_persistence(&entries);
@@ -2986,6 +3048,7 @@ mod tests {
                 previous: "128".to_string(),
                 applied: "2048".to_string(),
                 path: node.to_str().unwrap().to_string(),
+                category: None,
             },
         )]);
         let script = render_persistence(&entries)
@@ -3021,6 +3084,7 @@ mod tests {
                 previous: "128".to_string(),
                 applied: "2048".to_string(),
                 path: node.to_str().unwrap().to_string(),
+                category: None,
             },
         )]);
         let script = render_persistence(&entries)
@@ -3055,6 +3119,7 @@ mod tests {
                     previous: "60".to_string(),
                     applied: "1".to_string(),
                     path: "/proc/sys/vm/swappiness".to_string(),
+                    category: None,
                 },
             ),
             (
@@ -3063,6 +3128,7 @@ mod tests {
                     previous: "core".to_string(),
                     applied: "|/tmp/evil".to_string(),
                     path: "/proc/sys/kernel/core_pattern".to_string(),
+                    category: None,
                 },
             ),
             (
@@ -3072,6 +3138,7 @@ mod tests {
                     applied: "10".to_string(),
                     // Innocent name, deny-listed recorded path.
                     path: "/proc/sys/kernel/modprobe".to_string(),
+                    category: None,
                 },
             ),
         ]);
@@ -3121,6 +3188,7 @@ mod tests {
                 "kernel.core_pattern".to_string(),
                 "core".to_string(),
                 "|/tmp/evil".to_string(),
+                None,
             )],
         )
         .unwrap();
@@ -3149,6 +3217,7 @@ mod tests {
                 "vm.swappiness".to_string(),
                 "60".to_string(),
                 "10".to_string(),
+                None,
             )],
         )
         .unwrap();
@@ -3368,6 +3437,7 @@ mod tests {
                 "vm.swappiness".to_string(),
                 "60".to_string(),
                 "10".to_string(),
+                None,
             )],
         )
         .unwrap();
@@ -3399,6 +3469,7 @@ mod tests {
                         previous: "60".to_string(),
                         applied: "1".to_string(),
                         path: "/proc/sys/vm/swappiness".to_string(),
+                        category: None,
                     },
                 ),
                 (
@@ -3407,6 +3478,7 @@ mod tests {
                         previous: "mq-deadline".to_string(),
                         applied: "none".to_string(),
                         path: "/sys/block/sda/queue/scheduler".to_string(),
+                        category: None,
                     },
                 ),
             ]
@@ -3533,6 +3605,7 @@ mod tests {
                             previous: "0".to_string(),
                             applied: "1".to_string(),
                             path: format!("/proc/sys/{p}"),
+                            category: None,
                         },
                     )
                 })
@@ -3724,6 +3797,7 @@ mod tests {
                 "net.ipv4.conf.eth0.100.forwarding".to_string(),
                 "0".to_string(),
                 "1".to_string(),
+                None,
             )],
         );
         let data = merge_entries(
@@ -3732,6 +3806,7 @@ mod tests {
                 "net/ipv4/conf/eth0.100/forwarding".to_string(),
                 "1".to_string(),
                 "1".to_string(),
+                None,
             )],
         );
         assert_eq!(data.entries.len(), 1, "aliases must share one entry");
@@ -3755,6 +3830,7 @@ mod tests {
                 "net.ipv4.neigh.eth0.100.gc_thresh3".to_string(),
                 "1024".to_string(),
                 "4096".to_string(),
+                None,
             )],
         );
         let data = merge_entries(
@@ -3763,6 +3839,7 @@ mod tests {
                 "net/ipv4/neigh/eth0.100/gc_thresh3".to_string(),
                 "4096".to_string(),
                 "4096".to_string(),
+                None,
             )],
         );
         assert_eq!(data.entries.len(), 1, "aliases must share one entry");
@@ -4226,11 +4303,11 @@ mod tests {
             };
             let data = merge_entries(
                 data,
-                [(first.to_string(), "10".to_string(), "20".to_string())],
+                [(first.to_string(), "10".to_string(), "20".to_string(), None)],
             );
             let data = merge_entries(
                 data,
-                [(second.to_string(), "20".to_string(), "30".to_string())],
+                [(second.to_string(), "20".to_string(), "30".to_string(), None)],
             );
             assert_eq!(data.entries.len(), 1, "aliases {first} / {second}");
             let entry = &data.entries[first];
@@ -4254,6 +4331,7 @@ mod tests {
                 "vm.swappiness".to_string(),
                 "20".to_string(),
                 "30".to_string(),
+                None,
             )],
         );
         assert_eq!(data.entries.len(), 1);
@@ -4261,6 +4339,234 @@ mod tests {
         assert_eq!(entry.previous, "10");
         assert_eq!(entry.applied, "30");
         assert_eq!(entry.path, "/proc/sys/vm/swappiness");
+    }
+
+    #[test]
+    fn merge_entries_records_the_rule_category() {
+        // Each entry remembers which rule layer wrote it. The category is a
+        // property of the rule, not of the parameter name — the second
+        // entry below is a security finding on a net.* knob — so the ledger
+        // is the only place a later `rollback --category` can find it.
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [
+                (
+                    "net.core.somaxconn".to_string(),
+                    "128".to_string(),
+                    "4096".to_string(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "net.core.bpf_jit_harden".to_string(),
+                    "0".to_string(),
+                    "1".to_string(),
+                    Some(Category::Security),
+                ),
+            ],
+        );
+        assert_eq!(
+            data.entries["net.core.somaxconn"].category,
+            Some(Category::Performance)
+        );
+        assert_eq!(
+            data.entries["net.core.bpf_jit_harden"].category,
+            Some(Category::Security)
+        );
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(json.contains(r#""category":"performance""#), "{json}");
+        assert!(json.contains(r#""category":"security""#), "{json}");
+    }
+
+    #[test]
+    fn merge_entries_keeps_the_earliest_previous_and_the_latest_category() {
+        // One rule for both extra fields: the pristine original is kept from
+        // the earliest write, the classification from the latest — the same
+        // way `applied` describes the latest write. A knob re-recorded under
+        // another category is selected by that category afterwards.
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [(
+                "vm.swappiness".to_string(),
+                "60".to_string(),
+                "10".to_string(),
+                Some(Category::Performance),
+            )],
+        );
+        let data = merge_entries(
+            data,
+            [(
+                "vm/swappiness".to_string(),
+                "10".to_string(),
+                "20".to_string(),
+                Some(Category::Security),
+            )],
+        );
+        assert_eq!(data.entries.len(), 1);
+        let entry = &data.entries["vm.swappiness"];
+        assert_eq!(
+            entry.previous, "60",
+            "the pristine original is the earliest"
+        );
+        assert_eq!(entry.applied, "20");
+        assert_eq!(
+            entry.category,
+            Some(Category::Security),
+            "the classification is the latest write's"
+        );
+    }
+
+    #[test]
+    fn a_write_without_a_rule_category_records_none() {
+        // The library import path records no category: the value came from a
+        // file, not from a rule recommendation, and the ledger must not
+        // invent a classification for it. The field is then absent from the
+        // file, so a reader that does not know it sees the old shape.
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::new(),
+        };
+        let data = merge_entries(
+            data,
+            [(
+                "vm.swappiness".to_string(),
+                "60".to_string(),
+                "40".to_string(),
+                None,
+            )],
+        );
+        assert_eq!(data.entries["vm.swappiness"].category, None);
+        let json = serde_json::to_string(&data).unwrap();
+        assert!(!json.contains("category"), "{json}");
+        // Re-recording the knob through a rule classifies it, and the
+        // pristine original survives the refresh.
+        let data = merge_entries(
+            data,
+            [(
+                "vm.swappiness".to_string(),
+                "40".to_string(),
+                "10".to_string(),
+                Some(Category::Performance),
+            )],
+        );
+        let entry = &data.entries["vm.swappiness"];
+        assert_eq!(entry.category, Some(Category::Performance));
+        assert_eq!(entry.previous, "60");
+        assert_eq!(entry.applied, "10");
+    }
+
+    #[test]
+    fn a_ledger_without_categories_re_saves_without_adding_the_key() {
+        // A ledger written before the field existed: reading it must not
+        // invent a category, and the restore that keeps one of its entries
+        // must re-save that entry without adding the key — the record it had
+        // is the record it keeps.
+        let dir = AtomicTestDir::new("legacy-ledger-roundtrip");
+        let (conf, service, script) = fixture_paths(&dir);
+        let swappiness = dir.0.join("swappiness");
+        let somaxconn = dir.0.join("somaxconn");
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&somaxconn, "4096").unwrap();
+        let ledger = dir.0.join("rollback.json");
+        fs::write(
+            &ledger,
+            format!(
+                r#"{{"version":1,"entries":{{
+                    "net.core.somaxconn":{{"previous":"128","applied":"4096","path":"{}"}},
+                    "vm.swappiness":{{"previous":"60","applied":"10","path":"{}"}}
+                }}}}"#,
+                somaxconn.display(),
+                swappiness.display(),
+            ),
+        )
+        .unwrap();
+        let path = ledger.to_str().unwrap().to_string();
+        let data = load_rollback_from(&path).unwrap();
+        assert_eq!(data.entries["vm.swappiness"].category, None);
+
+        // Restoring one entry leaves the other, so the ledger is rewritten
+        // from a record that never had a category.
+        let (key, outcome) =
+            rollback_param_at("vm.swappiness", &path, &conf, &service, &script).unwrap();
+        assert_eq!(key, "vm.swappiness");
+        assert!(outcome.is_complete());
+        let raw = fs::read_to_string(&ledger).unwrap();
+        assert!(!raw.contains("category"), "re-saving added the key: {raw}");
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed["entries"]["net.core.somaxconn"],
+            serde_json::json!({
+                "previous": "128", "applied": "4096", "path": somaxconn.to_str().unwrap(),
+            })
+        );
+    }
+
+    #[test]
+    fn heal_alias_duplicates_keeps_the_latest_classification() {
+        // Two spellings of one kernel path chained by their values collapse
+        // to the earlier key with the later write's `applied` — and its
+        // category, for the same reason: the classification describes the
+        // record that survived.
+        let data: RollbackData = serde_json::from_str(
+            r#"{"version":1,"entries":{
+                "vm.swappiness":{
+                    "previous":"60","applied":"10",
+                    "path":"/proc/sys/vm/swappiness","category":"performance"
+                },
+                "vm/swappiness":{
+                    "previous":"10","applied":"20",
+                    "path":"/proc/sys/vm/swappiness","category":"security"
+                }
+            }}"#,
+        )
+        .unwrap();
+        let data = merge_entries(data, []);
+        assert_eq!(data.entries.len(), 1);
+        let entry = &data.entries["vm.swappiness"];
+        assert_eq!(entry.previous, "60");
+        assert_eq!(entry.applied, "20");
+        assert_eq!(entry.category, Some(Category::Security));
+    }
+
+    #[test]
+    fn a_cleared_sibling_inherits_the_category_of_its_clearer() {
+        // The twin has no rule of its own — the kernel zeroed it as a side
+        // effect of the write — so it is classified like the knob that
+        // cleared it: the pair is one restore unit, and a category that
+        // selects one half must select the other.
+        let dir = AtomicTestDir::new("sibling-category");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        let cleared = sibling_cleared_record("vm.dirty_ratio", "20").expect("configured twin");
+        let knob = Recommendation {
+            param: "vm.dirty_bytes".to_string(),
+            current_value: "0".to_string(),
+            recommended_value: "1073741824".to_string(),
+            category: Category::Security,
+            writable: true,
+            ..Default::default()
+        };
+        let sibling = sibling_rec(cleared, knob.category.clone());
+        let guard = lock_ledger_at(path).unwrap();
+        save_rollback(&guard, &[knob, sibling]).unwrap();
+        let data = load_rollback_from(path).unwrap();
+        assert_eq!(
+            data.entries["vm.dirty_bytes"].category,
+            Some(Category::Security)
+        );
+        assert_eq!(
+            data.entries["vm.dirty_ratio"].category,
+            Some(Category::Security),
+            "the cleared twin shares its clearer's classification"
+        );
+        assert_eq!(data.entries["vm.dirty_ratio"].applied, "0");
     }
 
     /// A ledger entry whose recorded `path` predates the dotted-interface
@@ -4289,6 +4595,7 @@ mod tests {
                 "net.ipv4.conf.Br0.100.forwarding".to_string(),
                 "0".to_string(),
                 "1".to_string(),
+                None,
             )],
         );
         assert_eq!(data.entries.len(), 1);
@@ -4313,11 +4620,13 @@ mod tests {
                     "vm.swappiness".to_string(),
                     "10".to_string(),
                     "20".to_string(),
+                    None,
                 ),
                 (
                     "vm.swappiness_extra".to_string(),
                     "40".to_string(),
                     "50".to_string(),
+                    None,
                 ),
             ],
         );
@@ -4345,6 +4654,7 @@ mod tests {
                     first.to_string(),
                     "before".to_string(),
                     "middle".to_string(),
+                    None,
                 )],
             );
             let data = merge_entries(
@@ -4353,6 +4663,7 @@ mod tests {
                     second.to_string(),
                     "middle".to_string(),
                     "after".to_string(),
+                    None,
                 )],
             );
             assert_eq!(data.entries.len(), 1, "aliases {first} / {second}");
@@ -4373,7 +4684,10 @@ mod tests {
         for (param, applied) in [("vm.swappiness", "20"), ("vm/swappiness", "30")] {
             let previous = fs::read_to_string(&path).unwrap();
             fs::write(&path, applied).unwrap();
-            data = merge_entries(data, [(param.to_string(), previous, applied.to_string())]);
+            data = merge_entries(
+                data,
+                [(param.to_string(), previous, applied.to_string(), None)],
+            );
         }
         assert_eq!(fs::read_to_string(&path).unwrap(), "30");
         // Run the production restore loop against a temporary parameter file;
@@ -4437,6 +4751,7 @@ mod tests {
                 "net.core.somaxconn".to_string(),
                 "128".to_string(),
                 "4096".to_string(),
+                None,
             )],
         );
         assert_eq!(data.entries.len(), 2, "one entry per knob");
@@ -4567,6 +4882,7 @@ mod tests {
                     previous: "10".to_string(),
                     applied: "20".to_string(),
                     path: path.to_str().unwrap().to_string(),
+                    category: None,
                 },
             );
         }
@@ -4599,6 +4915,7 @@ mod tests {
                 previous: "10".to_string(),
                 applied: "20".to_string(),
                 path: "/proc/sys/kernel/core_pattern".to_string(),
+                category: None,
             },
         );
         let data = RollbackData {
@@ -4645,6 +4962,7 @@ mod tests {
                     previous: "10".to_string(),
                     applied: "30".to_string(),
                     path: path.to_str().unwrap().to_string(),
+                    category: None,
                 },
             );
         }
@@ -4702,6 +5020,7 @@ mod tests {
                     previous: previous.to_string(),
                     applied: applied.to_string(),
                     path,
+                    category: None,
                 },
             );
         }
@@ -4770,6 +5089,7 @@ mod tests {
                     previous: "8589934592".into(),
                     applied: "0".into(),
                     path: kbytes_path.clone(),
+                    category: None,
                 },
             ),
             (
@@ -4778,6 +5098,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "80".into(),
                     path: ratio_path.clone(),
+                    category: None,
                 },
             ),
         ]);
@@ -4834,6 +5155,7 @@ mod tests {
                     previous: "10".to_string(),
                     applied: "30".to_string(),
                     path: path.to_str().unwrap().to_string(),
+                    category: None,
                 },
             );
         }
@@ -4863,6 +5185,7 @@ mod tests {
                 "vm.swappiness".to_string(),
                 "10".to_string(),
                 "20".to_string(),
+                None,
             )],
         );
         // Run 2: a second tune sees the CURRENT value (20) as "previous" and
@@ -4873,6 +5196,7 @@ mod tests {
                 "vm.swappiness".to_string(),
                 "20".to_string(),
                 "30".to_string(),
+                None,
             )],
         );
         let e = data.entries.get("vm.swappiness").expect("entry present");
@@ -5588,7 +5912,11 @@ mod tests {
         let dir = AtomicTestDir::new("preview-race");
         let ledger = dir.0.join("rollback.json");
         let path = ledger.to_str().unwrap();
-        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        merge_rollback_at(
+            path,
+            [("vm.swappiness".into(), "60".into(), "10".into(), None)],
+        )
+        .unwrap();
         ARM_FINALIZE_RACE_PROBE.store(true, Ordering::SeqCst);
         let entries = rollback_preview_at(path)
             .expect("preview must survive a concurrent finalize's delete window");
@@ -5627,7 +5955,12 @@ mod tests {
                 barrier_a.wait();
                 merge_rollback_at(
                     ledger_a.to_str().unwrap(),
-                    [("vm.audit_a".to_string(), "60".to_string(), "10".to_string())],
+                    [(
+                        "vm.audit_a".to_string(),
+                        "60".to_string(),
+                        "10".to_string(),
+                        None,
+                    )],
                 )
             });
             let join_b = std::thread::spawn(move || {
@@ -5638,6 +5971,7 @@ mod tests {
                         "net.core.audit_b".to_string(),
                         "128".to_string(),
                         "4096".to_string(),
+                        None,
                     )],
                 )
             });
@@ -6286,7 +6620,11 @@ mod tests {
         let data = load_rollback_from(path).unwrap();
         assert_eq!(data.version, 1);
         assert!(data.entries.is_empty());
-        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        merge_rollback_at(
+            path,
+            [("vm.swappiness".into(), "60".into(), "10".into(), None)],
+        )
+        .unwrap();
         let data = load_rollback_from(path).unwrap();
         assert_eq!(data.entries["vm.swappiness"].previous, "60");
         assert_eq!(data.entries["vm.swappiness"].applied, "10");
@@ -6301,12 +6639,21 @@ mod tests {
         let dir = AtomicTestDir::new("ledger-valid");
         let ledger = dir.0.join("rollback.json");
         let path = ledger.to_str().unwrap();
-        merge_rollback_at(path, [("vm.swappiness".into(), "60".into(), "10".into())]).unwrap();
+        merge_rollback_at(
+            path,
+            [("vm.swappiness".into(), "60".into(), "10".into(), None)],
+        )
+        .unwrap();
         merge_rollback_at(
             path,
             [
-                ("vm.swappiness".into(), "10".into(), "20".into()),
-                ("net.core.somaxconn".into(), "128".into(), "256".into()),
+                ("vm.swappiness".into(), "10".into(), "20".into(), None),
+                (
+                    "net.core.somaxconn".into(),
+                    "128".into(),
+                    "256".into(),
+                    None,
+                ),
             ],
         )
         .unwrap();
@@ -6331,9 +6678,11 @@ mod tests {
             fs::write(&ledger, contents).unwrap();
             fs::set_permissions(&ledger, fs::Permissions::from_mode(0o640)).unwrap();
             fs::set_permissions(&dir.0, fs::Permissions::from_mode(0o755)).unwrap();
-            let error =
-                merge_rollback_at(path, [("vm.swappiness".into(), "10".into(), "20".into())])
-                    .expect_err("invalid ledger must prevent a replacement");
+            let error = merge_rollback_at(
+                path,
+                [("vm.swappiness".into(), "10".into(), "20".into(), None)],
+            )
+            .expect_err("invalid ledger must prevent a replacement");
             assert!(error.to_string().contains(path), "{error:#}");
             assert_eq!(fs::read(&ledger).unwrap(), contents);
             assert_eq!(
@@ -6867,6 +7216,7 @@ mod tests {
                     previous: "60".into(),
                     applied: "10".into(),
                     path: "/proc/sys/vm/swappiness".into(),
+                    category: None,
                 },
             ),
             (
@@ -6875,6 +7225,7 @@ mod tests {
                     previous: "50".into(),
                     applied: "100".into(),
                     path: "/proc/sys/vm/overcommit_ratio".into(),
+                    category: None,
                 },
             ),
             (
@@ -6883,6 +7234,7 @@ mod tests {
                     previous: "0".into(),
                     applied: "1".into(),
                     path: "/proc/sys/net/ipv4/conf/Br0.100/forwarding".into(),
+                    category: None,
                 },
             ),
             (
@@ -6891,6 +7243,7 @@ mod tests {
                     previous: "mq-deadline".into(),
                     applied: "none".into(),
                     path: "/sys/block/sda/queue/scheduler".into(),
+                    category: None,
                 },
             ),
         ]);
@@ -8189,6 +8542,7 @@ mod tests {
                         previous: "128".into(),
                         applied: "4096".into(),
                         path: somaxconn.to_str().unwrap().to_string(),
+                        category: None,
                     },
                 ),
                 (
@@ -8197,6 +8551,7 @@ mod tests {
                         previous: "60".into(),
                         applied: "10".into(),
                         path: swappiness.to_str().unwrap().to_string(),
+                        category: None,
                     },
                 ),
             ]),

@@ -9,7 +9,15 @@ pub enum Confidence {
     Medium, // Workload-deterministic, high probability
 }
 
-#[derive(Debug, Clone, PartialEq, Default)]
+/// The rule layer's own classification of a finding: a performance
+/// opportunity or a hardening one. It is a property of the rule, not of the
+/// parameter name — `net.core.bpf_jit_harden` is a security finding on a
+/// `net.*` knob — so a consumer that has to answer "which category did this
+/// write come from" later (the rollback ledger records it per entry) must
+/// carry the value instead of re-deriving it from the name. The serde
+/// spelling is the lowercase one `check` publishes for the same field.
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Category {
     #[default]
     Performance,
