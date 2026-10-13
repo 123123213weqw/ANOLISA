@@ -2244,7 +2244,16 @@ fn save_ledger_at(path: &str, data: &RollbackData) -> Result<()> {
 /// the per-interface families keep their literal dots and case (`Br0.100`
 /// stays a different identity from `br0.100`). Pure so the lookup contract is
 /// unit-testable.
+///
+/// The canonicalization is for the recorded side; a user-supplied spelling
+/// that [`is_safe_param`] rejects (`vm..swappiness`, `/vm.swappiness`, a `..`
+/// segment) addresses no entry, even when the kernel would collapse it onto a
+/// recorded path — `why`, `check --only`, `fix` and `tune --exclude` treat the
+/// same spelling as an unknown name.
 fn ledger_key_for(entries: &BTreeMap<String, RollbackEntry>, param: &str) -> Option<String> {
+    if !is_safe_param(param) {
+        return None;
+    }
     let wanted = canonicalize_path(&param_to_path(param));
     entries
         .iter()
@@ -7948,6 +7957,49 @@ mod tests {
             "{error:#}"
         );
         assert!(!missing.exists(), "the refusal must not create a ledger");
+    }
+
+    /// A degenerate spelling addresses no ledger entry, even though the
+    /// kernel would collapse it onto a recorded path: `why`, `check --only`,
+    /// `fix` and `tune --exclude` all treat it as an unknown name, and
+    /// [`is_safe_param`] defines it as invalid. Every rollback form resolves
+    /// names through [`match_ledger_keys`], so a positional refuses the
+    /// command and an `--exclude` value reports it unmatched.
+    #[test]
+    fn rollback_params_refuses_a_degenerate_spelling() {
+        let dir = AtomicTestDir::new("rollback-params-degenerate");
+        let (conf, service, script) = fixture_paths(&dir);
+        let swappiness = dir.0.join("swappiness");
+        fs::write(&swappiness, "10").unwrap();
+        let ledger = fixture_ledger(
+            &dir,
+            &[("vm.swappiness", "60", "10", swappiness.to_str().unwrap())],
+        );
+        let conf_before = "vm.swappiness = 10\n";
+        fs::write(&conf, conf_before).unwrap();
+        let ledger_before = fs::read_to_string(&ledger).unwrap();
+
+        for spelling in [
+            "vm..swappiness",
+            "vm//swappiness",
+            "vm.swappiness.",
+            "/vm.swappiness",
+            "kernel/../vm/swappiness",
+        ] {
+            let error =
+                rollback_params_at(&[spelling.to_string()], &ledger, &conf, &service, &script)
+                    .err()
+                    .unwrap_or_else(|| panic!("{spelling} must refuse the command"));
+            assert!(error.to_string().contains("not recorded"), "{error:#}");
+            assert_eq!(fs::read_to_string(&swappiness).unwrap(), "10", "{spelling}");
+            assert_eq!(fs::read_to_string(&ledger).unwrap(), ledger_before);
+            assert_eq!(fs::read_to_string(&conf).unwrap(), conf_before);
+
+            let data: RollbackData = serde_json::from_str(&ledger_before).unwrap();
+            let (keys, unmatched) = match_ledger_keys(&data.entries, &[spelling.to_string()]);
+            assert!(keys.is_empty(), "{spelling} matched {keys:?}");
+            assert_eq!(unmatched, [spelling.to_string()]);
+        }
     }
 
     /// A batch where one unit lands and another does not retires only the unit
