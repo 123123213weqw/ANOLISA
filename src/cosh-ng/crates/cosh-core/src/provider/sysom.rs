@@ -150,7 +150,22 @@ impl SysomProvider {
         messages: &[Message],
         tools: &[ToolDeclaration],
         config: &GenerateConfig,
-    ) -> Value {
+    ) -> Result<Value, String> {
+        // Fields this builder constructs below. `tool_choice` and
+        // `instance_id` are owned here but not by the generic OpenAI-compatible
+        // builder, so the set is enumerated per provider.
+        const OWNED_REQUEST_FIELDS: [&str; 8] = [
+            "messages",
+            "model",
+            "stream",
+            "use_dashscope",
+            "version",
+            "tools",
+            "tool_choice",
+            "instance_id",
+        ];
+        super::reject_owned_field_overrides(&OWNED_REQUEST_FIELDS, config.extra_params.as_ref())?;
+
         let mut inner = serde_json::json!({
             "messages": messages,
             "model": config.model,
@@ -200,9 +215,9 @@ impl SysomProvider {
         super::clamp_output_cap_fields(&mut inner, config.max_tokens);
 
         // Wrap in llmParamString
-        serde_json::json!({
+        Ok(serde_json::json!({
             "llmParamString": inner.to_string()
-        })
+        }))
     }
 
     /// Compute ACS3-HMAC-SHA256 authorization header.
@@ -271,7 +286,7 @@ impl ContentGenerator for SysomProvider {
         self.cancelled.store(false, Ordering::SeqCst);
         self.instance_id.get_or_init(resolve_instance_id).await;
 
-        let body = self.build_request_body(messages, tools, config);
+        let body = self.build_request_body(messages, tools, config)?;
         let body_bytes = serde_json::to_vec(&body).map_err(|e| format!("JSON serialize: {e}"))?;
 
         if self.refresh_from_ecs_metadata
