@@ -2086,7 +2086,10 @@ fn eval_rq_affinity_at(
 /// `kernel/params.c`:185-186 in v6.6, :14-18 and :182-183 in 7.3-rc6), so a
 /// `threadirqs` token behind the separator never enables the mode.
 fn irqs_forced_threaded(cmdline_path: &str, version_path: &str) -> bool {
-    if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
+    // Lossy: the loader passes the command line as bytes (a `root=LABEL=` in
+    // a legacy encoding), and only the ASCII `threadirqs` token decides.
+    if let Ok(bytes) = std::fs::read(cmdline_path) {
+        let cmdline = String::from_utf8_lossy(&bytes);
         // The early parameter accepts both spellings; `setup_forced_irqthreads`
         // ignores the value.
         //
@@ -2906,8 +2909,10 @@ fn eval_core_uses_pid_at(
     if !info.param_exists(path) {
         return 1;
     }
-    if let Ok(pattern) = std::fs::read_to_string(pattern_path) {
-        if core_pattern_records_the_pid(&pattern) {
+    // Lossy: the pattern is a path the administrator chose, and a directory
+    // name that is not UTF-8 must not hide the `%p` that follows it.
+    if let Ok(pattern) = std::fs::read(pattern_path) {
+        if core_pattern_records_the_pid(&String::from_utf8_lossy(&pattern)) {
             return 1;
         }
     }
@@ -15345,6 +15350,55 @@ mod tests {
             }
         }
         std::fs::remove_file(&pattern).ok();
+    }
+
+    /// `kernel.core_pattern` and `/proc/cmdline` are kernel text that carries
+    /// whatever bytes the administrator or the boot loader wrote: a core
+    /// directory or a `root=LABEL=` value that is not UTF-8 made the strict
+    /// read fail, and each rule then fell back to its "unreadable" answer —
+    /// the core_uses_pid advice despite a `%p` pattern, and no forced
+    /// threading despite `threadirqs`.
+    #[test]
+    fn kernel_text_with_non_utf8_bytes_is_still_read() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_kernel_text_bytes_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, content: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let param = write("core_uses_pid", b"0\n");
+        let pattern = write("pattern-pid", b"/var/crash/\xff\xfe/core.%p\n");
+        let mut recs = Vec::new();
+        eval_core_uses_pid_at(
+            &make_test_info(),
+            &mut recs,
+            param.to_str().unwrap(),
+            pattern.to_str().unwrap(),
+        );
+        assert!(
+            recs.is_empty(),
+            "a %p pattern already records the pid, whatever its directory's bytes"
+        );
+
+        let cmdline = write(
+            "cmdline",
+            b"BOOT_IMAGE=/vmlinuz root=LABEL=\xc8\xed threadirqs quiet\n",
+        );
+        let version = write(
+            "version",
+            b"Linux version 6.6.0 (gcc) #1 SMP PREEMPT_DYNAMIC\n",
+        );
+        assert!(irqs_forced_threaded(
+            cmdline.to_str().unwrap(),
+            version.to_str().unwrap()
+        ));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
