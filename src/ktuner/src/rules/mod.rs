@@ -3341,6 +3341,25 @@ fn eval_busy_poll(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     eval_busy_poll_at(info, recs, "/proc/sys/net/core/busy_poll")
 }
 
+/// Whether the host runs a service whose network round-trips sit on the
+/// request path — the gate busy_poll and its twin busy_read share, so the two
+/// lists cannot drift apart.
+fn runs_busy_polling_service(info: &SystemInfo) -> bool {
+    info.has_process("redis-server")
+        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
+        // `valkey-server` binary with the same event-loop, memory-resident
+        // cache workload, so the redis-server gates must count it too.
+        || info.has_process("valkey-server")
+        || info.has_process("memcached")
+        || info.has_process("nginx")
+        || info.has_process("postgres")
+        || info.has_process("mysqld")
+        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
+        || info.has_process("mariadbd")
+        || info.has_process("mongod")
+        || info.has_process("clickhouse")
+}
+
 /// Path-injectable form of [`eval_busy_poll`] (the `eval_*_at` idiom) so the
 /// workload gate is assertable against a temp file on any host.
 ///
@@ -3357,20 +3376,7 @@ fn eval_busy_poll_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
         return 1;
     }
     let current = read_sysctl_u64(path);
-    let is_latency_sensitive = info.has_process("redis-server")
-        // Valkey is the Linux Foundation's fork of Redis 7.2.4 - a drop-in
-        // `valkey-server` binary with the same event-loop, memory-resident
-        // cache workload, so the redis-server gates must count it too.
-        || info.has_process("valkey-server")
-        || info.has_process("memcached")
-        || info.has_process("nginx")
-        || info.has_process("postgres")
-        || info.has_process("mysqld")
-        // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
-        || info.has_process("mariadbd")
-        || info.has_process("mongod")
-        || info.has_process("clickhouse");
-    if is_latency_sensitive && current == 0 {
+    if runs_busy_polling_service(info) && current == 0 {
         recs.push(Recommendation {
             param: "net.core.busy_poll".to_string(),
             current_value: "0".to_string(),
@@ -4268,7 +4274,8 @@ fn eval_busy_read(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 /// gate alone fired on every 10 GbE host: a backup or file server got
 /// busy_read=50 and every blocking read on the host started spinning
 /// through a 50 us poll for a workload nobody tuned for. Require the same
-/// services as the twin, on top of the 10 GbE premise the reason states.
+/// services as the twin ([`runs_busy_polling_service`]), on top of the 10 GbE
+/// premise the reason states.
 fn eval_busy_read_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
@@ -4277,11 +4284,7 @@ fn eval_busy_read_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
     if max_speed < 10000 {
         return 1;
     }
-    let is_latency_sensitive = info.has_process("redis-server")
-        || info.has_process("memcached")
-        || info.has_process("nginx")
-        || info.has_process("clickhouse");
-    if !is_latency_sensitive {
+    if !runs_busy_polling_service(info) {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -11941,6 +11944,59 @@ mod tests {
             recs.iter().all(|r| r.param != "net.core.busy_read"),
             "a 1 GbE link is not the busy-read case even for redis"
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// busy_read gates on "the same services as the twin", so every service
+    /// that earns a 10 GbE host the busy_poll advice must earn it busy_read
+    /// too: the twin's list grew the OLTP databases and valkey after the
+    /// busy_read gate copied it.
+    #[test]
+    fn busy_read_counts_every_service_its_twin_counts() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_busy_twins_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let read_knob = dir.join("busy_read");
+        let poll_knob = dir.join("busy_poll");
+        std::fs::write(&read_knob, "0\n").unwrap();
+        std::fs::write(&poll_knob, "0\n").unwrap();
+
+        for name in [
+            "redis-server",
+            "valkey-server",
+            "memcached",
+            "nginx",
+            "postgres",
+            "mysqld",
+            "mariadbd",
+            "mongod",
+            "clickhouse",
+        ] {
+            let mut info = make_test_info();
+            info.network = vec![NetInfo {
+                name: "eth0".to_string(),
+                speed_mbps: 10000,
+            }];
+            info.processes = vec![ProcessInfo {
+                name: name.to_string(),
+            }];
+            let mut recs = Vec::new();
+            eval_busy_poll_at(&info, &mut recs, poll_knob.to_str().unwrap());
+            assert!(
+                recs.iter().any(|r| r.param == "net.core.busy_poll"),
+                "{name} is one of busy_poll's services"
+            );
+            eval_busy_read_at(&info, &mut recs, read_knob.to_str().unwrap());
+            assert!(
+                recs.iter().any(|r| r.param == "net.core.busy_read"),
+                "{name} on 10 GbE gets busy_poll, so it must get its twin busy_read"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
