@@ -1000,12 +1000,21 @@ fn fix_dry_run_output(rec: &Recommendation) -> serde_json::Value {
 /// sysctls (mode 0200, e.g. vm.compact_memory) and transient EIO must not
 /// collapse into an empty "current". One named reader so the single-parameter
 /// path and the batch read every file by the same policy.
+///
+/// The bytes are decoded lossily. A string sysctl holds raw bytes (a
+/// latin-1 `kernel.hostname`, a legacy-encoded `kernel.core_pattern`), and
+/// `read_to_string` rejected the whole file over one of them, so `why`
+/// refused a parameter whose value is right there with the error code the
+/// README reserves for a file that cannot be read at all — the same
+/// rejection detect's comm / cmdline / cpuinfo readers decode lossily to
+/// avoid. Only the encoding stops being a failure: a read that really failed
+/// still is one.
 fn read_current_value(path: &str) -> Result<Option<String>, std::io::Error> {
     let path = std::path::Path::new(path);
     if !path.exists() {
         return Ok(None);
     }
-    std::fs::read_to_string(path).map(Some)
+    std::fs::read(path).map(|bytes| Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 /// JSON body of `ktuner why` for two or more positionals: `count` and one
@@ -3796,6 +3805,64 @@ mod tests {
             msg.contains("cannot read current value") && msg.contains("vm.compact_memory"),
             "error must name the parameter and the failed read: {msg}"
         );
+    }
+
+    /// A string sysctl is stored as raw bytes: `sethostname(2)` accepts any
+    /// non-NUL byte up to the length limit (the util-linux `hostname` tool's
+    /// charset check and systemd's hostname validation are policy, not the
+    /// kernel), so one non-UTF-8 byte in `kernel.hostname` — or in
+    /// `kernel.domainname` / `kernel.core_pattern`, which root writes as raw
+    /// bytes — made `read_to_string` reject the whole file. `why` then
+    /// refused a parameter that is right there with exit 2, contradicting the
+    /// README ("read from its own sysfs/sysctl file … answers with its
+    /// current value and exits 0"), while every other reader in the crate
+    /// decodes such files lossily (detect's comm / cmdline / cpuinfo readers).
+    /// Only the encoding is no longer a failure: an absent path is still "not
+    /// found" and a read that really failed is still an error.
+    #[test]
+    fn why_reads_a_value_the_kernel_stored_as_raw_bytes() {
+        let dir = std::env::temp_dir().join(format!("ktuner-why-raw-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("hostname");
+        std::fs::write(&raw, b"caf\xe9-host\n").unwrap();
+        let value = read_current_value(raw.to_str().unwrap())
+            .expect("a readable file must not fail on its encoding")
+            .expect("an existing path reads as a value");
+        assert_eq!(value.trim(), "caf\u{fffd}-host");
+        // The two states that are still not values: an absent path is the
+        // "not found" answer, and a read that really failed (the path is a
+        // directory, like a write-only knob's EACCES) stays an error.
+        assert!(read_current_value(dir.join("gone").to_str().unwrap())
+            .expect("an absent path is not an error")
+            .is_none());
+        assert!(read_current_value(dir.to_str().unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same value through the command's own answer: `why kernel.hostname`
+    /// on a host whose hostname holds a non-UTF-8 byte reads `optimal` with
+    /// the (lossily decoded) value and exits 0, instead of refusing the
+    /// parameter with the README's error code.
+    #[test]
+    fn why_answers_for_a_file_the_kernel_stored_as_raw_bytes() {
+        let dir =
+            std::env::temp_dir().join(format!("ktuner-why-raw-answer-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let raw = dir.join("hostname");
+        std::fs::write(&raw, b"caf\xe9-host\n").unwrap();
+        let eval = evaluation(Vec::new());
+        // The reader is injected (the why_with seam): the path under test is
+        // the fixture, not /proc/sys/kernel/hostname.
+        let read = |_path: &str| read_current_value(raw.to_str().unwrap());
+        let (output, code) = why_with("kernel.hostname", &eval, read)
+            .expect("a readable parameter must be answered, not refused");
+        assert_eq!(output["param"], json!("kernel.hostname"));
+        assert_eq!(output["current"], json!("caf\u{fffd}-host"));
+        assert_eq!(output["status"], json!("optimal"));
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
