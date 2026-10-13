@@ -6971,7 +6971,22 @@ fn interfaces_accepting_ra(conf_root: &std::path::Path) -> Vec<String> {
         // The per-device slot is a plain proc_dointvec (net/ipv6/addrconf.c)
         // read as a truthiness test when forwarding is off, so -1 counts as
         // accepting; an unreadable file is not evidence and does not.
-        if read_sysctl_i64(&entry.path().join("accept_ra").to_string_lossy()) != 0 {
+        // The kernel's own test, not a bare truthiness check: `ipv6_accept_ra()`
+        // (v6.6 include/net/ipv6.h:537-544) honours a plain 1 only while the
+        // interface does not forward, and `ip6_rcv_core()` (net/ipv6/
+        // ip6_input.c:171-173) drops every IPv6 packet on an interface whose
+        // disable_ipv6 is set, so no RA reaches it at all.
+        let read = |file: &str| read_sysctl_i64(&entry.path().join(file).to_string_lossy());
+        if read("disable_ipv6") != 0 {
+            continue;
+        }
+        let accept_ra = read("accept_ra");
+        let accepts = if read("forwarding") != 0 {
+            accept_ra == 2
+        } else {
+            accept_ra != 0
+        };
+        if accepts {
             names.push(name);
         }
     }
@@ -14301,6 +14316,58 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An interface is named only when the kernel would act on an RA there.
+    /// `ipv6_accept_ra()` (v6.6 include/net/ipv6.h:537-544) ignores a plain
+    /// `accept_ra = 1` on a forwarding interface (only the hybrid 2 counts), and
+    /// `ip6_rcv_core()` (net/ipv6/ip6_input.c:171-173) drops every IPv6 packet
+    /// on an interface with `disable_ipv6 = 1`. The rule reaches this list with
+    /// forwarding interfaces when the template itself is the hybrid 2.
+    #[test]
+    fn accept_ra_names_only_interfaces_that_act_on_an_ra() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_accept_ra_live_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let conf = dir.join("conf");
+        // (interface, forwarding, accept_ra, disable_ipv6)
+        for (iface, forwarding, accept_ra, disabled) in [
+            ("default", "0", "2", "0"),
+            ("all", "1", "2", "0"),
+            ("eth0", "0", "1", "0"),
+            ("eth1", "1", "1", "0"),
+            ("eth2", "1", "2", "0"),
+            ("eth3", "0", "1", "1"),
+        ] {
+            std::fs::create_dir_all(conf.join(iface)).unwrap();
+            std::fs::write(
+                conf.join(iface).join("forwarding"),
+                format!("{forwarding}\n"),
+            )
+            .unwrap();
+            std::fs::write(conf.join(iface).join("accept_ra"), format!("{accept_ra}\n")).unwrap();
+            std::fs::write(
+                conf.join(iface).join("disable_ipv6"),
+                format!("{disabled}\n"),
+            )
+            .unwrap();
+        }
+        let path = conf.join("default/accept_ra");
+
+        let mut recs = Vec::new();
+        eval_accept_ra_at(&make_test_info(), &mut recs, path.to_str().unwrap(), &conf);
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "net.ipv6.conf.default.accept_ra")
+            .expect("the hybrid template is a finding even on a forwarding host");
+        assert!(
+            rec.reason.contains("现有接口 eth0、eth2 仍在接受 RA"),
+            "eth1 forwards with accept_ra 1 and eth3 has IPv6 disabled: {}",
+            rec.reason
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
