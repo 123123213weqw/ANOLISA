@@ -6961,7 +6961,11 @@ fn interfaces_accepting_ra(conf_root: &std::path::Path) -> Vec<String> {
     let mut names: Vec<String> = Vec::new();
     for entry in entries.filter_map(|entry| entry.ok()) {
         let name = entry.file_name().to_string_lossy().to_string();
-        if name == "all" || name == "default" {
+        // `lo` is each namespace's loopback device (net/core/loopback.c
+        // registers it under that fixed name): it inherits the template's
+        // accept_ra like any device, but no Router Advertisement arrives on
+        // it from the network, so there is nothing for the operator to write.
+        if name == "all" || name == "default" || name == "lo" {
             continue;
         }
         // The per-device slot is a plain proc_dointvec (net/ipv6/addrconf.c)
@@ -14297,6 +14301,40 @@ mod tests {
             );
         }
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Each network namespace's loopback device is `lo` (net/core/loopback.c
+    /// registers it under that fixed name), and it carries the template's
+    /// `accept_ra` = 1 like any other device, but no Router Advertisement ever
+    /// arrives on it from the network. Naming it sent the operator to write a
+    /// per-interface value that guards nothing — on every host.
+    #[test]
+    fn accept_ra_does_not_name_the_loopback_device() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_accept_ra_lo_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let conf = dir.join("conf");
+        for iface in ["default", "all", "lo", "eth0"] {
+            std::fs::create_dir_all(conf.join(iface)).unwrap();
+            std::fs::write(conf.join(iface).join("forwarding"), "0\n").unwrap();
+            std::fs::write(conf.join(iface).join("accept_ra"), "1\n").unwrap();
+        }
+        let path = conf.join("default/accept_ra");
+
+        let mut recs = Vec::new();
+        eval_accept_ra_at(&make_test_info(), &mut recs, path.to_str().unwrap(), &conf);
+        let rec = recs
+            .iter()
+            .find(|r| r.param == "net.ipv6.conf.default.accept_ra")
+            .expect("an accepting template on a non-forwarding host is a finding");
+        assert!(
+            rec.reason.contains("现有接口 eth0 仍在接受 RA"),
+            "only eth0 is named; the loopback device receives no Router Advertisements: {}",
+            rec.reason
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
