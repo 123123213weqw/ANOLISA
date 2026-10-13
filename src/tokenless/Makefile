@@ -342,6 +342,7 @@ test-integration: test-hook-parity test-claude-code-detect test-toon-cleanup tes
 	python3 tests/test_verify_release_versions.py
 	python3 tests/test_qwenpaw_plugin.py
 	python3 tests/test_cosh_ng_compat.py
+	python3 tests/test_stats_http.py
 
 .PHONY: test-headroom-pipeline-worker
 test-headroom-pipeline-worker:
