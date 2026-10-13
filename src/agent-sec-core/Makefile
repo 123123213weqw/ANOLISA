@@ -166,14 +166,19 @@ test-python-coverage: ## Run Python tests with coverage report
 test-rust: ## Run Rust tests (agent-sec-cli + V2; linux-sandbox on Linux only)
 	@echo "🧪 Running agent-sec-cli workspace Rust tests..."
 	cd agent-sec-cli && { $(PYO3_PIN); cargo test --workspace; }
-	@echo "🧪 Running AgentSecCore V2 workspace Rust tests..."
-	cd v2 && cargo test --workspace --locked
+	@$(MAKE) test-rust-v2
 	@echo "🧪 Running linux-sandbox Rust tests (Linux only)..."
 	@if [ "$$(uname -s)" = "Linux" ]; then \
 		cd linux-sandbox && cargo test -- --skip bwrap_seccomp; \
 	else \
 		echo "  (linux-sandbox tests skipped: requires Linux)"; \
 	fi
+
+.PHONY: test-rust-v2
+test-rust-v2: ## Run V2 Rust tests and verify daemon server identity separately
+	@echo "🧪 Running AgentSecCore V2 workspace Rust tests..."
+	cd v2 && AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1 cargo test --workspace --locked --features asc-daemon-client/testing -- --skip untrusted_server_is_rejected_before_request_bytes_are_sent
+	cd v2 && cargo test --locked -p asc-daemon-client --test transport untrusted_server_is_rejected_before_request_bytes_are_sent -- --exact
 
 # One report per workspace: cargo-llvm-cov cannot merge across workspaces, and
 # CI unions them via diff-cover.  `-p` skips the untested PyO3 cdylib root.

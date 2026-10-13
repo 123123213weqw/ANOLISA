@@ -492,10 +492,9 @@ jobs:
 
       - name: Run AgentSecCore V2 Rust tests
         run: |
-          cd src/agent-sec-core/v2
-          AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1 cargo test --workspace --locked --features asc-daemon-client/testing -- --skip untrusted_server_is_rejected_before_request_bytes_are_sent
-          cargo test --locked -p asc-daemon-client --test transport untrusted_server_is_rejected_before_request_bytes_are_sent -- --exact
-          cargo doc --workspace --no-deps --locked
+          cd src/agent-sec-core
+          make test-rust-v2
+          cd v2 && cargo doc --workspace --no-deps --locked
 
       - name: Run Rust tests with coverage
         run: |
