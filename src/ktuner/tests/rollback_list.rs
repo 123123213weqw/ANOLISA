@@ -43,16 +43,23 @@ fn rollback_list_cli_contract() {
         assert!(entry["applied"].is_string());
         assert!(entry["previous"].is_string());
         // The live reading is a string or an explicit null; the comparison is
-        // a bool or null. Both keys are always present on every entry.
+        // a bool or null; the recorded category is one of the two documented
+        // strings or an explicit null. All three keys are always present on
+        // every entry.
         assert!(entry["live"].is_string() || entry["live"].is_null());
         assert!(entry["drifted"].is_boolean() || entry["drifted"].is_null());
-        assert_eq!(entry.as_object().unwrap().len(), 5, "entry keys: {entry}");
+        assert!(
+            entry["category"] == "performance"
+                || entry["category"] == "security"
+                || entry["category"].is_null()
+        );
+        assert_eq!(entry.as_object().unwrap().len(), 6, "entry keys: {entry}");
     }
 }
 
 /// End-to-end contract on a private fixture: run the real binary in a mount
 /// namespace with a hand-built ledger, and assert that `--list` publishes
-/// exactly the five documented keys per entry, that an unreadable path is
+/// exactly the six documented keys per entry, that an unreadable path is
 /// reported as null inside the JSON (never printed, never an error, stderr
 /// empty, exit code untouched), and that a changed value is flagged.
 ///
@@ -142,9 +149,12 @@ fn rollback_list_reports_live_drift_without_extra_output() {
             .collect();
         assert_eq!(
             keys,
-            ["applied", "drifted", "live", "param", "previous"],
+            ["applied", "category", "drifted", "live", "param", "previous"],
             "entry keys, in the documented alphabetical order: {entry}"
         );
+        // This fixture is a ledger written before the category was recorded:
+        // every entry publishes null, never a guess.
+        assert!(entry["category"].is_null(), "{entry}");
     }
     assert_eq!(pending[0]["param"], "block/sda/scheduler");
     assert!(pending[0]["live"].is_null(), "{body}");
@@ -155,6 +165,110 @@ fn rollback_list_reports_live_drift_without_extra_output() {
     assert_eq!(pending[2]["param"], "vm.swappiness");
     assert_eq!(pending[2]["live"], "1");
     assert_eq!(pending[2]["drifted"], false);
+}
+
+/// End-to-end contract for the recorded category: a ledger written after the
+/// field existed publishes each entry's recorded category with the spelling
+/// `check` uses for the same field, the category listing selects by it, and a
+/// record that carries none publishes null rather than a guess.
+#[test]
+#[ignore = "requires root and mount namespaces; writes only isolated fixture files"]
+fn rollback_list_reports_the_recorded_category() {
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    assert_eq!(unsafe { libc::geteuid() }, 0, "requires root");
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let scratch = std::env::temp_dir().join(format!(
+        "ktuner-list-category-{}-{nonce}",
+        std::process::id()
+    ));
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch(scratch);
+    fs::create_dir_all(scratch.0.join("varlib/ktuner")).expect("ledger directory");
+    fs::create_dir(scratch.0.join("etc")).expect("isolated persistence directory");
+
+    let somaxconn = scratch.0.join("somaxconn");
+    let bpf_jit_harden = scratch.0.join("bpf_jit_harden");
+    let swappiness = scratch.0.join("swappiness");
+    fs::write(&somaxconn, "4096").expect("live value");
+    fs::write(&bpf_jit_harden, "1").expect("live value");
+    fs::write(&swappiness, "10").expect("live value");
+    fs::write(
+        scratch.0.join("varlib/ktuner/rollback.json"),
+        serde_json::json!({"version": 1, "entries": {
+            "net.core.somaxconn": {"previous": "128", "applied": "4096", "path": somaxconn, "category": "performance"},
+            "net.core.bpf_jit_harden": {"previous": "0", "applied": "1", "path": bpf_jit_harden, "category": "security"},
+            "vm.swappiness": {"previous": "60", "applied": "10", "path": swappiness},
+        }})
+        .to_string(),
+    )
+    .expect("ledger");
+
+    let list = |extra: &[&str]| {
+        Command::new("unshare")
+            .args([
+                "--mount",
+                "--propagation",
+                "private",
+                "sh",
+                "-c",
+                "mount --bind \"$1\" /var/lib && mount --bind \"$2\" /etc && \
+                 bin=\"$3\" && shift 3 && exec \"$bin\" rollback --list \"$@\"",
+                "rollback-list-category-test",
+            ])
+            .arg(scratch.0.join("varlib"))
+            .arg(scratch.0.join("etc"))
+            .arg(env!("CARGO_BIN_EXE_ktuner"))
+            .args(extra)
+            .output()
+            .expect("run isolated rollback --list")
+    };
+
+    // The plain listing: the recorded categories come back verbatim — the
+    // security finding on the `net.*` knob keeps its category — and the
+    // pre-category record publishes null.
+    let out = list(&[]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let body: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(body["count"], 3, "{body}");
+    assert_eq!(body["pending"][0]["param"], "net.core.bpf_jit_harden");
+    assert_eq!(body["pending"][0]["category"], "security");
+    assert_eq!(body["pending"][1]["param"], "net.core.somaxconn");
+    assert_eq!(body["pending"][1]["category"], "performance");
+    assert_eq!(body["pending"][2]["param"], "vm.swappiness");
+    assert!(body["pending"][2]["category"].is_null(), "{body}");
+
+    // The category listing selects by the recorded value, and every entry it
+    // publishes carries the category it was selected for: `net` selects the
+    // recorded performance entry on the `net.*` knob, not the security one.
+    let out = list(&["--category", "net"]);
+    assert!(
+        out.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    let body: Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
+    assert_eq!(body["count"], 1, "{body}");
+    let pending = body["pending"].as_array().expect("pending is an array");
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0]["param"], "net.core.somaxconn");
+    assert_eq!(pending[0]["category"], "performance");
 }
 
 /// End-to-end contract for `--list <param>...` on the same kind of private

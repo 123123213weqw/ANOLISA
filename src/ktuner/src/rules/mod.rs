@@ -16,7 +16,7 @@ pub enum Confidence {
 /// write come from" later (the rollback ledger records it per entry) must
 /// carry the value instead of re-deriving it from the name. The serde
 /// spelling is the lowercase one `check` publishes for the same field.
-#[derive(Debug, Clone, PartialEq, Default, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     #[default]

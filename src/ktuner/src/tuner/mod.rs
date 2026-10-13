@@ -1457,7 +1457,8 @@ fn systemctl_quiet(program: &str, args: &[&str]) -> bool {
 }
 
 /// One ledger row as `rollback --list` publishes it: the recorded
-/// (param, applied, previous) triple plus the value live in the kernel now.
+/// (param, applied, previous) triple, the category the recording rule
+/// classified it as, and the value live in the kernel now.
 ///
 /// `live` is read from the entry's own path — the file a restore writes —
 /// and rendered through [`active_value_for_path`], the reader every other surface
@@ -1466,11 +1467,19 @@ fn systemctl_quiet(program: &str, args: &[&str]) -> bool {
 /// the path cannot be read: a device that is gone, a module that is not
 /// loaded, a write-only tunable or unreadable content is reported as
 /// unreadable, never guessed — an absent reading is not an error.
+///
+/// `category` is the rule-layer category of the recommendation that recorded
+/// the entry, carried from the ledger as it was recorded (never re-derived
+/// from the name: a security finding can sit on a `net.*` knob). It is `None`
+/// (JSON null) for a record written before the field existed and for one an
+/// imported file supplied, matching how the ledger treats them: no category
+/// ever selected them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackPreview {
     pub param: String,
     pub applied: String,
     pub previous: String,
+    pub category: Option<Category>,
     pub live: Option<String>,
     pub drifted: Option<bool>,
 }
@@ -1513,6 +1522,7 @@ fn preview_entries(data: &RollbackData) -> Vec<RollbackPreview> {
                 param: param.clone(),
                 applied: entry.applied.clone(),
                 previous: entry.previous.clone(),
+                category: entry.category.clone(),
                 live,
                 drifted,
             }
@@ -5793,6 +5803,7 @@ mod tests {
                     param: "net.core.somaxconn".to_string(),
                     applied: "256".to_string(),
                     previous: "128".to_string(),
+                    category: None,
                     live: Some("256".to_string()),
                     drifted: Some(false),
                 },
@@ -5800,6 +5811,7 @@ mod tests {
                     param: "vm.swappiness".to_string(),
                     applied: "10".to_string(),
                     previous: "60".to_string(),
+                    category: None,
                     live: Some("10".to_string()),
                     drifted: Some(false),
                 },
@@ -6109,6 +6121,7 @@ mod tests {
                     param: "net.core.somaxconn".to_string(),
                     applied: "4096".to_string(),
                     previous: "128".to_string(),
+                    category: None,
                     live: Some("1024".to_string()),
                     drifted: Some(true),
                 },
@@ -6116,6 +6129,7 @@ mod tests {
                     param: "vm.swappiness".to_string(),
                     applied: "10".to_string(),
                     previous: "60".to_string(),
+                    category: None,
                     live: Some("10".to_string()),
                     drifted: Some(false),
                 },
@@ -8658,6 +8672,134 @@ mod tests {
             ledger_before,
             "the preview is read-only"
         );
+    }
+
+    /// The category a rule recorded travels with its entry into every
+    /// `rollback --list` shape: the unfiltered listing, the by-name listing,
+    /// the exclusion listing and the category listing publish the recorded
+    /// value — never a name-derived guess, so the security finding on a
+    /// `net.*` knob keeps its category — and a record written before the
+    /// field existed publishes none.
+    #[test]
+    fn previews_carry_the_recorded_category_through_every_selection() {
+        let dir = AtomicTestDir::new("preview-category");
+        let somaxconn = dir.0.join("somaxconn");
+        let bpf_jit_harden = dir.0.join("bpf_jit_harden");
+        let swappiness = dir.0.join("swappiness");
+        let scheduler = dir.0.join("scheduler");
+        fs::write(&somaxconn, "4096").unwrap();
+        fs::write(&bpf_jit_harden, "1").unwrap();
+        fs::write(&swappiness, "10").unwrap();
+        fs::write(&scheduler, "none").unwrap();
+        let ledger = fixture_category_ledger(
+            &dir,
+            &[
+                (
+                    "net.core.somaxconn",
+                    "128",
+                    "4096",
+                    somaxconn.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+                (
+                    "net.core.bpf_jit_harden",
+                    "0",
+                    "1",
+                    bpf_jit_harden.to_str().unwrap(),
+                    Some(Category::Security),
+                ),
+                (
+                    "vm.swappiness",
+                    "60",
+                    "10",
+                    swappiness.to_str().unwrap(),
+                    None,
+                ),
+                (
+                    "block/sda/scheduler",
+                    "mq-deadline",
+                    "none",
+                    scheduler.to_str().unwrap(),
+                    Some(Category::Performance),
+                ),
+            ],
+        );
+
+        let recorded = |entries: Vec<RollbackPreview>| -> Vec<(String, Option<Category>)> {
+            entries
+                .into_iter()
+                .map(|entry| (entry.param, entry.category))
+                .collect()
+        };
+
+        // The unfiltered listing: every entry carries what it was recorded
+        // with, and the pre-category record carries none.
+        assert_eq!(
+            recorded(rollback_preview_at(&ledger).unwrap()),
+            vec![
+                (
+                    "block/sda/scheduler".to_string(),
+                    Some(Category::Performance)
+                ),
+                (
+                    "net.core.bpf_jit_harden".to_string(),
+                    Some(Category::Security)
+                ),
+                (
+                    "net.core.somaxconn".to_string(),
+                    Some(Category::Performance)
+                ),
+                ("vm.swappiness".to_string(), None),
+            ]
+        );
+
+        // The by-name listing keeps the recorded category.
+        assert_eq!(
+            recorded(
+                rollback_preview_params_at(&["net/core/somaxconn".to_string()], &ledger).unwrap()
+            ),
+            vec![(
+                "net.core.somaxconn".to_string(),
+                Some(Category::Performance)
+            )]
+        );
+
+        // The exclusion listing keeps it on every entry that stays.
+        let (unmatched, entries) =
+            rollback_preview_excluding_at(&["vm.swappiness".to_string()], &ledger).unwrap();
+        assert!(unmatched.is_empty(), "{unmatched:?}");
+        assert_eq!(
+            recorded(entries),
+            vec![
+                (
+                    "block/sda/scheduler".to_string(),
+                    Some(Category::Performance)
+                ),
+                (
+                    "net.core.bpf_jit_harden".to_string(),
+                    Some(Category::Security)
+                ),
+                (
+                    "net.core.somaxconn".to_string(),
+                    Some(Category::Performance)
+                ),
+            ]
+        );
+
+        // The category listing selects by the recorded value and publishes it:
+        // only recorded security entries come back, and the unclassified
+        // record is reported instead of listed.
+        let preview =
+            rollback_preview_categories_at(&["security".to_string()], &[], &ledger).unwrap();
+        assert_eq!(
+            recorded(preview.entries),
+            vec![(
+                "net.core.bpf_jit_harden".to_string(),
+                Some(Category::Security)
+            )]
+        );
+        assert_eq!(preview.unclassified, ["vm.swappiness"]);
+        assert!(preview.unmatched.is_empty(), "{:?}", preview.unmatched);
     }
 
     /// With no ledger there is nothing to restore and nothing to exclude: the

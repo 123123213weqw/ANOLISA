@@ -486,8 +486,11 @@ are unchanged; `rollback --list <param>…` previews a batch (see below).
 `sudo ktuner rollback --list` previews what a rollback would restore — read-only, nothing is
 written or deleted (the ledger is 0600 under a 0700 root-owned dir, so it shares rollback's
 root gate; a corrupt ledger surfaces as an error rather than an empty list). Each entry keeps
-its recorded `param`/`applied`/`previous` and adds what the kernel holds right now: `live`, read
-from the entry's own path through the same reader every other surface uses (the bracketed option
+its recorded `param`/`applied`/`previous`, carries the `category` the recording rule classified
+it as (the same lowercase spelling `check` reports; `null` for a record written before the field
+existed or one a library import supplied, which no category selects), and adds what the kernel
+holds right now: `live`, read from the entry's own path through the same reader every other
+surface uses (the bracketed option
 of a sysfs list, the single-space form of a multi-value sysctl), and `drifted`, whether `live`
 still matches `applied` — compared the way a write is verified, so a value the kernel renders in
 its own shape (a bracketed option list, TAB-separated multi-value, a leading-token echo) is not
@@ -495,19 +498,21 @@ drift:
 
 ```json
 {"count": 3, "pending": [
-  {"applied": "none", "drifted": null, "live": null, "param": "block/sda/scheduler", "previous": "mq-deadline"},
-  {"applied": "0", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"},
-  {"applied": "1", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
+  {"applied": "none", "category": null, "drifted": null, "live": null, "param": "block/sda/scheduler", "previous": "mq-deadline"},
+  {"applied": "0", "category": "performance", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"},
+  {"applied": "1", "category": "performance", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
 ]}
 ```
 
 An entry the kernel zeroed as a side effect of its mutually exclusive twin records
-`applied = "0"` — the value the kernel put live — so it is drifted once it is no longer 0. A path
-that cannot be read (a device that is gone, a module that is not loaded, a write-only tunable)
-reports `live: null` and `drifted: null`: an unreadable value is not an error and drift never
-changes the exit code. The listing is a snapshot — the kernel can change between the preview and
-the rollback. Plain `ktuner rollback` is unchanged: it restores, finalizes the ledger, and
-cleans up.
+`applied = "0"` — the value the kernel put live — so it is drifted once it is no longer 0. The
+`category` is never re-derived from the parameter name (a security finding can sit on a
+`net.*` knob), so a record written before the field existed, or imported, reports `null` rather
+than a guess, exactly as a path that cannot be read (a device that is gone, a module that is not
+loaded, a write-only tunable) reports `live: null` and `drifted: null`: an unreadable value is
+not an error and drift never changes the exit code. The listing is a snapshot — the kernel can
+change between the preview and the rollback. Plain `ktuner rollback` is unchanged: it restores,
+finalizes the ledger, and cleans up.
 
 `sudo ktuner rollback --list <param> [<param>…]` narrows the preview to what
 `rollback <param> [<param>…]` would restore. The names resolve exactly as the restore resolves
@@ -518,9 +523,9 @@ unfiltered listing, in the same param order — `rollback --list vm/swappiness v
 
 ```json
 {"count": 3, "pending": [
-  {"applied": "1073741824", "drifted": false, "live": "1073741824", "param": "vm.dirty_bytes", "previous": "0"},
-  {"applied": "0", "drifted": false, "live": "0", "param": "vm.dirty_ratio", "previous": "20"},
-  {"applied": "1", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
+  {"applied": "1073741824", "category": "performance", "drifted": false, "live": "1073741824", "param": "vm.dirty_bytes", "previous": "0"},
+  {"applied": "0", "category": "performance", "drifted": false, "live": "0", "param": "vm.dirty_ratio", "previous": "20"},
+  {"applied": "1", "category": "performance", "drifted": false, "live": "1", "param": "vm.swappiness", "previous": "60"}
 ]}
 ```
 
@@ -569,7 +574,8 @@ error (`2`, stderr JSON), refused before the root gate like the other argument e
 
 `sudo ktuner rollback --category <cat> [--category <cat>…]` restores only the recorded entries whose
 category matches, keeping every other record in the ledger, and `sudo ktuner rollback --list --category
-<cat>` previews that same set (`--drifted` narrows what remains). The values are the ones `check` and
+<cat>` previews that same set in the `--list` shape — each entry carrying the recorded `category`
+(`--drifted` narrows what remains). The values are the ones `check` and
 `tune` accept — repeatable, the union is kept — and the selection is the one `tune --category <cat>`
 would have written: the category is recorded with every entry a rule wrote, because a parameter name
 does not say which rule wrote the value. `net.core.bpf_jit_harden` is a security recommendation on a
@@ -591,6 +597,7 @@ are echoed by name in `unclassified`, in param order, and only when the list is 
   "pending": [
     {
       "applied": "1",
+      "category": "performance",
       "drifted": false,
       "live": "1",
       "param": "vm.swappiness",

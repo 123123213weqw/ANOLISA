@@ -1132,7 +1132,9 @@ fn drifted_entries(entries: Vec<tuner::RollbackPreview>) -> Vec<tuner::RollbackP
 /// (key names, count, entry fields, ordering) is unit-testable without a
 /// ledger on disk. Entries arrive as `rollback_preview` returns them, sorted
 /// by param (BTreeMap order); `live` and `drifted` arrive as `Option`s so an
-/// unreadable path publishes JSON `null` instead of a guessed value.
+/// unreadable path publishes JSON `null` instead of a guessed value, and
+/// `category` as one so a record that carries none publishes `null` the same
+/// way — the keys stay present on every entry.
 fn rollback_list_output(entries: &[tuner::RollbackPreview]) -> serde_json::Value {
     json!({
         "count": entries.len(),
@@ -1143,6 +1145,7 @@ fn rollback_list_output(entries: &[tuner::RollbackPreview]) -> serde_json::Value
                     "param": entry.param,
                     "applied": entry.applied,
                     "previous": entry.previous,
+                    "category": entry.category,
                     "live": entry.live,
                     "drifted": entry.drifted,
                 })
@@ -1562,6 +1565,7 @@ mod tests {
         param: &str,
         applied: &str,
         previous: &str,
+        category: Option<rules::Category>,
         live: Option<&str>,
         drifted: Option<bool>,
     ) -> tuner::RollbackPreview {
@@ -1569,6 +1573,7 @@ mod tests {
             param: param.to_string(),
             applied: applied.to_string(),
             previous: previous.to_string(),
+            category,
             live: live.map(str::to_string),
             drifted,
         }
@@ -1590,9 +1595,16 @@ mod tests {
         // unreadable path (`None`) — an unreadable value is not evidence of
         // drift and the plain `--list` still shows those entries.
         let entries = vec![
-            preview_entry("vm.dirty_ratio", "0", "20", Some("20"), Some(true)),
-            preview_entry("vm.swappiness", "1", "60", Some("1"), Some(false)),
-            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
+            preview_entry("vm.dirty_ratio", "0", "20", None, Some("20"), Some(true)),
+            preview_entry("vm.swappiness", "1", "60", None, Some("1"), Some(false)),
+            preview_entry(
+                "block/sda/scheduler",
+                "none",
+                "mq-deadline",
+                None,
+                None,
+                None,
+            ),
         ];
         let kept = drifted_entries(entries);
         assert_eq!(kept.len(), 1);
@@ -1601,7 +1613,7 @@ mod tests {
         assert_eq!(
             rollback_list_output(&kept),
             json!({ "count": 1, "pending": [
-                {"applied": "0", "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"}
+                {"applied": "0", "category": null, "drifted": true, "live": "20", "param": "vm.dirty_ratio", "previous": "20"}
             ]})
         );
         assert_eq!(
@@ -1726,8 +1738,22 @@ mod tests {
     #[test]
     fn rollback_list_output_maps_every_field() {
         let entries = vec![
-            preview_entry("vm.swappiness", "1", "60", Some("1"), Some(false)),
-            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
+            preview_entry(
+                "vm.swappiness",
+                "1",
+                "60",
+                Some(rules::Category::Performance),
+                Some("1"),
+                Some(false),
+            ),
+            preview_entry(
+                "block/sda/scheduler",
+                "none",
+                "mq-deadline",
+                None,
+                None,
+                None,
+            ),
         ];
         assert_eq!(
             rollback_list_output(&entries),
@@ -1736,6 +1762,7 @@ mod tests {
                 "pending": [
                     {
                         "applied": "1",
+                        "category": "performance",
                         "drifted": false,
                         "live": "1",
                         "param": "vm.swappiness",
@@ -1743,6 +1770,7 @@ mod tests {
                     },
                     {
                         "applied": "none",
+                        "category": null,
                         "drifted": null,
                         "live": null,
                         "param": "block/sda/scheduler",
@@ -1753,20 +1781,36 @@ mod tests {
         );
     }
 
-    /// The regression this feature owes: the two new keys are the ONLY change
-    /// to the published shape. Stripping them from the output must reproduce,
-    /// field for field, what `rollback --list` emitted before they existed.
+    /// The regression this feature owes: the three keys beyond the recorded
+    /// triple are the ONLY change to the published shape. Stripping them from
+    /// the output must reproduce, field for field, what `rollback --list`
+    /// emitted before they existed.
     #[test]
-    fn rollback_list_output_adds_only_live_and_drifted() {
+    fn rollback_list_output_adds_only_the_readings_and_category() {
         let entries = vec![
-            preview_entry("vm.swappiness", "1", "60", Some("60"), Some(true)),
-            preview_entry("block/sda/scheduler", "none", "mq-deadline", None, None),
+            preview_entry(
+                "vm.swappiness",
+                "1",
+                "60",
+                Some(rules::Category::Security),
+                Some("60"),
+                Some(true),
+            ),
+            preview_entry(
+                "block/sda/scheduler",
+                "none",
+                "mq-deadline",
+                None,
+                None,
+                None,
+            ),
         ];
         let mut out = rollback_list_output(&entries);
         for entry in out["pending"].as_array_mut().unwrap() {
             let object = entry.as_object_mut().unwrap();
             object.remove("live");
             object.remove("drifted");
+            object.remove("category");
         }
         assert_eq!(
             out,
@@ -1784,31 +1828,64 @@ mod tests {
     fn rollback_list_output_keys_are_alphabetical() {
         // The README's "Object keys are emitted in alphabetical order" is a
         // hard contract for consumers: the serialized entry must carry
-        // applied < drifted < live < param < previous.
+        // applied < category < drifted < live < param < previous.
         let entries = vec![preview_entry(
             "vm.swappiness",
             "1",
             "60",
+            Some(rules::Category::Security),
             Some("1"),
             Some(false),
         )];
         assert_eq!(
             serde_json::to_string(&rollback_list_output(&entries)).unwrap(),
-            r#"{"count":1,"pending":[{"applied":"1","drifted":false,"live":"1","param":"vm.swappiness","previous":"60"}]}"#
+            r#"{"count":1,"pending":[{"applied":"1","category":"security","drifted":false,"live":"1","param":"vm.swappiness","previous":"60"}]}"#
         );
     }
 
     #[test]
     fn rollback_list_output_serializes_unknown_readings_as_null() {
         // A path that could not be read has no value to publish and no
-        // comparison to report: the keys stay present with null and are never
-        // dropped, so a consumer never branches on key presence.
-        let entries = vec![preview_entry("vm.swappiness", "1", "60", None, None)];
+        // comparison to report, and a record that carries no category has none
+        // to publish: the keys stay present with null and are never dropped,
+        // so a consumer never branches on key presence.
+        let entries = vec![preview_entry("vm.swappiness", "1", "60", None, None, None)];
         let out = rollback_list_output(&entries);
         let entry = &out["pending"][0];
         assert!(entry.get("live").is_some_and(serde_json::Value::is_null));
         assert!(entry.get("drifted").is_some_and(serde_json::Value::is_null));
-        assert_eq!(entry.as_object().unwrap().len(), 5, "entry keys: {entry}");
+        assert!(entry
+            .get("category")
+            .is_some_and(serde_json::Value::is_null));
+        assert_eq!(entry.as_object().unwrap().len(), 6, "entry keys: {entry}");
+    }
+
+    #[test]
+    fn rollback_list_output_serializes_the_recorded_category() {
+        // The category is published with the serde spelling `check` uses for
+        // the same field, carried from the record rather than derived from the
+        // name: the security entry sits on a `net.*` knob.
+        let entries = vec![
+            preview_entry(
+                "vm.swappiness",
+                "1",
+                "60",
+                Some(rules::Category::Performance),
+                None,
+                None,
+            ),
+            preview_entry(
+                "net.core.bpf_jit_harden",
+                "0",
+                "1",
+                Some(rules::Category::Security),
+                None,
+                None,
+            ),
+        ];
+        let out = rollback_list_output(&entries);
+        assert_eq!(out["pending"][0]["category"], json!("performance"), "{out}");
+        assert_eq!(out["pending"][1]["category"], json!("security"), "{out}");
     }
 
     #[test]
@@ -1816,8 +1893,8 @@ mod tests {
         // The shaper must not re-sort: rollback_preview's BTreeMap order is
         // the contract.
         let entries = vec![
-            preview_entry("zzz", "1", "2", None, None),
-            preview_entry("aaa", "3", "4", None, None),
+            preview_entry("zzz", "1", "2", None, None, None),
+            preview_entry("aaa", "3", "4", None, None, None),
         ];
         let out = rollback_list_output(&entries);
         assert_eq!(out["pending"][0]["param"], json!("zzz"));
