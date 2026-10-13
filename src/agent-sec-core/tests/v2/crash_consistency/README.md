@@ -34,8 +34,8 @@ deletion has superseded it.
 
 ## Daemon black-box matrix
 
-The following six tests live in this directory: five default CI scenarios and
-one opt-in reproducer for the deferred protocol gap. The kill windows are observed
+The following lifecycle tests and the storage cases below are default CI coverage,
+except for the opt-in reproducer for the deferred protocol gap. Kill windows are observed
 through RPC, committed SQLite state, and mock HTTP gates; no product failpoint
 selects an exact instruction inside the daemon.
 
@@ -47,6 +47,24 @@ selects an exact instruction inside the daemon.
 | [`test_delete_during_apply_then_crash_cleans_committed_target`](test_binding_recovery.py) | Hold Apply before coordinator execution. Accept Scope deletion, then release Apply into an `after_apply` gate before killing the daemon. Its HTTP reply remains blocked. | Recovery deletes the committed target with HTTP 204, removes Binding and Scope, and sends no additional POST. No pre-crash DELETE or recovery 404 is allowed. | Pass |
 | [`test_late_apply_cannot_outlive_confirmed_scope_cleanup`](test_binding_recovery.py) | Received Apply is held before coordinator execution. Accept deletion, kill and restart daemon. Recovery DELETE gets `binding_not_found`; local cleanup finishes; release the old Apply. | An old Apply must not leave a remote target after confirmed local cleanup. | **Opt-in known failure: deferred AgentSecCore/AgentSight protocol gap** |
 | [`test_partial_scope_cleanup_survives_two_crashes_without_reapplying`](test_binding_recovery.py) | Two Bindings are `Ready`. Hold both committed DELETE responses, kill daemon; restart and release one target's replies. Observe one remaining Binding and `Deleting` Scope, then kill again. | Second recovery cleans the remaining target and removes Scope. Exactly two original POSTs; no Apply during cleanup recovery. | Pass |
+
+### Storage admission and retry recovery
+
+[`test_storage_recovery.py`](test_storage_recovery.py) adds real-process checks:
+
+| Test | Required behavior |
+| --- | --- |
+| `test_unusable_policy_database_rejects_startup_without_losing_responsibility` | Unknown schema, malformed Binding JSON, unsafe permissions and a real SQLite writer lock reject startup before UDS or remote I/O. Preserve all SQL data, schema version and file identity; ordinary WAL checkpointing may change main-file bytes. |
+| `test_shared_sqlite_write_lock_retains_both_results_and_recovers_without_http_replay` | Hold an external `BEGIN IMMEDIATE` after two remote Applies commit. Reject new PAP writes, retain both UNKNOWN results, then reach Ready without repeating HTTP after releasing the lock. Reads return committed data or explicit unavailable, never a false empty list. |
+| `test_pending_retry_budget_resets_in_a_new_daemon_process` | After two failed attempts and SIGKILL, the same DB/Binding can use a fresh five-attempt budget: four failures followed by success. |
+| `test_failed_binding_survives_restart_until_explicit_scope_retry` | Independent work completes after restart while the original Failed Binding stays terminal; explicit Scope retry resumes it. |
+
+BUSY is exercised through real SQLite locking. Real READONLY/FULL classification
+and Runtime fault injection remain separate component checks, not filesystem
+failure experiments. Ordinary-UID authorization is covered by
+[`test_policy_cli_errors_e2e.py`](../e2e/test_policy_cli_errors_e2e.py); its positive
+and denial cases require root with permission to switch client UID. A namespace
+mapping only UID 0 cannot run those cases.
 
 ### HTTP gates and repeated runs
 
@@ -116,6 +134,13 @@ Each compound case additionally asserts the remote operation sequence is exactly
 the `crash_child` helper collected by Rust's test harness; “3 tests passed” does
 not mean only three crash windows were exercised.
 
+The unit test
+[`sigkill_before_discovery_commit_rolls_back_pin_and_all_bindings`](../../../v2/crates/asc-policy-repository-sqlite/src/tests.rs)
+also kills a child before the production discovery transaction commits. It checks
+that neither a PID pin/Binding pair nor a 200-instance batch partially survives,
+then admits the same instances after reopening. Its gate is compiled only under
+`cfg(test)` and is absent from the daemon binary.
+
 ## Related contracts and known gap
 
 - [`contracts.rs`](../../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs)
@@ -136,10 +161,9 @@ current PR. Its reproducer retains the original safety assertion and is skipped
 unless `ASC_TEST_DEFERRED_PROTOCOL=1`. With that flag it still fails; passing the
 default CI scenarios does not establish that this protocol gap is fixed.
 
-After the SQLite lock and harness fixes, scoped validation passed all 34 SQLite
-crate tests and five consecutive runs of the four non-deferred black-box cases
-(20 case executions). The protocol case was separately reproduced as failing.
-These results do not establish production crash safety beyond this fault model.
+Record the tested source version, commands, environment, results and skipped cases
+in the corresponding PR/CI. Older test counts and PASS records do not establish
+current coverage or crash safety beyond this fault model.
 
 ## Running and diagnosing
 

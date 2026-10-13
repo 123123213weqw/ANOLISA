@@ -149,6 +149,10 @@ impl SqlitePolicyRepository {
                     return Err(error);
                 }
             };
+            #[cfg(test)]
+            if write {
+                tests::before_commit(&transaction);
+            }
             if let Err(error) = transaction.commit() {
                 let classified = RepositoryError::from(error).store();
                 storage.failure = Some(classified);

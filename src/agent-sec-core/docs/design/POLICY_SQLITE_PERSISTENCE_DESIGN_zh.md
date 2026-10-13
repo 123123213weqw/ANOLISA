@@ -253,8 +253,8 @@ Policy 删除只置空 current_json，不删除 revision 分配头；current 的
 Scope/Binding 不对 current Policy 加外键，模板更新/删除不能阻断旧快照继续工作。
 生产路径中同 Scope 内 Policy ID 唯一且 revision 固定，因此去重键不必再加 Policy revision。
 Binding 创建由 `sync_scope_instances` 按 Scope 快照和进程身份展开；删除、重试与
-reconciliation CAS 使用各自的原子写入口。`update_binding` 仅为 memory 测试后端的
-revision/CAS 构造辅助方法，不属于生产 Repository 契约或 SQLite 实现。
+reconciliation CAS 使用各自的原子写入口。`test-support` 的 `admit_binding_for_test`
+仅构造底层 revision/CAS 回归意图，不属于公开 PAP API；后续写入仍使用生产事务与校验。
 
 系统继续生成新的 UUID，不复用已删除 Scope/Binding ID，不提供客户端指定旧 ID 的入口。
 Policy revision 分配头不能按 TTL 回收，否则同 ID 重建可能复用 revision；历史 ID 很多时的
@@ -633,28 +633,18 @@ CAS 并发测试应使用 barrier 而不是放宽 wall-clock 等待；只有明�
 CLI/daemon E2E 使用 source-built 或 RPM 产物并注明身份/环境，不能把 user namespace 测试
 写成 systemd、真实宿主 root 部署或内核策略生效证据。
 
-### 9.1 本地实现与验收证据
+### 9.1 可执行验收入口与边界
 
-生产入口使用 SQLite。以下为分次本地验证记录，未运行远端 CI。
-持久化接线时的全 workspace 回归为 **998 passed、0 failed、3 ignored**；忽略项是既有 SkillSec 的宿主
-root/CAP_CHOWN/mount 专用测试。随后新增批量事务、迁移入口及声明式 schema 约束测试，重跑 Policy SQLite crate：
-**29 passed、0 failed**，包含 19 个 repository 契约、4 个初始化/迁移测试、3 个真实 SQLite 故障测试、
-2 个 crash harness 测试和 1 个持久 endpoint 恢复测试。两组数量有重叠，不能相加。
-迁移入口测试验证当前版本不重复初始化、未知版本和非空 version 0 拒绝，以及测试升级步骤
-失败后 DDL/数据/版本一起回滚并可重试；它们不代表已提供历史 Policy 库的转换实现。
-统一 schema 声明后，`asc-sqlite-kernel`、`asc-persistence-sqlite`、
-`asc-policy-repository-sqlite` 共 **211 passed、0 failed**，其中包含上述 29 项。
-共享生成器验证 `STRICT` 类型和表级约束，Policy 初始化验证停止屏障、完整写回执、实例唯一性及
-Scope 外键限制；事件库既有建表与旧版本迁移 fixtures 均通过。
+生产入口使用 SQLite。以下列出可执行覆盖，不保留旧源码的测试计数或 PASS 作为当前证据。
+每次运行须在对应 PR/CI 记录源码版本、命令、环境、结果及跳过项。
+迁移测试验证 runner 的事务回滚，不代表提供历史 Policy 库转换；当前只实现 0→1 初始化。
 
-补充 [CLI→daemon→HTTP mock E2E](../../tests/v2/e2e/test_policy_delivery_e2e.py)：真实二进制、
+[CLI→daemon→HTTP mock E2E](../../tests/v2/e2e/test_policy_delivery_e2e.py)：真实二进制、
 SQLite、procfs、Adapter 和 Client 贯穿同一用例；Scope 建立后先更新模板，再启动匹配进程，
 验证下发旧 revision、完整请求 fixture、Ready 数据行、远端删除及 Binding/Scope 回收。
-与既有 Policy CLI 测试合跑 **3 passed、0 failed**，环境为 Python 3.11.6、source-built
-debug 二进制及隔离的 user/mount/network namespace，使用私有 `/tmp`、`/var/log` 和 loopback。
 默认 AgentSight 端口由 mock 占用，不新增配置入口；已有 token 保留，测试临时创建的 token
-才由测试清理。预置 token 的独立复跑 **1 passed**，确认文件内容、inode、修改时间及权限均
-保持不变。该证据不等同于真实 AgentSight/内核验收，也没有新增崩溃窗口覆盖。
+才由测试清理。测试须使用 Python 3.11.6 及本次构建/RPM 的二进制，注明身份和隔离方式。
+这些覆盖不等同于真实 AgentSight/内核验收。
 
 | 覆盖 | 可执行证据及范围 |
 |---|---|
@@ -662,8 +652,8 @@ debug 二进制及隔离的 user/mount/network namespace，使用私有 `/tmp`�
 | PSQL-06～08 | 同一契约覆盖版本溢出事务回滚、部署数量/字节限制、坏 JSON/投影/外键/回执、未知 schema、关闭重开和 write_id 重放/碰撞；[存储故障测试](../../v2/crates/asc-policy-repository-sqlite/src/tests.rs) 使用 query_only、max_page_count 产生真实 READONLY/FULL，另用独立 SQL 写锁产生 BUSY；IOERR/提交回执丢失在写边界注入，没有定制 VFS 或硬件掉盘实验 |
 | PSQL-09～11 | 私有权限、symlink/hardlink、独占 lease、lease 比 repository 活得更久；keyset 扫描中删行、停止屏障、最后 Binding/Scope 回收、Active 空 Scope、PID pin 关闭重开；[discovery seed](../../v2/crates/asc-daemon-core/src/scope_discovery.rs) 覆盖部分扫描不误退休和 PID reuse。外层 drain 持锁由 daemon 所有权结构保证，未新增卡死内核 I/O 的宿主演练 |
 | PSQL-12/17 | [Runtime 测试](../../v2/crates/asc-policy-runtime/src/reconciliation/tests.rs) 注入 BUSY/FULL/READONLY/IOERR/OutcomeUnknown，分别覆盖远端前及实际结果已返回后的写入；连续失败超过自动预算，仍保留原 write_id/结果，释放 worker 给其他 Binding，恢复后不重复已完成调用。原有终态、补扫、panic 和预算测试均回归 |
-| PSQL-13/14 | [crash harness](../../v2/crates/asc-policy-repository-sqlite/tests/crash_recovery.rs) 用父子同步 gate 确认 12 个窗口后 SIGKILL；外部 mock 维护独立 ledger，保留远端成功但结果未写入的副作用，重启后最终清空目标；Ready 不重复 Apply |
-| PSQL-15 | [真实 daemon bootstrap](../../v2/apps/asc-daemon/tests/bootstrap.rs) 通过 UDS 创建/更新、SIGKILL 重启、确认旧 Scope 快照/新模板、删除后再次重启，并验证不同 socket 不能共用 DB；[procfs 组合](../../v2/apps/asc-daemon/tests/reconciliation.rs) 使用真实子进程、SQLite、PAP、Runtime、Adapter 和 scripted Client，覆盖实例退出清理及新实例；[CLI 流程](../../tests/v2/e2e/test_policy_cli_e2e.py) 使用 source-built 二进制，2 项通过。三种证据分别覆盖入口、执行组合和进程恢复，不冒充完整 CLI→真实 AgentSight 链路 |
+| PSQL-13/14 | [crash harness](../../v2/crates/asc-policy-repository-sqlite/tests/crash_recovery.rs) 用父子同步 gate 确认 12＋3 个窗口后 SIGKILL；外部 mock 维护独立 ledger，保留远端成功但结果未写入的副作用，重启后最终清空目标；Ready 不重复 Apply |
+| PSQL-15 | [真实 daemon bootstrap](../../v2/apps/asc-daemon/tests/bootstrap.rs) 通过 UDS 创建/更新、SIGKILL 重启、确认旧 Scope 快照/新模板、删除后再次重启，并验证不同 socket 不能共用 DB；[procfs 组合](../../v2/apps/asc-daemon/tests/reconciliation.rs) 使用真实子进程、SQLite、PAP、Runtime、Adapter 和 scripted Client，覆盖实例退出清理及新实例；[CLI 流程](../../tests/v2/e2e/test_policy_cli_e2e.py) 验证公开接口。三种证据分别覆盖入口、执行组合和进程恢复，不冒充完整 CLI→真实 AgentSight 链路 |
 | PSQL-16 | 未知 schema 保持原文件、坏数据拒绝打开、事务 panic 不泄漏未提交数据；关闭最后连接后复制主库并从备份恢复，核对 Deleting/UNKNOWN/回执。安全回退依赖第 10 节运维步骤，不能靠新库阻止旧二进制忽略它 |
 | PSQL-18 | [endpoint 恢复测试](../../v2/crates/asc-policy-repository-sqlite/tests/endpoint_recovery.rs) 保存 A 的责任、关闭重开、改配 B 后 DeleteFailed 且 A/B 均无 HTTP、cleanup 不变；恢复 A 并显式 retry，使用轮换 token 完成删除；[Client factory](../../v2/crates/asc-agentsight-client/tests/factory.rs) 另覆盖 create/update/delete 的调用前拒绝、等价 endpoint 和旧 cleanup 拒绝 |
 
@@ -671,28 +661,45 @@ crash gates 包括 Scope/Binding 提交、claim、UNKNOWN、远端 Apply 后结�
 删除意图、discovery 停止屏障、删除 UNKNOWN、远端删除后结果写入前、最终删除提交和恢复中再次崩溃。
 这些是操作系统进程终止与本地事务恢复证据；外部 mock 只模拟目标协议，不是 AgentSight/内核。
 
-本次环境为 Linux 本地 debug 构建。普通 workspace 测试在宿主普通用户下执行；真实 daemon
-启动用独立 user/mount namespace 映射 root，并挂载私有 tmpfs `/tmp`，bootstrap **7 项通过**。
-该测试环境不证明 RPM/systemd、宿主 root 权限部署或物理介质同步写保证。
-fmt、Clippy（deny warnings）、rustdoc 和 `git diff --check` 通过。
+普通 workspace 检查与 root daemon 测试分开记录。只映射 UID 0 的 user namespace
+不能证明普通 UID 的授权；RPM/systemd、宿主部署和物理介质同步写也须独立记录。
 
 主要命令（Rust 从 `v2/`，Python 从组件根执行）：
 
 ```bash
-cargo test --workspace --offline --no-fail-fast -- --test-threads=1
-cargo test --offline -p asc-policy-repository-sqlite -- --nocapture
-cargo clippy --workspace --all-targets --offline -- -D warnings
+cargo test --workspace --locked --offline --no-fail-fast
+cargo test --locked --offline -p asc-policy-repository-sqlite -- --nocapture
+cargo clippy --workspace --all-targets --locked --offline -- -D warnings
 cargo fmt --all -- --check
-cargo doc --workspace --no-deps --offline
+cargo doc --workspace --no-deps --locked --offline
 # In an isolated root environment, with this build's binaries on PATH:
-cargo test --offline -p asc-daemon --test bootstrap -- --test-threads=1
-agent-sec-cli/.venv/bin/python -m pytest tests/v2/e2e/test_policy_cli_e2e.py -q
+cargo test --locked --offline -p asc-daemon --test bootstrap -- --test-threads=1
+agent-sec-cli/.venv/bin/python -m pytest tests/v2/crash_consistency tests/v2/e2e/test_policy_cli_e2e.py tests/v2/e2e/test_policy_delivery_e2e.py -q --import-mode=importlib
+# Requires root with permission to switch the client to an ordinary UID:
+agent-sec-cli/.venv/bin/python -m pytest tests/v2/e2e/test_policy_cli_errors_e2e.py -q --import-mode=importlib
 ```
 
-`batch_discovery_and_cleanup_keep_all_children_atomic` 的一次本地样本：同一 Scope 的 200 个
-实例，WAL/FULL 下批量准入事务 56.17 ms，批量删除意图事务 75.38 ms，逐 Binding 认领并回收
-总计 781.52 ms；采样时主库 499,712 bytes、WAL 4,128,272 bytes、SHM 32,768 bytes。
-这是 debug/小样本观测，没有吞吐或延迟 SLA，也不能外推目标主机 fsync 性能。
+`batch_discovery_and_cleanup_keep_all_children_atomic` 输出同一 Scope 的 200 个实例在
+WAL/FULL 下的准入、删除意图、最终回收时间及 DB/WAL/SHM 大小。运行时记录样本，
+不设置吞吐或延迟 SLA，也不外推目标主机 fsync 性能。
+
+### 9.2 Repository 替换后的补充门禁
+
+| 要求 | 可执行入口 | 覆盖与限制 |
+|---|---|---|
+| 坏库启动不开放 admission、不丢责任、不发远端请求（PSQL-06/09/16） | [存储进程测试](../../tests/v2/crash_consistency/test_storage_recovery.py)：`test_unusable_policy_database_rejects_startup_without_losing_responsibility` | 未知 schema、坏 Binding JSON、不安全权限、真实 SQL 写锁四变体；保留完整 SQL 数据、版本和文件身份。正常 WAL checkpoint 可改变主文件字节 |
+| 共享数据库写故障后的结果补交（PSQL-08/17） | 同文件：`test_shared_sqlite_write_lock_retains_both_results_and_recovers_without_http_replay` | 两个 Apply 已生效、UNKNOWN 责任已提交；外部 BEGIN IMMEDIATE 阻止结果落库及新 PAP 写入。解除锁后两者 Ready，不重复 HTTP；读取可返回已提交结果或明确 unavailable，不能伪报空列表/NotFound |
+| Pending 新进程重建预算（PSQL-12） | 同文件：`test_pending_retry_budget_resets_in_a_new_daemon_process` | 崩溃前两次 503；同 DB 新进程还可完成四次失败及一次成功，保持原 Binding spec |
+| Failed 新进程保持终态（PSQL-12/15） | 同文件：`test_failed_binding_survives_restart_until_explicit_scope_retry` | 重启后独立 Binding 完成，原 Failed 不自动执行；Scope retry 后完成并清理 |
+| 未提交事务崩溃的全有或全无（PSQL-06/11/13） | [SQLite 单元测试](../../v2/crates/asc-policy-repository-sqlite/src/tests.rs)：`sigkill_before_discovery_commit_rolls_back_pin_and_all_bindings` | 单 PID pin/Binding 及 200 个实例，在真实 discovery 事务 COMMIT 前 gate 杀子进程。gate 仅编入 cfg(test)，不向 daemon 提供 failpoint |
+| 实际 SQL LIST 字节预算（PSQL-04） | [Repository 契约](../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs)：`sql_list_byte_budget_preserves_total_and_advances_every_page` | 大记录触发截断，完整比较排序、total、所有后续页及末页，不只测试 page helper |
+| 普通 UID 显式授权及重启撤销（PSQL-15） | [CLI 权限 E2E](../../tests/v2/e2e/test_policy_cli_errors_e2e.py)：`test_explicit_nonroot_administrator_can_manage_assignments_and_is_revoked_on_restart` | root daemon、普通 UID CLI；重启不提供 allowlist 后读写均拒绝。测试环境必须支持真实 UID 切换 |
+
+上述新增入口不补齐所有环境边界：FULL/READONLY 的真实错误分类与 Runtime 错误注入
+分别验证，尚不等同于 daemon 所在文件系统实际满盘/转只读后的全链路演练；IOERR 无硬件掉盘实验。
+迁移回滚测试不代表已覆盖首次初始化的所有 I/O 故障，备份测试仅覆盖关闭连接后的离线备份。
+晚到 Apply 在清理完成后执行的协议缺口仍见 [崩溃测试说明](../../tests/v2/crash_consistency/README_zh.md)，
+不因本地 SQLite 门禁通过而视为已解决。
 
 ## 10. 兼容、升级与回滚
 

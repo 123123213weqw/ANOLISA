@@ -18,6 +18,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
+from tests.v2.e2e.conftest import daemon_bin as daemon_bin
+from tests.v2.e2e.conftest import daemon_settings as daemon_settings
 from tests.v2.e2e.conftest import start_daemon as start_daemon
 
 _V2 = Path(__file__).resolve().parents[3] / "v2"
@@ -25,8 +27,8 @@ _WIRE = _V2 / "fixtures/clients/agentsight/file-deletion"
 _BINDINGS = "/api/enforcement/bindings"
 
 
-def until(read, ready):
-    deadline = time.monotonic() + 10
+def until(read, ready, timeout=10):
+    deadline = time.monotonic() + timeout
     while True:
         value = read()
         if ready(value):
@@ -56,6 +58,7 @@ class Remote:
         self.requests = []
         self.gates = []
         self.errors = []
+        self.apply_failures = []
 
     def pause(self, boundary, repeat=False):
         gate = Gate(boundary, repeat)
@@ -185,11 +188,12 @@ class Recovery:
             ).fetchall()
         return scopes, bindings
 
-    def ready(self, count):
+    def ready(self, count, timeout=10):
         return until(
             lambda: self.daemon.request("binding", "list"),
             lambda value: value["total"] == count
             and all(item["status"]["phase"] == "READY" for item in value["items"]),
+            timeout=timeout,
         )["items"]
 
     def clean(self):
@@ -249,6 +253,18 @@ def recovery(tmp_path, monkeypatch, start_daemon):
             remote.trace("POST", key)
             remote.checkpoint("before_apply", key)
             with remote.lifecycle:
+                if remote.apply_failures:
+                    status = remote.apply_failures.pop(0)
+                    self.reply(
+                        status,
+                        {
+                            "error": {
+                                "code": "enforcer_unavailable",
+                                "retryable": status >= 500,
+                            }
+                        },
+                    )
+                    return
                 previous = remote.records.get(key)
                 if previous is not None and previous["request"] != body:
                     self.reply(

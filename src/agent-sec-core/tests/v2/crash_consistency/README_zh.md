@@ -30,7 +30,7 @@ Apply 后恢复旧的 Apply。
 
 ## daemon 黑盒矩阵
 
-本目录包含以下六个测试：五个默认 CI 场景和一个需显式启用的延期协议缺口复现用例。
+以下生命周期测试与后文存储用例均纳入默认 CI；延期协议缺口复现用例需显式启用。
 通过 RPC、已提交 SQLite 状态和 mock HTTP gate 确认杀进程
 窗口，不通过产品 failpoint 选择 daemon 内部的精确指令位置。
 
@@ -42,6 +42,22 @@ Apply 后恢复旧的 Apply。
 | [`test_delete_during_apply_then_crash_cleans_committed_target`](test_binding_recovery.py) | 在协调器执行前阻塞 Apply。接受 Scope 删除，再放行 Apply 到 `after_apply` gate，确认远端已提交后杀 daemon，HTTP 响应仍被阻塞。 | 恢复以 HTTP 204 删除已提交目标，移除 Binding 和 Scope，不额外 POST；禁止崩溃前 DELETE 或恢复时 404。 | 通过 |
 | [`test_late_apply_cannot_outlive_confirmed_scope_cleanup`](test_binding_recovery.py) | 已收到的 Apply 在进入协调器执行前被阻塞。接受删除，杀 daemon 并重启；恢复 DELETE 得到 `binding_not_found`，本地清理完成，再放行旧 Apply。 | 本地确认清理后，旧 Apply 不得留下远端目标。 | **需显式启用的已知失败：延期处理的 AgentSecCore/AgentSight 协议缺口** |
 | [`test_partial_scope_cleanup_survives_two_crashes_without_reapplying`](test_binding_recovery.py) | 两个 Binding 已 `Ready`；阻塞两个已提交 DELETE 的响应，杀 daemon；重启后放行一个目标的响应，确认剩余一个 Binding 且 Scope 为 `Deleting`，再次杀进程。 | 第二次恢复清理剩余目标并删除 Scope；POST 仅为最初两次，清理恢复不执行 Apply。 | 通过 |
+
+### 存储准入与重试恢复
+
+[`test_storage_recovery.py`](test_storage_recovery.py) 增加真实进程验证：
+
+| 测试 | 必须满足的行为 |
+| --- | --- |
+| `test_unusable_policy_database_rejects_startup_without_losing_responsibility` | 未知 schema、坏 Binding JSON、不安全权限及真实 SQLite 写锁使启动在 UDS/远端 I/O 前失败。保留完整 SQL 数据、schema 版本和文件身份；正常 WAL checkpoint 可改变主文件字节。 |
+| `test_shared_sqlite_write_lock_retains_both_results_and_recovers_without_http_replay` | 两个远端 Apply 已提交后，外部 BEGIN IMMEDIATE 阻止结果写入。新 PAP 写入失败、两个 UNKNOWN 结果保留；释放锁后 Ready，不重复 HTTP。读取返回已提交数据或明确 unavailable，不伪报空列表。 |
+| `test_pending_retry_budget_resets_in_a_new_daemon_process` | 两次失败后 SIGKILL；同 DB/Binding 新进程获得五次预算，还能经历四次失败后成功。 |
+| `test_failed_binding_survives_restart_until_explicit_scope_retry` | 重启后独立任务可完成，原 Failed Binding 保持终态；显式 Scope retry 后继续。 |
+
+BUSY 使用真实 SQLite 写锁；真实 READONLY/FULL 分类与 Runtime 错误注入仍分别属于组件验证，
+不是实际文件系统故障实验。普通 UID 授权见
+[`test_policy_cli_errors_e2e.py`](../e2e/test_policy_cli_errors_e2e.py)；正向授权与拒绝用例需要
+允许切换客户端 UID 的 root 环境，只映射 UID 0 的 namespace 不能运行这些用例。
 
 ### HTTP gate 与重复运行
 
@@ -105,6 +121,11 @@ Binding，其 ID 必须保持不变。最后显式删除后，Binding、Scope、
 该文件用两个父测试覆盖 **12 + 3 个窗口**，加上被 Rust harness 收集的 `crash_child`
 辅助测试；输出“3 tests passed”不代表只覆盖三个崩溃窗口。
 
+单元测试
+[`sigkill_before_discovery_commit_rolls_back_pin_and_all_bindings`](../../../v2/crates/asc-policy-repository-sqlite/src/tests.rs)
+另在生产 discovery 事务 COMMIT 前杀子进程，验证 PID pin/Binding 及 200 个实例批次
+均不部分保留，重开后可重新准入。该 gate 仅编入 cfg(test)，不进入 daemon binary。
+
 ## 相关契约与已知缺口
 
 - [`contracts.rs`](../../../v2/crates/asc-policy-repository-sqlite/tests/contracts.rs)
@@ -120,9 +141,8 @@ Binding，其 ID 必须保持不变。最后显式删除后，Binding、Scope、
 协议修复延期到当前 PR 之外；复现用例保留原有安全断言，默认 skip，设置
 `ASC_TEST_DEFERRED_PROTOCOL=1` 后启用并仍会失败。默认 CI 场景通过不代表协议缺口已修复。
 
-修复 SQLite 锁和测试 harness 后，已通过 SQLite crate 全部 34 项测试，以及四个
-非延期黑盒场景连续五轮运行（20 次用例执行）；协议场景单独复验仍失败。
-这些结果不能证明超出本故障模型的生产崩溃安全。
+每次运行在对应 PR/CI 记录被测源码版本、命令、环境、结果和跳过项。
+旧版本测试数量及 PASS 不证明当前覆盖，也不证明超出本故障模型的生产崩溃安全。
 
 ## 运行与诊断
 

@@ -449,6 +449,57 @@ fn scope_capacity_and_snapshot_admission_are_atomic() {
 }
 
 #[test]
+fn sql_list_byte_budget_preserves_total_and_advances_every_page() {
+    let dir = private_dir();
+    let repo = SqlitePolicyRepository::open(&dir.path().join("policy-state.db")).unwrap();
+    let initial = seed(&repo).binding.spec.policy;
+    let mut policy = initial.clone();
+    let mut template = serde_json::to_value(&policy.template).unwrap();
+    let rule = template["rules"][0].clone();
+    template["rules"] = serde_json::Value::Array(
+        (0..200)
+            .map(|index| {
+                let mut rule = rule.clone();
+                rule["target"]["path"] = format!("/{index}{}", "x".repeat(3000)).into();
+                rule
+            })
+            .collect(),
+    );
+    policy.template = serde_json::from_value(template).unwrap();
+    let mut expected = vec![initial];
+    for index in 0..7 {
+        policy.policy_id = ResourceId::new(format!("large-{index}")).unwrap();
+        expected.push(repo.put_policy(&policy).unwrap());
+    }
+    expected.sort_by(|a, b| a.policy_id.cmp(&b.policy_id));
+    let mut actual = vec![];
+    while actual.len() < expected.len() {
+        let page = repo
+            .list_policies(100, u32::try_from(actual.len()).unwrap())
+            .unwrap();
+        assert_eq!(page.total, u64::try_from(expected.len()).unwrap());
+        assert!(
+            !page.items.is_empty(),
+            "byte-limited pagination must make progress"
+        );
+        assert!(serde_json::to_vec(&page.items).unwrap().len() <= 3 * 1024 * 1024 + 1);
+        if actual.is_empty() {
+            assert!(
+                page.items.len() < expected.len(),
+                "SQL page must hit the byte budget"
+            );
+        }
+        actual.extend(page.items);
+    }
+    assert_eq!(actual, expected);
+    let end = repo
+        .list_policies(100, u32::try_from(actual.len()).unwrap())
+        .unwrap();
+    assert_eq!(end.total, u64::try_from(expected.len()).unwrap());
+    assert!(end.items.is_empty());
+}
+
+#[test]
 fn invalid_authoritative_rows_are_rejected_without_repair() {
     for sql in [
         "PRAGMA ignore_check_constraints=ON; UPDATE bindings SET spec_json='broken-json'",
