@@ -1227,12 +1227,13 @@ fn rollback_list_output(entries: &[tuner::RollbackPreview]) -> serde_json::Value
     })
 }
 
-/// JSON body of `ktuner rollback`. One builder for both shapes: a full
+/// JSON body of `ktuner rollback`. One builder for every shape: a full
 /// rollback keeps exactly the four keys it always had, while restoring a single
 /// parameter adds `param` — the ledger key it retired, spelled the way
 /// `rollback --list` publishes it, so the entry can be reconciled with the
 /// preview. Keys stay in alphabetical order (serde_json's map is sorted):
-/// `failed` < `param` < `restored` < `skipped` < `status`.
+/// `boot_unit_enabled` < `failed` < `failures` < `missing` < `param` <
+/// `params` < `restored` < `skipped` < `status`.
 fn rollback_output(param: Option<&str>, outcome: &tuner::RollbackOutcome) -> serde_json::Value {
     let status = tuner::classify_rollback(outcome);
     let mut body = json!({
@@ -1243,6 +1244,23 @@ fn rollback_output(param: Option<&str>, outcome: &tuner::RollbackOutcome) -> ser
     });
     if let Some(param) = param {
         body["param"] = json!(param);
+    }
+    // A count says how many parameters are still tuned, never which ones, so a
+    // caller that had to undo one of them (or explain the exit code) had to
+    // re-run `rollback --list` as root to find out. Name them the way `tune`
+    // names the parameters it failed to write, in the same {param, error}
+    // shape. Both keys appear only when they have something to say, like
+    // `unmatched_exclude`, `unclassified` and `boot_unit_enabled` below, so a
+    // rollback that left nothing keeps the body it has always had.
+    if !outcome.failures.is_empty() {
+        body["failures"] = json!(outcome
+            .failures
+            .iter()
+            .map(|failure| json!({ "param": failure.param, "error": failure.error }))
+            .collect::<Vec<_>>());
+    }
+    if !outcome.missing.is_empty() {
+        body["missing"] = json!(outcome.missing);
     }
     // A partial rollback regenerates the boot replay for the entries it keeps,
     // and a refused `systemctl enable` there was dropped: the run reported
@@ -1266,7 +1284,9 @@ fn rollback_output(param: Option<&str>, outcome: &tuner::RollbackOutcome) -> ser
 /// caller can read back the batch it asked for. A mutually exclusive twin
 /// restored with an entry is counted in `restored` but not named here, exactly
 /// as the single-parameter body does not name it; whether the batch restored
-/// everything is `status`'s answer, not the array's.
+/// everything is `status`'s answer, not the array's. The reports of what the
+/// batch left (`failures`, `missing`) come from the shared base, so a batch
+/// carries them exactly as a full rollback does.
 fn rollback_params_output(keys: &[String], outcome: &tuner::RollbackOutcome) -> serde_json::Value {
     let mut body = rollback_output(None, outcome);
     body["params"] = json!(keys);
@@ -4387,24 +4407,35 @@ mod tests {
                 leftovers: Vec::new(),
                 boot_unit_enabled: true,
             };
-            assert_eq!(
-                rollback_output(None, &outcome),
-                json!({
-                    "restored": restored,
-                    "failed": failed,
-                    "skipped": skipped,
-                    "status": status,
-                })
-            );
+            let mut expected = json!({
+                "restored": restored,
+                "failed": failed,
+                "skipped": skipped,
+                "status": status,
+            });
+            // The counts agree with the reports, which arrive only when they
+            // have something to say.
+            if failed > 0 {
+                expected["failures"] = json!(test_failures(failed)
+                    .iter()
+                    .map(|failure| json!({
+                        "param": failure.param,
+                        "error": failure.error
+                    }))
+                    .collect::<Vec<_>>());
+            }
+            if skipped > 0 {
+                expected["missing"] = json!(test_missing(skipped));
+            }
+            assert_eq!(rollback_output(None, &outcome), expected);
         }
     }
 
-    /// Carrying the entries must not move a byte of the body: the counters are
-    /// still what a caller reads, so an outcome that names what it left
-    /// answers with the same keys and the same numbers as one that only
-    /// counted them.
+    /// An outcome that left entries names them: the counts stay what they
+    /// were, and the two reports arrive beside them in the {param, error}
+    /// shape `tune` uses for the same news.
     #[test]
-    fn rollback_output_counts_the_carried_entries() {
+    fn rollback_output_names_the_entries_a_rollback_left() {
         let outcome = tuner::RollbackOutcome {
             restored: 1,
             failures: test_failures(2),
@@ -4414,7 +4445,74 @@ mod tests {
         };
         assert_eq!(
             serde_json::to_string_pretty(&rollback_output(None, &outcome)).unwrap(),
-            "{\n  \"failed\": 2,\n  \"restored\": 1,\n  \"skipped\": 1,\n  \"status\": \"Partial\"\n}"
+            "{\n  \"failed\": 2,\n  \"failures\": [\n    {\n      \"error\": \"write refused\",\n      \"param\": \"vm.ktuner_failed_0\"\n    },\n    {\n      \"error\": \"write refused\",\n      \"param\": \"vm.ktuner_failed_1\"\n    }\n  ],\n  \"missing\": [\n    \"vm.ktuner_missing_0\"\n  ],\n  \"restored\": 1,\n  \"skipped\": 1,\n  \"status\": \"Partial\"\n}"
+        );
+    }
+
+    /// Every invocation shape reports them, because every shape is built on
+    /// the same base: the plain rollback, the single positional, the batch,
+    /// and the bodies `--exclude` and `--category` wrap. A caller that named
+    /// one parameter reads the same two keys as one that rolled back
+    /// everything.
+    #[test]
+    fn rollback_body_names_the_entries_in_every_shape() {
+        let outcome = tuner::RollbackOutcome {
+            restored: 0,
+            failures: test_failures(1),
+            missing: test_missing(1),
+            leftovers: Vec::new(),
+            boot_unit_enabled: true,
+        };
+        let one = ["vm.swappiness".to_string()];
+        let two = ["vm.swappiness".to_string(), "vm.dirty_ratio".to_string()];
+        let excluded = ["vm.swappiness".to_string()];
+        for (shape, body) in [
+            ("plain", rollback_body(0, &[], &outcome)),
+            ("single positional", rollback_body(1, &one, &outcome)),
+            ("batch", rollback_body(2, &two, &outcome)),
+            // `--exclude` and `--category` answer with the full-rollback body
+            // plus their own reports, added by the same wrapper.
+            (
+                "exclude",
+                with_unmatched_exclude(rollback_body(0, &[], &outcome), &excluded),
+            ),
+        ] {
+            assert_eq!(
+                body["failures"],
+                json!([{ "param": "vm.ktuner_failed_0", "error": "write refused" }]),
+                "{shape}: the failed entries are named"
+            );
+            assert_eq!(
+                body["missing"],
+                json!(["vm.ktuner_missing_0"]),
+                "{shape}: the missing entries are named"
+            );
+            // The counts keep their meaning: `failed` counts the entries the
+            // report names, and a clean rollback's untouched body stays clean.
+            assert_eq!(body["failed"], json!(1), "{shape}: failed count");
+            assert_eq!(body["skipped"], json!(1), "{shape}: skipped count");
+        }
+    }
+
+    /// A rollback that left nothing answers exactly as it did before the
+    /// reports existed: the keys appear only when they have something to say,
+    /// the rule `unmatched_exclude`, `unclassified` and `boot_unit_enabled`
+    /// follow.
+    #[test]
+    fn rollback_output_hides_the_reports_when_nothing_was_left() {
+        let clean = tuner::RollbackOutcome {
+            restored: 3,
+            failures: test_failures(0),
+            missing: test_missing(0),
+            leftovers: Vec::new(),
+            boot_unit_enabled: true,
+        };
+        let body = rollback_output(None, &clean);
+        assert!(body.get("failures").is_none(), "{body}");
+        assert!(body.get("missing").is_none(), "{body}");
+        assert_eq!(
+            serde_json::to_string_pretty(&body).unwrap(),
+            "{\n  \"failed\": 0,\n  \"restored\": 3,\n  \"skipped\": 0,\n  \"status\": \"Full\"\n}"
         );
     }
 
@@ -4480,7 +4578,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string_pretty(&rollback_output(Some("vm.swappiness"), &skipped))
                 .unwrap(),
-            "{\n  \"failed\": 0,\n  \"param\": \"vm.swappiness\",\n  \"restored\": 0,\n  \"skipped\": 1,\n  \"status\": \"Nothing\"\n}"
+            "{\n  \"failed\": 0,\n  \"missing\": [\n    \"vm.ktuner_missing_0\"\n  ],\n  \"param\": \"vm.swappiness\",\n  \"restored\": 0,\n  \"skipped\": 1,\n  \"status\": \"Nothing\"\n}"
         );
     }
 
@@ -4543,7 +4641,7 @@ mod tests {
         assert_eq!(
             serde_json::to_string_pretty(&rollback_body(1, &["vm.swappiness".to_string()], &skipped))
                 .unwrap(),
-            "{\n  \"failed\": 0,\n  \"param\": \"vm.swappiness\",\n  \"restored\": 0,\n  \"skipped\": 1,\n  \"status\": \"Nothing\"\n}"
+            "{\n  \"failed\": 0,\n  \"missing\": [\n    \"vm.ktuner_missing_0\"\n  ],\n  \"param\": \"vm.swappiness\",\n  \"restored\": 0,\n  \"skipped\": 1,\n  \"status\": \"Nothing\"\n}"
         );
     }
 
@@ -4603,6 +4701,8 @@ mod tests {
                 "skipped": 1,
                 "status": "Partial",
                 "params": ["vm.swappiness", "vm.vfs_cache_pressure"],
+                "failures": [{ "param": "vm.ktuner_failed_0", "error": "write refused" }],
+                "missing": ["vm.ktuner_missing_0"],
             })
         );
         assert!(body.get("param").is_none(), "{body}");
