@@ -625,6 +625,26 @@ fn tune_short_circuit<'a>(
     ))
 }
 
+/// The twins this plan's writes clear in the kernel, in plan order and
+/// deduplicated: the mutually exclusive partner of every parameter the plan
+/// applies, from the write path's own twin table ([`tuner::cleared_sibling`]),
+/// so the preview names what a real run clears instead of deriving the pair
+/// relationship a second time. The built-in rules never plan both halves of a
+/// pair, so a twin named here is cleared by the plan and not also applied by
+/// it. Empty when no applied parameter has a twin; the caller omits the key
+/// then, the same rule `fix --dry-run` follows.
+fn would_clear_json(applicable: &[Recommendation]) -> Vec<&'static str> {
+    let mut twins: Vec<&'static str> = Vec::new();
+    for rec in applicable {
+        if let Some(twin) = tuner::cleared_sibling(&rec.param) {
+            if !twins.contains(&twin) {
+                twins.push(twin);
+            }
+        }
+    }
+    twins
+}
+
 /// JSON body of the `tune --dry-run` preview. Pure so the status contract
 /// stays unit-testable without a live host.
 ///
@@ -636,7 +656,12 @@ fn tune_short_circuit<'a>(
 /// out — this environment filtered them (unwritable, or runtime-dangerous) or
 /// the operator's selection dropped them — with the reason, so the parameters
 /// a partial plan leaves behind are visible and not just counted. `blocked`
-/// stays their count.
+/// stays their count. `would_clear` names the mutually exclusive twins those
+/// writes zero — `fix --dry-run`'s key and meaning, for the whole plan: a
+/// write clears its twin in the kernel whether or not the plan selected the
+/// twin, so a selection that leaves the twin out does not leave the kernel
+/// alone, and the preview saying so is the same "one table, named once" rule
+/// the single-parameter preview follows.
 fn dry_run_output<'a>(
     in_scope: &[Recommendation],
     applicable: &[Recommendation],
@@ -652,6 +677,10 @@ fn dry_run_output<'a>(
         "would_apply": recs_json,
         "would_skip": would_skip,
     });
+    let would_clear = would_clear_json(applicable);
+    if !would_clear.is_empty() {
+        body["would_clear"] = json!(would_clear);
+    }
     if let Some((key, unmatched)) = selection.unmatched_report(in_scope) {
         body[key] = unmatched;
     }
@@ -2284,6 +2313,56 @@ mod tests {
             output["would_skip"],
             json!([{ "param": "vm.nr_hugepages", "reason": "unwritable" }])
         );
+    }
+
+    #[test]
+    fn dry_run_output_names_the_twins_the_plan_clears() {
+        // A write zeroes its mutually exclusive twin in the kernel whether or
+        // not the plan selected the twin (mm/page-writeback.c, mm/util.c), and
+        // the ledger records that cleared original — so a preview that stays
+        // silent about it hides a change the run makes. `fix --dry-run` names
+        // its one twin in `would_clear`; the whole-plan preview names every
+        // twin its writes clear, in plan order and once each, from the same
+        // table the write path records from.
+        let recs = vec![
+            rec("vm.dirty_bytes", true),
+            rec("vm.swappiness", true),
+            rec("vm.overcommit_ratio", true),
+        ];
+        let output = dry_run_output(&recs, &recs, &[]);
+        assert_eq!(
+            output["would_clear"],
+            json!(["vm.dirty_ratio", "vm.overcommit_kbytes"])
+        );
+        // The single-parameter preview answers the same thing for the same
+        // parameter, so a script reading either one learns the same pair.
+        assert_eq!(
+            fix_dry_run_output(&rec("vm.dirty_bytes", true))["would_clear"],
+            json!(["vm.dirty_ratio"])
+        );
+        // A parameter the plan carries twice names its twin once: the list is
+        // the set of twins the plan clears, not one entry per write.
+        let duplicate = vec![
+            rec("vm.dirty_background_ratio", true),
+            rec("vm.dirty_background_ratio", true),
+        ];
+        assert_eq!(
+            dry_run_output(&duplicate, &duplicate, &[])["would_clear"],
+            json!(["vm.dirty_background_bytes"])
+        );
+        // A plan whose parameters have no twin keeps the shape it always had:
+        // the key is absent, exactly like `fix --dry-run`'s.
+        let plain = vec![rec("vm.swappiness", true)];
+        let output = dry_run_output(&plain, &plain, &[]);
+        assert!(output.get("would_clear").is_none(), "{output}");
+        // The skipped entries' params do not contribute: only the writes the
+        // plan would actually make clear a twin.
+        let in_scope = vec![
+            rec("vm.overcommit_kbytes", true),
+            rec("vm.swappiness", false),
+        ];
+        let output = dry_run_output(&in_scope, &in_scope[..1], &[]);
+        assert_eq!(output["would_clear"], json!(["vm.overcommit_ratio"]));
     }
 
     #[test]
