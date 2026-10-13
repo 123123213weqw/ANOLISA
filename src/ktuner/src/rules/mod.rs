@@ -6057,9 +6057,37 @@ fn suid_dumpable_recommendation(current: u64) -> Option<Recommendation> {
     })
 }
 
-fn eval_icmp_ignore_bogus(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/icmp_ignore_bogus_error_responses";
-    if !std::path::Path::new(path).exists() {
+fn eval_icmp_ignore_bogus(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_icmp_ignore_bogus_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/icmp_ignore_bogus_error_responses",
+    )
+}
+
+/// Path-injectable form of [`eval_icmp_ignore_bogus`] (the `eval_*_at` idiom).
+///
+/// `net/ipv4/icmp_ignore_bogus_error_responses` is a truthiness knob whose
+/// `== 0` gate is already the right test for it — but the value has to be
+/// read signed. Through v5.12 `net/ipv4/sysctl_net_ipv4.c` registered it as
+/// a plain `proc_dointvec` int with no min/max, so `-1` is legal and means
+/// "on". The unsigned reader parsed `-1` to `Err` and fell back to `0`, the
+/// disabled value, so the rule reported "bogus ICMP responses are not
+/// ignored" on a host that is in fact ignoring them — and the `= 1` it
+/// recommended was a no-op there. From v5.13 the same table registers it as
+/// u8 (`proc_dou8vec_minmax`, `extra1 = SYSCTL_ZERO`), where `0..=255` is
+/// writable.
+///
+/// The consumer is a truthiness test — `net/ipv4/icmp.c`:
+/// `if (!READ_ONCE(net->ipv4.sysctl_icmp_ignore_bogus_error_responses) && ...)`,
+/// so `0` is the only off value.
+/// `Documentation/networking/ip-sysctl.rst` documents the knob as `BOOLEAN`.
+fn eval_icmp_ignore_bogus_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     let current = read_sysctl_i64(path);
@@ -8130,13 +8158,46 @@ fn eval_unres_qlen_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
 }
 
 fn eval_ip_nonlocal_bind(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/ip_nonlocal_bind";
-    if !std::path::Path::new(path).exists() {
+    eval_ip_nonlocal_bind_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/ip_nonlocal_bind",
+        info.has_process("keepalived") || info.has_process("haproxy"),
+    )
+}
+
+/// Path-injectable form of [`eval_ip_nonlocal_bind`] (the `eval_*_at` idiom).
+///
+/// `net/ipv4/ip_nonlocal_bind` is a truthiness knob, not an enum, and both
+/// registrations it has had hold values the `== 1` comparison drops:
+///
+/// - Through v5.12 `net/ipv4/sysctl_net_ipv4.c` registered it as a plain
+///   `proc_dointvec` int with no min/max, so `-1` is legal and persistent.
+///   The unsigned reader parsed `-1` to `Err` and fell back to `0` — the
+///   *disabled* value — so the finding was withheld on a host that binds
+///   non-local addresses.
+/// - From v5.13 the same table registers it as u8 (`proc_dou8vec_minmax`,
+///   and no `extra1`/`extra2`), so `0..=255` stays writable and every
+///   non-zero value is on.
+///
+/// The only consumer is a truthiness test — `include/net/inet_sock.h`:
+/// `inet_can_nonlocal_bind()` returns
+/// `READ_ONCE(net->ipv4.sysctl_ip_nonlocal_bind) || ...`, i.e. any non-zero
+/// value enables binding non-local addresses.
+/// `Documentation/networking/ip-sysctl.rst` documents the knob as `BOOLEAN`,
+/// which spells the polarity from the other side: `0` is the only off value.
+fn eval_ip_nonlocal_bind_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    vip_host: bool,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
     // HA / VIP setups (keepalived VRRP, HAProxy binding to floating IPs) require
-    // ip_nonlocal_bind=1 on purpose — don't recommend disabling it there.
-    if info.has_process("keepalived") || info.has_process("haproxy") {
+    // ip_nonlocal_bind non-zero on purpose — don't recommend disabling it there.
+    if vip_host {
         return 1;
     }
     let current = read_sysctl_i64(path);
@@ -14734,6 +14795,91 @@ mod tests {
                 assert_eq!(recs.last().unwrap().category, Category::Security);
             }
         }
+    }
+
+    #[test]
+    fn ip_nonlocal_bind_reads_truthiness_signed() {
+        // Both registrations hold values the `== 1` comparison dropped: a
+        // plain proc_dointvec int with no min/max through v5.12 (net/ipv4/
+        // sysctl_net_ipv4.c, so -1 is legal), and a u8 proc_dou8vec_minmax
+        // with no extra1/extra2 from v5.13 (0..=255). The only consumer is a
+        // truthiness test (include/net/inet_sock.h `inet_can_nonlocal_bind()`
+        // returns `READ_ONCE(net->ipv4.sysctl_ip_nonlocal_bind) || ...`), so
+        // every non-zero value means "binding non-local addresses is on".
+        let path =
+            std::env::temp_dir().join(format!("ktuner-ip-nonlocal-bind-{}", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        for (value, expect_rec) in [
+            ("-1", true),
+            ("0", false),
+            ("1", true),
+            ("2", true),
+            ("255", true),
+        ] {
+            std::fs::write(&path, value).unwrap();
+            let info = make_test_info();
+            let mut recs = Vec::new();
+            let checked = eval_ip_nonlocal_bind_at(&info, &mut recs, path_str, false);
+            assert_eq!(checked, 1);
+            let rec = recs.iter().find(|r| r.param == "net.ipv4.ip_nonlocal_bind");
+            assert_eq!(
+                rec.is_some(),
+                expect_rec,
+                "value={value}: 0 is the only off value"
+            );
+            if let Some(rec) = rec {
+                assert_eq!(
+                    rec.current_value, value,
+                    "current must be what the kernel holds"
+                );
+                assert_eq!(rec.recommended_value, "0");
+                assert_eq!(rec.category, Category::Security);
+            }
+        }
+        // The VRRP gate still short-circuits: keepalived/HAProxy bind to
+        // floating addresses on purpose.
+        std::fs::write(&path, "1").unwrap();
+        let info = make_test_info();
+        let mut recs = Vec::new();
+        eval_ip_nonlocal_bind_at(&info, &mut recs, path_str, true);
+        assert!(
+            recs.iter().all(|r| r.param != "net.ipv4.ip_nonlocal_bind"),
+            "an HA host is not recommended to turn the bind off"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn icmp_ignore_bogus_reads_truthiness_signed() {
+        // Same split registration as the tcp option bools: plain proc_dointvec
+        // with no min/max through v5.12 (net/ipv4/sysctl_net_ipv4.c, -1 legal),
+        // u8 proc_dou8vec_minmax from v5.13. icmp.c only tests truthiness
+        // (`if (!READ_ONCE(...icmp_ignore_bogus_error_responses) && ...)`), so
+        // the `== 0` gate is right — but the unsigned reader mapped -1 to 0 and
+        // reported the finding on a host that ignores bogus responses already.
+        let path =
+            std::env::temp_dir().join(format!("ktuner-icmp-ignore-bogus-{}", std::process::id()));
+        let path_str = path.to_str().unwrap();
+        for (value, expect_rec) in [("-1", false), ("0", true), ("1", false), ("2", false)] {
+            std::fs::write(&path, value).unwrap();
+            let info = make_test_info();
+            let mut recs = Vec::new();
+            eval_icmp_ignore_bogus_at(&info, &mut recs, path_str);
+            let rec = recs
+                .iter()
+                .find(|r| r.param == "net.ipv4.icmp_ignore_bogus_error_responses");
+            assert_eq!(
+                rec.is_some(),
+                expect_rec,
+                "value={value}: only 0 means the responses are not ignored"
+            );
+            if let Some(rec) = rec {
+                assert_eq!(rec.current_value, "0");
+                assert_eq!(rec.recommended_value, "1");
+                assert_eq!(rec.category, Category::Security);
+            }
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
