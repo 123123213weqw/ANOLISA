@@ -1178,6 +1178,15 @@ fn rollback_output(param: Option<&str>, outcome: &tuner::RollbackOutcome) -> ser
     if let Some(param) = param {
         body["param"] = json!(param);
     }
+    // A partial rollback regenerates the boot replay for the entries it keeps,
+    // and a refused `systemctl enable` there was dropped: the run reported
+    // success while the block/THP values still recorded will not be replayed
+    // after a reboot. The key is the one `tune` and `fix` publish, and it
+    // appears only when the replay is not armed, so every other rollback keeps
+    // the body it has always had.
+    if !outcome.boot_unit_enabled {
+        body["boot_unit_enabled"] = json!(false);
+    }
     body
 }
 
@@ -1563,6 +1572,7 @@ mod tests {
                 restored,
                 failed,
                 skipped,
+                boot_unit_enabled: true,
             };
             assert_eq!(rollback_exit_code(&outcome), expected, "{name}");
         }
@@ -3994,6 +4004,7 @@ mod tests {
             restored: 5,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         let body = rollback_output(None, &full);
         println!(
@@ -4015,6 +4026,7 @@ mod tests {
                 restored,
                 failed,
                 skipped,
+                boot_unit_enabled: true,
             };
             assert_eq!(
                 rollback_output(None, &outcome),
@@ -4029,6 +4041,34 @@ mod tests {
     }
 
     #[test]
+    fn rollback_output_reports_an_unarmed_boot_replay() {
+        // A partial rollback re-runs `systemctl enable` for the entries it
+        // keeps; a refused enable must reach the body under the key `tune` and
+        // `fix` publish, and an armed replay keeps the body unchanged.
+        let unarmed = tuner::RollbackOutcome {
+            restored: 1,
+            failed: 0,
+            skipped: 0,
+            boot_unit_enabled: false,
+        };
+        for body in [
+            rollback_output(None, &unarmed),
+            rollback_output(Some("vm.swappiness"), &unarmed),
+            rollback_params_output(&["vm.swappiness".to_string()], &unarmed),
+        ] {
+            assert_eq!(body["boot_unit_enabled"], json!(false), "{body}");
+        }
+
+        let armed = tuner::RollbackOutcome {
+            boot_unit_enabled: true,
+            ..unarmed
+        };
+        assert!(rollback_output(Some("vm.swappiness"), &armed)
+            .get("boot_unit_enabled")
+            .is_none());
+    }
+
+    #[test]
     fn rollback_output_names_the_restored_param() {
         // The single-parameter body adds exactly one key, carrying the ledger
         // entry that was retired — the spelling `rollback --list` publishes.
@@ -4038,6 +4078,7 @@ mod tests {
             restored: 2,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         let body = rollback_output(Some("vm.dirty_bytes"), &twins);
         println!(
@@ -4052,6 +4093,7 @@ mod tests {
             restored: 0,
             failed: 0,
             skipped: 1,
+            boot_unit_enabled: true,
         };
         assert_eq!(
             serde_json::to_string_pretty(&rollback_output(Some("vm.swappiness"), &skipped))
@@ -4097,6 +4139,7 @@ mod tests {
             restored: 2,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         assert_eq!(
             serde_json::to_string_pretty(&rollback_body(
@@ -4111,6 +4154,7 @@ mod tests {
             restored: 0,
             failed: 0,
             skipped: 1,
+            boot_unit_enabled: true,
         };
         assert_eq!(
             serde_json::to_string_pretty(&rollback_body(1, &["vm.swappiness".to_string()], &skipped))
@@ -4129,6 +4173,7 @@ mod tests {
             restored: 3,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         let keys = vec![
             "net.core.somaxconn".to_string(),
@@ -4154,6 +4199,7 @@ mod tests {
             restored: 1,
             failed: 1,
             skipped: 1,
+            boot_unit_enabled: true,
         };
         let body = rollback_body(
             2,
@@ -4201,6 +4247,7 @@ mod tests {
             restored: 1,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         for keys in [
             vec!["vm.swappiness".to_string()],
@@ -4237,6 +4284,7 @@ mod tests {
             restored: 5,
             failed: 0,
             skipped: 0,
+            boot_unit_enabled: true,
         };
         assert_eq!(rollback_body(0, &[], &full), rollback_output(None, &full));
         assert_eq!(

@@ -487,6 +487,14 @@ parameter gets: skipping the miss would let a typo drop the rest of the batch
 while the run still exited `0`. `rollback` with no parameter and `rollback --list`
 are unchanged; `rollback --list <param>…` previews a batch (see below).
 
+Every rollback that keeps part of the ledger (named parameters, `--exclude`,
+`--category`) regenerates the persisted files from the entries that remain and
+re-runs `systemctl enable` for the non-sysctl boot replay. When that enable is
+refused, the body adds `"boot_unit_enabled": false`, the key `tune` and `fix`
+publish: block-device or THP values still recorded will not be replayed after a
+reboot. The key is absent whenever the replay is armed or nothing is
+regenerated, so those bodies are unchanged.
+
 ### rollback --list output
 
 `sudo ktuner rollback --list` previews what a rollback would restore — read-only, nothing is

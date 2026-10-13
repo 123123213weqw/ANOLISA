@@ -432,6 +432,11 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 一个名字丢掉一整批回滚，而命令仍然退出 `0`。无参数的 `rollback` 与 `rollback --list` 不变；
 `rollback --list <param>…` 预览一批回滚（见下）。
 
+所有只撤掉部分账本的 rollback（指定参数、`--exclude`、`--category`）都会按剩余条目重新生成
+持久化文件，并为非 sysctl 配置的启动重放重新执行 `systemctl enable`。enable 被拒绝时，输出
+多一个 `"boot_unit_enabled": false`（与 `tune`、`fix` 的键相同）：仍在账本里的块设备或 THP
+配置重启后不会自动重放。启动重放已就绪、或本次没有重新生成时不出现这个键，输出保持不变。
+
 ### rollback --list 输出
 
 `sudo ktuner rollback --list` 预览回滚将恢复的内容——只读，不写入不删除（ledger 是 0700 root 目录下的 0600 文件，因此与 rollback 共用 root 门槛；损坏的 ledger 报错而不是当作空列表）。每个条目保留原有的 `param`/`applied`/`previous`，附带记录该条目的规则给出的 `category`（与 `check` 的词条同一小写拼写；本字段出现之前写入的记录、或库导入的记录为 `null`，任何类别都不选中它们），并新增内核当前的实际状态：`live` 从该条目自己的路径读取，使用与其他所有界面相同的读取器（sysfs 选项列表取方括号中的活动项、多值 sysctl 折叠为单空格）；`drifted` 表示 `live` 是否仍与 `applied` 一致，比较方式与写入校验相同——内核按自身形态呈现的值（方括号选项列表、TAB 分隔的多值、领先 token 回显）不算漂移：
