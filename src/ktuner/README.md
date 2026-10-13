@@ -454,6 +454,23 @@ value; persistence reproduces the cleared state.
 {"failed": 0, "restored": 5, "skipped": 0, "status": "Full"}
 ```
 
+A rollback that left something behind names it, so a caller reading `failed` or
+`skipped` does not have to run `rollback --list` as root to find out which
+parameters are still tuned: `failures` carries one `{"param", "error"}` per
+entry whose restore did not land (a write the kernel refused, a read-back that
+stayed clamped, a value a later write clobbered), and `missing` names the
+entries whose recorded path is gone. Both keys appear only when they have
+something to say, so a rollback that left nothing answers with the body above,
+byte for byte. The counters keep their meaning: `failed` still counts
+everything that did not land, including the persisted files and the ledger a
+cleanup could not remove, and `skipped` still counts the absent paths. Every
+invocation shape reports them — the plain rollback, a single positional, a
+batch, and the bodies `--exclude` and `--category` wrap.
+
+```json
+{"failed": 1, "failures": [{"error": "Is a directory (os error 21)", "param": "vm.dirty_ratio"}], "missing": ["net.core.somaxconn"], "restored": 1, "skipped": 1, "status": "Partial"}
+```
+
 ### rollback <param>… output
 
 `sudo ktuner rollback <param>` restores just the recorded entry the parameter
@@ -493,7 +510,8 @@ key each positional resolved to, in the order given and deduplicated, so
 The twin restored with an entry is counted in `restored` but not named, exactly
 as the single-parameter body does not name it, and naming both halves of a pair
 restores it once. A parameter whose write failed or whose path is gone is still
-named — the counters and `status` say whether the batch restored. A batch that
+named in `failures` / `missing` — the counters and `status` say whether the
+batch restored. A batch that
 restores only part of what it named retires the entries that landed, keeps the
 records of the ones that did not (with their twins), exits `1` and reports
 `Partial`; a batch where nothing lands touches neither the ledger nor the
