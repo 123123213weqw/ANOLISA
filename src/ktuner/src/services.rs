@@ -45,6 +45,20 @@ const KNOWN_SERVICES: &[(&str, &str)] = &[
     ("minio", "MinIO"),
     ("pulsar", "Pulsar"),
     ("bookkeeper", "BookKeeper"),
+    // The canonical names RUNTIME_SERVICE_MARKERS resolves a JVM or a script
+    // to. `read_processes` pushes those names into the same process list this
+    // table filters, so without an entry the engine detected the service (and,
+    // for hadoop, acted on it) while the report named no service at all — the
+    // hole the mariadbd and valkey-server entries closed for their daemons.
+    // Appended rather than inserted so an existing host's report keeps its
+    // order.
+    ("cassandra", "Cassandra"),
+    ("hadoop", "Hadoop"),
+    ("hbase", "HBase"),
+    ("jenkins", "Jenkins"),
+    ("logstash", "Logstash"),
+    ("solr", "Solr"),
+    ("tomcat", "Tomcat"),
 ];
 
 pub fn detect_services(info: &SystemInfo) -> Vec<&'static str> {

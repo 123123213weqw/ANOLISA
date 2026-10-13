@@ -4284,6 +4284,21 @@ mod tests {
         assert_eq!(runtime_service_from_cmdline(cmdline), Some("elasticsearch"));
     }
 
+    /// Every canonical name the runtime markers resolve has to be reportable:
+    /// `read_processes` pushes that name into the same process list the report's
+    /// `services` field filters, so a marker without a matching table entry is a
+    /// service the engine detects (and, for hadoop, one a rule acts on) while a
+    /// host running only that service reports no service at all.
+    #[test]
+    fn every_runtime_marker_resolves_to_a_reported_service() {
+        for (_, service) in RUNTIME_SERVICE_MARKERS {
+            assert!(
+                !crate::services::detect_services(&info_with_processes(&[*service])).is_empty(),
+                "{service} is resolved by the runtime markers but the report cannot name it"
+            );
+        }
+    }
+
     #[test]
     fn test_runtime_service_reads_the_rabbitmq_erlang_node() {
         // RabbitMQ's launcher execs the Erlang VM, so the process is
