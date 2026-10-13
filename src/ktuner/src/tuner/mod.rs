@@ -2749,6 +2749,26 @@ fn restore_entries_with(
             failed += 1;
             continue;
         }
+        // The structural guard the write choke point enforces belongs here for
+        // the same reason the deny-list does: `restore` writes the path the
+        // ledger recorded, and a name like
+        // `net/ipv4/conf/../../../../..<file>` resolves outside /proc/sys and
+        // /sys entirely. The apply path refuses such a name before writing it
+        // (`write_and_verify`); a ledger written before that guard existed, or
+        // by a library caller, still holds one, and restoring it would replay
+        // the same traversal as root — the write the undo path must refuse for
+        // the write path's own decision to mean anything.
+        if !is_safe_param(param) {
+            if !quiet {
+                progress!(
+                    "  {} {} : 拒绝恢复非法参数名（路径穿越或空路径段）",
+                    "✗".red(),
+                    param
+                );
+            }
+            failed += 1;
+            continue;
+        }
         if Path::new(&entry.path).exists() {
             match write_value(&entry.path, &entry.previous) {
                 Ok(()) => {
@@ -6048,6 +6068,52 @@ mod tests {
         assert_eq!(outcome.failed, 1);
         assert_eq!(outcome.skipped, 0);
         assert!(!rollback_should_finalize(outcome.failed, outcome.skipped));
+    }
+
+    /// The undo path has to refuse the names the write path refuses. The write
+    /// choke point enforces `is_safe_param` before any live write, which is
+    /// what lets the apply paths take a caller-built parameter; `restore`
+    /// writes the path the ledger RECORDED and checks only the deny-list next
+    /// to it. A ledger written before that guard existed, or by a library
+    /// caller, can hold `net/ipv4/conf/../../../../..<file>`: its recorded
+    /// path resolves outside /proc/sys, and restoring it would replay as root
+    /// the very traversal the apply path now refuses.
+    #[test]
+    fn restore_refuses_a_param_the_write_path_refuses() {
+        let dir = AtomicTestDir::new("restore_unsafe_name");
+        let victim = dir.0.join("victim");
+        fs::write(&victim, "original").unwrap();
+        // /proc/sys/net/ipv4/conf/../../../../.. reaches the filesystem root,
+        // so this name addresses the file it names, not a kernel parameter.
+        let param = format!("net/ipv4/conf/../../../../..{}", victim.display());
+        assert!(
+            !is_safe_param(&param),
+            "the write choke point refuses this name"
+        );
+        let entry = RollbackEntry {
+            previous: "pwned".to_string(),
+            applied: "original".to_string(),
+            path: param_to_path(&param),
+            category: None,
+        };
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::from([(param.clone(), entry)]),
+        };
+
+        let outcome = restore_entries(&data, true);
+
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "original",
+            "a restore must not write outside the kernel's own trees"
+        );
+        assert_eq!(outcome.restored, 0);
+        assert_eq!(
+            outcome.failed, 1,
+            "the refusal is a failure, so the record stays for a retry"
+        );
+        assert_eq!(outcome.skipped, 0);
     }
 
     #[test]
