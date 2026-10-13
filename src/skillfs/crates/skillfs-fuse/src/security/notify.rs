@@ -55,6 +55,10 @@ pub const DEFAULT_NOTIFY_DEBOUNCE_MS: u64 = 300;
 /// `paths: []` to signal "whole skill may have changed".
 pub const MAX_NOTIFY_PATHS: usize = 64;
 
+/// Maximum LF-terminated request frame accepted by the ASC daemon.
+const MAX_SESSION_FRAME_BYTES: usize = 64 * 1024;
+const MAX_SESSION_FRAME_PAYLOAD_BYTES: usize = MAX_SESSION_FRAME_BYTES - 1;
+
 /// Maximum response body size (bytes) accepted from the daemon.
 /// Responses exceeding this limit are rejected as `InvalidResponse`
 /// to prevent unbounded memory allocation on a malicious/buggy peer.
@@ -136,7 +140,7 @@ impl NotifyEventKind {
 // Wire format
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct NotifyChangeEvent {
     pub id: String,
     pub method: &'static str,
@@ -145,7 +149,7 @@ pub struct NotifyChangeEvent {
     pub timeout_ms: u64,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 /// Versioned notify parameters sent inside the daemon request envelope.
 pub struct NotifyParams {
@@ -159,6 +163,34 @@ pub struct NotifyParams {
     pub event_kind: String,
     /// Sorted changed paths relative to the canonical Skill directory.
     pub paths: Vec<String>,
+}
+
+/// Serializes a request that fits the authenticated session's payload cap.
+///
+/// An oversized path list is replaced with an empty list, which means the
+/// daemon must rescan the whole skill. If the remaining request still cannot
+/// fit, it is rejected locally instead of being sent into a session the
+/// daemon will close.
+fn serialize_session_request(event: &NotifyChangeEvent) -> Result<Vec<u8>, NotifyError> {
+    let serialize = |event: &NotifyChangeEvent| {
+        serde_json::to_vec(event).map_err(|error| NotifyError::Write(std::io::Error::other(error)))
+    };
+
+    let mut request = serialize(event)?;
+    if request.len() > MAX_SESSION_FRAME_PAYLOAD_BYTES && !event.params.paths.is_empty() {
+        let mut whole_skill_event = event.clone();
+        whole_skill_event.params.paths.clear();
+        request = serialize(&whole_skill_event)?;
+    }
+    if request.len() > MAX_SESSION_FRAME_PAYLOAD_BYTES {
+        return Err(NotifyError::Write(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "notify request exceeds the authenticated session payload limit of {MAX_SESSION_FRAME_PAYLOAD_BYTES} bytes"
+            ),
+        )));
+    }
+    Ok(request)
 }
 
 impl NotifyChangeEvent {
@@ -483,13 +515,14 @@ impl NotifyClient for UnixSocketNotifyClient {
             None
         };
 
-        let request = serde_json::to_vec(event)
-            .map_err(|e| NotifyError::Write(std::io::Error::new(std::io::ErrorKind::Other, e)))?;
         if let Some(session) = &authenticated_session {
+            let request = serialize_session_request(event)?;
             session
                 .write_frame(&mut stream, FrameSender::Client, &request)
                 .map_err(auth_error_to_notify)?;
         } else {
+            let request = serde_json::to_vec(event)
+                .map_err(|e| NotifyError::Write(std::io::Error::other(e)))?;
             let mut writer = std::io::BufWriter::new(&stream);
             writer.write_all(&request).map_err(NotifyError::Write)?;
             writer.write_all(b"\n").map_err(NotifyError::Write)?;
@@ -4429,6 +4462,111 @@ mod tests {
         let result = client.send(&event);
         handle.join().unwrap();
         assert!(result.is_ok(), "authenticated notify failed: {result:?}");
+    }
+
+    #[test]
+    fn authenticated_notify_preserves_paths_at_frame_limit_and_falls_back_above() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        for excess_bytes in [0, 1] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+            let sock_path = dir.path().join("test.sock");
+            let key_path = dir.path().join("key");
+            std::fs::write(&key_path, [5_u8; 32]).unwrap();
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let listener = UnixListener::bind(&sock_path).unwrap();
+            std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let client = UnixSocketNotifyClient::new_authenticated(
+                &sock_path,
+                Duration::from_secs(5),
+                &key_path,
+            )
+            .unwrap();
+            let server_secret = SharedSecret::load(&key_path).unwrap();
+            let paths = (0..16)
+                .map(|index| format!("{index:02}") + &"a".repeat(3998))
+                .collect::<Vec<_>>();
+            let mut event = NotifyChangeEvent::new(
+                "/srv/skills/alpha",
+                "alpha",
+                NotifyEventKind::Write,
+                paths,
+                5000,
+            );
+            // ASC's request reader counts LF inside its 64 KiB wire budget,
+            // unlike the local SkillFS authenticated payload reader.
+            let target_bytes = 64 * 1024 - 1 + excess_bytes;
+            let padding = target_bytes - serde_json::to_vec(&event).unwrap().len();
+            let path_count = event.params.paths.len();
+            for index in 0..padding {
+                event.params.paths[index % path_count].push('a');
+            }
+            assert_eq!(serde_json::to_vec(&event).unwrap().len(), target_bytes);
+            let original_paths = event.params.paths.clone();
+            let expected_paths = if excess_bytes == 0 {
+                original_paths.clone()
+            } else {
+                vec![]
+            };
+
+            let handle = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let session = authenticate_server(
+                    &mut stream,
+                    &server_secret,
+                    NOTIFY_CLIENT_DOMAIN,
+                    NOTIFY_SERVER_DOMAIN,
+                )
+                .unwrap();
+                let request = {
+                    let mut reader = BufReader::new(&mut stream);
+                    let mut wire = Vec::new();
+                    (&mut reader)
+                        .take(64 * 1024 + 1)
+                        .read_until(b'\n', &mut wire)
+                        .unwrap();
+                    assert!(wire.ends_with(b"\n"));
+                    assert!(
+                        wire.len() <= 64 * 1024,
+                        "request exceeds the production daemon's LF-inclusive budget"
+                    );
+                    wire.pop();
+
+                    let mut tag = Vec::new();
+                    (&mut reader)
+                        .take(64 * 1024 + 1)
+                        .read_until(b'\n', &mut tag)
+                        .unwrap();
+                    assert!(tag.ends_with(b"\n") && tag.len() <= 64 * 1024);
+                    let tag: serde_json::Value = serde_json::from_slice(&tag).unwrap();
+                    assert_eq!(tag["type"], "auth.frame");
+                    wire
+                };
+                let request: serde_json::Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["method"], NOTIFY_METHOD);
+                assert!(
+                    request["params"]["paths"] == serde_json::json!(expected_paths),
+                    "unexpected path hints for a {target_bytes}-byte request"
+                );
+                session
+                    .write_frame(
+                        &mut stream,
+                        FrameSender::Server,
+                        br#"{"ok":true,"data":{"schemaVersion":2,"accepted":true}}"#,
+                    )
+                    .unwrap();
+            });
+
+            let result = client.send(&event);
+            handle.join().unwrap();
+            assert!(result.is_ok(), "authenticated notify failed: {result:?}");
+            assert_eq!(
+                event.params.paths, original_paths,
+                "serialization must not mutate the logged event"
+            );
+        }
     }
 
     #[test]
