@@ -1539,8 +1539,19 @@ fn is_veth_end(dir: &Path, speed_mbps: u64) -> bool {
             return false;
         }
     }
-    match fs::read_to_string(dir.join("uevent")) {
-        Ok(uevent) => !uevent.lines().any(|line| line.starts_with("DEVTYPE=")),
+    // The uevent embeds the interface name in its `INTERFACE=` line, and a
+    // name the kernel accepts may be non-UTF-8 (`dev_valid_name` rejects only
+    // `/`, `:` and whitespace), so `read_to_string` rejected the whole file
+    // and answered "not a veth end" for a veth end: the caller's `iflink`
+    // test then decided it, a cross-namespace peer index can collide with a
+    // local one, and the pair's fixed 10000 Mbps was counted as the host's
+    // link speed. Decode lossily, like every other reader of kernel-provided
+    // text — the marker tested below is an ASCII line prefix, which a lossy
+    // decode keeps.
+    match fs::read(dir.join("uevent")) {
+        Ok(bytes) => !String::from_utf8_lossy(&bytes)
+            .lines()
+            .any(|line| line.starts_with("DEVTYPE=")),
         // An unreadable uevent is not evidence of a veth end.
         Err(_) => false,
     }
@@ -3381,6 +3392,64 @@ mod tests {
         assert!(
             names.contains(&"eth0.100"),
             "a VLAN's reading comes from its parent and stays: {names:?}"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `dev_valid_name` accepts any interface name without `/`, `:` or
+    /// whitespace, so a CNI (or an admin) can name a host end with non-UTF-8
+    /// bytes — the crate's own speed lookup is built from the raw name for the
+    /// same reason. The uevent file embeds that name in its `INTERFACE=` line,
+    /// so `read_to_string` rejected the whole file and the reader answered
+    /// "not a veth end" for a veth end: the caller's `iflink` test decided it
+    /// and lost to the peer-index collision, the pair's fixed 10000 Mbps was
+    /// counted as the host's link speed, and every 10 GbE rule sized its advice
+    /// for a link the machine does not have.
+    #[test]
+    fn network_info_ignores_a_veth_end_whose_name_holds_raw_bytes() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_net_veth_raw_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::remove_dir_all(&dir).ok();
+
+        // eth0 is this namespace's first NIC (ifindex 2, backed by a bus
+        // device, so no veth marker): the local device the container-side peer
+        // index collides with.
+        let eth0 = dir.join("eth0");
+        fs::create_dir_all(&eth0).expect("create eth0");
+        fs::write(eth0.join("speed"), "1000\n").expect("write speed");
+        fs::write(eth0.join("ifindex"), "2\n").expect("write ifindex");
+        fs::write(eth0.join("iflink"), "2\n").expect("write iflink");
+        fs::create_dir_all(eth0.join("device")).expect("create the bus-device link");
+        fs::write(eth0.join("uevent"), "INTERFACE=eth0\nIFINDEX=2\n").expect("write uevent");
+
+        // The host end of a container pair, named with a raw 0xE9 byte: its
+        // peer is the container's eth0 (ifindex 2 in ITS namespace), so its
+        // iflink collides with this host's eth0. Its uevent carries the raw
+        // name, exactly as the kernel writes it.
+        let raw = dir.join(std::ffi::OsStr::from_bytes(b"lxc\xe9a1b2"));
+        fs::create_dir_all(&raw).expect("create the veth host end");
+        fs::write(raw.join("speed"), "10000\n").expect("write speed");
+        fs::write(raw.join("ifindex"), "4\n").expect("write ifindex");
+        fs::write(raw.join("iflink"), "2\n").expect("write iflink");
+        fs::write(raw.join("uevent"), b"INTERFACE=lxc\xe9a1b2\nIFINDEX=4\n").expect("write uevent");
+
+        let mut info = info_with_processes(&[]);
+        info.network = read_network_info_from(&dir).expect("read fake sysfs tree");
+        let names: Vec<&str> = info.network.iter().map(|n| n.name.as_str()).collect();
+        assert!(
+            !names.contains(&"lxc\u{fffd}a1b2"),
+            "a veth end whose name holds raw bytes must not decide the host link speed: {names:?}"
+        );
+        assert_eq!(
+            info.max_net_speed(),
+            1000,
+            "the host's own NIC is the only real link here: {names:?}"
         );
 
         fs::remove_dir_all(&dir).ok();
