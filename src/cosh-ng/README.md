@@ -142,7 +142,9 @@ complete a command before adding arguments; Enter submits drafts with arguments
 or multiple lines as written.
 Ordinary shell prompts keep native path completion.
 
-In `cosh-core`, configured Hooks run by default without `hooks.enabled = true`.
+In `cosh-core`, system and user config Hooks run by default without `hooks.enabled = true`.
+Project config Hook definitions are ignored; project Shell Hooks in `.cosh/hooks` require
+separate consent through `/hooks trust-project`.
 Explicit `hooks.enabled = false` keeps config Hooks disabled even when Extensions
 are installed. See [Hooks](../../docs/user-guide/en/user-entrypoint/cosh-ng/core/hooks.md)
 for disable scope and fail-closed `PreToolUse` behavior.

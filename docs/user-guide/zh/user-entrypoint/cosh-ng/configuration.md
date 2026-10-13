@@ -12,7 +12,7 @@
 | `~/.copilot-shell/config.toml` | `cosh-core` 和 `cosh-shell` | 用户设置 |
 | `<workspace>/.copilot-shell/config.toml` | `cosh-core` | 项目运行偏好 |
 
-Core 按系统 → 用户 → 项目的顺序合并配置。项目配置可以设置 Agent、Hook、Skill、会话、`active_model` 和回答语言偏好，但会忽略 `active_provider`、Provider 定义、MCP server 和项目审计设置。项目 Hook 仍需在交互式 Shell 中运行 `/hooks trust-project` 才会执行。`cosh-shell` 只读取用户文件，不读取系统或项目文件。
+Core 按系统 → 用户 → 项目的顺序合并配置。项目配置可以设置 Agent、Skill、会话、`active_model` 和回答语言偏好，但会忽略 `active_provider`、Provider 定义、MCP server、Hook 定义、`agent.approval_mode`、`agent.allowed_tools` 和项目审计设置。`cosh-shell` 只读取用户文件，不读取系统或项目文件。
 
 ## 最小用户配置
 

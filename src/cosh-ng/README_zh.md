@@ -127,7 +127,9 @@ bash: hello: command not found
 需要填写参数时先按 Tab 补全；带参数或多行的草稿由 Enter 按原文提交。
 普通 Shell prompt 保留原生路径补全。
 
-`cosh-core` 中的配置 Hook 默认启用，无需设置 `hooks.enabled = true`。
+`cosh-core` 中的系统和用户配置 Hook 默认启用，无需设置 `hooks.enabled = true`。
+项目配置中的 Hook 定义被忽略；`.cosh/hooks` 中的项目 Shell Hook 另由
+`/hooks trust-project` 授权。
 显式设置 `hooks.enabled = false` 后，即使安装了 Extension，配置 Hook 也保持禁用。
 禁用范围和 `PreToolUse` 默认阻断行为详见
 [Hooks](../../docs/user-guide/zh/user-entrypoint/cosh-ng/core/hooks.md)。

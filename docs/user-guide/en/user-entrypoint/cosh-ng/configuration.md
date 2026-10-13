@@ -14,11 +14,10 @@ interactive changes; edit TOML when settings must persist or be shared.
 | `<workspace>/.copilot-shell/config.toml` | `cosh-core` | Project runtime preferences |
 
 Core layers files in system → user → project order. Project config may set
-Agent, Hook, Skill, session, `active_model`, and output-language preferences,
-but `active_provider`, provider definitions, MCP servers, and project audit
-settings are ignored. Project Hooks still require `/hooks trust-project` in the
-interactive shell. `cosh-shell` reads the user file, not the system or project
-file.
+Agent, Skill, session, `active_model`, and output-language preferences, but
+`active_provider`, provider definitions, MCP servers, Hook definitions,
+`agent.approval_mode`, `agent.allowed_tools`, and project audit settings are
+ignored. `cosh-shell` reads the user file, not the system or project file.
 
 ## Minimal user configuration
 
