@@ -4565,9 +4565,18 @@ fn eval_page_cluster_at(
 /// (zram and file-backed areas are listed the same way). An unreadable table
 /// counts as "no swap", so the rule stays quiet instead of promising a swap
 /// saving it cannot verify.
+///
+/// Read as bytes: the table prints each path through `seq_file_path(swap,
+/// file, " \t\n\\")` (v6.6 mm/swapfile.c:2643), which escapes only those four
+/// bytes, so a swap file whose name is not UTF-8 is listed raw and a strict
+/// `read_to_string` rejected the whole table as "no swap".
 fn swap_configured(path: &str) -> bool {
-    std::fs::read_to_string(path)
-        .is_ok_and(|content| content.lines().skip(1).any(|line| !line.trim().is_empty()))
+    std::fs::read(path).is_ok_and(|content| {
+        content
+            .split(|&byte| byte == b'\n')
+            .skip(1)
+            .any(|line| !line.trim_ascii().is_empty())
+    })
 }
 
 fn eval_rmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -12454,6 +12463,43 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "vm.page-cluster") {
             assert_eq!(rec.recommended_value, "0");
         }
+    }
+
+    /// `/proc/swaps` prints each area's path through `seq_file_path(swap,
+    /// file, " \t\n\\")` (v6.6 mm/swapfile.c:2643), and `mangle_path` escapes
+    /// only those four bytes: a swap file whose name is not UTF-8 is listed
+    /// with its raw bytes, and the area is still configured.
+    #[test]
+    fn page_cluster_sees_a_swap_file_with_a_non_utf8_name() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_page_cluster_bytes_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let param = dir.join("page-cluster");
+        std::fs::write(&param, b"3\n").unwrap();
+        let swaps = dir.join("swaps-non-utf8");
+        std::fs::write(
+            &swaps,
+            b"Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n/swap\xff\xfe.img                          file\t\t1048572\t\t0\t\t-2\n",
+        )
+        .unwrap();
+        assert!(std::str::from_utf8(&std::fs::read(&swaps).unwrap()).is_err());
+
+        assert!(swap_configured(swaps.to_str().unwrap()));
+        let mut recs = Vec::new();
+        eval_page_cluster_at(
+            &make_test_info(),
+            &mut recs,
+            param.to_str().unwrap(),
+            swaps.to_str().unwrap(),
+        );
+        assert!(
+            recs.iter().any(|r| r.param == "vm.page-cluster"),
+            "a configured swap area must keep the page-cluster advice"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
