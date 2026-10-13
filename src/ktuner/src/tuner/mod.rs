@@ -1850,6 +1850,32 @@ fn restore_units_at(
     service_path: &str,
     script_path: &str,
 ) -> Result<RollbackOutcome> {
+    restore_units_with(
+        guard,
+        data,
+        units,
+        ledger,
+        sysctl_path,
+        service_path,
+        script_path,
+        "systemctl",
+    )
+}
+
+/// [`restore_units_at`] with the `systemctl` program injectable, the same
+/// seam [`persist_rollback_data_at`] and [`finalize_rollback_at`] take, so a
+/// test can stand in for a host whose `systemctl` refuses.
+#[allow(clippy::too_many_arguments)]
+fn restore_units_with(
+    guard: &LedgerLock,
+    data: &mut RollbackData,
+    units: &[BTreeMap<String, RollbackEntry>],
+    ledger: &str,
+    sysctl_path: &str,
+    service_path: &str,
+    script_path: &str,
+    systemctl: &str,
+) -> Result<RollbackOutcome> {
     let mut outcome = RollbackOutcome {
         restored: 0,
         failed: 0,
@@ -1900,7 +1926,7 @@ fn restore_units_at(
             service_path,
             script_path,
             true,
-            "systemctl",
+            systemctl,
         );
         outcome.failed += cleanup_failed;
         return Ok(outcome);
@@ -1914,7 +1940,7 @@ fn restore_units_at(
         sysctl_path,
         script_path,
         service_path,
-        "systemctl",
+        systemctl,
     )?;
     save_ledger_at(ledger, data)?;
     Ok(outcome)
