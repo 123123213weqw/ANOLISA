@@ -86,9 +86,9 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 ```
 
 `sudo ktuner fix <param> --dry-run` 以与 `tune --dry-run` 相同的形态预览这一次
-单参数写入（`dry_run`、`status`、`blocked`、`would_apply`、`would_skip`），
-不写入任何东西并以 `0` 退出，便于改参数前先看清结果。它不需要 root；参数有会被
-内核清零的互斥孪生时在 `would_clear` 中列出；参数不在计划里、不可写或运行时危险时，
+单参数写入（`dry_run`、`status`、`blocked`、`would_apply`、`would_skip`，
+写入会清零互斥孪生时两者都会多出 `would_clear`），不写入任何东西并以 `0` 退出，
+便于改参数前先看清结果。它不需要 root；参数不在计划里、不可写或运行时危险时，
 与 `sudo ktuner fix <param>` 给出完全相同的 stderr JSON 与退出码，因此预检不会
 与被预览的命令不一致。
 

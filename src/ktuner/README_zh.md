@@ -317,10 +317,14 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 （此处为 `planned`；无可应用项时为 `optimal`/`blocked`）。`would_apply`
 列出真实运行会写入的项，`would_skip` 列出本次运行不写入的项及原因
 （`unwritable`、`runtime_dangerous`，或选择器点名时的 `excluded` /
-`not_selected`），`blocked` 为这些项的数量：
+`not_selected`），`blocked` 为这些项的数量；`would_clear` 列出这些写入会在内核中
+清零的互斥孪生——与 `fix --dry-run` 同名同义，只是范围覆盖整个计划，取值来自
+写入路径记账所用的同一张表。写互斥对的一半必然在核内清零另一半，与选择器是否点名
+无关，因此该键就是把上面那段说明摆到预览里；没有孪生的计划不带此键，多个写入命中
+同一个孪生时只列一次，顺序同计划顺序：
 
 ```json
-{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
+{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_clear": ["vm.dirty_ratio"], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
 ```
 
 `ktuner why` 对没有任何写路径会采纳的推荐同样携带该原因

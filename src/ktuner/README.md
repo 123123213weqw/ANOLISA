@@ -355,10 +355,16 @@ vocabulary as the short-circuit path (`planned` here; `optimal`/`blocked`
 when there is nothing to apply). `would_apply` lists the entries a real run
 would write, `would_skip` names the ones this run leaves out (with the
 reason: `unwritable`, `runtime_dangerous`, or `excluded` / `not_selected` for
-a name a selection left out), and `blocked` stays their count:
+a name a selection left out), and `blocked` stays their count. `would_clear`
+names the mutually exclusive twins those writes zero — `fix --dry-run`'s key
+and meaning, for the whole plan, from the same table the write path records
+from. A plan that writes one half of a pair clears the other half in the
+kernel whether or not the selection named it, so the key is what makes the
+paragraph above visible in the preview; it is absent when no applied
+parameter has a twin, and each twin is named once, in plan order:
 
 ```json
-{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
+{"blocked": 1, "dry_run": true, "status": "planned", "would_apply": [ ... ], "would_clear": ["vm.dirty_ratio"], "would_skip": [{"param": "vm.nr_hugepages", "reason": "runtime_dangerous"}]}
 ```
 
 `ktuner why` carries the same reason on a recommendation no write path will

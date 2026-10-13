@@ -89,13 +89,12 @@ sudo ktuner rollback --list --category net   # preview that same set
 
 `sudo ktuner fix <param> --dry-run` previews that one write in the same shape
 as `tune --dry-run` (`dry_run`, `status`, `blocked`, `would_apply`,
-`would_skip`) and exits `0` without writing anything, so a parameter can be
-inspected before it is changed. It needs no root, reports a mutually exclusive
-twin the kernel would zero in `would_clear` when the parameter has one, and
-refuses exactly like `sudo ktuner fix <param>` — same stderr JSON, same exit
-code — when the parameter is outside the plan, unwritable, or
-runtime-dangerous, so the preview cannot disagree with the command it
-previews.
+`would_skip`, plus `would_clear` on either preview when a write zeroes a
+mutually exclusive twin) and exits `0` without writing anything, so a
+parameter can be inspected before it is changed. It needs no root, and refuses
+exactly like `sudo ktuner fix <param>` — same stderr JSON, same exit code —
+when the parameter is outside the plan, unwritable, or runtime-dangerous, so
+the preview cannot disagree with the command it previews.
 
 A real `tune` or `fix` names the mutually exclusive twins its writes zeroed in
 `cleared`, in the shape of `would_clear`: exactly the twins the ledger recorded
