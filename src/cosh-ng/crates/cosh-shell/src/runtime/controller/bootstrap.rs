@@ -6,7 +6,7 @@ use crate::approval::handoff::trust_key_from_command;
 use crate::config::parse_recommendations_environment_override;
 use crate::diagnostics::health::{spawn_startup_health_scan, startup_health_scan_enabled_for_env};
 use crate::hooks::{
-    dirs_for_hook_loading, is_trusted_project_root, load_hook_feedback_preferences,
+    dirs_for_hook_loading, load_hook_feedback_preferences, load_project_hooks_with_consent,
     project_hook_root_from_cwd,
 };
 use crate::recommendation::personal_analysis_runtime::AnalyzerCancellation;
@@ -620,11 +620,12 @@ fn load_hook_engine(cosh_config: &CoshConfig) -> HookEngine {
     }
     if let Ok(cwd) = std::env::current_dir() {
         if let Some(project_root) = project_hook_root_from_cwd(&cwd) {
-            let trusted = is_trusted_project_root(
+            load_project_hooks_with_consent(
+                &mut hook_engine,
                 &project_root,
-                cosh_config.trusted_project_roots.as_slice(),
+                &cosh_config.trusted_project_roots,
+                &cosh_config.consented_project_hooks,
             );
-            hook_engine.load_project_hooks_from_root(&project_root, trusted);
         }
     }
     hook_engine
