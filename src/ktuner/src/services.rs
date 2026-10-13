@@ -66,8 +66,10 @@ mod tests {
             os_distro: String::new(),
             cpu_model: String::new(),
             cpu_cores: 1,
+            cpu_cores_host: 1,
             numa_nodes: 1,
             memory_total_gb: 1,
+            memory_gb_host: 1,
             disks: vec![],
             network: vec![],
             sysctl: SysctlValues {

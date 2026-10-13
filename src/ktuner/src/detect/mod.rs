@@ -122,8 +122,10 @@ mod java_application_argument_regressions {
             os_distro: String::new(),
             cpu_model: String::new(),
             cpu_cores: 8,
+            cpu_cores_host: 8,
             numa_nodes: 1,
             memory_total_gb: 16,
+            memory_gb_host: 16,
             disks: vec![DiskInfo {
                 name: "fixture-java-client".into(),
                 disk_type: DiskType::HDD,
@@ -169,8 +171,17 @@ pub struct SystemInfo {
     pub os_distro: String,
     pub cpu_model: String,
     pub cpu_cores: usize,
+    /// The host's own processors, before the cgroup CPU limit: what
+    /// /proc/cpuinfo counts. Equal to `cpu_cores` unless a cgroup limit binds
+    /// below it; the rules scale by `cpu_cores`.
+    pub cpu_cores_host: usize,
     pub numa_nodes: usize,
     pub memory_total_gb: u64,
+    /// The host's MemTotal in whole GB, before the cgroup memory limit: the
+    /// same floor-and-clamp `effective_memory_gb` applies, with no limit to
+    /// apply. Equal to `memory_total_gb` unless a cgroup limit binds below
+    /// it; the rules scale by `memory_total_gb`.
+    pub memory_gb_host: u64,
     pub disks: Vec<DiskInfo>,
     pub network: Vec<NetInfo>,
     pub sysctl: SysctlValues,
@@ -405,17 +416,21 @@ fn root_run_can_write(path: &str) -> bool {
 }
 
 pub fn gather_system_info() -> Result<SystemInfo> {
-    let (cpu_model, cpu_cores) = read_cpu_info()?;
+    let (cpu_model, host_cores) = read_cpu_info()?;
+    // The effective count is the scaling input every cpu-scaled rule consumes
+    // — inside a cgroup CPU limit those rules would otherwise size their
+    // recommendation for processors the workload can never run on — and the
+    // host count travels with it, so the report says what was clamped.
+    let (memory_gb_host, memory_total_gb) = read_memory_total_gb()?;
     Ok(SystemInfo {
         kernel_version: read_kernel_version()?,
         os_distro: read_os_distro(),
         cpu_model,
-        // The same scaling input memory_total_gb already is: inside a cgroup
-        // CPU limit, every cpu-scaled rule would size its recommendation for
-        // processors the workload can never run on.
-        cpu_cores: effective_cpu_cores(cpu_cores, read_cgroup_cpu_limit_cores()),
+        cpu_cores: effective_cpu_cores(host_cores, read_cgroup_cpu_limit_cores()),
+        cpu_cores_host: host_cores,
         numa_nodes: read_numa_nodes(),
-        memory_total_gb: read_memory_total_gb()?,
+        memory_total_gb,
+        memory_gb_host,
         disks: read_disk_info()?,
         network: read_network_info()?,
         sysctl: read_sysctl_values()?,
@@ -517,11 +532,16 @@ fn read_numa_nodes() -> usize {
     }
 }
 
-fn read_memory_total_gb() -> Result<u64> {
+/// The host's memory and the effective value rules scale by, in whole GB,
+/// from one /proc/meminfo read: the host reading is [`effective_memory_gb`]
+/// with no limit to apply, so the two agree unless a cgroup limit binds
+/// below the host.
+fn read_memory_total_gb() -> Result<(u64, u64)> {
     let meminfo = fs::read_to_string("/proc/meminfo").context("failed to read /proc/meminfo")?;
-    Ok(effective_memory_gb(
-        parse_meminfo_total_kb(&meminfo),
-        read_cgroup_memory_limit_kb(),
+    let host_kb = parse_meminfo_total_kb(&meminfo);
+    Ok((
+        effective_memory_gb(host_kb, 0),
+        effective_memory_gb(host_kb, read_cgroup_memory_limit_kb()),
     ))
 }
 
@@ -2033,8 +2053,10 @@ mod tests {
             os_distro: String::new(),
             cpu_model: String::new(),
             cpu_cores: 1,
+            cpu_cores_host: 1,
             numa_nodes: 1,
             memory_total_gb: 1,
+            memory_gb_host: 1,
             disks: vec![],
             network: vec![],
             sysctl: SysctlValues {
@@ -2059,6 +2081,11 @@ mod tests {
         assert!(!info.kernel_version.is_empty());
         assert!(info.cpu_cores > 0);
         assert!(info.memory_total_gb > 0);
+        // The host readings travel with the effective values the rules scale
+        // by and can never sit below them: the effective value is the host
+        // reading clamped down to the cgroup limit, nothing else.
+        assert!(info.cpu_cores_host >= info.cpu_cores);
+        assert!(info.memory_gb_host >= info.memory_total_gb);
     }
 
     #[test]
@@ -2465,6 +2492,65 @@ mod tests {
             read_cgroup_cpu_limit_cores_at(&root, &membership),
             2,
             "the non-UTF-8 cgroup's own two-core quota must bind, not the root's eight"
+        );
+        fs::remove_dir_all(&base).ok();
+    }
+
+    /// The two readings a report carries come from one host read and one
+    /// cgroup read: with nothing limiting the process they agree, and with a
+    /// limit they split — the effective value rules scale by takes the limit
+    /// while the host reading stays the host's. The published fields are
+    /// exactly these two numbers.
+    #[test]
+    fn a_cgroup_limit_is_the_only_thing_that_splits_the_host_and_effective_readings() {
+        let base = std::env::temp_dir().join(format!(
+            "ktuner_host_readings_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&base);
+        let root = base.join("root");
+        let unlimited = root.join("unlimited");
+        let limited = root.join("limited");
+        fs::create_dir_all(&unlimited).expect("create cgroup directory");
+        fs::create_dir_all(&limited).expect("create cgroup directory");
+        // The kernel's own no-limit spelling in the first cgroup, and a
+        // 2-core quota plus a 2-GB limit in the second.
+        fs::write(unlimited.join("memory.max"), b"max\n").expect("write memory.max");
+        fs::write(unlimited.join("cpu.max"), b"max 100000\n").expect("write cpu.max");
+        fs::write(limited.join("memory.max"), b"2147483648\n").expect("write memory.max");
+        fs::write(limited.join("cpu.max"), b"200000 100000\n").expect("write cpu.max");
+
+        let (host_cores, host_kb) = (16usize, 16 * 1024 * 1024u64);
+        let membership = base.join("self-cgroup");
+
+        fs::write(&membership, b"0::/unlimited\n").expect("write the membership file");
+        let cgroup_cores = read_cgroup_cpu_limit_cores_at(&root, &membership);
+        let cgroup_kb = read_cgroup_memory_limit_kb_at(&root, &membership);
+        assert_eq!(cgroup_cores, 0, "the no-limit sentinel is not a limit");
+        assert_eq!(cgroup_kb, 0, "the no-limit sentinel is not a limit");
+        // The host field the report publishes is this same computation with
+        // no limit to apply, so without one the two readings agree.
+        assert_eq!(effective_cpu_cores(host_cores, cgroup_cores), host_cores);
+        assert_eq!(
+            effective_memory_gb(host_kb, cgroup_kb),
+            effective_memory_gb(host_kb, 0)
+        );
+
+        fs::write(&membership, b"0::/limited\n").expect("write the membership file");
+        let cgroup_cores = read_cgroup_cpu_limit_cores_at(&root, &membership);
+        let cgroup_kb = read_cgroup_memory_limit_kb_at(&root, &membership);
+        let host_gb = effective_memory_gb(host_kb, 0);
+        let effective_cores = effective_cpu_cores(host_cores, cgroup_cores);
+        let effective_gb = effective_memory_gb(host_kb, cgroup_kb);
+        assert_eq!((effective_cores, effective_gb), (2, 2));
+        assert!(
+            effective_cores < host_cores,
+            "the quota must sit below the host count"
+        );
+        assert!(
+            effective_gb < host_gb,
+            "the memory limit must sit below the host's memory"
         );
         fs::remove_dir_all(&base).ok();
     }
@@ -3122,8 +3208,10 @@ mod tests {
             os_distro: String::new(),
             cpu_model: String::new(),
             cpu_cores: 1,
+            cpu_cores_host: 1,
             numa_nodes: 1,
             memory_total_gb: 1,
+            memory_gb_host: 1,
             disks: vec![],
             network: vec![],
             sysctl: SysctlValues {
