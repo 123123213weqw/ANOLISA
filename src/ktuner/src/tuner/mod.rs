@@ -1542,13 +1542,22 @@ fn render_persistence(
 /// to the boot path instead — the root code-execution write the list exists to
 /// prevent, deferred to the next reboot. Both fields are checked, since the
 /// recorded path is what the script writes.
+///
+/// The structural guard the write choke point enforces holds here for the same
+/// reason: the `block/` and `transparent_hugepage/` branch renders the
+/// recorded path into the generated script verbatim, so a name like
+/// `block/../../../../tmp/x` — which resolves outside /sys — would be replayed
+/// by the init system as root at every boot. A ledger written before the guard
+/// existed can still hold one.
 fn persistable_entries(
     entries: &BTreeMap<String, RollbackEntry>,
 ) -> BTreeMap<String, RollbackEntry> {
     entries
         .iter()
         .filter(|(param, entry)| {
-            !is_forbidden_param(param) && !is_forbidden_resolved_path(&entry.path)
+            is_safe_param(param)
+                && !is_forbidden_param(param)
+                && !is_forbidden_resolved_path(&entry.path)
         })
         .map(|(param, entry)| (param.clone(), entry.clone()))
         .collect()
@@ -3949,6 +3958,58 @@ mod tests {
             "nothing deny-listed may reach the rendered file: {config}"
         );
         assert!(script.is_none());
+    }
+
+    /// The boot path refuses the names the write path refuses, for the same
+    /// reason it refuses the deny-listed ones: the `block/` branch renders the
+    /// RECORDED path into the generated script, which the init system runs as
+    /// root at every boot, so a name that walks out of /sys must be dropped
+    /// before the file is rendered — not only before the entry is restored.
+    #[test]
+    fn persistence_drops_entries_the_write_path_refuses() {
+        let victim = std::env::temp_dir().join(format!(
+            "ktuner-persist-unsafe-victim-{}",
+            std::process::id()
+        ));
+        let param = format!("block/../../../../..{}", victim.display());
+        assert!(
+            !is_safe_param(&param),
+            "the write choke point refuses this name"
+        );
+        let entries = BTreeMap::from([
+            (
+                "vm.swappiness".to_string(),
+                RollbackEntry {
+                    previous: "60".to_string(),
+                    applied: "1".to_string(),
+                    path: "/proc/sys/vm/swappiness".to_string(),
+                    category: None,
+                },
+            ),
+            (
+                param.clone(),
+                RollbackEntry {
+                    previous: "x".to_string(),
+                    applied: "pwned".to_string(),
+                    path: param_to_path(&param),
+                    category: None,
+                },
+            ),
+        ]);
+
+        let kept = persistable_entries(&entries);
+        assert!(kept.contains_key("vm.swappiness"), "ordinary params stay");
+        assert!(
+            !kept.contains_key(&param),
+            "an unsafe name must not reach the boot path: {:?}",
+            kept.keys().collect::<Vec<_>>()
+        );
+        let (_, script) = render_persistence(&kept);
+        let script = script.unwrap_or_default();
+        assert!(
+            !script.contains("victim"),
+            "the generated script must not carry the traversal: {script}"
+        );
     }
 
     /// Dropping a deny-listed entry from the *render* is not enough: the file
