@@ -1,7 +1,8 @@
 use std::io::Write;
 
 use crate::activity::runtime::{
-    close_untracked_shell_handoffs, record_approved_shell_handoff_blocks, render_activity_rows,
+    close_untracked_shell_handoffs_with_history_base, record_approved_shell_handoff_blocks,
+    render_activity_rows,
 };
 use crate::adapter::AgentAdapter;
 use crate::agent::events::flush_held_agent_events;
@@ -263,7 +264,7 @@ fn render_inline_guidance_from_batch<W: Write>(
         output,
         event_index_base,
     )?;
-    let activity_actions = ActivityConsumer::consume(events, &ledger.blocks, state, output)?;
+    let activity_actions = ActivityConsumer::consume(snapshot, &ledger.blocks, state, output)?;
     RuntimeDispatcher::apply_actions(activity_actions, state);
     let findings = findings_from_blocks(&ledger.blocks);
     record_blocks_followed_by_user_input(events, &ledger.blocks, state);
@@ -658,7 +659,7 @@ impl EvidenceRequestConsumer {
 
 impl ActivityConsumer {
     pub(crate) fn consume<W: Write>(
-        events: &[ShellEvent],
+        snapshot: &ShellEventSnapshot,
         blocks: &[CommandBlock],
         state: &mut InlineState,
         output: &mut W,
@@ -666,7 +667,11 @@ impl ActivityConsumer {
         let mut handoff_activity_ids = record_approved_shell_handoff_blocks(state, blocks);
         // Fallback: close emitted handoffs that reached a prompt boundary
         // without ever producing command tracking (lost preexec marker).
-        handoff_activity_ids.extend(close_untracked_shell_handoffs(state, events));
+        handoff_activity_ids.extend(close_untracked_shell_handoffs_with_history_base(
+            state,
+            snapshot.events(),
+            snapshot.base(),
+        ));
         render_activity_rows(state, &handoff_activity_ids, output)?;
         Ok(Vec::new())
     }
