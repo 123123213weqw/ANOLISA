@@ -94,6 +94,7 @@ sudo ktuner rollback --list --category net   # 预览同一集合
   ],
   "system": {
     "cpu_cores": 12,
+    "cpu_cores_host": 12,
     "cpu_model": "AMD Ryzen 9 7945HX with Radeon Graphics",
     "disks": [
       {
@@ -129,6 +130,7 @@ sudo ktuner rollback --list --category net   # 预览同一集合
     ],
     "kernel": "6.6.87.2-microsoft-standard-WSL2",
     "memory_gb": 11,
+    "memory_gb_host": 11,
     "network": [
       {
         "name": "eth0",
@@ -148,8 +150,11 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 列出每块磁盘的全部九个已采集字段——其中 `hidden`、`holders`、
 `available_schedulers` 正是磁盘规则的门槛，因此「某条建议为什么没出现」
 可以直接从报告里解释——`network` 则是每个网卡的 `name`/`speed_mbps`，
-`speed_mbps: 0` 表示速率未知，不是零。本页的示例把 `disks` 与 `network`
-截短了；真实报告会列出读到的每一块磁盘和网卡。
+`speed_mbps: 0` 表示速率未知，不是零。`cpu_cores` 与 `memory_gb` 是规则
+用于缩放的生效值，会被约束进程的 cgroup 限额夹紧；`cpu_cores_host` 与
+`memory_gb_host` 是宿主本身的值——没有限额约束时两者相等，有限额时宿主值
+更大。本页的示例把 `disks` 与 `network` 截短了；真实报告会列出读到的每一块
+磁盘和网卡。
 
 `--category` 可重复：每个值各自保留其分类（名称与从前相同），展示的条目
 是所给分类的并集，因此 `check --category net --category mem` 一次覆盖两者
@@ -172,13 +177,13 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 `tune` 不同）。收窄到一条建议时只报告该条：
 
 ```json
-{"counts": {"high_confidence": 1, "performance": 1, "security": 0, "writable": 1}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [ ... ], "score": 30, "services": [], "system": {"cpu_cores": 12, "cpu_model": "AMD Ryzen 9 7945HX with Radeon Graphics", "disks": [{"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdd", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}, {"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdb", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}], "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "network": [{"name": "eth0", "speed_mbps": 10000}], "numa_nodes": 1, "os_distro": "Ubuntu 24.04.3 LTS"}, "total_checked": 208, "workload": "mixed"}
+{"counts": {"high_confidence": 1, "performance": 1, "security": 0, "writable": 1}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [ ... ], "score": 30, "services": [], "system": {"cpu_cores": 12, "cpu_cores_host": 12, "cpu_model": "AMD Ryzen 9 7945HX with Radeon Graphics", "disks": [{"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdd", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}, {"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdb", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}], "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "memory_gb_host": 11, "network": [{"name": "eth0", "speed_mbps": 10000}], "numa_nodes": 1, "os_distro": "Ubuntu 24.04.3 LTS"}, "total_checked": 208, "workload": "mixed"}
 ```
 
 未命中的名字被回显，而不是让命令失败：
 
 ```json
-{"counts": {"high_confidence": 0, "performance": 0, "security": 0, "writable": 0}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [], "score": 30, "services": [], "system": {"cpu_cores": 12, "cpu_model": "AMD Ryzen 9 7945HX with Radeon Graphics", "disks": [{"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdd", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}, {"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdb", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}], "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "network": [{"name": "eth0", "speed_mbps": 10000}], "numa_nodes": 1, "os_distro": "Ubuntu 24.04.3 LTS"}, "total_checked": 208, "unmatched_only": ["no_such_ktuner_param"], "workload": "mixed"}
+{"counts": {"high_confidence": 0, "performance": 0, "security": 0, "writable": 0}, "environment": "物理机/虚拟机", "predicted_score": 30, "recommendations": [], "score": 30, "services": [], "system": {"cpu_cores": 12, "cpu_cores_host": 12, "cpu_model": "AMD Ryzen 9 7945HX with Radeon Graphics", "disks": [{"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdd", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}, {"available_schedulers": ["none", "mq-deadline", "kyber"], "hidden": false, "holders": [], "name": "sdb", "nr_requests": 950, "read_ahead_kb": 128, "rq_affinity": 1, "scheduler": "none", "type": "HDD"}], "kernel": "6.6.87.2-microsoft-standard-WSL2", "memory_gb": 11, "memory_gb_host": 11, "network": [{"name": "eth0", "speed_mbps": 10000}], "numa_nodes": 1, "os_distro": "Ubuntu 24.04.3 LTS"}, "total_checked": 208, "unmatched_only": ["no_such_ktuner_param"], "workload": "mixed"}
 ```
 
 ### why 输出

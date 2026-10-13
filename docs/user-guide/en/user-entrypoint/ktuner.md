@@ -134,7 +134,11 @@ The report's `system` object describes the machine itself: `kernel`,
 `cpu_model`, the `disks` inventory (one entry per disk, carrying the fields
 the disk rules gate on — `hidden`, `holders`, `available_schedulers`) and
 the `network` inventory (`name`/`speed_mbps` per interface, where
-`speed_mbps: 0` means the speed is unknown, not zero).
+`speed_mbps: 0` means the speed is unknown, not zero). `cpu_cores` and
+`memory_gb` are the effective values the rules scale by, clamped to the
+cgroup limits binding the process; `cpu_cores_host` and `memory_gb_host` are
+the host's own readings — equal unless a limit binds, and larger when one
+does.
 `ktuner why <param>…` explains one or several parameters. A single parameter keeps
 its flat body: a recommendation with the fields `check` publishes for it (`skip_reason`
 when no write path would take it), or `{"param": …, "current": …, "status": "optimal"}`

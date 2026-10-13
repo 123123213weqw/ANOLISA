@@ -264,6 +264,11 @@ fn cmd_check(
 /// re-reading it. The disk entries carry the fields the disk rules gate on
 /// (`hidden`, `holders`, `available_schedulers`), so a suggestion those
 /// rules did not make can be explained from the report alone.
+///
+/// `cpu_cores` and `memory_gb` are the effective values the rules scale by,
+/// clamped to the cgroup limits that bind the process; `cpu_cores_host` and
+/// `memory_gb_host` are the host's own readings, so a report tells whether
+/// and from what those values were clamped.
 fn system_json(info: &detect::SystemInfo) -> serde_json::Value {
     let disks: Vec<serde_json::Value> = info
         .disks
@@ -290,7 +295,9 @@ fn system_json(info: &detect::SystemInfo) -> serde_json::Value {
     json!({
         "kernel": info.kernel_version,
         "cpu_cores": info.cpu_cores,
+        "cpu_cores_host": info.cpu_cores_host,
         "memory_gb": info.memory_total_gb,
+        "memory_gb_host": info.memory_gb_host,
         "numa_nodes": info.numa_nodes,
         "os_distro": info.os_distro,
         "cpu_model": info.cpu_model,
@@ -4281,10 +4288,12 @@ mod tests {
             keys,
             [
                 "cpu_cores",
+                "cpu_cores_host",
                 "cpu_model",
                 "disks",
                 "kernel",
                 "memory_gb",
+                "memory_gb_host",
                 "network",
                 "numa_nodes",
                 "os_distro",
@@ -4292,10 +4301,16 @@ mod tests {
         );
         assert_eq!(system["kernel"], json!(info.kernel_version.as_str()));
         assert_eq!(system["cpu_cores"], json!(info.cpu_cores));
+        assert_eq!(system["cpu_cores_host"], json!(info.cpu_cores_host));
         assert_eq!(system["memory_gb"], json!(info.memory_total_gb));
+        assert_eq!(system["memory_gb_host"], json!(info.memory_gb_host));
         assert_eq!(system["numa_nodes"], json!(info.numa_nodes));
         assert_eq!(system["os_distro"], json!(info.os_distro.as_str()));
         assert_eq!(system["cpu_model"], json!(info.cpu_model.as_str()));
+        // The host readings are the un-clamped pair: at or above the values
+        // the rules scale by, equal exactly when no cgroup limit binds.
+        assert!(info.cpu_cores_host >= info.cpu_cores);
+        assert!(info.memory_gb_host >= info.memory_total_gb);
 
         let disks = system["disks"].as_array().expect("disks is an array");
         assert_eq!(disks.len(), info.disks.len());

@@ -61,6 +61,22 @@ fn system_reports_the_host_identity_and_the_disk_and_link_inventory() {
         "the report names the CPU it read: {body}"
     );
 
+    // The cpu and memory readings come in pairs: the effective value the
+    // rules scale by and the host's own reading, which can never sit below
+    // it (they are equal when no cgroup limit binds).
+    assert!(system["cpu_cores"].is_u64(), "{body}");
+    assert!(system["cpu_cores_host"].is_u64(), "{body}");
+    assert!(system["memory_gb"].is_u64(), "{body}");
+    assert!(system["memory_gb_host"].is_u64(), "{body}");
+    assert!(
+        system["cpu_cores_host"].as_u64() >= system["cpu_cores"].as_u64(),
+        "the host's cpu count is at or above the effective count: {body}"
+    );
+    assert!(
+        system["memory_gb_host"].as_u64() >= system["memory_gb"].as_u64(),
+        "the host's memory is at or above the effective value: {body}"
+    );
+
     for disk in system["disks"]
         .as_array()
         .unwrap_or_else(|| panic!("disks must be an array: {body}"))

@@ -119,7 +119,10 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 `memory_gb`、`numa_nodes` 之外，新增 `os_distro`、`cpu_model`、`disks`
 清单（每块磁盘一条，携带磁盘规则的门槛字段 `hidden`、`holders`、
 `available_schedulers`）与 `network` 清单（每个网卡 `name`/`speed_mbps`，
-`speed_mbps: 0` 表示速率未知，不是零）。
+`speed_mbps: 0` 表示速率未知，不是零）。`cpu_cores` 与 `memory_gb` 是规则
+用于缩放的生效值，会被约束进程的 cgroup 限额夹紧；`cpu_cores_host` 与
+`memory_gb_host` 是宿主本身的值——没有限额约束时两者相等，有限额时宿主值
+更大。
 `ktuner why <param>…` 解释一个或多个参数。单个参数保持原有的平铺形态：推荐项携带
 `check` 对同一参数发布的字段（没有任何写路径会采纳时带 `skip_reason`），已达推荐值的
 参数输出 `{"param": …, "current": …, "status": "optimal"}`。两个及以上参数在一次运行里
