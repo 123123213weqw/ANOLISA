@@ -282,7 +282,7 @@ def verify_raw_hook_manifests(payload_root: Path) -> None:
 
 def verify_raw_payload(payload_root: Path) -> None:
     """Verify the V2 core boundary and adapter launcher invariants."""
-    for binary in ("agent-sec-cli", "agent-sec-daemon"):
+    for binary in ("agent-sec-cli", "agent-sec-daemon", "agent-sec-daemon-health"):
         path = payload_root / "bin" / binary
         if not path.is_file() or not path.stat().st_mode & 0o100:
             raise SystemExit(f"ERROR: raw payload is missing V2 executable: {path}")

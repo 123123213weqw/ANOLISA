@@ -12,6 +12,10 @@ publish.workspace = true
 name = "agent-sec-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "agent-sec-daemon-health"
+path = "src/health.rs"
+
 [dependencies]
 chrono = { workspace = true }
 crossterm = { workspace = true }

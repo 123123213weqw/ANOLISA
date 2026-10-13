@@ -213,6 +213,12 @@ def daemon_bin() -> str:
 
 
 @pytest.fixture
+def health_probe() -> str:
+    """Resolve the installed native probe, failing if the package omits it."""
+    return _require("agent-sec-daemon-health")
+
+
+@pytest.fixture
 def start_daemon(tmp_path: Path):
     """Returns a factory that starts a daemon and tears it down after the test.
 

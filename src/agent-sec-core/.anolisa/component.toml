@@ -74,6 +74,12 @@ mode = "0755"
 type = "executable"
 
 [[component.layout.files]]
+source = "bin/agent-sec-daemon-health"
+target = "{bindir}/agent-sec-daemon-health"
+mode = "0755"
+type = "executable"
+
+[[component.layout.files]]
 source = "bin/agent-sec-python"
 target = "{bindir}/agent-sec-python"
 mode = "0755"

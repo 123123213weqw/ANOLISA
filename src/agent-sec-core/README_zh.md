@@ -319,6 +319,9 @@ L2 分类器默认使用 ModelScope 上的
 
 详见 [Prompt Scanner 用户使用指南](../../docs/user-guide/zh/agent-security/agent-sec-core/prompt-scanner.md)。
 
+V2 包提供轻量 Rust 探针 `agent-sec-daemon-health`，发送 health 请求前先校验 daemon 的
+UID。用法见[探针说明](../../docs/user-guide/zh/agent-security/agent-sec-core/internal-commands.md#agent-sec-daemon-health)。
+
 ## Code Scanner
 
 扫描 bash 与 python 源码中的危险操作。V2 RPM 中，`scan-code` 是 Rust daemon client：

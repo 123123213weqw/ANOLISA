@@ -359,8 +359,15 @@ runner 工作目录的 owner、权限和 umask。
 返回不支持认证的错误。期望 UID 不从 socket 文件属主、客户端 UID 或响应 JSON 推导。
 服务 UID 是信任域；该检查不区分其它 root 进程，也不能保护同 UID 的不可信 Agent。
 
+`agent-sec-daemon-health` 是独立 Rust probe，直接复用上述 client，不经过主 CLI 的
+参数解析和 telemetry runtime 初始化。raw/RPM 安装同名二进制，容器探针直接执行它。
+它使用 `AGENT_SEC_DAEMON_SOCKET` 或 `/run/agent-sec-core/daemon.sock`，
+`AGENT_SEC_HEALTH_TIMEOUT_SECONDS` 默认 1 秒，覆盖 connect/write/read 的共同预算。
+只有经过身份校验的 V2 response 中 `result.status == "ok"` 才静默退出 0；认证、传输、
+协议或状态检查失败退出 1。该 probe 检查进程响应，不证明模型、Job 或 enforcement 就绪。
+
 可执行 fixture：`tests/v2/e2e/test_daemon_process_e2e.py::test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket`
-验证 socket 文件属主改为 root 的非 root 伪服务仍被真实 Rust CLI 拒绝，
+验证 socket 文件属主改为 root 的非 root 伪服务仍被真实 Rust CLI 和 native health probe 拒绝，
 服务端不得收到请求字节；该用例需要 root 的跨 UID 进程环境，编译或单元测试不替代该验收。
 普通 workspace CI 统一启用默认关闭的 `asc-daemon-client/testing` feature，并设置
 `AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1`，允许非 root 模拟服务执行协议和业务测试，

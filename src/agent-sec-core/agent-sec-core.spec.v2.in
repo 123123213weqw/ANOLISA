@@ -65,6 +65,7 @@ own. Agent Hook migration is delivered separately.
 %defattr(0644,root,root,0755)
 %attr(0755,root,root) /usr/bin/agent-sec-cli
 %attr(0755,root,root) /usr/bin/agent-sec-daemon
+%attr(0755,root,root) /usr/bin/agent-sec-daemon-health
 %{_unitdir}/agent-sec-core.service
 %dir %{_sysconfdir}/agent-sec
 %config(noreplace) %attr(0600,root,root) %{_sysconfdir}/agent-sec/skillsec.json

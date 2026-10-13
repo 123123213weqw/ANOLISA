@@ -143,6 +143,18 @@ async fn uds_peer_owns_ingestion_and_cli_pages_reports_without_local_fallback() 
     .await
     .unwrap();
 
+    let health = Command::new(env!("CARGO_BIN_EXE_agent-sec-daemon-health"))
+        .env("AGENT_SEC_DAEMON_SOCKET", &socket)
+        .output()
+        .unwrap();
+    assert!(
+        health.status.success(),
+        "{}",
+        String::from_utf8_lossy(&health.stderr)
+    );
+    assert!(health.stdout.is_empty());
+    assert!(health.stderr.is_empty());
+
     let result = cli(&socket, &["report", "--last", "--format", "json"]);
     assert!(
         result.status.success(),

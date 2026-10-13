@@ -280,6 +280,7 @@ build-cli-v2: ## Build V2 Rust CLI and daemon binaries
 	install -d -m 0755 $(V2_BIN_BUILD_DIR)
 	cp -p "$(abspath $(V2_CARGO_TARGET_DIR))/release/agent-sec-cli" \
 		"$(abspath $(V2_CARGO_TARGET_DIR))/release/agent-sec-daemon" \
+		"$(abspath $(V2_CARGO_TARGET_DIR))/release/agent-sec-daemon-health" \
 		$(V2_BIN_BUILD_DIR)/
 
 .PHONY: setup
@@ -499,6 +500,8 @@ install-cli-v2: ## RPM: Install V2 Rust CLI and daemon binaries
 		$(DESTDIR)/usr/bin/agent-sec-cli
 	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon \
 		$(DESTDIR)/usr/bin/agent-sec-daemon
+	install -p -m 0755 $(V2_BIN_BUILD_DIR)/agent-sec-daemon-health \
+		$(DESTDIR)/usr/bin/agent-sec-daemon-health
 
 .PHONY: install-cli-venv
 install-cli-venv: ## Create venv, install deps from uv.lock, install wheel, symlink

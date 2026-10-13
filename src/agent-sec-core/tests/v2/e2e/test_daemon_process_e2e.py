@@ -24,7 +24,10 @@ def test_bound_socket_allows_ordinary_users(daemon):
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="cross-UID UDS test requires root")
-def test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket(cli):
+@pytest.mark.parametrize("client", ["cli", "health"])
+def test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket(
+    cli, health_probe, client
+):
     untrusted = pwd.getpwnam("nobody")
     with tempfile.TemporaryDirectory(prefix="asc-fake-peer-") as directory:
         runtime = Path(directory)
@@ -67,9 +70,23 @@ with socket.socket(socket.AF_UNIX) as listener:
                 time.sleep(0.02)
             # A file-owner check would accept this endpoint; its listener remains nobody.
             os.chown(endpoint, 0, 0)
-            result = cli(
-                "--socket", str(endpoint), "policy", "list", "--timeout-ms", "1000"
-            )
+            if client == "cli":
+                result = cli(
+                    "--socket", str(endpoint), "policy", "list", "--timeout-ms", "1000"
+                )
+            else:
+                environment = os.environ.copy()
+                environment["AGENT_SEC_DAEMON_SOCKET"] = str(endpoint)
+                # Installed binaries must ignore the workspace-only bypass setting.
+                environment["AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK"] = "1"
+                result = subprocess.run(
+                    [health_probe],
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
             assert result.returncode == 1, result.stderr
             assert result.stdout == ""
             assert (
@@ -82,6 +99,22 @@ with socket.socket(socket.AF_UNIX) as listener:
             if server.poll() is None:
                 server.kill()
                 server.communicate(timeout=5)
+
+
+def test_native_health_probe_accepts_real_root_daemon(daemon, health_probe):
+    environment = os.environ.copy()
+    environment["AGENT_SEC_DAEMON_SOCKET"] = str(daemon.socket_path)
+    result = subprocess.run(
+        [health_probe],
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
+    assert result.stderr == ""
 
 
 @pytest.mark.skipif(os.geteuid() != 0, reason="cross-UID UDS test requires root")

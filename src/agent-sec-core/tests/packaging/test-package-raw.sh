@@ -25,7 +25,7 @@ install -d -m 0755 \
     "$BUILD/qwen-code-extension/hooks" \
     "$BUILD/cosh-extension/hooks"
 
-for binary in agent-sec-cli agent-sec-daemon; do
+for binary in agent-sec-cli agent-sec-daemon agent-sec-daemon-health; do
     printf '#!/bin/sh\nexit 0\n' > "$BUILD/v2/bin/$binary"
     chmod 0755 "$BUILD/v2/bin/$binary"
 done
@@ -84,7 +84,7 @@ make -C "$ROOT" stage-raw \
     TARGET_OS=linux \
     TARGET_ARCH=x86_64
 
-for binary in agent-sec-cli agent-sec-daemon agent-sec-python linux-sandbox; do
+for binary in agent-sec-cli agent-sec-daemon agent-sec-daemon-health agent-sec-python linux-sandbox; do
     test "$(stat -c '%a' "$STAGE/bin/$binary")" = "755"
 done
 test ! -e "$STAGE/lib/anolisa/sec-core/python3.11/site-packages"
@@ -96,6 +96,7 @@ tar -tzf "$OUT_ONE/$ARTIFACT" > "$TMP/tar-list.txt"
 for expected in \
     "./bin/agent-sec-cli" \
     "./bin/agent-sec-daemon" \
+    "./bin/agent-sec-daemon-health" \
     "./bin/agent-sec-python" \
     "./lib/anolisa/sec-core/python3.11/runtime/bin/python3.11"; do
     grep -Fxq "$expected" "$TMP/tar-list.txt"

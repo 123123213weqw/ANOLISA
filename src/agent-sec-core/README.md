@@ -339,6 +339,10 @@ can serve the selected model; it never downloads models automatically.
 
 Details: [Prompt Scanner User Guide](../../docs/user-guide/en/agent-security/agent-sec-core/prompt-scanner.md).
 
+The V2 packages include `agent-sec-daemon-health`, a lightweight Rust probe that
+authenticates the daemon's UID before sending a health request. See the
+[probe reference](../../docs/user-guide/en/agent-security/agent-sec-core/internal-commands.md#agent-sec-daemon-health).
+
 ## Code Scanner
 
 Scans bash and python source for dangerous operations. In the V2 RPM,
