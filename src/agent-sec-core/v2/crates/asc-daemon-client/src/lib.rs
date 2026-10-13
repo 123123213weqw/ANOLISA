@@ -21,6 +21,8 @@ pub const MAX_FRAME_BYTES: usize = asc_daemon_protocol::BUSINESS_FRAME_BYTES;
 /// The caller's thread blocks until completion; no async runtime is needed.
 /// Encoding precedes the I/O deadline, and decoding follows receipt of the frame.
 /// The connected server must belong to UID 0 before any request bytes are sent.
+/// Test builds may opt out through the `testing` feature and
+/// `AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1`.
 ///
 /// # Errors
 /// Returns local encoding/limit failures, connection failures, a call deadline,
@@ -143,6 +145,12 @@ fn verify_server(stream: &UnixStream) -> io::Result<()> {
     // Authenticate this connection rather than a path that could be replaced.
     let uid = rustix::net::sockopt::socket_peercred(stream)?.uid.as_raw();
     if uid != 0 {
+        #[cfg(feature = "testing")]
+        if std::env::var_os("AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            return Ok(());
+        }
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             format!("expected daemon UID 0, got {uid}"),

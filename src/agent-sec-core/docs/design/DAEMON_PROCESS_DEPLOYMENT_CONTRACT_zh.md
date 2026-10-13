@@ -362,7 +362,10 @@ runner 工作目录的 owner、权限和 umask。
 可执行 fixture：`tests/v2/e2e/test_daemon_process_e2e.py::test_dproc_uds_002_rejects_fake_peer_even_with_root_owned_socket`
 验证 socket 文件属主改为 root 的非 root 伪服务仍被真实 Rust CLI 拒绝，
 服务端不得收到请求字节；该用例需要 root 的跨 UID 进程环境，编译或单元测试不替代该验收。
-包含成功模拟服务的 transport 和 CLI 进程测试要求 listener 由 UID 0 的进程创建。
+普通 workspace CI 统一启用默认关闭的 `asc-daemon-client/testing` feature，并设置
+`AGENT_SEC_TEST_SKIP_SERVER_UID_CHECK=1`，允许非 root 模拟服务执行协议和业务测试，
+普通测试无需修改。身份认证回归单独使用默认配置执行；RPM 构建和 E2E 不启用该 feature
+或配置，仍要求服务端 UID 为 0。该配置不影响服务端对客户端的身份识别和授权。
 非 root 开发环境可运行 `asc-daemon-client/tests/transport.rs::untrusted_server_is_rejected_before_request_bytes_are_sent`，
 验证本 UID 模拟服务被拒绝且未收到请求；该用例在 root 环境交由上述跨 UID E2E 覆盖。
 
