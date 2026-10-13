@@ -2179,8 +2179,9 @@ fn restore_units_with(
 ) -> Result<RollbackOutcome> {
     let mut outcome = RollbackOutcome {
         restored: 0,
-        failed: 0,
-        skipped: 0,
+        failures: Vec::new(),
+        missing: Vec::new(),
+        leftovers: Vec::new(),
         boot_unit_enabled: true,
     };
     let mut retired = false;
@@ -2197,15 +2198,16 @@ fn restore_units_with(
         // regenerate persistence from the ledger and return the rolled-back
         // value to the boot path. Each unit decides on its own, so the batch
         // retires what did restore and keeps what did not.
-        if rollback_should_finalize(unit_outcome.failed, unit_outcome.skipped) {
+        if rollback_should_finalize(unit_outcome.failed(), unit_outcome.skipped()) {
             for key in unit.keys() {
                 data.entries.remove(key);
             }
             retired = true;
         }
         outcome.restored += unit_outcome.restored;
-        outcome.failed += unit_outcome.failed;
-        outcome.skipped += unit_outcome.skipped;
+        outcome.failures.extend(unit_outcome.failures);
+        outcome.missing.extend(unit_outcome.missing);
+        outcome.leftovers.extend(unit_outcome.leftovers);
     }
 
     if !retired {
@@ -2222,7 +2224,7 @@ fn restore_units_with(
         // caller exits 1 — the surviving file would re-apply the tuned values
         // at the next boot, and the kept ledger preserves the originals for a
         // retry.
-        let cleanup_failed = finalize_rollback_at(
+        let cleanup_leftovers = finalize_rollback_at(
             ledger,
             sysctl_path,
             service_path,
@@ -2230,7 +2232,7 @@ fn restore_units_with(
             true,
             systemctl,
         );
-        outcome.failed += cleanup_failed;
+        outcome.leftovers.extend(cleanup_leftovers);
         return Ok(outcome);
     }
     // A failed regenerate can leave the old boot config replaying the value
@@ -2628,13 +2630,27 @@ fn paired_ledger_key(entries: &BTreeMap<String, RollbackEntry>, param: &str) -> 
         .cloned()
 }
 
-/// Outcome of a rollback attempt: how many params were restored vs. failed to
-/// restore vs. skipped (path absent). `failed`/`skipped` decide whether the
-/// rollback ledger is safe to delete and whether the restore was actually total.
+/// Outcome of a rollback attempt: how many params were restored, and which
+/// ones the attempt left behind.
+///
+/// The entries are carried, not just counted: a run that exits 1 has to be
+/// able to name what it did not restore, the way `tune` names the parameters
+/// it failed to write. `failed`/`skipped` are therefore the lengths of the
+/// lists below, and cannot drift from the names a caller reports.
 pub struct RollbackOutcome {
+    /// How many ledger entries landed: the writes whose read-back still held
+    /// the recorded original after every write in the batch ran.
     pub restored: usize,
-    pub failed: usize,
-    pub skipped: usize,
+    /// The entries whose restore did not land, with the reason.
+    pub failures: Vec<ApplyFailure>,
+    /// The ledger keys whose recorded path does not exist, so there was
+    /// nothing to write.
+    pub missing: Vec<String>,
+    /// The persisted files and the ledger a terminal cleanup could not
+    /// remove. Each survivor re-applies the tuned values at the next boot (or
+    /// keeps the originals for a retry), so it counts like a failed restore
+    /// even though no parameter is at fault.
+    pub leftovers: Vec<String>,
     /// Whether the non-sysctl boot replay is still armed after this rollback.
     /// A partial rollback regenerates the persisted files from the entries it
     /// keeps and re-runs `systemctl enable`; `false` means that enable was
@@ -2645,10 +2661,21 @@ pub struct RollbackOutcome {
 }
 
 impl RollbackOutcome {
+    /// How many units of the attempt did not land: the failed parameters plus
+    /// whatever the cleanup left behind.
+    pub fn failed(&self) -> usize {
+        self.failures.len() + self.leftovers.len()
+    }
+
+    /// How many entries were skipped because their recorded path was absent.
+    pub fn skipped(&self) -> usize {
+        self.missing.len()
+    }
+
     /// Whether all recorded values were restored, including an empty ledger.
     /// Failed writes and missing paths leave restoration incomplete.
     pub fn is_complete(&self) -> bool {
-        rollback_should_finalize(self.failed, self.skipped)
+        rollback_should_finalize(self.failed(), self.skipped())
     }
 }
 
@@ -2669,7 +2696,7 @@ pub enum RollbackStatus {
 pub fn classify_rollback(outcome: &RollbackOutcome) -> RollbackStatus {
     if outcome.restored == 0 {
         RollbackStatus::Nothing
-    } else if outcome.failed == 0 && outcome.skipped == 0 {
+    } else if outcome.failed() == 0 && outcome.skipped() == 0 {
         RollbackStatus::Full
     } else {
         RollbackStatus::Partial
@@ -2725,9 +2752,9 @@ fn restore_entries_with(
     // `dirty_ratio_handler` clears `vm.dirty_bytes` on every changed write.
     // Verdicts therefore wait for the post-loop read below, exactly like the
     // divergence check for accepted writes.
-    let mut refused: Vec<&String> = Vec::new();
-    let mut failed = 0;
-    let mut skipped = 0;
+    let mut refused: Vec<(&String, String)> = Vec::new();
+    let mut failures: Vec<ApplyFailure> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
     // A disabled twin is restored AFTER its clearer: the clearer's write
     // zeroes the twin whenever it lands, so a twin written first would be
     // wiped again by the clearer's own restore. That is what key order does
@@ -2755,7 +2782,10 @@ fn restore_entries_with(
             if !quiet {
                 progress!("  {} {} : 拒绝恢复（代码执行参数）", "✗".red(), param);
             }
-            failed += 1;
+            failures.push(ApplyFailure {
+                param: param.clone(),
+                error: "拒绝恢复（代码执行参数）".to_string(),
+            });
             continue;
         }
         // The structural guard the write choke point enforces belongs here for
@@ -2775,7 +2805,10 @@ fn restore_entries_with(
                     param
                 );
             }
-            failed += 1;
+            failures.push(ApplyFailure {
+                param: param.clone(),
+                error: "拒绝恢复非法参数名（路径穿越或空路径段）".to_string(),
+            });
             continue;
         }
         if Path::new(&entry.path).exists() {
@@ -2810,7 +2843,13 @@ fn restore_entries_with(
                                     entry.previous
                                 );
                             }
-                            failed += 1;
+                            failures.push(ApplyFailure {
+                                param: param.clone(),
+                                error: format!(
+                                    "回读为 {effective}（期望 {}），未恢复",
+                                    entry.previous
+                                ),
+                            });
                         }
                     }
                 }
@@ -2818,14 +2857,14 @@ fn restore_entries_with(
                     if !quiet {
                         progress!("  {} {} : {}", "✗".red(), param, e);
                     }
-                    refused.push(param);
+                    refused.push((param, e.to_string()));
                 }
             }
         } else {
             if !quiet {
                 progress!("  {} {} : 路径不存在，跳过", "⊘".yellow(), param);
             }
-            skipped += 1;
+            missing.push(param.clone());
         }
     }
 
@@ -2856,7 +2895,13 @@ fn restore_entries_with(
                 );
             }
             restored -= 1;
-            failed += 1;
+            failures.push(ApplyFailure {
+                param: (*param).clone(),
+                error: format!(
+                    "最终回读为 {effective}（期望 {}），已被后续写入覆盖，未恢复",
+                    entry.previous
+                ),
+            });
         }
     }
 
@@ -2868,8 +2913,8 @@ fn restore_entries_with(
     // replay in place on a host whose pair state was already fully restored.
     // An unreadable path proves nothing (write-only tunables have no
     // read-back), so only a readable, matching value counts.
-    for param in &refused {
-        let entry = &data.entries[*param];
+    for (param, error) in refused {
+        let entry = &data.entries[param];
         let live = fs::read_to_string(&entry.path).ok();
         let restored_by_twin = live.is_some_and(|live| {
             matches!(
@@ -2888,14 +2933,18 @@ fn restore_entries_with(
             }
             restored += 1;
         } else {
-            failed += 1;
+            failures.push(ApplyFailure {
+                param: param.clone(),
+                error,
+            });
         }
     }
 
     RollbackOutcome {
         restored,
-        failed,
-        skipped,
+        failures,
+        missing,
+        leftovers: Vec::new(),
         boot_unit_enabled: true,
     }
 }
@@ -2959,22 +3008,22 @@ fn finalize_rollback_at(
     script_path: &str,
     quiet: bool,
     systemctl: &str,
-) -> usize {
-    let mut failed = 0;
+) -> Vec<String> {
+    let mut leftovers: Vec<String> = Vec::new();
     if !remove_persisted(sysctl_path, quiet) {
-        failed += 1;
+        leftovers.push(sysctl_path.to_string());
     }
     if Path::new(service_path).exists() {
         systemctl_quiet(systemctl, &["disable", "ktuner-nonsysctl.service"]);
         if !remove_persisted(service_path, quiet) {
-            failed += 1;
+            leftovers.push(service_path.to_string());
         }
         systemctl_quiet(systemctl, &["daemon-reload"]);
     }
     if !remove_persisted(script_path, quiet) {
-        failed += 1;
+        leftovers.push(script_path.to_string());
     }
-    if failed == 0 {
+    if leftovers.is_empty() {
         match fs::remove_file(ledger) {
             Ok(()) => {}
             // Only a delete that left the ledger behind counts: ENOENT — the
@@ -2983,12 +3032,12 @@ fn finalize_rollback_at(
                 if !quiet {
                     progress!("  {} {ledger} : {error}（未清理）", "✗".red());
                 }
-                failed += 1;
+                leftovers.push(ledger.to_string());
             }
             Err(_) => {}
         }
     }
-    failed
+    leftovers
 }
 
 fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
@@ -3002,10 +3051,13 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
     let RollbackOutcome {
         restored,
-        mut failed,
-        skipped,
+        failures,
+        missing,
+        mut leftovers,
         ..
     } = restore_entries(&data, quiet);
+    let mut failed = failures.len() + leftovers.len();
+    let skipped = missing.len();
 
     // A persisted file that survived cleanup re-applies the tuned values on the
     // next boot, and a ledger that survived it keeps the record a retry
@@ -3013,25 +3065,24 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     // both like a failed or skipped restore is what keeps the ledger for a
     // retry and turns the exit code into 1 (#4535), instead of a silent success
     // that deletes the originals.
-    let mut cleanup_failed = 0;
     if rollback_should_finalize(failed, skipped) {
-        cleanup_failed = finalize_rollback_at(
+        leftovers.extend(finalize_rollback_at(
             ROLLBACK_PATH,
             SYSCTL_PERSIST_PATH,
             NONSYSCTL_SERVICE_PATH,
             NONSYSCTL_SCRIPT_PATH,
             quiet,
             "systemctl",
-        );
-        failed += cleanup_failed;
+        ));
+        failed = failures.len() + leftovers.len();
     }
 
     if !quiet {
-        if cleanup_failed > 0 {
+        if !leftovers.is_empty() {
             progress!(
                 "  {} {} 项清理未能完成，已保留 {} 以便重试（未能删除的持久化配置会在下次启动时重新生效）",
                 "⚠".yellow(),
-                cleanup_failed,
+                leftovers.len(),
                 ROLLBACK_PATH
             );
         } else if failed > 0 || skipped > 0 {
@@ -3048,8 +3099,9 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     }
     Ok(RollbackOutcome {
         restored,
-        failed,
-        skipped,
+        failures,
+        missing,
+        leftovers,
         boot_unit_enabled: true,
     })
 }
@@ -3735,10 +3787,30 @@ mod tests {
             "20",
             "the cleared ratio must come back with the rollback"
         );
-        assert!(rollback_should_finalize(outcome.failed, outcome.skipped));
+        assert!(rollback_should_finalize(
+            outcome.failed(),
+            outcome.skipped()
+        ));
     }
 
     use super::*;
+
+    /// An outcome's failure list of length `n`. The classifier, the
+    /// completeness gate and the JSON body read the lists' lengths and (for
+    /// the body) their names, so a fixture only has to be well formed.
+    fn test_failures(n: usize) -> Vec<ApplyFailure> {
+        (0..n)
+            .map(|i| ApplyFailure {
+                param: format!("vm.ktuner_failed_{i}"),
+                error: "write refused".to_string(),
+            })
+            .collect()
+    }
+
+    /// An outcome's missing list of length `n`, the path-absent entries.
+    fn test_missing(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("vm.ktuner_missing_{i}")).collect()
+    }
 
     #[test]
     fn render_persistence_normalizes_slashed_sysctl_names() {
@@ -5040,8 +5112,9 @@ mod tests {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
                 restored: 3,
-                failed: 0,
-                skipped: 0,
+                failures: test_failures(0),
+                missing: test_missing(0),
+                leftovers: Vec::new(),
                 boot_unit_enabled: true,
             }),
             RollbackStatus::Full
@@ -5049,8 +5122,9 @@ mod tests {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
                 restored: 2,
-                failed: 1,
-                skipped: 0,
+                failures: test_failures(1),
+                missing: test_missing(0),
+                leftovers: Vec::new(),
                 boot_unit_enabled: true,
             }),
             RollbackStatus::Partial
@@ -5061,8 +5135,9 @@ mod tests {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
                 restored: 2,
-                failed: 0,
-                skipped: 1,
+                failures: test_failures(0),
+                missing: test_missing(1),
+                leftovers: Vec::new(),
                 boot_unit_enabled: true,
             }),
             RollbackStatus::Partial
@@ -5070,8 +5145,9 @@ mod tests {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
                 restored: 0,
-                failed: 2,
-                skipped: 0,
+                failures: test_failures(2),
+                missing: test_missing(0),
+                leftovers: Vec::new(),
                 boot_unit_enabled: true,
             }),
             RollbackStatus::Nothing
@@ -5081,8 +5157,9 @@ mod tests {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
                 restored: 0,
-                failed: 0,
-                skipped: 0,
+                failures: test_failures(0),
+                missing: test_missing(0),
+                leftovers: Vec::new(),
                 boot_unit_enabled: true,
             }),
             RollbackStatus::Nothing
@@ -5103,8 +5180,9 @@ mod tests {
             assert_eq!(
                 RollbackOutcome {
                     restored,
-                    failed,
-                    skipped,
+                    failures: test_failures(failed),
+                    missing: test_missing(skipped),
+                    leftovers: Vec::new(),
                     boot_unit_enabled: true,
                 }
                 .is_complete(),
@@ -5150,7 +5228,7 @@ mod tests {
         let script = dir.join("apply-nonsysctl.sh");
         fs::write(&script, b"#!/bin/sh\n").expect("write script");
 
-        let cleanup_failed = finalize_rollback_at(
+        let cleanup_leftovers = finalize_rollback_at(
             ledger.to_str().unwrap(),
             sysctl.to_str().unwrap(),
             service.to_str().unwrap(),
@@ -5160,8 +5238,9 @@ mod tests {
         );
 
         assert_eq!(
-            cleanup_failed, 1,
-            "exactly the file that could not be removed is counted"
+            cleanup_leftovers,
+            vec![sysctl.to_str().unwrap().to_string()],
+            "exactly the file that could not be removed is named"
         );
         assert!(
             ledger.exists(),
@@ -5170,13 +5249,14 @@ mod tests {
         );
         assert!(!script.exists(), "the removable files are still cleaned up");
 
-        // What those counts mean for the caller: a cleanup failure is an
+        // What those names mean for the caller: a cleanup failure is an
         // incomplete restoration, like a failed or skipped restore, so the
         // ledger survives and `rollback` exits 1 rather than 0.
         let outcome = RollbackOutcome {
             restored: 3,
-            failed: cleanup_failed,
-            skipped: 0,
+            failures: test_failures(0),
+            missing: test_missing(0),
+            leftovers: cleanup_leftovers,
             boot_unit_enabled: true,
         };
         assert!(!outcome.is_complete());
@@ -5205,7 +5285,7 @@ mod tests {
         let script = dir.join("apply-nonsysctl.sh");
         fs::write(&script, b"#!/bin/sh\n").expect("write script");
 
-        let cleanup_failed = finalize_rollback_at(
+        let cleanup_leftovers = finalize_rollback_at(
             ledger.to_str().unwrap(),
             sysctl.to_str().unwrap(),
             service.to_str().unwrap(),
@@ -5214,7 +5294,7 @@ mod tests {
             "true",
         );
 
-        assert_eq!(cleanup_failed, 0);
+        assert!(cleanup_leftovers.is_empty());
         assert!(!sysctl.exists() && !service.exists() && !script.exists());
         assert!(
             !ledger.exists(),
@@ -5253,7 +5333,7 @@ mod tests {
         let calls = dir.join("systemctl-calls");
         let program = executable_systemctl_stand_in(&dir, &calls);
 
-        let cleanup_failed = finalize_rollback_at(
+        let cleanup_leftovers = finalize_rollback_at(
             ledger.to_str().unwrap(),
             sysctl.to_str().unwrap(),
             service.to_str().unwrap(),
@@ -5262,7 +5342,7 @@ mod tests {
             program.to_str().unwrap(),
         );
 
-        assert_eq!(cleanup_failed, 0);
+        assert!(cleanup_leftovers.is_empty());
         assert!(
             !service.exists(),
             "the named program's work still completes"
@@ -5302,7 +5382,7 @@ mod tests {
         let script = dir.join("apply-nonsysctl.sh");
         fs::write(&script, b"#!/bin/sh\n").expect("write script");
 
-        let cleanup_failed = finalize_rollback_at(
+        let cleanup_leftovers = finalize_rollback_at(
             ledger.to_str().unwrap(),
             sysctl.to_str().unwrap(),
             service.to_str().unwrap(),
@@ -5312,7 +5392,8 @@ mod tests {
         );
 
         assert_eq!(
-            cleanup_failed, 1,
+            cleanup_leftovers,
+            vec![ledger.to_str().unwrap().to_string()],
             "the persisted files went, so the ledger is the removal that failed"
         );
         assert!(
@@ -5322,12 +5403,13 @@ mod tests {
         );
         assert!(!sysctl.exists() && !script.exists());
 
-        // What the count means for the caller: the rollback is incomplete, so
+        // What the name means for the caller: the rollback is incomplete, so
         // `rollback` exits 1 instead of reporting a finished cleanup.
         let outcome = RollbackOutcome {
             restored: 3,
-            failed: cleanup_failed,
-            skipped: 0,
+            failures: test_failures(0),
+            missing: test_missing(0),
+            leftovers: cleanup_leftovers,
             boot_unit_enabled: true,
         };
         assert!(!outcome.is_complete());
@@ -5847,8 +5929,8 @@ mod tests {
         let outcome = restore_entries(&data, true);
         assert_eq!(fs::read_to_string(&path).unwrap(), "10");
         assert_eq!(outcome.restored, 1);
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed(), 0);
+        assert_eq!(outcome.skipped(), 0);
     }
 
     #[test]
@@ -5878,8 +5960,8 @@ mod tests {
             "rollback must restore the pristine pre-ktuner value, not the intermediate"
         );
         assert_eq!(outcome.restored, 1, "one knob, one restore write");
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed(), 0);
+        assert_eq!(outcome.skipped(), 0);
     }
 
     #[test]
@@ -5986,8 +6068,8 @@ mod tests {
             "the healed restore must change no outcome: the key-order double write leaves 100"
         );
         assert_eq!(outcome.restored, 1, "one knob, one restore write");
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.failed(), 0);
+        assert_eq!(outcome.skipped(), 0);
     }
 
     #[test]
@@ -6045,8 +6127,8 @@ mod tests {
         assert_eq!(fs::read_to_string(allowed).unwrap(), "10");
         assert_eq!(fs::read_to_string(forbidden).unwrap(), "unchanged");
         assert_eq!(outcome.restored, 1);
-        assert_eq!(outcome.failed, 2);
-        assert_eq!(outcome.skipped, 1);
+        assert_eq!(outcome.failed(), 2);
+        assert_eq!(outcome.skipped(), 1);
     }
 
     #[test]
@@ -6082,7 +6164,7 @@ mod tests {
             "a deny-listed target must never receive a write: {attempted:?}"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (0, 1, 0),
             "the entry must be counted as refused, not skipped or restored"
         );
@@ -6126,9 +6208,12 @@ mod tests {
         // so the ledger is kept for a retry.
         assert_eq!(fs::read_to_string(&restored).unwrap(), "10");
         assert_eq!(outcome.restored, 1);
-        assert_eq!(outcome.failed, 1);
-        assert_eq!(outcome.skipped, 0);
-        assert!(!rollback_should_finalize(outcome.failed, outcome.skipped));
+        assert_eq!(outcome.failed(), 1);
+        assert_eq!(outcome.skipped(), 0);
+        assert!(!rollback_should_finalize(
+            outcome.failed(),
+            outcome.skipped()
+        ));
     }
 
     /// The undo path has to refuse the names the write path refuses. The write
@@ -6171,10 +6256,11 @@ mod tests {
         );
         assert_eq!(outcome.restored, 0);
         assert_eq!(
-            outcome.failed, 1,
+            outcome.failed(),
+            1,
             "the refusal is a failure, so the record stays for a retry"
         );
-        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.skipped(), 0);
     }
 
     #[test]
@@ -6246,12 +6332,13 @@ mod tests {
         );
         assert_eq!(outcome.restored, 1, "only the ratio write holds");
         assert_eq!(
-            outcome.failed, 1,
+            outcome.failed(),
+            1,
             "the bytes knob was cleared by the ratio write and must count as failed"
         );
-        assert_eq!(outcome.skipped, 0);
+        assert_eq!(outcome.skipped(), 0);
         assert!(
-            !rollback_should_finalize(outcome.failed, outcome.skipped),
+            !rollback_should_finalize(outcome.failed(), outcome.skipped()),
             "a cleared sibling must keep the ledger for inspection"
         );
     }
@@ -6327,12 +6414,12 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&ratio).unwrap(), "20");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "both halves of the pair are restored"
         );
         assert!(
-            rollback_should_finalize(outcome.failed, outcome.skipped),
+            rollback_should_finalize(outcome.failed(), outcome.skipped()),
             "a fully restored pair must finalize: the ledger is deleted and the boot replay removed"
         );
     }
@@ -6372,7 +6459,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&bytes).unwrap(), "268435456");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (0, 1, 0),
             "a refusal nothing else repaired stays a failure"
         );
@@ -6450,8 +6537,11 @@ mod tests {
             "the ratio the kernel disabled is left at its recorded original"
         );
         assert_eq!(outcome.restored, 2);
-        assert_eq!(outcome.failed, 0);
-        assert!(rollback_should_finalize(outcome.failed, outcome.skipped));
+        assert_eq!(outcome.failed(), 0);
+        assert!(rollback_should_finalize(
+            outcome.failed(),
+            outcome.skipped()
+        ));
     }
 
     #[test]
@@ -6484,9 +6574,12 @@ mod tests {
             true,
         );
         assert_eq!(outcome.restored, 2);
-        assert_eq!(outcome.failed, 0);
-        assert_eq!(outcome.skipped, 0);
-        assert!(rollback_should_finalize(outcome.failed, outcome.skipped));
+        assert_eq!(outcome.failed(), 0);
+        assert_eq!(outcome.skipped(), 0);
+        assert!(rollback_should_finalize(
+            outcome.failed(),
+            outcome.skipped()
+        ));
     }
 
     #[test]
@@ -8353,7 +8446,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -8482,7 +8575,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -8537,7 +8630,7 @@ mod tests {
 
             assert_eq!(key, target, "the resolved key is the recorded spelling");
             assert_eq!(
-                (outcome.restored, outcome.failed, outcome.skipped),
+                (outcome.restored, outcome.failed(), outcome.skipped()),
                 (2, 0, 0),
                 "{target}: the recorded twin is restored and counted"
             );
@@ -8608,7 +8701,7 @@ mod tests {
 
         assert_eq!(key, "vm.overcommit_ratio");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert_eq!(fs::read_to_string(&ratio).unwrap(), "50");
@@ -8642,7 +8735,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (0, 0, 1)
         );
         assert!(
@@ -8654,6 +8747,75 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(&ledger).unwrap()).unwrap();
         assert_eq!(data["entries"]["vm.swappiness"]["previous"], "60");
         assert_eq!(fs::read_to_string(&conf).unwrap(), "vm.swappiness = 10\n");
+    }
+
+    /// The outcome names what a batch left behind, not just how many entries
+    /// did. One entry is addressed at a directory, which `fs::write` refuses
+    /// with `EISDIR` on every filesystem; the next one's recorded path is
+    /// absent. A caller that exits 1 has to be able to name both, without a
+    /// second root-only `--list` run to find out which parameters are still
+    /// tuned.
+    #[test]
+    fn rollback_params_name_the_entries_they_left() {
+        let dir = AtomicTestDir::new("rollback-param-leftovers");
+        let (conf, service, script) = fixture_paths(&dir);
+        let blocked = dir.0.join("blocked");
+        fs::create_dir(&blocked).unwrap();
+        let absent = dir.0.join("absent");
+        let ledger = fixture_ledger(
+            &dir,
+            &[
+                ("vm.swappiness", "60", "10", blocked.to_str().unwrap()),
+                (
+                    "net.core.somaxconn",
+                    "4096",
+                    "128",
+                    absent.to_str().unwrap(),
+                ),
+            ],
+        );
+        fs::write(&conf, "vm.swappiness = 10\n").unwrap();
+
+        let (keys, outcome) = rollback_params_at(
+            &[
+                "vm.swappiness".to_string(),
+                "net.core.somaxconn".to_string(),
+            ],
+            &ledger,
+            &conf,
+            &service,
+            &script,
+        )
+        .unwrap();
+
+        assert_eq!(keys, ["vm.swappiness", "net.core.somaxconn"]);
+        assert_eq!(
+            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (0, 1, 1)
+        );
+        assert_eq!(
+            outcome
+                .failures
+                .iter()
+                .map(|failure| failure.param.as_str())
+                .collect::<Vec<_>>(),
+            ["vm.swappiness"],
+            "the entry the write refused is named"
+        );
+        assert!(
+            !outcome.failures[0].error.is_empty(),
+            "and it carries the reason the write did not land"
+        );
+        assert_eq!(
+            outcome.missing,
+            ["net.core.somaxconn"],
+            "the entry whose recorded path is gone is named too"
+        );
+        assert!(
+            !outcome.is_complete(),
+            "neither entry restored, so the ledger must be kept for a retry"
+        );
+        assert!(Path::new(&ledger).exists(), "the record must survive");
     }
 
     /// A pair restores as one unit: one half landing while the other is skipped
@@ -8682,7 +8844,7 @@ mod tests {
 
         assert_eq!(key, "vm.dirty_bytes");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 0, 1)
         );
         assert_eq!(
@@ -8873,7 +9035,7 @@ mod tests {
         let (key, outcome) = worker.join().unwrap().unwrap();
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -8970,7 +9132,7 @@ mod tests {
             "each positional reports the ledger key it resolved to, in the order given"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (3, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9038,7 +9200,7 @@ mod tests {
 
         assert_eq!(keys, params, "each named half reports its ledger key");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "both halves of the pair are restored once, not four times"
         );
@@ -9110,7 +9272,7 @@ mod tests {
             "one ledger key per entry, in the order the spellings first appear"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "an aliased spelling must not restore the entry twice"
         );
@@ -9274,7 +9436,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 1, 1)
         );
         assert!(
@@ -9339,7 +9501,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (0, 0, 2)
         );
         assert_eq!(fs::read_to_string(&ledger).unwrap(), ledger_before);
@@ -9380,7 +9542,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9486,7 +9648,7 @@ mod tests {
         let (keys, outcome) = worker.join().unwrap().unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (3, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -9538,7 +9700,7 @@ mod tests {
         let (_, outcome) = rollback_params_at(&params, &ledger, &conf, &service, &script).unwrap();
 
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (1, 1, 1)
         );
         assert_eq!(
@@ -9583,7 +9745,7 @@ mod tests {
         let (_, outcome) = rollback_params_at(&params, &ledger, &conf, &service, &script).unwrap();
 
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert_eq!(batch_writes("ledger", &ledger), 1);
@@ -9606,7 +9768,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (0, 0, 1)
         );
         assert_eq!(batch_writes("ledger", &ledger), 0);
@@ -9663,7 +9825,7 @@ mod tests {
 
         assert!(unmatched.is_empty(), "{unmatched:?}");
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9728,7 +9890,7 @@ mod tests {
 
             assert!(unmatched.is_empty(), "{unmatched:?}");
             assert_eq!(
-                (outcome.restored, outcome.failed, outcome.skipped),
+                (outcome.restored, outcome.failed(), outcome.skipped()),
                 (1, 0, 0),
                 "only the entry outside the pair is restored ({excluded} excluded)"
             );
@@ -9799,7 +9961,7 @@ mod tests {
 
         assert_eq!(unmatched, ["vm.typo", "net.core.typo2", "vm.typo"]);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9847,7 +10009,7 @@ mod tests {
 
             assert!(unmatched.is_empty(), "{excluded:?} names recorded entries");
             assert_eq!(
-                (outcome.restored, outcome.failed, outcome.skipped),
+                (outcome.restored, outcome.failed(), outcome.skipped()),
                 (0, 0, 0),
                 "{excluded:?}: nothing is attempted"
             );
@@ -10431,8 +10593,8 @@ mod tests {
         assert_eq!(
             (
                 report.outcome.restored,
-                report.outcome.failed,
-                report.outcome.skipped
+                report.outcome.failed(),
+                report.outcome.skipped()
             ),
             (1, 0, 0)
         );
@@ -10504,8 +10666,8 @@ mod tests {
         assert_eq!(
             (
                 report.outcome.restored,
-                report.outcome.failed,
-                report.outcome.skipped
+                report.outcome.failed(),
+                report.outcome.skipped()
             ),
             (0, 0, 0)
         );
@@ -10529,8 +10691,8 @@ mod tests {
         assert_eq!(
             (
                 report.outcome.restored,
-                report.outcome.failed,
-                report.outcome.skipped
+                report.outcome.failed(),
+                report.outcome.skipped()
             ),
             (0, 0, 0)
         );
@@ -10869,7 +11031,7 @@ mod tests {
         };
         let outcome = restore_entries(&data, false);
         assert_eq!(
-            (outcome.restored, outcome.failed, outcome.skipped),
+            (outcome.restored, outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "every recorded entry must be restored despite the failed writes"
         );
