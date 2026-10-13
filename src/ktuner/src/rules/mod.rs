@@ -6062,7 +6062,7 @@ fn eval_icmp_ignore_bogus(_info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let current = read_sysctl_i64(path);
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.icmp_ignore_bogus_error_responses".to_string(),
@@ -8139,11 +8139,11 @@ fn eval_ip_nonlocal_bind(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
     if info.has_process("keepalived") || info.has_process("haproxy") {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current == 1 {
+    let current = read_sysctl_i64(path);
+    if current != 0 {
         recs.push(Recommendation {
             param: "net.ipv4.ip_nonlocal_bind".to_string(),
-            current_value: "1".to_string(),
+            current_value: current.to_string(),
             recommended_value: "0".to_string(),
             reason: "允许绑定非本地 IP 地址可能导致安全风险，除非使用高可用（VRRP/keepalived）否则应禁用".to_string(),
             confidence: Confidence::Medium,
@@ -14728,8 +14728,8 @@ mod tests {
         let checked = eval_ip_nonlocal_bind(&info, &mut recs);
         if std::path::Path::new("/proc/sys/net/ipv4/ip_nonlocal_bind").exists() {
             assert_eq!(checked, 1);
-            let val = read_sysctl_u64("/proc/sys/net/ipv4/ip_nonlocal_bind");
-            if val == 1 {
+            let val = read_sysctl_i64("/proc/sys/net/ipv4/ip_nonlocal_bind");
+            if val != 0 {
                 assert!(recs.iter().any(|r| r.param == "net.ipv4.ip_nonlocal_bind"));
                 assert_eq!(recs.last().unwrap().category, Category::Security);
             }
