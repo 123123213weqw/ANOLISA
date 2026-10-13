@@ -438,14 +438,28 @@ pub fn gather_system_info() -> Result<SystemInfo> {
     })
 }
 
-fn read_file_trimmed(path: &str) -> Result<String> {
-    fs::read_to_string(path)
-        .with_context(|| format!("failed to read {path}"))
-        .map(|s| s.trim().to_string())
+fn read_kernel_version() -> Result<String> {
+    read_kernel_version_from("/proc/sys/kernel/osrelease")
 }
 
-fn read_kernel_version() -> Result<String> {
-    read_file_trimmed("/proc/sys/kernel/osrelease")
+/// Path-injectable form of [`read_kernel_version`] (the `eval_*_at` idiom) so
+/// the raw-byte handling is assertable against a fixture instead of the live
+/// `/proc`.
+///
+/// Read as bytes and decoded lossily: the file is the byte array
+/// `init_uts_ns.name.release`, handed to the reader verbatim (v6.6
+/// `kernel/utsname_sysctl.c`:93-99), and that array is composed from build
+/// inputs — `KERNELRELEASE` is `VERSION.PATCHLEVEL.SUBLEVEL` plus
+/// `EXTRAVERSION`/`LOCALVERSION`, written into `include/config/kernel.release`
+/// (v6.6 `Makefile`:368-370, :1173-1180) and only length-checked, a `wc -c`
+/// against 64, before it becomes `UTS_RELEASE` (v6.6 `Makefile`:1232-1239) —
+/// so nothing checks its encoding. A strict read rejected the whole file on one
+/// such byte, which made [`gather_system_info`] fail and took every command
+/// with it, although the version is reported and compared as a `major.minor`
+/// prefix that a replacement character cannot impersonate.
+fn read_kernel_version_from(path: &str) -> Result<String> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {path}"))?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
 }
 
 fn read_os_distro() -> String {
@@ -2307,6 +2321,34 @@ mod tests {
             .expect("a non-UTF-8 model name must not hide the processors");
         assert_eq!(cores, 2);
         assert!(model.starts_with("Test CPU "), "{model}");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The release string is kernel text: `/proc/sys/kernel/osrelease` is the
+    /// byte array `init_uts_ns.name.release` handed to the reader verbatim
+    /// (v6.6 `kernel/utsname_sysctl.c`:93-99), and it is composed from build
+    /// inputs — `KERNELRELEASE` is `VERSION.PATCHLEVEL.SUBLEVEL` plus
+    /// `EXTRAVERSION`/`LOCALVERSION`, written into
+    /// `include/config/kernel.release` (v6.6 `Makefile`:368-370, :1173-1180)
+    /// and only length-checked before it becomes `UTS_RELEASE` (v6.6
+    /// `Makefile`:1232-1239, a `wc -c` against 64, no encoding check). One byte
+    /// outside UTF-8 therefore used to make `read_kernel_version()` fail,
+    /// aborting `gather_system_info()` and every command with it.
+    #[test]
+    fn read_kernel_version_survives_non_utf8_bytes() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_release_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let release = dir.join("osrelease");
+        std::fs::write(&release, b"6.6.0-vendor\xffbuild\n").unwrap();
+
+        let version = read_kernel_version_from(release.to_str().unwrap())
+            .expect("one byte outside UTF-8 in the release must not abort every command");
+        assert_eq!(version, "6.6.0-vendor\u{fffd}build");
 
         fs::remove_dir_all(&dir).ok();
     }
