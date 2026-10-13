@@ -2133,8 +2133,16 @@ fn irqs_forced_threaded(cmdline_path: &str, version_path: &str) -> bool {
             return true;
         }
     }
-    match std::fs::read_to_string(version_path) {
-        Ok(version) => version.contains("PREEMPT_RT"),
+    // Lossy, like the command line above: the banner carries the build
+    // environment's bytes — `whoami`/`uname -n` land in `(user@host)`
+    // (`scripts/mkcompile_h`:9,14, or `KBUILD_BUILD_USER`/`KBUILD_BUILD_HOST`
+    // :11,16) and `version_proc_show` prints them through `seq_printf`
+    // (`fs/proc/version.c`) — and only the ASCII `PREEMPT_RT` token, which
+    // `preempt-flag-$(CONFIG_PREEMPT_RT)` feeds into `UTS_VERSION` (`init/
+    // Makefile`), decides. A strict read dropped the whole banner on one such
+    // byte, and the gate then reported a threaded kernel as unthreaded.
+    match std::fs::read(version_path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).contains("PREEMPT_RT"),
         Err(_) => false,
     }
 }
@@ -15824,6 +15832,49 @@ mod tests {
             cmdline.to_str().unwrap(),
             version.to_str().unwrap()
         ));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The forced-threading gate reads a second file, `/proc/version`, for the
+    /// config flag a CONFIG_PREEMPT_RT build carries. That line is kernel text
+    /// too: its `(user@host)` field is the build environment's `whoami`/
+    /// `uname -n` bytes (`scripts/mkcompile_h`:9,14, or `KBUILD_BUILD_USER`/
+    /// `KBUILD_BUILD_HOST`:11,16), and `version_proc_show` prints the banner
+    /// through `seq_printf` (`fs/proc/version.c`), so one non-UTF-8 byte in the
+    /// build host's name made the strict read fail and the rule advised an
+    /// `rq_affinity` write the kernel ignores on an RT kernel.
+    #[test]
+    fn a_preempt_rt_banner_that_is_not_utf8_still_suppresses_the_advice() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_version_banner_bytes_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cmdline = dir.join("cmdline");
+        std::fs::write(&cmdline, "BOOT_IMAGE=/vmlinuz root=/dev/sda1\n").unwrap();
+        let version = dir.join("version");
+        std::fs::write(
+            &version,
+            b"Linux version 6.6.0 (kbuilder@b\xffuild) (gcc) #1 SMP PREEMPT_RT\n",
+        )
+        .unwrap();
+
+        let mut info = make_test_info();
+        info.numa_nodes = 2;
+        info.disks[0].rq_affinity = 0;
+        let mut recs = Vec::new();
+        eval_rq_affinity_at(
+            &info,
+            &mut recs,
+            cmdline.to_str().unwrap(),
+            version.to_str().unwrap(),
+        );
+        assert!(
+            !recs.iter().any(|r| r.param.contains("rq_affinity")),
+            "a PREEMPT_RT kernel threads every handler, whatever the build host's bytes"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
