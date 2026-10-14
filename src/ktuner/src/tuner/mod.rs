@@ -94,15 +94,39 @@ pub struct ClampNote {
     pub effective: String,
 }
 
-/// Outcome of applying a batch: how many params were applied, which failed
-/// with why, and which the kernel accepted with an adjusted value. Mirrors
-/// `RollbackOutcome` so `tune` can report partial failure the way `rollback`
-/// already does — the previous return type (a bare count) could not represent
-/// failures at all, so quiet mode dropped them entirely. `clamped` is disjoint
-/// from `failed`: a rejected write is a failure, an accepted-but-adjusted
-/// write is applied with a note.
+/// One parameter a batch wrote, and the two values that describe the change:
+/// what the ledger recorded as the original and what the kernel took.
+pub struct WrittenEntry {
+    pub param: String,
+    /// The original the ledger recorded under the transaction lock — the value
+    /// `ktuner rollback` restores, with [`AppliedFix::recorded_previous`]'s
+    /// meaning. This is the ledger's own record when the parameter already had
+    /// one (a re-write keeps the FIRST previous), so a caller reporting it
+    /// agrees with the ledger and `rollback --list` instead of naming an
+    /// intermediate value no rollback can restore. `None` for a write-only
+    /// tunable: the write lands but is unrecordable.
+    pub previous: Option<String>,
+    /// The value the kernel actually took: the request unless the kernel
+    /// clamped/normalized it, with [`WriteOutcome::effective`]'s meaning.
+    /// Recording the request instead would make the ledger's `applied` differ
+    /// from what is live.
+    pub applied: String,
+}
+
+/// Outcome of applying a batch: which params were written with what, which
+/// failed with why, and which the kernel accepted with an adjusted value.
+/// Mirrors `RollbackOutcome` so `tune` can report partial failure the way
+/// `rollback` already does — the previous return type (a bare count) could not
+/// represent failures at all, so quiet mode dropped them entirely. `clamped` is
+/// disjoint from `failed`: a rejected write is a failure, an
+/// accepted-but-adjusted write is applied with a note.
 pub struct ApplyOutcome {
-    pub applied: usize,
+    /// The parameters this batch wrote, in write order — one entry per write,
+    /// so [`Self::applied`] is derived from this list and can never drift from
+    /// the names it summarizes. A write that also zeroes its mutually
+    /// exclusive twin is still one write: the twin is a ledger record and a
+    /// kernel side effect, named by [`Self::cleared`], not a write of its own.
+    pub written: Vec<WrittenEntry>,
     pub failed: Vec<ApplyFailure>,
     pub clamped: Vec<ClampNote>,
     /// Whether the boot replay is armed: false when a non-sysctl entry was
@@ -121,6 +145,16 @@ pub struct ApplyOutcome {
     pub cleared: Vec<String>,
 }
 
+impl ApplyOutcome {
+    /// How many parameters this batch wrote — one per [`Self::written`] entry,
+    /// not one per ledger record: a `*_bytes` knob also records the ratio twin
+    /// the kernel clears for it, and the batch's progress and exit-code
+    /// semantics stay per-write.
+    pub fn applied(&self) -> usize {
+        self.written.len()
+    }
+}
+
 pub fn apply(recommendations: &[Recommendation]) -> Result<ApplyOutcome> {
     apply_inner(recommendations, false)
 }
@@ -131,7 +165,6 @@ pub fn apply_quiet(recommendations: &[Recommendation]) -> Result<ApplyOutcome> {
 
 fn apply_inner(recommendations: &[Recommendation], quiet: bool) -> Result<ApplyOutcome> {
     let guard = lock_ledger_at(ROLLBACK_PATH)?;
-    load_rollback()?; // Refuse an unreadable ledger before any live write.
     apply_locked(recommendations, quiet, &guard)
 }
 
@@ -141,9 +174,16 @@ fn apply_locked(
     quiet: bool,
     guard: &LedgerLock,
 ) -> Result<ApplyOutcome> {
+    // The ledger this transaction mutates, read through the guard's own path
+    // so a fixture guard reaches its fixture and not the production constant.
+    // An unreadable ledger is refused here, before any live write, and the
+    // originals it already holds are the ones this batch must report: a
+    // re-write keeps the FIRST previous, so the pre-write read of an
+    // already-recorded knob is an intermediate value no rollback restores.
+    let ledger = load_rollback_from(&guard.path)?;
     let total = recommendations.len();
     let mut applied_recs: Vec<Recommendation> = Vec::new();
-    let mut applied = 0usize;
+    let mut written: Vec<WrittenEntry> = Vec::new();
     let mut failed: Vec<ApplyFailure> = Vec::new();
     let mut clamped: Vec<ClampNote> = Vec::new();
     let mut cleared: Vec<String> = Vec::new();
@@ -194,16 +234,25 @@ fn apply_locked(
                     });
                 }
                 // The write landed whether or not a pristine value exists.
-                applied += 1;
-                if let Some(previous) = previous {
+                if let Some(recorded) = previous.as_ref() {
                     // The ledger and sysctl.d must describe live reality:
                     // record the value the kernel actually took, not the
                     // request (#4160). A param whose original could not be
                     // read is applied but unrecordable — see apply_recordable.
                     let mut applied_rec = rec_with_effective(rec, &outcome);
-                    applied_rec.current_value = previous;
+                    applied_rec.current_value = recorded.clone();
                     applied_recs.push(applied_rec);
                 }
+                written.push(WrittenEntry {
+                    param: rec.param.clone(),
+                    // The ledger's keep-original merge leaves an earlier
+                    // record, when there is one, in place of this pre-write
+                    // read, so the ledger's own value is the original a later
+                    // `rollback` restores and the one this entry must report;
+                    // the read is the original of a first write.
+                    previous: recorded_previous_value(&ledger, &rec.param).or(previous),
+                    applied: outcome.effective.clone(),
+                });
                 // The write disabled the mutually exclusive twin: record what
                 // was live before the write (the snapshot above), or no
                 // rollback can ever bring that original back. The twin is a
@@ -242,20 +291,20 @@ fn apply_locked(
             // the ratio sibling the kernel clears for it, and the batch's
             // progress and exit-code semantics stay per-write.
             if boot_unit_enabled {
-                progress!("  {} 项配置已应用并持久化（重启后自动生效）", applied);
+                progress!("  {} 项配置已应用并持久化（重启后自动生效）", written.len());
             } else {
                 progress!(
                     "  {} 项配置已应用，但 ktuner-nonsysctl.service 未能启用（systemctl enable 失败），块设备与 THP 等非 sysctl 配置重启后不会自动生效",
-                    applied
+                    written.len()
                 );
             }
         }
-    } else if applied == 0 && !quiet {
+    } else if written.is_empty() && !quiet {
         progress!();
         progress!("  没有配置被成功应用");
     }
     Ok(ApplyOutcome {
-        applied,
+        written,
         failed,
         clamped,
         boot_unit_enabled,
@@ -4745,7 +4794,7 @@ mod tests {
         let guard = lock_ledger_at(ledger.to_str().unwrap()).unwrap();
         let outcome = apply_locked(&recs, true, &guard)
             .expect("apply_quiet must not fail on per-param errors");
-        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.applied(), 0);
         assert_eq!(outcome.failed.len(), 2, "both failures must be reported");
         assert_eq!(outcome.failed[0].param, "vm.ktuner_no_such_a");
         assert!(
@@ -6834,7 +6883,7 @@ mod tests {
             ..Default::default()
         }];
         let outcome = apply_locked(&recs, true, &guard).expect("fixture-guarded apply");
-        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.applied(), 1);
         assert!(outcome.clamped.is_empty());
         // The entry followed the LOCK, not the production constant: a
         // fixture-guarded transaction publishes its ledger beside its own
@@ -6854,6 +6903,39 @@ mod tests {
         assert!(fs::read_to_string(SYSCTL_PERSIST_PATH)
             .unwrap()
             .contains("65535"));
+        // The batch's own record of the write: the count is derived from the
+        // entries, and each entry names the original the ledger holds. That
+        // second half only holds if the recording site consults the ledger:
+        // the fixture's live value moves with every write, so a re-write of
+        // the same knob must still report the FIRST original — the one
+        // `rollback` restores — and not the value it found live.
+        assert_eq!(outcome.applied(), outcome.written.len());
+        assert_eq!(outcome.written.len(), 1);
+        assert_eq!(outcome.written[0].param, "net.core.somaxconn");
+        assert_eq!(outcome.written[0].previous.as_deref(), Some("1024"));
+        assert_eq!(outcome.written[0].applied, "65535");
+        let again = [Recommendation {
+            param: "net.core.somaxconn".to_string(),
+            current_value: "stale gathered value".to_string(),
+            recommended_value: "4096".to_string(),
+            writable: true,
+            ..Default::default()
+        }];
+        let outcome = apply_locked(&again, true, &guard).expect("second fixture-guarded apply");
+        assert_eq!(
+            outcome.written[0].previous.as_deref(),
+            Some("1024"),
+            "a re-write must report the original the ledger keeps, not the live value"
+        );
+        assert_eq!(outcome.written[0].applied, "4096");
+        assert_eq!(
+            load_rollback_from(guard_ledger.to_str().unwrap())
+                .unwrap()
+                .entries["net.core.somaxconn"]
+                .previous,
+            "1024",
+            "the entry must agree with the ledger it summarizes"
+        );
         let _ = fs::remove_dir_all(&guard_dir);
     }
 
@@ -8138,7 +8220,7 @@ mod tests {
         let guard = lock_ledger_at(ledger.to_str().unwrap()).unwrap();
         let outcome =
             apply_locked(&recs, true, &guard).expect("apply must not fail on per-param errors");
-        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.applied(), 0);
         assert_eq!(outcome.failed.len(), 2);
         assert!(outcome.clamped.is_empty());
         assert!(

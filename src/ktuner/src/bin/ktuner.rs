@@ -755,7 +755,7 @@ fn tune_output<'a>(
     // rollback ledger / sysctl.d; the note makes the delta visible (#4160).
     let clamped = serde_json::to_value(&outcome.clamped).unwrap_or_else(|_| json!([]));
     let mut body = json!({
-        "applied": outcome.applied,
+        "applied": outcome.applied(),
         "failed": failed,
         "clamped": clamped,
         "score_before": score_before,
@@ -1700,6 +1700,16 @@ mod tests {
         }
     }
 
+    /// One `written` entry for the output-shape tests: a write that landed,
+    /// with the original the ledger recorded and the value the kernel took.
+    fn written_entry(param: &str, previous: &str, applied: &str) -> tuner::WrittenEntry {
+        tuner::WrittenEntry {
+            param: param.to_string(),
+            previous: Some(previous.to_string()),
+            applied: applied.to_string(),
+        }
+    }
+
     #[test]
     fn rollback_list_output_empty() {
         // Empty ledger: count 0, empty pending — still a valid listing.
@@ -2235,7 +2245,7 @@ mod tests {
             rec("vm.nr_hugepages", true), // writable but runtime-dangerous
         ];
         let outcome = tuner::ApplyOutcome {
-            applied: 1,
+            written: vec![written_entry("vm.swappiness", "60", "10")],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
@@ -2273,7 +2283,10 @@ mod tests {
         // the output accounts for.
         let in_scope = vec![rec("vm.dirty_bytes", true), rec("vm.swappiness", true)];
         let outcome = tuner::ApplyOutcome {
-            applied: 2,
+            written: vec![
+                written_entry("vm.dirty_bytes", "2097152", "1073741824"),
+                written_entry("vm.swappiness", "60", "10"),
+            ],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
@@ -2629,7 +2642,7 @@ mod tests {
         // reboot.
         let in_scope = vec![rec("vm.swappiness", true)];
         let unarmed = tuner::ApplyOutcome {
-            applied: 1,
+            written: vec![written_entry("vm.swappiness", "60", "10")],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: false,
@@ -2658,7 +2671,7 @@ mod tests {
         // the same parameters, and the exclusion is the difference.
         let in_scope = vec![rec("vm.swappiness", true), rec("fs.file-max", true)];
         let outcome = tuner::ApplyOutcome {
-            applied: 1,
+            written: vec![written_entry("vm.swappiness", "60", "10")],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
@@ -3006,7 +3019,7 @@ mod tests {
         // the same parameters, and the selection is the difference.
         let in_scope = vec![rec("vm.swappiness", true), rec("fs.file-max", true)];
         let outcome = tuner::ApplyOutcome {
-            applied: 1,
+            written: vec![written_entry("vm.swappiness", "60", "10")],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
@@ -3142,7 +3155,7 @@ mod tests {
             "a no-flag preview must keep its old key set: {preview}"
         );
         let outcome = tuner::ApplyOutcome {
-            applied: 1,
+            written: vec![written_entry("vm.swappiness", "60", "10")],
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,

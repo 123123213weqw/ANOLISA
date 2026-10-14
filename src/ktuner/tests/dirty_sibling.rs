@@ -109,7 +109,7 @@ fn body() {
         rec("vm.dirty_background_bytes", "268435456"),
     ])
     .unwrap();
-    assert_eq!(outcome.applied, 2);
+    assert_eq!(outcome.applied(), 2);
     assert_eq!(
         outcome.cleared,
         ["vm.dirty_ratio", "vm.dirty_background_ratio"],
@@ -152,7 +152,7 @@ fn no_op_body() {
     // The same no-op through `tune`'s path names no twin either: the list
     // follows the ledger, not the twin table.
     let outcome = tuner::apply_quiet(&[rec("vm.dirty_bytes", "0")]).unwrap();
-    assert_eq!(outcome.applied, 1);
+    assert_eq!(outcome.applied(), 1);
     assert!(
         outcome.cleared.is_empty(),
         "a no-op write names no cleared twin: {:?}",

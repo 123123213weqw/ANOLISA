@@ -61,12 +61,14 @@ fn body() {
                 }
                 "quiet" => {
                     assert_eq!(
-                        tuner::apply_quiet(&[rec(PARAM, "65535")]).unwrap().applied,
+                        tuner::apply_quiet(&[rec(PARAM, "65535")])
+                            .unwrap()
+                            .applied(),
                         1
                     );
                 }
                 "batch" => {
-                    assert_eq!(tuner::apply(&[rec(PARAM, "65535")]).unwrap().applied, 1);
+                    assert_eq!(tuner::apply(&[rec(PARAM, "65535")]).unwrap().applied(), 1);
                 }
                 _ => {
                     tuner::apply_import(PARAM, "65535", Some("1024")).unwrap();
@@ -127,7 +129,7 @@ fn body() {
     }
     // Successful batch members are reversible even when another member fails.
     let outcome = tuner::apply_quiet(&[rec(PARAM, "4096"), rec("vm.ktuner_absent", "10")]).unwrap();
-    assert_eq!(outcome.applied, 1);
+    assert_eq!(outcome.applied(), 1);
     assert_eq!(outcome.failed.len(), 1);
     assert_eq!(ledger()["entries"].as_object().unwrap().len(), 1);
     tuner::rollback_quiet().unwrap();
@@ -210,7 +212,7 @@ fn write_only_body() {
     // A readable param in the same batch still records its pristine value;
     // the write-only one applies without one.
     let outcome = tuner::apply_quiet(&[rec(PARAM, "65535"), rec("vm.swappiness", "40")]).unwrap();
-    assert_eq!(outcome.applied, 2, "both writes landed");
+    assert_eq!(outcome.applied(), 2, "both writes landed");
     assert!(outcome.failed.is_empty(), "{:?}", outcome.failed);
     assert_eq!(ledger()["entries"][PARAM]["previous"], "1024");
     assert_eq!(
