@@ -3110,6 +3110,10 @@ const FORWARDING_DAEMONS: &[&str] = &[
     // is not running yet, and was judged "no forwarding in use".
     "pptpd",
     "zerotier-one",
+    // Incus, the community fork of LXD (`lxd` above), runs `incusd`; its
+    // default bridge is `incusbr0`, which the interface scan does not name, so
+    // a host whose containers route out through it showed neither sign.
+    "incusd",
 ];
 
 /// Whether one of the daemons that forward traffic for others is running.
@@ -13289,6 +13293,9 @@ mod tests {
             // runs zerotier-one while routing for its network.
             "pptpd",
             "zerotier-one",
+            // Incus, the LXD fork: its daemon and its `incusbr0` bridge are
+            // the only signs, and the bridge name is not one the scan knows.
+            "incusd",
         ] {
             let mut info = make_test_info();
             info.processes = vec![crate::detect::ProcessInfo {
