@@ -92,6 +92,9 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 与 `sudo ktuner fix <param>` 给出完全相同的 stderr JSON 与退出码，因此预检不会
 与被预览的命令不一致。
 
+真实 `tune` 或 `fix` 用 `cleared` 列出写入清零的互斥孪生，形状与 `would_clear`
+相同：恰好是账本为 `rollback` 记录的孪生。没有清零任何孪生时不出现该键。
+
 所有输出为 stdout 上的 JSON，错误为 stderr 上的 JSON。退出码：`0` 成功、
 `1` check 发现可改进项或 rollback 仍有值未恢复、`2` 命令错误。
 回滚遇到写入失败或路径缺失时返回 `1`（包括部分恢复），仍在 stdout 输出 JSON 计数，

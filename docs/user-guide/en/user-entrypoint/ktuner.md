@@ -97,6 +97,10 @@ code — when the parameter is outside the plan, unwritable, or
 runtime-dangerous, so the preview cannot disagree with the command it
 previews.
 
+A real `tune` or `fix` names the mutually exclusive twins its writes zeroed in
+`cleared`, in the shape of `would_clear`: exactly the twins the ledger recorded
+for `rollback` to restore. The key is absent when nothing was cleared.
+
 All output is JSON on stdout; errors are JSON on stderr. Exit codes: `0` success,
 `1` check found recommendations or rollback left values unrestored, `2` command error.
 Rollback returns `1` for failed writes or missing paths, including partial restoration;

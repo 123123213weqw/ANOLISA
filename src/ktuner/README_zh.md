@@ -244,6 +244,11 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 值当前已生效，重启后却不会重放，只看 `applied` 无法看出这一点。单元启用成功、或本次
 没有 `/proc/sys` 之外的持久化内容时为 `true`。`fix` 的返回体携带同一个键。
 
+写入互斥 sysctl 对的一半时，内核会把另一半清零，返回体用 `cleared` 列出本次运行
+清零的孪生（例如 `"cleared": ["vm.dirty_ratio"]`）。列表恰好是账本记录的孪生，
+`rollback` 会恢复它们；原本就是 0 的孪生、或因值未变化而未被清零的孪生不会列出。
+没有清零任何孪生时不出现该键。
+
 当本环境过滤掉了部分建议（不可写，或运行时危险）时，真实 `tune` 会在
 `would_skip` 中列出这些项及原因，形状与 dry-run 预览一致，便于与 `check`
 对账——部分成功后 `check` 仍会对这些参数报 exit 1：
@@ -387,6 +392,9 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
   "would_skip": []
 }
 ```
+
+真实 `fix` 用 `cleared` 列出这次写入清零的孪生，形状与 `would_clear` 相同；
+写入没有清零任何孪生时不出现该键。
 
 真实 `fix` 运行时，只有孪生持有已配置的（非零）原值，才会把被清零的原值
 记入账本（`rollback` 因此能恢复）；持久化重现清零后的状态。

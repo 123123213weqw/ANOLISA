@@ -266,6 +266,13 @@ be replayed after a reboot, and `applied` on its own would not say so. It is
 `true` when the unit is enabled, and when the run had nothing outside
 `/proc/sys` to persist. `fix`'s body carries the same key.
 
+Writing one half of a mutually exclusive sysctl pair zeroes the other half in
+the kernel, and the body names the twins this run zeroed in `cleared` (for
+example `"cleared": ["vm.dirty_ratio"]`). The list is exactly the twins the
+ledger recorded, so `rollback` restores them; a twin that already read 0, or
+one a write left alone because the value did not change, is not named. The key
+is absent when nothing was cleared.
+
 When this environment filters recommendations out (unwritable, or
 runtime-dangerous), a real `tune` names them in `would_skip` with the same
 shape as the dry-run preview, so the output reconciles with `check` — which
@@ -427,6 +434,9 @@ twin in `would_clear`, taken from the same table the write path records from
   "would_skip": []
 }
 ```
+
+A real `fix` names the twin its write zeroed in `cleared`, in the same shape
+as `would_clear`; the key is absent when the write cleared nothing.
 
 A real `fix` records the cleared twin's original in the ledger — so
 `rollback` restores it — only when the twin holds a configured (non-zero)
