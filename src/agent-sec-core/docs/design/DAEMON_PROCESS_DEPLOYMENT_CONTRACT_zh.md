@@ -327,8 +327,10 @@ root 也返回容量耗尽错误，连接完成后恢复容量。该 fixture 需
 stdout/stderr 进入 journal；SkillSec 目录访问与最小 capabilities 见第 11 节。
 **DPROC-V2-HARDENING-1（2026-09-10，获准实施，跟踪 issue #2861）**：V2 默认启用
 `SystemCallFilter=@system-service`、`SystemCallArchitectures=native` 和
-`MemoryDenyWriteExecute=true`；SkillSec 将 CapabilityBoundingSet 限定为
-`CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER`，AmbientCapabilities 仍为空。
+`MemoryDenyWriteExecute=true`；CapabilityBoundingSet 限定为
+`CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE`，AmbientCapabilities 仍为空。
+前三项用于 SkillSec 目录访问与恢复；`CAP_SYS_PTRACE` 用于 scope discovery 读取跨 UID、
+不可 dump 或权限较高进程的 `/proc/<pid>/exe` 和 `ns/pid`，通过 `PTRACE_MODE_READ_FSCREDS` 检查。
 打包 fixture 锁定这些生效指令；实际 syscall/W^X 兼容性需在目标发行版的 systemd
 服务下验收当前业务路径，不能用 unit 语法检查或普通进程测试替代。
 SkillSec 核心 CLI 子包不再依赖 Python、GPG/PGPy 或 loongshield；未迁移 Hook

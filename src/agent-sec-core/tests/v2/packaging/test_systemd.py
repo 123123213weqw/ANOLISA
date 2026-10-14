@@ -37,7 +37,7 @@ def test_v2_stages_root_system_unit(tmp_path):
         "KillMode=control-group",
         "StartLimitBurst=5",
         "StandardError=journal",
-        "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER",
+        "CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE",
         "AmbientCapabilities=",
         "StateDirectory=agent-sec/skillsec",
         "LogsDirectory=agent-sec",

@@ -60,11 +60,13 @@ V2 核心 CLI 子包不再依赖 Python Ledger；Hook 子包依赖及 wheel 专�
 V2 RPM CI 同时检查 system unit 的 root 身份配置，并断言 user unit 不存在；
 `test-e2e-rpm-v2` 收集整个 `tests/v2/`，包含打包和 systemd 生命周期测试。容器中的 unit 检查仍不等于 system manager 验收。
 默认启用 `SystemCallFilter=@system-service`、`SystemCallArchitectures=native` 和
-`MemoryDenyWriteExecute=true`，保留空 AmbientCapabilities；SkillSec 仅授予
-`CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER` 以访问和恢复受管目录（issue #2861）。上述 pytest 生命周期
+`MemoryDenyWriteExecute=true`，保留空 AmbientCapabilities；CapabilityBoundingSet 包含
+`CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SYS_PTRACE`。前三项用于访问和恢复受管目录（issue #2861），
+`CAP_SYS_PTRACE` 用于 scope discovery 读取跨 UID、不可 dump 或权限较高进程的 procfs 链接。上述 pytest 生命周期
 测试直接使用该模板，覆盖加固下的启动、RPC 和退出；目标发行版还须验证当前业务路径，
 检查 journal 中的 SIGSYS、权限错误或内存执行限制错误。后续引入 JIT 或新增 syscall
-依赖时必须重新验收。上述当前核心路径已完成真实 systemd 验收；不代表新增 JIT/syscall 路径或整个 issue 的验收。
+依赖时必须重新验收。既有核心路径的真实 systemd 验收记录不覆盖新增 `CAP_SYS_PTRACE` 后的
+scope discovery；该路径仍需在目标环境中验证进程匹配和 Binding 自动创建。
 
 运维切换前停止、禁用原 V1 user service，安装 V2 包。运行中的 system manager 会自动启动
 V2 service；随后验证：
