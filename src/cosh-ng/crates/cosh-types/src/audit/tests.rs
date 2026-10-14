@@ -298,3 +298,32 @@ fn audit_settings_default_matches_the_approved_per_user_budget() {
     assert_eq!(settings.retention_days, 30);
     assert_eq!(settings.max_disk_bytes, 100 * 1024 * 1024);
 }
+
+#[test]
+fn shell_truncation_marker_is_a_strictly_validated_known_event() {
+    let event: AuditEventV1 = serde_json::from_str(include_str!(
+        "../../tests/fixtures/audit-v1-shell-truncated.json"
+    ))
+    .expect("Shell-produced truncation fixture");
+    assert_eq!(
+        event.event_type,
+        AuditEventType::from(KnownAuditEventType::AuditTruncated),
+        "readers reconciling known variants must see the gap marker"
+    );
+    event
+        .validate()
+        .expect("the fixture is a valid truncation marker");
+    for data in [
+        serde_json::json!({"operation": "event_snapshot_shrunk", "seen": 2}),
+        serde_json::json!({"operation": "event_snapshot_shrunk", "seen": 2, "len": 1, "x": 1}),
+        serde_json::json!({"operation": "event_snapshot_shrunk", "seen": "2", "len": 1}),
+    ] {
+        let mut drifted = event.clone();
+        drifted.data = data;
+        assert!(
+            drifted.validate().is_err(),
+            "a drifted truncation payload must fail strict validation: {}",
+            drifted.data
+        );
+    }
+}

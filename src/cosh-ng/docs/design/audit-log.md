@@ -214,7 +214,7 @@ Each line is one complete UTF-8 JSON object:
 | Tool | `tool.requested`, `tool.execution.started`, `tool.completed`, `tool.failed`, `tool.cancelled` |
 | Approval | `approval.requested`, `approval.resolved` |
 | Shell/evidence | `shell.command.started`, `shell.command.completed`, `shell.command.failed`, `evidence.accessed` |
-| Audit control | `audit.degraded`, `audit.recovered`, `retention.pruned`, `export.created` |
+| Audit control | `audit.degraded`, `audit.recovered`, `audit.truncated`, `retention.pruned`, `export.created` |
 
 A provider stream, control permission, and foreground handoff for one tool share
 `run_id + tool_use_id`; they are lifecycle events, not three executions. A Shell handoff adds
