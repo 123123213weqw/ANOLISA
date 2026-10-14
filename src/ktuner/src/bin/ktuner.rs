@@ -1002,6 +1002,12 @@ fn fix_with(param: &str, dry_run: bool, is_root: bool, eval: &rules::EvalResult)
 ///
 /// `cleared` names the twin the write zeroed, in `fix --dry-run`'s
 /// `would_clear` shape; it is absent when the write cleared nothing.
+///
+/// `fixed` echoes the name the operator typed, while `param` is the ledger
+/// key the write was recorded under — the recommendation's own spelling, the
+/// one `rollback --list` publishes and `tune`'s `written` entries carry. An
+/// alias (`VM/SWAPPINESS`, `vm/swappiness`) or a dotted interface name
+/// otherwise leaves a caller no way to find the entry it just created.
 fn fix_output(
     param: &str,
     fix: &tuner::AppliedFix,
@@ -1010,6 +1016,7 @@ fn fix_output(
 ) -> serde_json::Value {
     let mut output = json!({
         "fixed": param,
+        "param": rec.param,
         // The original the ledger recorded under the transaction lock — the
         // value `ktuner rollback` restores. The gathered rec.current_value
         // can be stale (the knob moved between gather and apply), and
@@ -3644,6 +3651,32 @@ mod tests {
             recommendations,
             total_checked: 1,
         }
+    }
+
+    #[test]
+    fn fix_output_names_the_ledger_key_it_recorded() {
+        // The operator may type an alias; the ledger records the
+        // recommendation's own key, and that key is what `rollback --list`
+        // publishes and `rollback <param>` answers with. `fixed` keeps the
+        // spelling as typed, `param` carries the recorded key.
+        let rec = rec("vm.swappiness", true);
+        let fix = tuner::AppliedFix {
+            recorded_previous: Some("60".to_string()),
+            outcome: tuner::WriteOutcome {
+                effective: "10".to_string(),
+                clamped: false,
+            },
+            boot_unit_enabled: true,
+            cleared: None,
+        };
+        let after = evaluation(vec![]);
+        let output = fix_output("VM/SWAPPINESS", &fix, &after, &rec);
+        assert_eq!(output["fixed"], json!("VM/SWAPPINESS"));
+        assert_eq!(
+            output["param"],
+            json!("vm.swappiness"),
+            "the ledger key the write was recorded under: {output}"
+        );
     }
 
     #[test]
