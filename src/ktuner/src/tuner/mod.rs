@@ -388,23 +388,57 @@ pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
     })
 }
 
+/// The ledger record a write of the kernel file `identity` belongs to, with
+/// whether it was recognized by its recorded `path`.
+///
+/// Two rules, in this order: the entry whose recorded path IS that kernel file,
+/// or — when that recorded path is gone — the entry whose own KEY resolves to
+/// the same identity. A key names the same kernel file, so a record written
+/// under an older translation of the knob (a dotted interface spelled
+/// `.../conf/Br0/100/forwarding` before [`net_iface_path`] kept the interface
+/// segment verbatim) is still the record a later write of that file belongs to;
+/// [`merge_entries`] re-points it at the path the knob resolves to now. A
+/// recorded path that still exists keeps its entry: only a path that is gone
+/// can be an older translation of the same file, never a second knob.
+///
+/// One predicate for every reader of the ledger by kernel file — the merge,
+/// the original `fix` reports, the classification a no-op `import` keeps — so
+/// no two of them can disagree about which record a write belongs to, and none
+/// can read past a record the merge adopts. The third element is the answer's
+/// provenance: `true` when the recorded path matched, `false` when the entry
+/// was recognized by its key because its recorded path is gone.
+fn matching_record<'a>(
+    entries: &'a BTreeMap<String, RollbackEntry>,
+    identity: &str,
+) -> Option<(&'a String, &'a RollbackEntry, bool)> {
+    entries.iter().find_map(|(key, entry)| {
+        let same_path = canonicalize_path(&entry.path) == identity;
+        let stale = !same_path
+            && !Path::new(&entry.path).exists()
+            && canonicalize_path(&param_to_path(key)) == identity;
+        (same_path || stale).then_some((key, entry, same_path))
+    })
+}
+
 /// The ledger's own record of `param`'s kernel file, for the original a
 /// rollback restores, or `None` when the ledger does not record it yet.
 ///
-/// Keyed exactly like [`merge_entries`] keys a record — the canonicalized
-/// path, so the alias spellings of one file resolve to the same entry — so the
-/// answer is the value the record keeps: merge refreshes `applied`/`category`
-/// on the latest write and never the original `previous`.
+/// The record is the one [`matching_record`] answers with — the same rule
+/// [`merge_entries`] adopts a write by — so the answer is the value that
+/// record keeps: merge refreshes `applied`/`category` on the latest write and
+/// never the original `previous`. A lookup keyed on the recorded path alone
+/// missed the record a merge adopts through its key (a path an older
+/// translation left behind) and reported the fresh re-read instead,
+/// contradicting the ledger and `rollback` on the very knob just written.
 fn recorded_previous_value(data: &RollbackData, param: &str) -> Option<String> {
     let identity = canonicalize_path(&param_to_path(param));
-    data.entries
-        .values()
-        .find(|entry| canonicalize_path(&entry.path) == identity)
-        .map(|entry| entry.previous.clone())
+    matching_record(&data.entries, &identity)
+        .map(|(_key, entry, _same_path)| entry.previous.clone())
 }
 
 /// The classification an imported write of `param` records, looked up in the
-/// ledger by the same canonicalized path [`recorded_previous_value`] keys on.
+/// ledger by the same kernel-file rule [`matching_record`] keys the reported
+/// original on.
 ///
 /// A write that MOVES the value records none: the live value is then the
 /// imported file's, not a rule's, and the ledger's classification is the rule
@@ -416,7 +450,9 @@ fn recorded_previous_value(data: &RollbackData, param: &str) -> Option<String> {
 /// `--category` would select the entry, `rollback --category` would leave the
 /// rules' own write in place and echo the knob as one no category wrote. That
 /// is the same "a no-op write records nothing the kernel did not do" rule the
-/// twin recorder follows ([`ClearedSibling::cleared_by`]).
+/// twin recorder follows ([`ClearedSibling::cleared_by`]). A lookup keyed on
+/// the recorded path alone found no record for one whose path an older
+/// translation left behind, and cleared the classification anyway.
 ///
 /// `previous` and `effective` are the canonical forms [`read_previous`] and
 /// the read-back produce, so an exact match is the no-op test; a value the
@@ -1196,21 +1232,13 @@ where
         let identity = canonicalize_path(&path);
         // Equivalent spellings must share the first rollback record, or a
         // later alias would restore an intermediate value over the original.
-        // The record this write belongs to is the one whose recorded path is
-        // that kernel file — or, when that path is stale and gone (see the
-        // insert branch below), the one whose own KEY resolves to the same
-        // identity: the key names the same knob, so the record is this write's.
-        // Matching by path alone inserted a second record for one kernel file
-        // — the pristine `previous` then sat in a record no restore can reach,
-        // while the restore wrote the new record's intermediate value and the
-        // ledger could never clear.
-        let matched = data.entries.iter().find_map(|(key, entry)| {
-            let same_path = canonicalize_path(&entry.path) == identity;
-            let stale = !same_path
-                && !Path::new(&entry.path).exists()
-                && canonicalize_path(&param_to_path(key)) == identity;
-            (same_path || stale).then(|| (key.clone(), same_path))
-        });
+        // The record this write belongs to is the one [`matching_record`]
+        // answers with; matching by path alone inserted a second record for one
+        // kernel file — the pristine `previous` then sat in a record no restore
+        // can reach, while the restore wrote the new record's intermediate
+        // value and the ledger could never clear.
+        let matched = matching_record(&data.entries, &identity)
+            .map(|(key, _entry, same_path)| (key.clone(), same_path));
         if let Some((key, same_path)) = matched {
             if let Some(entry) = data.entries.get_mut(&key) {
                 if !same_path {
@@ -6707,6 +6735,70 @@ mod tests {
         // A knob the ledger does not record yet has no recorded original: the
         // caller's under-lock pre-write read is then the value to report.
         assert_eq!(recorded_previous_value(&data, "vm.dirty_ratio"), None);
+    }
+
+    /// A record whose `path` no longer is what the knob resolves to (a ledger
+    /// written before the dotted-interface fix translated
+    /// `net.ipv4.conf.Br0.100.forwarding` as `conf/Br0/100/forwarding`, a path
+    /// no kernel has) is still the record a later write belongs to: the merge
+    /// recognizes it by its key, re-points it and keeps its `previous`. The
+    /// reported original has to come from that same record, or `fix` answers
+    /// with the intermediate value it just read while the ledger and a rollback
+    /// restore the pristine one — the contradiction a lookup keyed on the
+    /// recorded path alone leaves in place.
+    #[test]
+    fn a_stale_record_reports_the_original_the_merge_keeps() {
+        let param = "net.ipv4.conf.Br0.100.forwarding";
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::from([(
+                param.to_string(),
+                RollbackEntry {
+                    previous: "0".to_string(),
+                    applied: "1".to_string(),
+                    path: "/proc/sys/net/ipv4/conf/Br0/100/forwarding".to_string(),
+                    category: None,
+                },
+            )]),
+        };
+        // Both spellings of the knob resolve to the file the record is about;
+        // neither resolves to the path it recorded.
+        for spelling in [param, "net/ipv4/conf/Br0.100/forwarding"] {
+            assert_eq!(
+                recorded_previous_value(&data, spelling).as_deref(),
+                Some("0"),
+                "{spelling}: the record the merge adopts holds this original"
+            );
+        }
+        // The control the answer keys on: the write of either spelling lands on
+        // that one record — one entry, pristine `previous`, path re-pointed —
+        // so the reported original and the merge cannot disagree about it.
+        let merged = merge_entries(
+            data,
+            [(
+                "net/ipv4/conf/Br0.100/forwarding".to_string(),
+                "1".to_string(),
+                "0".to_string(),
+                None,
+            )],
+        );
+        assert_eq!(
+            merged.entries.len(),
+            1,
+            "one kernel file stays one record: {:?}",
+            merged.entries.keys().collect::<Vec<_>>()
+        );
+        let entry = &merged.entries[param];
+        assert_eq!(entry.previous, "0", "the pristine original survives");
+        assert_eq!(entry.applied, "0");
+        assert_eq!(
+            entry.path, "/proc/sys/net/ipv4/conf/Br0.100/forwarding",
+            "the stale path is re-pointed at what the knob resolves to"
+        );
+        assert_eq!(
+            recorded_previous_value(&merged, "net/ipv4/conf/Br0.100/forwarding").as_deref(),
+            Some("0")
+        );
     }
 
     /// Acquire the exclusive lock on `fd`, retrying while it is briefly
