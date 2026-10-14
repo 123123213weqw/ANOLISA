@@ -3177,6 +3177,12 @@ fn host_needs_ip_forward_in(info: &SystemInfo, net_dir: &std::path::Path) -> boo
                 // stopped runs neither qemu nor libvirtd, so this name is the
                 // only sign left, and a zero written there cuts every guest off
                 // as soon as one starts.
+                // Podman 4+ (netavark) creates `podman0` for its default
+                // network. Podman has no daemon: between container runs no
+                // process names it (conmon lives only as long as a container),
+                // so this bridge is the only sign that its containers route
+                // out through the host.
+                || n.starts_with("podman")
                 || n.starts_with("vmbr")
                 || n == "br0"
                 || n == "br1"
@@ -13335,6 +13341,20 @@ mod tests {
             name: "nginx".to_string(),
         }];
         assert!(!runs_a_forwarding_daemon(&info));
+    }
+
+    #[test]
+    fn host_needs_ip_forward_counts_the_podman_bridge() {
+        // Podman's default network bridge is `podman0` (netavark, Podman 4+),
+        // and daemonless Podman leaves no process behind while no container
+        // runs, so the bridge is the only sign; the CNI-era `cni-podman0` was
+        // already covered by the `cni` prefix.
+        let info = make_test_info();
+        let podman = NetDir::new(&["lo/", "eno1/", "podman0/"]);
+        assert!(
+            host_needs_ip_forward_in(&info, &podman.0),
+            "the Podman default bridge is a forwarding sign"
+        );
     }
 
     #[test]
