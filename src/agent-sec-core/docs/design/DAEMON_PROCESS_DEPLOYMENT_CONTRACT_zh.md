@@ -617,7 +617,10 @@ CLI/进程均支持显式 --socket 和非空 AGENT_SEC_DAEMON_SOCKET 覆盖；�
 
 领域状态默认 `/var/lib/agent-sec/skillsec`，root 所有、0700，当前 signing-key.pk8 为 0600。
 `/etc/agent-sec/skillsec.json` 或 --skillsec-config 可注入 stateDir、精确 managedSkillDirs、
-scanners 和 parsers；配置要求 root 所有、不可被普通用户写入，不接受 HOME 配置覆盖。
+scanners 和 parsers，以及默认开启的 enableDefaultSkillDirs；配置要求 root 所有、不可被普通用户写入，不接受 HOME 配置覆盖。
+默认授权包含系统目录及本地 `/etc/passwd` 的所有有效账户 HOME 下标准 Skill 目录，不按 UID 或
+登录 shell 排除账户，不采信客户端环境。禁用默认目录不影响显式配置或 SkillFS；账户变化重启后生效。
+DPROC-SG-007 的可执行边界为 `apps/asc-daemon/src/skill_sec/defaults.rs` 及 capability 的 `tests/scope.rs`。
 配置、状态与 runtime 路径校验不跟随符号链接。客户端有业务访问权限不意味着有密钥或配置权限。
 
 换钥不执行 DPROC-017 的 V1 state migration：本模块明确采用新信任域，不导入历史密钥和记录。
@@ -651,6 +654,7 @@ RPM 安装套件通过 914 项，并单独通过修正后的 systemd 生命周�
 | DPROC-SG-004 | 真实二进制 staging、配置权限/保留、V1/V2 unit 分离 | `tests/packaging/test-skillsec-install.sh` |
 | DPROC-SG-005 | 安装后 CLI 核心流程、公共审计及进程退出 | `tests/v2/e2e/test_skillsec_cli_e2e.py`、`test_daemon_process_e2e.py` |
 | DPROC-SG-006 | 实际 RPM 安装、system unit 启停/重启、普通 UID 与用户/系统 Skill 操作 | 第七批独立 Linux 安装环境执行；staging 和进程 fixture 不替代此证据 |
+| DPROC-SG-007 | 默认目录、多账户 HOME、范围关闭及部分发现错误 | `apps/asc-daemon/src/skill_sec/defaults.rs`、capability `tests/scope.rs` |
 
 ## [TARGET V2] 可观测采集存储接线（DPROC-022）
 

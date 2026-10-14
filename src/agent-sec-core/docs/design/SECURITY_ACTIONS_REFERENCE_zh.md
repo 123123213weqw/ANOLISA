@@ -727,7 +727,12 @@ V1 合成用例及单测验证。完整差异、未来 Evidence 边界和回滚�
 `asc-capability-skill-sec` 的 SkillSecExecutor 通过共享 SkillSecService 执行业务，
 SkillSecAuditProjector 单独生成公共审计投影，ActionRuntime/Finalizer/Sink 统一收尾。
 ActionId::SkillSec 的 event_type/category 均保持 `skill_ledger`。调用者 UID/PID 来自内核，
-请求 JSON 无法覆盖；启动 reconcile 记录实际 daemon 进程身份。
+请求 JSON 无法覆盖；启动 reconcile 和内部 StartupScan 记录实际 daemon 进程身份。
+聚合发现部分失败返回保留成功项的 `discoveryErrors: [{root, error}]`，退出码 1、
+errorType=SkillLedgerError；init/scan/check 审计 verdict=error，status 不生成风险 verdict。
+公共审计只增加 discoveryErrorCount，不复制错误路径或原文；status 健康状态为 critical。
+全部发现失败不创建扫描或 baseline 密钥，强制密钥初始化也不得变更密钥。
+可执行边界为 capability 的 `tests/scope.rs`。
 
 [PRESERVE V1] scan/certify 完成风险扫描仍退出 0；check deny/tampered/error 退出 1；
 audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1、非法输入 2。业务失败与执行错误

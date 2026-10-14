@@ -43,7 +43,8 @@ This produces `src/agent-sec-core/target/v2/bin/agent-sec-cli` and `agent-sec-da
 The core binaries require no Python Ledger runtime. `install-core-v2` installs both binaries into
 `/usr/bin`, the system unit into `/usr/lib/systemd/system`, and an initial 0600 configuration into
 `/etc/agent-sec/skillsec.json`. Reinstallation preserves an existing configuration; RPM uses
-`%config(noreplace)`. Installation does not initialize a signing key or enable Agent Hooks.
+`%config(noreplace)`. Installation does not enable Agent Hooks. When the service starts, background scanning of discovered
+Skills may initialize its signing key.
 
 The V2 systemd unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable/process name.
 V1 used the same unit name as a user service; V2 runs it as a system service.
@@ -99,8 +100,8 @@ directory must already exist; it creates the private state directory if absent.
 
 Restart the Agent after installing the matching plugin or changing its trusted launch environment.
 Keep `AGENT_SEC_DAEMON_SOCKET` consistent with the daemon when using a non-default socket. Before
-loading a Skill, run `agent-sec-cli skill-ledger status` and explicitly scan that Skill to establish
-V2 trust; a V1 key or manifest does not establish V2 trust.
+loading a Skill, run `agent-sec-cli skill-ledger status` and scan it explicitly if startup has not
+established V2 trust; a V1 key or manifest does not establish V2 trust.
 
 | Host | Query | Initialization on a matched Skill call | Default policy |
 | --- | --- | --- | --- |
@@ -115,7 +116,7 @@ The four initializing adapters ask the daemon on each matched invocation. They d
 HOME key files, scan Skills, reset an unsafe key, or rotate keys. OpenClaw does not initialize at
 plugin registration or retain a process-wide readiness result. Disabled and unmatched Hooks do
 not invoke the CLI. Qoder and Hermes retain their read-only behavior; initialize trust explicitly
-for these hosts. Host approval applies to the current invocation and does not write a Ledger decision.
+for these hosts if startup has not already done so. Host approval applies to the current invocation and does not write a Ledger decision.
 
 `check` consumers accept a valid risk result with exit code 1; they do not mistake it for a transport
 failure. `show` consumers require exit code 0 and a valid exposure summary, then use `message` to
@@ -145,63 +146,73 @@ the following defaults; a malformed or unsafe file fails startup.
 ```json
 {
   "stateDir": "/var/lib/agent-sec/skillsec",
+  "enableDefaultSkillDirs": true,
   "managedSkillDirs": []
 }
 ```
 
-`managedSkillDirs` defines the ordinary-directory authorization boundary. It accepts absolute
-paths in the same three forms as V1:
+Default directories are enabled even when an existing configuration omits
+`enableDefaultSkillDirs`. The daemon authorizes these locations at startup:
+
+| Location | Discovery |
+| --- | --- |
+| `/usr/share/anolisa/skills/*`, `/usr/local/share/anolisa/skills/*` | Direct Skill children |
+| `<home>/.local/share/anolisa/skills/*` | ANOLISA user installations |
+| `<home>/.openclaw/skills/*`, `<home>/.copilot-shell/skills/*` | Direct Skill children |
+| `<home>/.hermes/skills/**` | Recursive Skills, including the root if it has `SKILL.md` |
+| `<home>/.qoder/skills/*`, `<home>/.codex/skills/*`, `<home>/.agents/skills/*`, `<home>/.qwen/skills/*` | Direct Skill children |
+
+`<home>` is the absolute HOME field from each local `/etc/passwd` record, including root and
+service accounts. Duplicate homes are merged; invalid homes, `/`, symlink homes and existing
+non-directories such as `/dev/null` are skipped with diagnostics. Missing homes retain their
+scope. Account changes take effect after a daemon restart. NSS-only accounts and nonstandard
+`XDG_DATA_HOME`, `CODEX_HOME`, `QWEN_HOME` or project locations require explicit configuration
+or authenticated SkillFS integration; caller environment variables cannot extend authorization.
+
+`managedSkillDirs` adds administrator-authorized absolute paths:
 
 | Entry | Authorized and discovered Skills |
 | --- | --- |
 | `/srv/skills/demo` | This exact Skill |
 | `/srv/skills/*` | Direct, non-hidden Skill children |
-| `/srv/skills/**` | Skills at any depth, including `/srv/skills` itself if it has `SKILL.md` |
+| `/srv/skills/**` | Recursive Skills, including the root if it has `SKILL.md` |
 
-Wildcards skip hidden descendants and do not follow symlinks. An explicitly named host directory
-such as `/home/alice/.hermes/skills/*` is supported. General glob syntax and `~` are not expanded;
-use absolute paths in system configuration. An empty list allows no ordinary Skill directories.
-Authenticated SkillFS mounts are authorized separately by their existing root-owned mount settings.
+Edit the existing file with `sudoedit /etc/agent-sec/skillsec.json`, preserving other settings,
+and apply changes with `sudo systemctl restart agent-sec-core.service`. Setting
+`enableDefaultSkillDirs` to `false` disables only default directories; explicit configuration
+and authenticated SkillFS mounts retain their scope. An empty explicit list does not disable
+enabled defaults. Disabling scope does not remove existing Skill metadata or reset trust.
+General glob syntax and `~` are unsupported. Discovery skips hidden descendants and never follows
+symlinks. All local users retain access to all managed Skills; this does not introduce a user ACL.
 
-As root, edit the existing configuration with `sudoedit /etc/agent-sec/skillsec.json`, preserving
-`stateDir`, scanner and SkillFS settings. For example, set:
+`init`, `scan --all`, `check --all` and `status` discover through the daemon, combining defaults,
+explicit patterns and still-authorized registration. Explicit caller roots are checked before
+Skill I/O; one out-of-range root rejects the entire request with `PermissionDenied`. Successful
+registration records history without expanding scope. `init --no-baseline` and single-path
+requests do not discover directories.
 
-```json
-"managedSkillDirs": ["/srv/skills/*", "/home/alice/.hermes/skills/**"]
-```
+Startup scans run asynchronously in the existing worker, alternating with ready SkillFS
+notifications; the socket does not wait for scans. Mounted Skills come from authenticated
+notifications and registered identities, never a FUSE walk. New Skills under existing standard
+roots are authorized immediately and discovered on the next aggregate command or daemon restart.
+There is no directory watcher or scan triggered by ordinary Skill invocation. Host Hook policies
+continue to control invocation; installation alone does not make all direct filesystem reads block.
 
-Apply configuration changes with `sudo systemctl restart agent-sec-core.service`. New Skill
-children under an existing wildcard need no configuration update or restart. Ordinary users can
-then scan, certify, query and modify any Skill within the approved range; no per-user ACL is added.
-Paths outside it return `PermissionDenied`, including `analyze`, and cannot be registered implicitly.
+One default-discovery pass visits at most 10,000 directory entries and adds at most 1,024 new
+Skill identities. These limits do not truncate explicit configuration, registered history or key
+rotation/recovery sets. A directory failure or exhausted budget retains completed discoveries and
+returns `discoveryErrors` entries with `root` and `error`, exit code 1 and non-healthy status.
+Startup logs incomplete discovery and scans the successful selection. A forced key initialization
+with incomplete discovery leaves the key unchanged. Discovery deadlines and corrupt global
+registration remain fatal errors.
 
-`init`, `scan --all` and `check --all` combine configured-pattern discovery, still-authorized
-registered roots, and caller discovery. Caller-supplied roots are checked before Skill I/O; a batch
-containing an out-of-range root is rejected before any member is processed. Use an explicit approved
-Skill path, or ask root to add the intended parent pattern. Registration stores exact history and
-cannot expand configuration. `status` uses configured patterns and authorized history independently
-of caller HOME. Removing a pattern does not delete that Skill's existing metadata; startup recovery
-also refuses ordinary operations on roots outside the current range.
-
-At daemon startup, ordinary configured Skills and authorized history are scanned in the background,
-including Skills without prior registration. The same worker handles registered SkillFS Skills and
-notifications; it never discovers mounted Skills by traversing FUSE. The socket opens without waiting
-for scanning to finish. Each unchanged, fully scanned Skill remains a no-op.
-
-For `scan --all` and the `init` baseline, an authorized direct child of `/usr/share/anolisa/skills`
-or `/usr/local/share/anolisa/skills` is skipped if the daemon itself cannot write its host Ledger
-location, including a read-only filesystem. The result is `status: skipped`,
-`reasonCode: readonly_system_skill`, `persisted: false`; it does not certify the Skill as safe.
-Explicit scans, SkillFS failures, out-of-range paths and other storage failures remain errors.
-
-Default discovery skips hidden child directories, including Ledger snapshots; legitimate Skill
-locations beneath host directories such as `.hermes/skills` remain supported.
-It includes direct Skill children of `$XDG_DATA_HOME/anolisa/skills`, using the CLI caller's
-environment. If `XDG_DATA_HOME` is unset, empty, relative, or contains `.`/`..` path segments, it
-uses `$HOME/.local/share/anolisa/skills`, matching ANOLISA's user installation layout. If `HOME`
-is unset or empty, it uses the CLI user's system account home directory. A valid
-override whose directory is absent is skipped without falling back. Explicit Skill paths and
-`init --no-baseline` do not invoke discovery.
+Startup scans, `scan --all` and the `init` baseline skip authorized host Skills directly under
+`/usr/share/anolisa/skills` or `/usr/local/share/anolisa/skills` when the daemon cannot write their
+Ledger location, including read-only mounts. Results contain `status: skipped`,
+`reasonCode: readonly_system_skill`, `persisted: false`. Startup does not activate a skipped Skill.
+This is not a safety verdict or certification. A root-writable mode-0555 directory still scans.
+Explicit scans, user-directory write failures, SkillFS failures and other storage errors remain
+errors. Skipped Skills need a writable managed copy to establish trust.
 
 The state directory is root-owned 0700; `signing-key.pk8` is 0600. All local users may operate all
 managed Skills in phase one. Ownership is not an authorization ACL. Only kernel UID 0 may rotate

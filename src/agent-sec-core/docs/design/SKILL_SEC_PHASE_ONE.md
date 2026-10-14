@@ -482,7 +482,7 @@ These focused lifecycle changes align with the open system-service proposal #321
 they do not imply that proposal has merged or that its service identity is adopted.
 
 Root-owned `/etc/agent-sec/skillsec.json` (or `--skillsec-config`) configures `stateDir`,
-`managedSkillDirs`, scanner overrides and parsers. The default state is
+`managedSkillDirs`, `enableDefaultSkillDirs`, scanner overrides and parsers. The default state is
 `/var/lib/agent-sec/skillsec`, owned by root with mode 0700; the current key remains 0600.
 No user config, history or keyring is imported. `managedSkillDirs` retains exact, terminal `/*`
 and terminal `/**` forms. It is parsed separately from exact request identities; no additional
@@ -490,12 +490,12 @@ and terminal `/**` forms. It is parsed separately from exact request identities;
 root has `SKILL.md`, skips hidden descendants, refuses symlink traversal and expands on each
 aggregate request so new children do not require a restart. Paths are absolute; no HOME expansion.
 
-The Executor rejects caller paths outside configured patterns or authenticated SkillFS mounts
+The Executor rejects caller paths outside default/configured patterns or authenticated SkillFS mounts
 before physical resolution and business side effects. All commands share this boundary, including
 analyze, export, background work and ordinary startup reconcile. Aggregate discovery combines
-configured patterns and still-authorized registration; caller discovery does not expand authority.
+default/configured patterns and still-authorized registration; caller inputs do not expand authority.
 One out-of-range caller path rejects the whole batch before processing any Skill. Empty
-`check/scan --all` remains an execution failure without creating keys. Caller discovery is bounded
+`check/scan --all` remains an execution failure without creating keys. Explicit caller input is bounded
 to 1024 roots. Registration is operational history, never an authorization source. Status uses the
 current configuration and authorized history independently of caller HOME. Configured mount trees
 are not walked through FUSE; authenticated notifications and the existing registry supply their roots.
@@ -504,12 +504,13 @@ Root must restore a removed scope before a new rotation can withdraw its histori
 An already authorized private rotation intent can still finish withdrawal after reconfiguration;
 this exception only permits root rotation recovery, not a new baseline scan outside current scope.
 
-The shared CLI discovery includes direct Skill children of `$XDG_DATA_HOME/anolisa/skills`.
-It follows the installer's syntax rules: unset/empty/relative overrides or raw `.`/`..` segments
-fall back to `$HOME/.local/share/anolisa/skills`; a valid but absent directory is simply skipped.
-An unset or empty `HOME` resolves through the CLI user's system account home directory.
-Only the CLI reads this caller environment. `init --no-baseline` and explicit-path requests bypass
-discovery, and hidden/snapshot directory filtering remains in effect.
+Default scope is enabled by `enableDefaultSkillDirs` (also true when omitted). Daemon startup
+reads local `/etc/passwd` homes and adds the system and standard user patterns documented in the
+[V2 guide](../../../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md#system-configuration-and-trust).
+No caller environment or CLI discovery participates. Default-only discovery is bounded to 10,000
+entries and 1,024 additional Skills; explicit patterns, registration and rotation sets remain intact.
+Per-directory failures retain discoveries with `discoveryErrors` and a failed outcome; forced key
+initialization refuses partial discovery. Account/configuration changes require a restart.
 
 Rotation takes the service generation write lock, records a private intent, and withdraws every
 registered exposure before replacing the key. A pending rollback must first reconcile. A failed

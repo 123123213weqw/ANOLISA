@@ -14,9 +14,23 @@ pub struct SkillSecConfig {
     // TODO(SkillSec maintainers): add per-user isolation before restricting the phase-one
     // contract that allows every local caller to operate every managed Skill.
     pub managed_skill_dirs: Vec<ManagedSkillDir>,
+    /// Standard directories derived by the daemon from trusted local account records.
+    /// Only discovery in this additional scope uses the default-discovery budget.
+    #[serde(default)]
+    pub default_skill_dirs: Vec<ManagedSkillDir>,
 }
 
 impl SkillSecConfig {
+    pub(crate) fn patterns(&self) -> impl Iterator<Item = &ManagedSkillDir> {
+        self.managed_skill_dirs
+            .iter()
+            .chain(&self.default_skill_dirs)
+    }
+
+    pub(crate) fn allows(&self, identity: &SkillIdentity) -> bool {
+        self.patterns().any(|pattern| pattern.contains(identity))
+    }
+
     /// Checks deployment paths before loading keys or accessing Skills.
     ///
     /// # Errors

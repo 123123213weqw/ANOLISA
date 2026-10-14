@@ -113,11 +113,7 @@ impl SkillSecService {
     /// Reports unavailable keys, invalid source paths and deadlines.
     pub fn show(&self, root: &SkillRoot, deadline: Instant) -> Result<Value, SkillSecError> {
         self.with_skill(root, deadline, |directory, key| {
-            if !self
-                .config
-                .managed_skill_dirs
-                .iter()
-                .any(|pattern| pattern.contains(&root.identity))
+            if !self.config.allows(&root.identity)
                 && !self
                     .managed
                     .lock()

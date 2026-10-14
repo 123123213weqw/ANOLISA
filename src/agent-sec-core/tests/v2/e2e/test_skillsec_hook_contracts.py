@@ -501,7 +501,7 @@ def test_out_of_scope_show_preserves_error_policy_without_registration(
     assert result.returncode == 1
     failure = json.loads(result.stdout)
     assert failure["status"] == "error"
-    assert "outside managedSkillDirs" in failure["error"]
+    assert "outside enabled default directories, managedSkillDirs" in failure["error"]
     output, stderr = _invoke(hook_case, policy="block")
     _allowed(output)
     assert "skill-ledger" in stderr

@@ -67,6 +67,7 @@ async fn cli_runs_full_core_workflow_and_emits_safe_public_audit() {
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.clone(),
                 managed_skill_dirs: vec![
                     asc_capability_skill_sec::ManagedSkillDir::new(&skill).unwrap(),

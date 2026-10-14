@@ -66,6 +66,7 @@ fn canonical_identity_is_lexical_and_validated_after_json_decode() {
     assert_eq!(left.name(), right.name());
     assert_ne!(left, right);
     let config = SkillSecConfig {
+        default_skill_dirs: Vec::new(),
         state_dir: "/var/lib/agent-sec/skillsec".into(),
         managed_skill_dirs: vec![
             asc_capability_skill_sec::ManagedSkillDir::new(left.path()).unwrap(),
@@ -341,6 +342,7 @@ fn service_construction_reclaims_crashed_key_temporaries() {
 
     let service = SkillSecService::new(
         asc_capability_skill_sec::SkillSecConfig {
+            default_skill_dirs: Vec::new(),
             state_dir: state.clone(),
             managed_skill_dirs: vec![
                 asc_capability_skill_sec::ManagedSkillDir::new(

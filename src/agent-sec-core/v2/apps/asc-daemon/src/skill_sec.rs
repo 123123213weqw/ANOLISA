@@ -1,5 +1,6 @@
 //! Process-owned `SkillSec` configuration and startup recovery, independent of user HOME.
 
+mod defaults;
 #[cfg(test)]
 mod tests;
 
@@ -28,6 +29,8 @@ struct Settings {
     state_dir: PathBuf,
     #[serde(default)]
     managed_skill_dirs: Vec<ManagedSkillDir>,
+    #[serde(default = "defaults_enabled")]
+    enable_default_skill_dirs: bool,
     #[serde(default)]
     scanners: Vec<ScannerConfig>,
     #[serde(default)]
@@ -38,6 +41,10 @@ struct Settings {
 
 fn default_state() -> PathBuf {
     PathBuf::from("/var/lib/agent-sec/skillsec")
+}
+
+fn defaults_enabled() -> bool {
+    true
 }
 
 pub(super) fn start(
@@ -55,6 +62,7 @@ pub(super) fn start(
             Err(StartupError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Settings {
                 state_dir: default_state(),
                 managed_skill_dirs: Vec::new(),
+                enable_default_skill_dirs: true,
                 scanners: Vec::new(),
                 parsers: BTreeMap::new(),
                 skillfs: None,
@@ -70,10 +78,16 @@ pub(super) fn start(
         return Err(StartupError::UnsafePath);
     }
     private_state(&settings.state_dir)?;
+    let default_skill_dirs = if settings.enable_default_skill_dirs {
+        defaults::directories(Path::new("/etc/passwd"))?
+    } else {
+        Vec::new()
+    };
     let service = Arc::new(SkillSecService::new(
         SkillSecConfig {
             state_dir: settings.state_dir,
             managed_skill_dirs: settings.managed_skill_dirs,
+            default_skill_dirs,
         },
         ScannerRegistry::new(settings.scanners, settings.parsers)?,
     )?);

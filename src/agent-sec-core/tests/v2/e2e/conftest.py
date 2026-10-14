@@ -115,6 +115,7 @@ def _daemon_settings(socket_path: Path) -> tuple[Path, dict[str, str]]:
             {
                 "stateDir": str(socket_path.with_suffix(".state")),
                 "managedSkillDirs": [str(socket_path.parent / "*")],
+                "enableDefaultSkillDirs": False,
             }
         )
     )

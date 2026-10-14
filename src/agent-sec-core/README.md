@@ -49,12 +49,14 @@ not preload Prompt Scanner models or serve scan RPCs.
 
 The Rust V2 core adds **SkillSec** behind the existing `skill-ledger` command: local scanners,
 system-key signing, version history, decisions, rollback and SkillFS activation share one root
-daemon. All local users may manage all Skills within administrator-configured directories or authenticated SkillFS mounts; only root may rotate the signing key.
-Baseline initialization and batch scan/check discover ANOLISA user-installed Skills using the
-caller's XDG/HOME layout, alongside existing system and Agent locations.
-Root-owned `managedSkillDirs` accepts exact paths, direct children (`/*`) and recursive trees (`/**`).
-Caller discovery and successful registration cannot expand that boundary.
-Startup scans authorized ordinary Skills in the background, using the same worker as SkillFS.
+daemon. All local users may manage all Skills within the enabled defaults, administrator-configured
+directories or authenticated SkillFS mounts; only root may rotate the signing key.
+Default system directories and standard Skill directories for all local account homes are authorized
+and scanned in the background after daemon startup. No directory configuration is needed for these
+locations. Set `enableDefaultSkillDirs: false` to disable this scope; `managedSkillDirs` remains
+available for additional absolute paths, direct children (`/*`) and recursive trees (`/**`).
+Homes come from `/etc/passwd`, not caller environment variables. Account/configuration changes
+require a daemon restart. Read-only packaged system Skills remain visibly skipped, not certified.
 
 The V2 systemd system unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable name.
 Check the service with `sudo systemctl status agent-sec-core.service`.

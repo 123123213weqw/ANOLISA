@@ -39,7 +39,7 @@ sudo make -C src/agent-sec-core install-core-v2
 产物为 `src/agent-sec-core/target/v2/bin/agent-sec-cli` 和 `agent-sec-daemon`。
 核心二进制不依赖 Python Ledger 运行时。`install-core-v2` 将两个二进制安装到 `/usr/bin`，
 系统 unit 安装到 `/usr/lib/systemd/system`，初始配置以 0600 安装到 `/etc/agent-sec/skillsec.json`。
-重装保留已有配置；RPM 使用 `%config(noreplace)`。安装过程不会初始化签名密钥或启用 Agent Hook。
+重装保留已有配置；RPM 使用 `%config(noreplace)`。安装不启用 Agent Hook；服务启动后，对已发现 Skill 的后台扫描可能初始化签名密钥。
 
 V2 systemd 服务单元名为 `agent-sec-core.service`，可执行文件／进程名为 `agent-sec-daemon`。
 V1 使用同名单元作为用户服务，V2 将其作为系统服务运行。
@@ -90,7 +90,7 @@ bash src/agent-sec-core/tests/packaging/test-skillsec-install.sh
 
 安装配套插件或修改可信启动环境后，重启 Agent。使用自定义 socket 时，确保
 `AGENT_SEC_DAEMON_SOCKET` 与 daemon 一致。加载 Skill 前先运行
-`agent-sec-cli skill-ledger status`，再显式扫描该 Skill 建立 V2 信任；V1 密钥或 manifest
+`agent-sec-cli skill-ledger status`，若启动尚未建立 V2 信任，再显式扫描该 Skill；V1 密钥或 manifest
 不能建立 V2 信任。
 
 | 宿主 | 查询 | 命中 Skill 时的初始化 | 默认策略 |
@@ -104,7 +104,7 @@ bash src/agent-sec-core/tests/packaging/test-skillsec-install.sh
 
 四类执行初始化的适配器在每次命中调用时询问 daemon，不检查 HOME 密钥文件，不扫描 Skill，
 不重置不安全的密钥，也不换钥。OpenClaw 不在插件注册时初始化，不缓存进程级就绪结果。
-禁用或未命中的 Hook 不调用 CLI。Qoder、Hermes 保持只读，需显式建立信任。
+禁用或未命中的 Hook 不调用 CLI。Qoder、Hermes 保持只读，启动尚未完成扫描时需显式建立信任。
 宿主确认仅允许当前操作继续，不写入 Ledger 人工决策。
 
 `check` 消费者接受退出码 1 的有效风险结果，不把它当作通信失败。`show` 消费者要求
@@ -132,54 +132,61 @@ daemon 读取 root 所有的 `/etc/agent-sec/skillsec.json`；`--skillsec-config
 ```json
 {
   "stateDir": "/var/lib/agent-sec/skillsec",
+  "enableDefaultSkillDirs": true,
   "managedSkillDirs": []
 }
 ```
 
-`managedSkillDirs` 定义普通目录的授权范围，保留 V1 的三种绝对路径形式：
+默认目录自动启用，旧配置未填写 `enableDefaultSkillDirs` 时也默认开启。daemon 启动时授权：
+
+| 位置 | 发现范围 |
+| --- | --- |
+| `/usr/share/anolisa/skills/*`、`/usr/local/share/anolisa/skills/*` | 直接 Skill 子目录 |
+| `<home>/.local/share/anolisa/skills/*` | ANOLISA 用户安装目录 |
+| `<home>/.openclaw/skills/*`、`<home>/.copilot-shell/skills/*` | 直接 Skill 子目录 |
+| `<home>/.hermes/skills/**` | 递归 Skill；根目录自身有 `SKILL.md` 时也包含自身 |
+| `<home>/.qoder/skills/*`、`<home>/.codex/skills/*`、`<home>/.agents/skills/*`、`<home>/.qwen/skills/*` | 直接 Skill 子目录 |
+
+`<home>` 来自本地 `/etc/passwd` 的绝对 HOME 字段，包含 root 和服务账户。重复 HOME 合并；
+非法 HOME、`/`、符号链接 HOME 及 `/dev/null` 等已存在的非目录会跳过并记录诊断。
+尚不存在的 HOME 保留授权范围。账户变更后需重启 daemon。仅由 NSS 提供的账户、非标准
+`XDG_DATA_HOME`、`CODEX_HOME`、`QWEN_HOME` 及项目目录需显式配置或通过已认证 SkillFS 接入；
+调用者环境变量不能扩大授权范围。
+
+`managedSkillDirs` 用于追加管理员授权的绝对路径：
 
 | 配置项 | 授权及发现的 Skill |
 | --- | --- |
 | `/srv/skills/demo` | 该精确 Skill |
 | `/srv/skills/*` | 直接、非隐藏 Skill 子目录 |
-| `/srv/skills/**` | 任意深度的 Skill；若 `/srv/skills` 自身有 `SKILL.md`，也包括自身 |
+| `/srv/skills/**` | 递归 Skill；根目录自身有 `SKILL.md` 时也包含自身 |
 
-通配模式跳过隐藏后代，不跟随符号链接。可以显式指定 `/home/alice/.hermes/skills/*` 这样的宿主目录。
-不展开其他 glob 语法或 `~`，系统配置使用绝对路径。空列表不允许访问任何普通 Skill 目录。
-SkillFS 认证挂载继续通过已有的 root 所有挂载配置授权。
+用 `sudoedit /etc/agent-sec/skillsec.json` 编辑现有配置，保留其他设置，再执行
+`sudo systemctl restart agent-sec-core.service` 生效。`enableDefaultSkillDirs: false` 仅关闭
+默认目录；显式配置和已认证 SkillFS 挂载继续有效。显式列表为空不会关闭已启用的默认目录。
+关闭范围不会删除既有 Skill 元数据或重置信任。不支持其他 glob 语法或 `~`；发现跳过隐藏后代，
+不跟随符号链接。所有本地用户仍可操作全部受管 Skill，本次不引入用户 ACL。
 
-root 使用 `sudoedit /etc/agent-sec/skillsec.json` 编辑现有配置，保留 `stateDir`、scanner 和
-SkillFS 设置。例如，将目录配置设为：
+`init`、`scan --all`、`check --all`、`status` 统一由 daemon 发现，合并默认目录、显式模式和
+仍受授权的登记历史。调用端显式路径在 Skill I/O 前校验；一个越界路径即以 `PermissionDenied`
+拒绝整个请求。成功登记仅保存历史，不扩大授权。`init --no-baseline` 和单路径请求不发现目录。
 
-```json
-"managedSkillDirs": ["/srv/skills/*", "/home/alice/.hermes/skills/**"]
-```
+启动扫描在现有 worker 中异步执行，与已到期的 SkillFS 通知交替处理，socket 无需等待扫描。
+挂载内 Skill 来自认证通知和已登记身份，不遍历 FUSE。已有标准范围内新增 Skill 立即获得授权，
+在下次聚合命令或 daemon 重启时发现；不增加目录 watcher，也不在普通 Skill 调用时自动扫描。
+宿主 Hook 继续按原策略控制调用；安装本身不保证拦截所有直接文件读取。
 
-执行 `sudo systemctl restart agent-sec-core.service` 应用配置修改。已有通配范围下新增 Skill
-无需改配置或重启。随后普通用户均可扫描、认证、查询和修改范围内的 Skill，不增加用户 ACL。
-范围外的路径返回 `PermissionDenied`，包括 `analyze`，也不能通过扫描自动扩大登记范围。
+单次默认发现最多读取 10,000 个目录项、加入 1,024 个新 Skill 身份；这些限制不截断显式配置、
+已登记历史或换钥及恢复集合。单目录失败或预算耗尽时保留已完成的发现，返回含 `root`、`error`
+的 `discoveryErrors`，退出码为 1，状态不能显示健康。启动时记录发现不完整并继续扫描成功的部分。
+带有发现错误的强制密钥初始化不会更换密钥。发现超时或全局登记损坏仍直接失败。
 
-`init`、`scan --all` 和 `check --all` 合并配置模式发现、仍在授权范围内的登记目录及调用端发现。
-调用端传入的路径在 Skill I/O 前校验；批量请求只要含越界路径，整个请求就会在处理任一 Skill 前被拒绝。
-可以改用已授权 Skill 的显式路径，或由 root 增加所需父目录模式。登记仅保存精确路径历史，不能扩大配置范围。
-`status` 查询配置模式及仍受授权的历史目录，不依赖调用者 HOME。移除模式不会删除该 Skill 已有元数据；
-启动恢复也会拒绝对当前范围之外的目录执行业务操作。
-
-daemon 启动后在后台扫描配置中的普通 Skill 及仍受授权的历史目录，包括尚未登记的 Skill。
-同一个 worker 处理已登记的 SkillFS Skill 和通知，不通过遍历 FUSE 发现挂载内的 Skill。
-socket 开放不等待扫描完成；内容及扫描结果齐备且未变化时保持 noop。
-
-`scan --all` 和 `init` 基线处理中，如果已授权 Skill 是 `/usr/share/anolisa/skills` 或
-`/usr/local/share/anolisa/skills` 的直接子目录，且 daemon 自身也无法写入其普通宿主账本位置
-（包括只读文件系统），则返回 `status: skipped`、`reasonCode: readonly_system_skill`、
-`persisted: false`，不代表已认证为安全。显式扫描、SkillFS 失败、越界路径及其他存储错误仍报错。
-
-默认发现跳过隐藏子目录，包括账本快照；`.hermes/skills` 等宿主目录下的正常 Skill 仍受支持。
-发现范围包括 `$XDG_DATA_HOME/anolisa/skills` 下的直接 Skill 子目录，环境变量来自 CLI 调用者。
-`XDG_DATA_HOME` 未设置、为空、为相对路径或含 `.`/`..` 路径段时，使用
-`$HOME/.local/share/anolisa/skills`，与 ANOLISA 用户安装目录规则一致。`HOME` 未设置或为空时，
-使用 CLI 当前用户的系统账户主目录。合法的自定义目录不存在时
-直接跳过，不再回退。显式 Skill 路径及 `init --no-baseline` 不触发自动发现。
+启动扫描、`scan --all` 和 `init` baseline 对 `/usr/share/anolisa/skills` 或
+`/usr/local/share/anolisa/skills` 的直接宿主 Skill 子目录复用只读跳过规则：daemon 无法写入
+账本位置（包括只读挂载）时返回 `status: skipped`、`reasonCode: readonly_system_skill`、
+`persisted: false`；启动任务不再尝试激活该项。跳过不表示安全或认证成功。
+root 仍可写的 `0555` 目录正常扫描。显式扫描、用户目录写入失败、SkillFS 失败及其他存储错误
+仍报错；跳过的 Skill 需放入可写的受管副本后才能建立信任。
 
 状态目录归 root 所有，模式为 0700；`signing-key.pk8` 为 0600。第一阶段允许所有本地用户操作所有
 受管 Skill，文件归属不作为用户访问 ACL。仅内核 UID 0 可以换钥。系统密钥签名的是 daemon 计算的记录，

@@ -33,6 +33,7 @@ impl Fixture {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
                     managed_skill_dirs: vec![],
                 },
@@ -269,6 +270,7 @@ fn exact_registration_persists_without_registering_siblings() {
     fs::write(sibling.join("SKILL.md"), SKILL).unwrap();
     let restarted = SkillSecService::new(
         SkillSecConfig {
+            default_skill_dirs: Vec::new(),
             state_dir: f.state.clone(),
             managed_skill_dirs: vec![],
         },

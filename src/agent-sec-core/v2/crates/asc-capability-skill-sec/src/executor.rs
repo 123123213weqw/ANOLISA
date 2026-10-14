@@ -8,6 +8,35 @@ use serde_json::{Map, Value, json};
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Discovered identities plus directory failures that prevent complete coverage.
+#[derive(Debug, Default)]
+pub struct SkillDiscovery {
+    /// Authorized identities, sorted and deduplicated across all discovery sources.
+    pub skills: Vec<crate::SkillIdentity>,
+    /// Business diagnostics; raw paths and errors must not enter public audit events.
+    pub errors: Vec<DiscoveryError>,
+}
+
+/// A failed discovery or physical resolution, separate from a scanner finding.
+#[derive(Debug, serde::Serialize)]
+pub struct DiscoveryError {
+    /// Directory whose coverage or physical resolution failed.
+    pub root: crate::SkillIdentity,
+    /// Diagnostic returned to the requesting client, not the public audit sink.
+    pub error: String,
+}
+
+struct PreparedRoots {
+    roots: Vec<SkillRoot>,
+    errors: Vec<DiscoveryError>,
+}
+
+fn discovery_failed(output: &Value) -> bool {
+    output["discoveryErrors"]
+        .as_array()
+        .is_some_and(|errors| !errors.is_empty())
+}
+
 /// Physical resolution and integration health supplied by daemon composition.
 /// Implementations must authenticate mounted mappings and never fall back inside a mount.
 pub trait SkillEnvironment: Send + Sync {
@@ -71,42 +100,77 @@ impl SkillSecExecutor {
     }
 
     fn allowed(&self, identity: &crate::SkillIdentity) -> bool {
-        self.service
-            .config
-            .managed_skill_dirs
-            .iter()
-            .any(|pattern| pattern.contains(identity))
-            || self.environment.manages(identity)
+        self.service.config.allows(identity) || self.environment.manages(identity)
     }
 
-    /// Discovers authorized ordinary Skills and registered mounts without traversing FUSE.
-    /// Shared by aggregate commands and the daemon's asynchronous startup scan.
+    /// Discovers authorized Skills without traversing authenticated mounts.
+    /// Directory failures retain successful discoveries and identify incomplete coverage.
     ///
     /// # Errors
-    /// Reports invalid or unreadable configured roots, corrupt registration and expired deadlines.
-    pub fn discover(&self, deadline: Instant) -> Result<Vec<crate::SkillIdentity>, SkillSecError> {
+    /// Reports corrupt registration and expired deadlines.
+    pub fn discover(&self, deadline: Instant) -> Result<SkillDiscovery, SkillSecError> {
         let mut skills: std::collections::BTreeSet<_> = self
             .service
             .managed_skills()?
             .into_iter()
             .filter(|identity| self.allowed(identity))
             .collect();
-        for pattern in &self.service.config.managed_skill_dirs {
-            // Mounted Skills are discovered by authenticated notifications, never by traversing FUSE.
-            if !self.environment.manages(&pattern.root) {
-                skills.extend(crate::discovery::discover(pattern, deadline, |id| {
-                    self.environment.manages(id)
-                })?);
+        let mut errors = Vec::new();
+        let mut completed: Vec<&crate::ManagedSkillDir> = Vec::new();
+        let config = &self.service.config;
+        let mut budget = crate::discovery::DefaultBudget::default();
+        for (patterns, defaults) in [
+            (&config.managed_skill_dirs, false),
+            (&config.default_skill_dirs, true),
+        ] {
+            for pattern in patterns {
+                if defaults && budget.exhausted {
+                    break;
+                }
+                if self.environment.manages(&pattern.root)
+                    || (defaults
+                        && completed.iter().any(|explicit| {
+                            *explicit == pattern
+                                || (explicit.scope == crate::config::Scope::Recursive
+                                    && explicit.contains(&pattern.root))
+                        })
+                        // Recursive discovery skips symlinks; a default root must still reject them.
+                        && crate::ledger::storage::Directory::open(pattern.root.path()).is_ok())
+                {
+                    continue;
+                }
+                let result = crate::discovery::discover(
+                    pattern,
+                    deadline,
+                    |id| self.environment.manages(id),
+                    &mut skills,
+                    if defaults { Some(&mut budget) } else { None },
+                );
+                match result {
+                    Ok(()) => {
+                        if !defaults {
+                            completed.push(pattern);
+                        }
+                    }
+                    Err(SkillSecError::Timeout) => return Err(SkillSecError::Timeout),
+                    Err(error) => errors.push(DiscoveryError {
+                        root: pattern.root.clone(),
+                        error: error.to_string(),
+                    }),
+                }
             }
         }
-        Ok(skills.into_iter().collect())
+        Ok(SkillDiscovery {
+            skills: skills.into_iter().collect(),
+            errors,
+        })
     }
 
     fn prepare(
         &self,
         request: &SkillSecRequest,
         deadline: Instant,
-    ) -> Result<Vec<SkillRoot>, SkillSecError> {
+    ) -> Result<PreparedRoots, SkillSecError> {
         check_deadline(deadline)?;
         let command = &request.command;
         let rotates = matches!(
@@ -138,14 +202,25 @@ impl SkillSecExecutor {
         } else {
             Vec::new()
         };
-        if matches!(
+        let aggregate = matches!(
             command,
             SkillSecCommand::Init { baseline: true, .. }
                 | SkillSecCommand::Scan { all: true, .. }
                 | SkillSecCommand::Check { all: true, .. }
                 | SkillSecCommand::Status { .. }
-        ) {
-            managed.extend(self.discover(deadline)?);
+        );
+        let mut errors = Vec::new();
+        if aggregate {
+            let discovery = self.discover(deadline)?;
+            managed.extend(discovery.skills);
+            errors = discovery.errors;
+        }
+        // A partial baseline must never rotate only part of the registered trust set.
+        if rotates && !errors.is_empty() {
+            return Ok(PreparedRoots {
+                roots: Vec::new(),
+                errors,
+            });
         }
         identities.extend(managed);
         identities.sort();
@@ -161,10 +236,19 @@ impl SkillSecExecutor {
                 return Err(SkillSecError::ScopeDenied(identity.clone()));
             }
         }
-        identities
-            .iter()
-            .map(|identity| self.environment.resolve(identity, deadline))
-            .collect()
+        let mut roots = Vec::new();
+        for identity in identities {
+            match self.environment.resolve(&identity, deadline) {
+                Ok(root) => roots.push(root),
+                Err(SkillSecError::Timeout) => return Err(SkillSecError::Timeout),
+                Err(error) if aggregate && !rotates => errors.push(DiscoveryError {
+                    root: identity,
+                    error: error.to_string(),
+                }),
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(PreparedRoots { roots, errors })
     }
 
     fn run(
@@ -207,6 +291,9 @@ impl SkillSecExecutor {
                 } else {
                     Ok((service.scan(root()?, &options, deadline)?, 0))
                 }
+            }
+            SkillSecCommand::StartupScan { .. } => {
+                service.scan_batch(roots, &ScanOptions::default(), deadline)
             }
             SkillSecCommand::Certify {
                 scanner,
@@ -328,7 +415,7 @@ impl SkillSecExecutor {
         } else {
             "healthy"
         };
-        let mut value = json!({"command":"status","keys":keys,"config":{"managedSkillDirPatterns":service.config.managed_skill_dirs.len(),"registeredScanners":service.scanners().scanners().iter().map(|s| &s.name).collect::<Vec<_>>()},"skills":{"discovered":results.len(),"breakdown":breakdown,"health":health}});
+        let mut value = json!({"command":"status","keys":keys,"config":{"managedSkillDirPatterns":service.config.patterns().count(),"registeredScanners":service.scanners().scanners().iter().map(|s| &s.name).collect::<Vec<_>>()},"skills":{"discovered":results.len(),"breakdown":breakdown,"health":health}});
         if verbose {
             value["results"] = json!(results);
         }
@@ -356,15 +443,34 @@ impl CapabilityExecutor for SkillSecExecutor {
         let result = if control.cancelled {
             Err(SkillSecError::Timeout)
         } else {
-            self.prepare(request, control.deadline).and_then(|roots| {
-                skill_count = roots.len();
-                self.run(request, &roots, control.deadline)
-            })
+            self.prepare(request, control.deadline)
+                .and_then(|prepared| {
+                    skill_count = prepared.roots.len();
+                    let (mut data, mut code) = if prepared.roots.is_empty()
+                        && !prepared.errors.is_empty()
+                        && !matches!(request.command, SkillSecCommand::Status { .. })
+                    {
+                        // Preserve discovery errors instead of replacing them with an empty-batch error.
+                        // No scan or baseline key may be created for an entirely failed selection.
+                        (json!({"command": request.command.name(), "results": []}), 1)
+                    } else {
+                        self.run(request, &prepared.roots, control.deadline)?
+                    };
+                    if !prepared.errors.is_empty() {
+                        data["discoveryErrors"] = json!(prepared.errors);
+                        if matches!(request.command, SkillSecCommand::Status { .. }) {
+                            data["skills"]["health"] = json!("critical");
+                        }
+                        code = 1;
+                    }
+                    Ok((data, code))
+                })
         };
         let mut outcome = match result {
             Ok((data, exit_code)) => {
                 let failed_execution = exit_code != 0
-                    && (data["status"] == "error"
+                    && (discovery_failed(&data)
+                        || data["status"] == "error"
                         || data["results"]
                             .as_array()
                             .is_some_and(|items| items.iter().any(|v| v["status"] == "error")));
@@ -405,6 +511,17 @@ fn event_verdict(command: &SkillSecCommand, output: &Value) -> Option<&'static s
         "tampered",
         "error",
     ];
+    if discovery_failed(output)
+        && matches!(
+            command,
+            SkillSecCommand::Init { .. }
+                | SkillSecCommand::Scan { .. }
+                | SkillSecCommand::Check { .. }
+                | SkillSecCommand::StartupScan { .. }
+        )
+    {
+        return Some("error");
+    }
     let known = |value: &Value| {
         VERDICTS
             .iter()
@@ -415,6 +532,7 @@ fn event_verdict(command: &SkillSecCommand, output: &Value) -> Option<&'static s
         SkillSecCommand::Init { .. }
         | SkillSecCommand::Scan { .. }
         | SkillSecCommand::Check { .. }
+        | SkillSecCommand::StartupScan { .. }
             if output["results"].is_array() =>
         {
             output["results"]
@@ -522,6 +640,9 @@ impl AuditProjector for SkillSecAuditProjector {
         }
         if let Some(items) = output["results"].as_array() {
             result.insert("resultCount".into(), json!(items.len()));
+        }
+        if let Some(errors) = output["discoveryErrors"].as_array() {
+            result.insert("discoveryErrorCount".into(), json!(errors.len()));
         }
         if let Some(verdict) = event_verdict(&request.command, output) {
             result.insert("verdict".into(), json!(verdict));
@@ -899,6 +1020,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 crate::SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },

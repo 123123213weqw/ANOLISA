@@ -32,6 +32,7 @@ fn startup_retries_unfinished_rotation_and_only_cleans_up_committed_rotation() {
         fs::write(skill.join("SKILL.md"), "Safe fixture").unwrap();
         let service = SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state.clone(),
                 managed_skill_dirs: Vec::new(),
             },
@@ -70,6 +71,7 @@ fn startup_retries_unfinished_rotation_and_only_cleans_up_committed_rotation() {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
                     managed_skill_dirs: vec![
                         ManagedSkillDir::new(fixture_root.join("extra")).unwrap(),
@@ -151,6 +153,7 @@ fn startup_finalizes_preparation_failures_once_and_continues_with_the_next_skill
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
                     managed_skill_dirs: vec![ManagedSkillDir::new(root.join("*")).unwrap()],
                 },

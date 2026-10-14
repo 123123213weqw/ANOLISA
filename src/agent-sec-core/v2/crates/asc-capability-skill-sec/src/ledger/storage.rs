@@ -129,6 +129,35 @@ impl Directory {
         Ok(names)
     }
 
+    /// Bounds default-discovery allocation before a large directory is materialized.
+    pub fn bounded_names(
+        &self,
+        deadline: Instant,
+        remaining: &mut usize,
+    ) -> Result<(Vec<String>, bool), SkillSecError> {
+        let mut names = Vec::new();
+        let mut truncated = false;
+        for item in Dir::read_from(&self.file).map_err(|e| io_error(&self.path, e))? {
+            check_deadline(deadline)?;
+            let item = item.map_err(|e| io_error(&self.path, e))?;
+            let name = item
+                .file_name()
+                .to_str()
+                .map_err(|_| SkillSecError::Integrity("non-UTF-8 discovery entry".into()))?;
+            if matches!(name, "." | "..") {
+                continue;
+            }
+            if *remaining == 0 {
+                truncated = true;
+                break;
+            }
+            *remaining -= 1;
+            names.push(name.to_owned());
+        }
+        names.sort();
+        Ok((names, truncated))
+    }
+
     pub fn read(
         &self,
         name: &str,

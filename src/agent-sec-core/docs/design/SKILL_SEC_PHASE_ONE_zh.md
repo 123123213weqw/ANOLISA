@@ -402,28 +402,28 @@ CLI 调用者自身权限执行。
 默认仍为 0600。这部分定向对齐尚未合并的系统服务 PR #3217（`5d2ff1f`）；不意味着该 PR 已合并，
 也不采用其服务身份设计。
 
-root 所有的 `/etc/agent-sec/skillsec.json` 或 `--skillsec-config` 指定 `stateDir`、精确
-`managedSkillDirs`、scanner 覆盖配置与 parsers。默认状态目录 `/var/lib/agent-sec/skillsec`
+root 所有的 `/etc/agent-sec/skillsec.json` 或 `--skillsec-config` 指定 `stateDir`、
+`managedSkillDirs`、`enableDefaultSkillDirs`、scanner 覆盖配置与 parsers。默认状态目录 `/var/lib/agent-sec/skillsec`
 要求 root 所有、0700，当前密钥保持 0600。不导入用户配置、旧历史和 keyring。
 `managedSkillDirs` 保留精确路径、末尾 `/*` 和末尾 `/**` 三种形式，与请求中的精确身份分开解析，
 不增加 `allowedSkillRoots`。递归发现包含有 `SKILL.md` 的模式根目录自身，跳过隐藏后代，拒绝符号
 链接遍历；每次聚合请求重新发现，因此通配范围内新增子目录无需重启。配置采用绝对路径，不展开 HOME。
 
-Executor 在物理解析和业务副作用前，拒绝不属于配置模式或已认证 SkillFS 挂载范围的调用路径。
+Executor 在物理解析和业务副作用前，拒绝不属于默认/显式配置模式或已认证 SkillFS 挂载范围的调用路径。
 analyze、导出、后台工作及普通启动 reconcile 共用这个边界。聚合发现合并配置模式和仍受授权的
 登记历史，调用端发现不能扩权；一个越界调用路径就会使整个批次在处理任一 Skill 前失败。
-空 check/scan --all 仍为执行失败，不创建密钥；调用端发现限制为 1024 项。登记只记录运行历史，
+空 check/scan --all 仍为执行失败，不创建密钥；调用端显式输入限制为 1024 项。登记只记录运行历史，
 不能作为授权来源。status 使用当前配置和仍受授权的历史，不随调用者 HOME 改变。
 配置挂载子树不经 FUSE 遍历，其精确目录由认证通知和已有登记提供。
 
 新的换钥若需撤销已移出范围的历史暴露，root 须先恢复该范围配置。已有的私有换钥恢复意图仍可在
 配置变化后完成撤销；例外仅适用于 root 换钥恢复，不允许对当前范围外目录发起新的 baseline 扫描。
 
-CLI 的共享发现逻辑包括 `$XDG_DATA_HOME/anolisa/skills` 下的直接 Skill 子目录，遵循安装器的
-路径规则：未设置、为空、相对路径或原始路径含 `.`/`..` 段时，回退到
-`$HOME/.local/share/anolisa/skills`；合法但不存在的目录直接跳过。`HOME` 未设置或为空时，
-使用 CLI 当前用户的系统账户主目录。只有 CLI 读取调用者环境，
-`init --no-baseline` 和显式路径请求不触发发现，隐藏目录及快照过滤保持不变。
+`enableDefaultSkillDirs` 默认开启，省略时也为 true。daemon 启动时从本地 `/etc/passwd` 获取
+HOME，加入系统及标准用户目录，详见 [V2 指南](../../../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md#系统配置与信任)。
+不使用调用者环境变量或 CLI 发现。仅默认发现限制为 10,000 个目录项、1,024 个新增 Skill；
+显式模式、登记历史及换钥集合保持完整。单目录错误保留发现结果，返回 `discoveryErrors` 和失败
+状态；强制密钥初始化拒绝不完整发现。账户与配置变更需重启 daemon。
 
 换钥持有全局代际写锁，写入私有 intent，撤销全部登记 Skill 的 activation 后才替换密钥。
 有未完成回滚时须先 reconcile。撤销失败保留旧密钥，并阻止普通账本操作，直到管理员重试或启动

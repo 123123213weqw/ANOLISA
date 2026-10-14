@@ -45,11 +45,12 @@ V1 后台守护进程 `agent-sec-daemon`（以 `agent-sec-core.service` systemd 
 ## V2 SkillSec 与 Policy CLI
 
 Rust V2 核心通过现有 `skill-ledger` 命令提供 **SkillSec**：本地扫描、系统密钥签名、版本历史、
-人工决策、回滚及 SkillFS 激活由一个 root daemon 统一处理。所有本地用户均可管理管理员配置范围或已认证 SkillFS 挂载内的 Skill，
-仅 root 可以更换签名密钥。基线初始化与批量扫描、检查按调用者 XDG/HOME 规则发现 ANOLISA
-用户安装的 Skill，同时保留已有的系统及 Agent 目录发现。root 所有的 `managedSkillDirs` 支持精确路径、
-直接子目录（`/*`）和递归子树（`/**`），调用端发现和扫描登记均不能扩大授权范围。
-启动后在后台补扫获授权的普通 Skill，与 SkillFS 共用同一个 worker。
+人工决策、回滚及 SkillFS 激活由一个 root daemon 统一处理。所有本地用户均可管理已启用的默认目录、
+管理员配置范围或已认证 SkillFS 挂载内的 Skill，仅 root 可以更换签名密钥。
+daemon 启动后自动授权并在后台扫描系统默认目录及所有本地账户 HOME 下的标准 Skill 目录，
+这些位置无需用户配置。`enableDefaultSkillDirs: false` 可关闭默认范围；`managedSkillDirs` 继续支持
+额外绝对路径、直接子目录（`/*`）和递归子树（`/**`）。HOME 来自 `/etc/passwd`，不采信调用者环境变量。
+账户或配置修改后需重启 daemon；只读的已打包系统 Skill 保持明确跳过，不视为已经认证。
 
 V2 systemd 系统服务单元名为 `agent-sec-core.service`，可执行文件名为 `agent-sec-daemon`。
 使用 `sudo systemctl status agent-sec-core.service` 检查服务状态。

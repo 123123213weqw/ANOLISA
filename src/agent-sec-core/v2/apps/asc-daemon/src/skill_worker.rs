@@ -3,7 +3,7 @@
 use crate::skillfs::SkillFsError;
 use asc_action_runtime::ExecutionControl;
 use asc_action_types::{CallerIdentity, SkillIdentity, SkillSecCommand};
-use asc_capability_skill_sec::SkillSecError;
+use asc_capability_skill_sec::{SkillSecError, executor::SkillDiscovery};
 use asc_daemon_core::{ActionService, PeerCredentials};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, VecDeque};
@@ -26,7 +26,7 @@ impl SkillWorker {
     pub fn start(
         &self,
         application: Arc<ActionService>,
-        discover: impl FnOnce() -> Result<Vec<SkillIdentity>, SkillSecError> + Send + 'static,
+        discover: impl FnOnce() -> Result<SkillDiscovery, SkillSecError> + Send + 'static,
     ) -> Result<(), SkillFsError> {
         let mut worker = self
             .worker
@@ -74,6 +74,7 @@ pub(crate) struct Queue {
 struct State {
     pending: BTreeMap<SkillIdentity, Entry>,
     startup: VecDeque<(SkillIdentity, CallerIdentity)>,
+    prefer_notify: bool,
     stopping: bool,
     running: bool,
     processed: u64,
@@ -172,25 +173,34 @@ impl Queue {
         self.changed.notify_all();
     }
 
-    fn next(&self) -> Option<(SkillIdentity, CallerIdentity)> {
+    fn next(&self) -> Option<(SkillIdentity, CallerIdentity, bool)> {
         let mut state = self.state.lock().ok()?;
         loop {
             if state.stopping {
                 return None;
             }
-            if let Some(entry) = state.startup.pop_front() {
+            let due = state
+                .pending
+                .iter()
+                .filter(|(_, entry)| entry.due <= Instant::now())
+                .min_by_key(|(_, entry)| entry.due)
+                .map(|(identity, _)| identity.clone());
+            if (state.prefer_notify || state.startup.is_empty())
+                && let Some(identity) = due
+            {
+                let entry = state.pending.remove(&identity)?;
+                state.prefer_notify = false;
                 state.running = true;
-                return Some(entry);
+                return Some((identity, entry.peer, false));
             }
-            if let Some((identity, entry)) = state.pending.iter().min_by_key(|(_, e)| e.due) {
-                if let Some(wait) = entry.due.checked_duration_since(Instant::now()) {
-                    state = self.changed.wait_timeout(state, wait).ok()?.0;
-                } else {
-                    let identity = identity.clone();
-                    let entry = state.pending.remove(&identity)?;
-                    state.running = true;
-                    return Some((identity, entry.peer));
-                }
+            if let Some((identity, caller)) = state.startup.pop_front() {
+                state.prefer_notify = true;
+                state.running = true;
+                return Some((identity, caller, true));
+            }
+            if let Some(due) = state.pending.values().map(|entry| entry.due).min() {
+                let wait = due.saturating_duration_since(Instant::now());
+                state = self.changed.wait_timeout(state, wait).ok()?.0;
             } else {
                 state = self.changed.wait(state).ok()?;
             }
@@ -212,14 +222,18 @@ impl Queue {
 pub(super) fn start(
     queue: Arc<Queue>,
     application: Arc<ActionService>,
-    discover: impl FnOnce() -> Result<Vec<SkillIdentity>, SkillSecError> + Send + 'static,
+    discover: impl FnOnce() -> Result<SkillDiscovery, SkillSecError> + Send + 'static,
 ) -> Result<JoinHandle<()>, SkillFsError> {
     Ok(thread::Builder::new()
         .name("skillsec-worker".into())
         .spawn(move || {
             let _lifetime = WorkerLifetime(queue.clone());
-            if let Ok(identities) = discover() {
-                if queue.schedule_startup(identities).is_err() {
+            if let Ok(discovery) = discover() {
+                for error in &discovery.errors {
+                    tracing::warn!(root = %error.root.path().display(), error = %error.error,
+                        "SkillSec startup discovery incomplete");
+                }
+                if queue.schedule_startup(discovery.skills).is_err() {
                     return;
                 }
             } else {
@@ -228,19 +242,26 @@ pub(super) fn start(
                     state.last_error = Some("startup discovery failed".into());
                 }
             }
-            while let Some((identity, caller)) = queue.next() {
-                crate::skill_task_scope("notify", || {
+            while let Some((identity, caller, startup)) = queue.next() {
+                crate::skill_task_scope(if startup { "startup_scan" } else { "notify" }, || {
                     let peer = PeerCredentials::new(caller.uid, caller.gid, caller.pid);
                     let mut errors = Vec::new();
                     // Activation must still run when scanning fails or returns a no-op.
-                    for command in [
+                    let scan = if startup {
+                        SkillSecCommand::StartupScan {
+                            skill_dir: identity.clone(),
+                        }
+                    } else {
                         SkillSecCommand::Scan {
                             skill_dir: Some(identity.clone()),
                             all: false,
                             skill_dirs: Vec::new(),
                             scanners: None,
                             force: false,
-                        },
+                        }
+                    };
+                    'commands: for command in [
+                        scan,
                         SkillSecCommand::Activate {
                             skill_dir: identity.clone(),
                         },
@@ -263,6 +284,15 @@ pub(super) fn start(
                             {
                                 thread::sleep(Duration::from_millis(100));
                                 continue;
+                            }
+                            if matches!(command, SkillSecCommand::StartupScan { .. })
+                                && outcome.success
+                                && outcome.data["output"]["results"][0]["status"] == "skipped"
+                                && outcome.data["output"]["results"][0]["reasonCode"]
+                                    == "readonly_system_skill"
+                                && outcome.data["output"]["results"][0]["persisted"] == false
+                            {
+                                break 'commands;
                             }
                             if !outcome.success
                                 || outcome.data["output"]["activationPending"] == true
@@ -340,6 +370,120 @@ mod tests {
     }
 
     #[test]
+    fn startup_and_due_notifications_alternate_without_waiting_for_debounce() {
+        let queue = Queue::default();
+        let first = SkillIdentity::new("/fixture/first").unwrap();
+        let second = SkillIdentity::new("/fixture/second").unwrap();
+        let notify = SkillIdentity::new("/fixture/notify").unwrap();
+        queue
+            .schedule_startup(vec![first.clone(), second.clone()])
+            .unwrap();
+        queue
+            .enqueue(
+                notify.clone(),
+                CallerIdentity {
+                    uid: 1001,
+                    gid: 1001,
+                    pid: 42,
+                },
+            )
+            .unwrap();
+        // An unready notification must not delay startup work.
+        let item = queue.next().unwrap();
+        assert_eq!(item.0, first);
+        assert!(item.2);
+        queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .get_mut(&notify)
+            .unwrap()
+            .due = Instant::now();
+        let item = queue.next().unwrap();
+        assert_eq!(item.0, notify);
+        assert!(!item.2);
+        queue
+            .enqueue(
+                notify.clone(),
+                CallerIdentity {
+                    uid: 1001,
+                    gid: 1001,
+                    pid: 42,
+                },
+            )
+            .unwrap();
+        queue
+            .state
+            .lock()
+            .unwrap()
+            .pending
+            .get_mut(&notify)
+            .unwrap()
+            .due = Instant::now();
+        let item = queue.next().unwrap();
+        assert_eq!(item.0, second);
+        assert!(item.2);
+        assert_eq!(queue.next().unwrap().0, notify);
+        queue.stop();
+    }
+
+    #[test]
+    fn skipped_startup_scan_is_audited_without_activation_or_pass_verdict() {
+        struct Skipped;
+        impl CapabilityExecutor for Skipped {
+            type Request = SkillSecRequest;
+            fn execute(&self, _: &ExecutionControl, request: &SkillSecRequest) -> ActionOutcome {
+                assert!(matches!(
+                    request.command,
+                    SkillSecCommand::StartupScan { .. }
+                ));
+                ActionOutcome {
+                    success: true,
+                    exit_code: 0,
+                    error: None,
+                    error_type: String::new(),
+                    data: serde_json::Map::from_iter([(
+                        "output".into(),
+                        json!({"results":[{"status":"skipped","reasonCode":"readonly_system_skill","persisted":false}]}),
+                    )]),
+                }
+            }
+        }
+        #[derive(Default)]
+        struct Events(Mutex<Vec<SecurityEvent>>);
+        impl SecurityEventSink for Events {
+            fn write(&self, event: &SecurityEvent) {
+                self.0.lock().unwrap().push(event.clone());
+            }
+        }
+        let events = Arc::new(Events::default());
+        let queue = Arc::new(Queue::default());
+        let worker = start(queue.clone(), application(Skipped, events.clone()), || {
+            Ok(SkillDiscovery {
+                skills: vec![SkillIdentity::new("/usr/share/anolisa/skills/fixture").unwrap()],
+                errors: Vec::new(),
+            })
+        })
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while queue.status()["processed"] != 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        queue.stop();
+        worker.join().unwrap();
+        assert_eq!(queue.status()["processed"], 1);
+        assert_eq!(queue.status()["failed"], 0);
+        let events = events.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            !serde_json::to_string(&*events)
+                .unwrap()
+                .contains("\"verdict\":\"pass\"")
+        );
+    }
+
+    #[test]
     fn failed_scan_still_activates_and_worker_continues_with_audited_busy_retries() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -398,7 +542,13 @@ mod tests {
         )
         .unwrap();
         let _parent = context.attach();
-        let worker = start(queue.clone(), application, move || Ok(startup)).unwrap();
+        let worker = start(queue.clone(), application, move || {
+            Ok(SkillDiscovery {
+                skills: startup,
+                errors: Vec::new(),
+            })
+        })
+        .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while queue.status()["processed"] != 2 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
@@ -504,7 +654,14 @@ mod tests {
             .iter()
             .map(|(id, _)| id.clone())
             .collect();
-        owner.start(application, move || Ok(startup)).unwrap();
+        owner
+            .start(application, move || {
+                Ok(SkillDiscovery {
+                    skills: startup,
+                    errors: Vec::new(),
+                })
+            })
+            .unwrap();
         let entered = entered.recv_timeout(Duration::from_secs(5));
         queue.stop();
         release.send(()).unwrap();

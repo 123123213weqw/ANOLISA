@@ -143,6 +143,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
                     managed_skill_dirs: Vec::new(),
                 },
@@ -198,6 +199,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },
@@ -251,6 +253,7 @@ mod tests {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: directory.path().canonicalize().unwrap(),
                     managed_skill_dirs: Vec::new(),
                 },

@@ -26,6 +26,7 @@ pub(crate) fn uninitialized_fixture() -> (tempfile::TempDir, Arc<SkillSecService
     let service = Arc::new(
         SkillSecService::new(
             SkillSecConfig {
+                default_skill_dirs: Vec::new(),
                 state_dir: state,
                 managed_skill_dirs: vec![crate::ManagedSkillDir::new(base.join("*")).unwrap()],
             },

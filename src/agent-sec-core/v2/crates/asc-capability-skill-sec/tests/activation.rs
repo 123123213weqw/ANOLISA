@@ -31,6 +31,7 @@ impl Fixture {
         let service = Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
                     managed_skill_dirs: vec![],
                 },

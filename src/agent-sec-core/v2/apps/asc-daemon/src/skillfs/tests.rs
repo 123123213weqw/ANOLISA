@@ -3,7 +3,9 @@
 use super::*;
 use asc_action_runtime::{Finalizer, SecurityEventSink, testing::audit_finalizer};
 use asc_capability_skill_sec::{
-    SkillSecConfig, SkillSecService, executor::SkillSecExecutor, scanner::ScannerRegistry,
+    SkillSecConfig, SkillSecService,
+    executor::{SkillDiscovery, SkillSecExecutor},
+    scanner::ScannerRegistry,
 };
 use asc_daemon_core::RootManagedPrincipalPolicy;
 use asc_daemon_service::{BoundUnixSocket, ServiceConfig, ShutdownToken, UnixService};
@@ -42,7 +44,7 @@ fn start_bridge(
         Arc::new(asc_capability_pii_scan::PiiRuleSet::builtin().unwrap()),
         executor,
     );
-    worker.start(application, || Ok(Vec::new()))?;
+    worker.start(application, || Ok(SkillDiscovery::default()))?;
     Ok((bridge, worker))
 }
 
@@ -143,6 +145,7 @@ impl Fixture {
         Arc::new(
             SkillSecService::new(
                 SkillSecConfig {
+                    default_skill_dirs: Vec::new(),
                     state_dir: state,
                     managed_skill_dirs: Vec::new(),
                 },
@@ -501,7 +504,7 @@ async fn public_socket_authenticates_notify_and_keeps_v2_requests_separate() {
         executor,
     );
     worker
-        .start(application.clone(), || Ok(Vec::new()))
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
         .unwrap();
     let dispatcher = Arc::new(SkillFsDispatcher::new(
         ordinary_dispatcher(application),
@@ -786,7 +789,7 @@ async fn an_acceptance_whose_echo_exceeds_the_session_frame_is_delivered_degrade
         executor,
     );
     worker
-        .start(application.clone(), || Ok(Vec::new()))
+        .start(application.clone(), || Ok(SkillDiscovery::default()))
         .unwrap();
     let dispatcher = Arc::new(SkillFsDispatcher::new(
         ordinary_dispatcher(application),
