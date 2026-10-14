@@ -3183,6 +3183,11 @@ fn host_needs_ip_forward_in(info: &SystemInfo, net_dir: &std::path::Path) -> boo
                 // so this bridge is the only sign that its containers route
                 // out through the host.
                 || n.starts_with("podman")
+                // lxc-net creates `lxcbr0` for LXC containers (the
+                // `LXC_BRIDGE` default). A host whose containers are all
+                // stopped runs no `lxc-*` process, the same shape as the
+                // stopped Proxmox guests behind `vmbr0` below.
+                || n.starts_with("lxcbr")
                 || n.starts_with("vmbr")
                 || n == "br0"
                 || n == "br1"
@@ -13354,6 +13359,18 @@ mod tests {
         assert!(
             host_needs_ip_forward_in(&info, &podman.0),
             "the Podman default bridge is a forwarding sign"
+        );
+    }
+
+    #[test]
+    fn host_needs_ip_forward_counts_the_lxc_bridge() {
+        // lxc-net's default bridge is `lxcbr0`, and with every container
+        // stopped no `lxc-*` process is left to name the host's role.
+        let info = make_test_info();
+        let lxc = NetDir::new(&["lo/", "eno1/", "lxcbr0/"]);
+        assert!(
+            host_needs_ip_forward_in(&info, &lxc.0),
+            "the LXC default bridge is a forwarding sign"
         );
     }
 
