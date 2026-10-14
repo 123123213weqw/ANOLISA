@@ -503,7 +503,9 @@ _cosh_guard_slash_submission() {
     fi
   fi
   local first_word="${classification_input%%[[:space:]]*}"
-  if ! _cosh_assistance_enabled || ! _cosh_is_slash_control_candidate "$first_word"; then
+  if ! _cosh_is_slash_control_candidate "$first_word" ||
+     { ! _cosh_assistance_enabled &&
+       [[ ! "$classification_input" =~ ^/mode[[:space:]]+routing($|[[:space:]]) ]]; }; then
     (( restore_xtrace == 1 )) && set -x
     return 0
   fi
