@@ -2878,18 +2878,55 @@ fn eval_rp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_i64(path);
-    if current == 0 {
-        recs.push(Recommendation {
-            param: "net.ipv4.conf.default.rp_filter".to_string(),
-            current_value: "0".to_string(),
-            recommended_value: "1".to_string(),
-            reason: "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由、部分 VPN 场景需保持 0）".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Security, writable: true,
-        });
+    if let Some(rec) = rp_filter_recommendation(
+        "net.ipv4.conf.default.rp_filter",
+        read_sysctl_i64(path),
+        host_needs_ip_forward(info),
+        "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
+    ) {
+        recs.push(rec);
     }
     1
+}
+
+/// The reason an `rp_filter` rule gives on a host that forwards for others.
+const RP_FILTER_LOOSE_REASON: &str = "本机为容器/虚拟化/VPN/路由主机，转发路径可能非对称，严格模式会丢弃合法流量；按内核文档对非对称或复杂路由的建议启用宽松模式（RFC 3704 Loose），仍可拦截无路由可达的伪造源 IP";
+
+/// Value-driven core of the two `rp_filter` rules: what to recommend for a
+/// disabled (0) validation, and nothing for an armed one.
+///
+/// Strict mode (1) drops a packet whose source is not reachable back through
+/// the interface it arrived on, which is exactly what asymmetric routing
+/// produces; Documentation/networking/ip-sysctl.rst (v6.6 and 7.3-rc6) says
+/// "If using asymmetric routing or other complicated routing, then loose mode
+/// is recommended" — 2, "Loose mode as defined in RFC3704". A host that
+/// forwards for others ([`host_needs_ip_forward`]: a router, a VPN gateway, a
+/// container or VM host) is the host whose paths can be asymmetric, so it is
+/// advised loose mode, which still drops a source with no route at all;
+/// strict mode stays the advice everywhere else.
+fn rp_filter_recommendation(
+    param: &str,
+    current: i64,
+    host_forwards: bool,
+    strict_reason: &str,
+) -> Option<Recommendation> {
+    if current != 0 {
+        return None;
+    }
+    let (recommended, reason) = if host_forwards {
+        ("2", RP_FILTER_LOOSE_REASON)
+    } else {
+        ("1", strict_reason)
+    };
+    Some(Recommendation {
+        param: param.to_string(),
+        current_value: "0".to_string(),
+        recommended_value: recommended.to_string(),
+        reason: reason.to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Security,
+        writable: true,
+    })
 }
 
 fn eval_panic(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -19134,6 +19171,52 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rp_filter_advises_loose_mode_on_a_forwarding_host() {
+        // ip-sysctl.rst: "If using asymmetric routing or other complicated
+        // routing, then loose mode is recommended." A forwarding host is the
+        // one whose paths can be asymmetric, so it gets 2; any other host
+        // keeps strict mode, and an armed validation is left alone.
+        let path = std::env::temp_dir().join(format!(
+            "ktuner_rp_filter_mode_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, "0").unwrap();
+        let mut forwarding = make_test_info();
+        forwarding.processes = vec![crate::detect::ProcessInfo {
+            name: "docker".to_string(),
+        }];
+        assert!(host_needs_ip_forward(&forwarding));
+        for (param, run) in rp_filter_rules() {
+            let mut recs = Vec::new();
+            run(&forwarding, &mut recs, path.to_str().unwrap());
+            let rec = recs.iter().find(|r| r.param == param).unwrap();
+            assert_eq!(
+                rec.recommended_value, "2",
+                "{param}: a forwarding host gets loose mode"
+            );
+            assert_eq!(rec.reason, RP_FILTER_LOOSE_REASON, "{param}");
+        }
+        let _ = std::fs::remove_file(&path);
+
+        let strict = rp_filter_recommendation("p", 0, false, "strict").unwrap();
+        assert_eq!(strict.recommended_value, "1");
+        assert_eq!(strict.reason, "strict");
+        for armed in [1, 2, -1] {
+            assert!(rp_filter_recommendation("p", armed, true, "strict").is_none());
+            assert!(rp_filter_recommendation("p", armed, false, "strict").is_none());
+        }
+    }
+
+    /// An `eval_*_at` rule: the system, the recommendation sink, the path.
+    type EvalAt = fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize;
+
+    /// The `rp_filter` rules routed through [`rp_filter_recommendation`].
+    fn rp_filter_rules() -> Vec<(&'static str, EvalAt)> {
+        vec![("net.ipv4.conf.default.rp_filter", eval_rp_filter_at)]
     }
 
     #[test]
