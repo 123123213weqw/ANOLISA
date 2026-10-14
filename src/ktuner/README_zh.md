@@ -249,6 +249,14 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 `rollback` 会恢复它们；原本就是 0 的孪生、或因值未变化而未被清零的孪生不会列出。
 没有清零任何孪生时不出现该键。
 
+真实运行也会点名它写了什么：`written` 每次写入一条，形如
+`{param, previous, applied}`——`previous` 是账本记录的原值（`rollback` 恢复的就是
+它），`applied` 是内核实际生效的值（内核调整过请求时就是调整后的值）。这正是单参数
+`fix` 报告的那一对，批量运行因此不必再用 root 读一次账本，就能说出改了哪些参数、
+原来是多少。该键恒出现，与 `failed` 一致：没有写入任何参数时返回空列表。原值读不到的
+只写参数报告 `previous: null`，与 `fix` 的答案相同。清零孪生的写入仍算一条：孪生由
+`cleared` 点名，列表长度即 `applied`。
+
 当本环境过滤掉了部分建议（不可写，或运行时危险）时，真实 `tune` 会在
 `would_skip` 中列出这些项及原因，形状与 dry-run 预览一致，便于与 `check`
 对账——部分成功后 `check` 仍会对这些参数报 exit 1：

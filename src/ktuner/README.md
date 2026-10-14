@@ -273,6 +273,17 @@ ledger recorded, so `rollback` restores them; a twin that already read 0, or
 one a write left alone because the value did not change, is not named. The key
 is absent when nothing was cleared.
 
+A real run also names what it wrote: `written` lists one entry per write, each
+`{param, previous, applied}`, where `previous` is the original the ledger
+recorded — the value `rollback` restores — and `applied` is the value the
+kernel took, the clamped one when the kernel adjusted the request. It is the
+pair a single `fix` reports, so a batch no longer needs a second root read of
+the ledger to say which parameters changed and from what. The key is always
+present, the way `failed` is: a run that wrote nothing answers an empty list.
+A write-only tunable, whose original cannot be read, reports `previous: null` —
+the same answer `fix` gives. A write that zeroed a twin is still one entry: the
+twin is named by `cleared`, and the list's length is `applied`.
+
 When this environment filters recommendations out (unwritable, or
 runtime-dangerous), a real `tune` names them in `would_skip` with the same
 shape as the dry-run preview, so the output reconciles with `check` — which

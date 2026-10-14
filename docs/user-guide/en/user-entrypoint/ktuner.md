@@ -100,6 +100,13 @@ A real `tune` or `fix` names the mutually exclusive twins its writes zeroed in
 `cleared`, in the shape of `would_clear`: exactly the twins the ledger recorded
 for `rollback` to restore. The key is absent when nothing was cleared.
 
+A real `tune` also names what it wrote: `written` lists one entry per write
+with the parameter, `previous` (the original the ledger recorded, which
+`rollback` restores) and `applied` (the value the kernel took), the pair a
+single `fix` already reports. The key is always present; a run that wrote
+nothing answers an empty list, and a write-only tunable reports a null
+`previous` because its write cannot be recorded.
+
 All output is JSON on stdout; errors are JSON on stderr. Exit codes: `0` success,
 `1` check found recommendations or rollback left values unrestored, `2` command error.
 Rollback returns `1` for failed writes or missing paths, including partial restoration;
