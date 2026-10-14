@@ -45,6 +45,9 @@ The core binaries require no Python Ledger runtime. `install-core-v2` installs b
 `/etc/agent-sec/skillsec.json`. Reinstallation preserves an existing configuration; RPM uses
 `%config(noreplace)`. Installation does not initialize a signing key or enable Agent Hooks.
 
+The V2 systemd unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable/process name.
+V1 used the same unit name as a user service; V2 runs it as a system service.
+
 On a host with a running systemd manager, RPM enables and starts the root system service during
 initial installation and V1-to-V2 upgrades. Review its configuration before installing, then verify
 that the daemon is available:
@@ -62,8 +65,10 @@ sudo systemctl enable --now agent-sec-core.service
 ```
 
 Use system `systemctl`, without `--user`. The unit creates runtime/state/log directories, keeps
-the key and logs private, and grants only `CAP_DAC_OVERRIDE`, `CAP_CHOWN` and `CAP_FOWNER` to the
-daemon. It retains `NoNewPrivileges`, `SystemCallFilter=@system-service`, native syscall
+the key and logs private, and grants `CAP_DAC_OVERRIDE`, `CAP_CHOWN`, `CAP_FOWNER` and
+`CAP_SYS_PTRACE` to the daemon. The first three support SkillSec directory access and recovery;
+`CAP_SYS_PTRACE` supports process discovery reads of protected procfs executable and namespace links.
+It retains `NoNewPrivileges`, `SystemCallFilter=@system-service`, native syscall
 architecture, `MemoryDenyWriteExecute` and kernel protections, while keeping HOME, `/tmp`, system Skill
 directories and shared mounts accessible for scanning, metadata publication and rollback. It does
 not grant `CAP_SYS_ADMIN` to the daemon. Custom SkillFS mounts must be visible to the service. In-place SkillFS backing setup requires kernel support for `open_tree` and `move_mount`,

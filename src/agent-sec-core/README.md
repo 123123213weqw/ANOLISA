@@ -55,6 +55,10 @@ caller's XDG/HOME layout, alongside existing system and Agent locations.
 Root-owned `managedSkillDirs` accepts exact paths, direct children (`/*`) and recursive trees (`/**`).
 Caller discovery and successful registration cannot expand that boundary.
 Startup scans authorized ordinary Skills in the background, using the same worker as SkillFS.
+
+The V2 systemd system unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable name.
+Check the service with `sudo systemctl status agent-sec-core.service`.
+
 See the [V2 core guide](../../docs/user-guide/en/agent-security/agent-sec-core/skillsec-v2.md)
 for configuration, commands and the separate deployment/Agent Hook acceptance boundaries.
 V1 history and per-user keys are not imported. Hook adapters use daemon-owned initialization and
@@ -360,7 +364,8 @@ agent-sec-cli --socket /run/agent-sec-core/daemon.sock \
   scan-code --code 'import os; os.system("rm -rf /")' --language python
 
 # Local-model engine: set AGENT_SEC_OLLAMA_MODEL in the daemon service
-# environment and restart agent-sec-daemon before invoking the CLI.
+# environment, then restart the service before invoking the CLI.
+sudo systemctl restart agent-sec-core.service
 agent-sec-cli scan-code --mode llm --code 'rm -rf /'
 ```
 

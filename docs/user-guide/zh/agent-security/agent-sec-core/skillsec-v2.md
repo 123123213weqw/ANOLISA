@@ -41,6 +41,9 @@ sudo make -C src/agent-sec-core install-core-v2
 系统 unit 安装到 `/usr/lib/systemd/system`，初始配置以 0600 安装到 `/etc/agent-sec/skillsec.json`。
 重装保留已有配置；RPM 使用 `%config(noreplace)`。安装过程不会初始化签名密钥或启用 Agent Hook。
 
+V2 systemd 服务单元名为 `agent-sec-core.service`，可执行文件／进程名为 `agent-sec-daemon`。
+V1 使用同名单元作为用户服务，V2 将其作为系统服务运行。
+
 在运行 systemd manager 的主机上，RPM 会在首次安装和 V1 升级到 V2 时启用并启动 root
 系统服务。安装前先检查配置，随后验证 daemon 是否可用：
 
@@ -56,7 +59,8 @@ sudo systemctl enable --now agent-sec-core.service
 ```
 
 使用系统级 `systemctl`，不带 `--user`。unit 创建运行、状态和日志目录，保持密钥和日志私有，
-只向 daemon 授予 `CAP_DAC_OVERRIDE`、`CAP_CHOWN` 和 `CAP_FOWNER`。
+向 daemon 授予 `CAP_DAC_OVERRIDE`、`CAP_CHOWN`、`CAP_FOWNER` 和 `CAP_SYS_PTRACE`。
+前三项支持 SkillSec 目录访问与恢复；`CAP_SYS_PTRACE` 支持进程发现读取受保护的 procfs 可执行文件和 namespace 链接。
 保留 `NoNewPrivileges`、`SystemCallFilter=@system-service`、native syscall 架构、
 `MemoryDenyWriteExecute` 和内核保护，同时保留 HOME、`/tmp`、系统 Skill 目录及共享挂载的访问能力，
 以完成扫描、元数据发布和回滚。daemon 不具有 `CAP_SYS_ADMIN`。自定义 SkillFS 挂载须对服务可见。

@@ -50,6 +50,10 @@ Rust V2 核心通过现有 `skill-ledger` 命令提供 **SkillSec**：本地扫�
 用户安装的 Skill，同时保留已有的系统及 Agent 目录发现。root 所有的 `managedSkillDirs` 支持精确路径、
 直接子目录（`/*`）和递归子树（`/**`），调用端发现和扫描登记均不能扩大授权范围。
 启动后在后台补扫获授权的普通 Skill，与 SkillFS 共用同一个 worker。
+
+V2 systemd 系统服务单元名为 `agent-sec-core.service`，可执行文件名为 `agent-sec-daemon`。
+使用 `sudo systemctl status agent-sec-core.service` 检查服务状态。
+
 配置、命令以及单独的部署和 Agent Hook 验收边界见
 [V2 核心指南](../../docs/user-guide/zh/agent-security/agent-sec-core/skillsec-v2.md)。
 不导入 V1 历史及用户密钥。Hook 适配器通过 daemon 初始化，校验 `check`／`show` 结果，
@@ -338,7 +342,8 @@ agent-sec-cli --socket /run/agent-sec-core/daemon.sock \
   scan-code --code 'import os; os.system("rm -rf /")' --language python
 
 # 本地模型引擎：在 daemon service 环境中设置 AGENT_SEC_OLLAMA_MODEL，
-# 重启 agent-sec-daemon 后再调用 CLI。
+# 重启系统服务后再调用 CLI。
+sudo systemctl restart agent-sec-core.service
 agent-sec-cli scan-code --mode llm --code 'rm -rf /'
 ```
 
