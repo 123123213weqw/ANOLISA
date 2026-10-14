@@ -3122,6 +3122,11 @@ const FORWARDING_DAEMONS: &[&str] = &[
     "ocserv",
     "accel-pppd",
     "vpnserver",
+    // Mesh VPN daemons of the `tailscaled`/`zerotier-one` class whose
+    // interfaces the scan does not name: Nebula (`nebula1` by default) and
+    // NetBird (`wt0`), both of which route subnets for their peers.
+    "nebula",
+    "netbird",
 ];
 
 /// Whether one of the daemons that forward traffic for others is running.
@@ -13309,6 +13314,10 @@ mod tests {
             "ocserv",
             "accel-pppd",
             "vpnserver",
+            // Mesh VPN daemons of the tailscaled/zerotier-one class whose
+            // interfaces (nebula1, wt0) the scan does not name.
+            "nebula",
+            "netbird",
         ] {
             let mut info = make_test_info();
             info.processes = vec![crate::detect::ProcessInfo {
