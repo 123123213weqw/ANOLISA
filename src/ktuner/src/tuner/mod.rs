@@ -1486,6 +1486,24 @@ fn validate_import_value(param: &str, value: &str) -> Result<()> {
 /// Unreadable write-only parameters can still be applied when `current` is
 /// absent, without inventing a rollback value or persistence entry.
 pub fn apply_import(param: &str, value: &str, current: Option<&str>) -> Result<()> {
+    apply_import_reporting_boot_unit(param, value, current).map(|_| ())
+}
+
+/// [`apply_import`] with the boot-replay verdict kept: `false` when the write
+/// recorded a non-sysctl entry and `systemctl enable ktuner-nonsysctl.service`
+/// did not succeed, with [`ApplyOutcome::boot_unit_enabled`]'s meaning — the
+/// value is live now but will not be replayed after a reboot. `tune`, `fix`
+/// and `rollback` report that fact to their callers; a library caller of the
+/// import path was told success instead, with no way to learn that the
+/// block-device or THP value it just imported is not coming back. `true` when
+/// the unit is enabled, and when this write had nothing outside `/proc/sys` to
+/// persist. The write, its ledger record and its persistence are exactly
+/// [`apply_import`]'s.
+pub fn apply_import_reporting_boot_unit(
+    param: &str,
+    value: &str,
+    current: Option<&str>,
+) -> Result<bool> {
     // Structural name guard before anything else: the rollback ledger records
     // the key verbatim and persistence re-emits it, so a degenerate spelling
     // must never be applied — rejecting here keeps it out of the ledger.
@@ -1517,6 +1535,7 @@ pub fn apply_import(param: &str, value: &str, current: Option<&str>) -> Result<(
     let sibling = cleared_sibling_entry(param);
     let outcome = write_and_verify(param, value)?;
     let sibling = sibling.filter(|twin| twin.cleared_by(previous.as_deref(), &outcome));
+    let mut boot_unit_enabled = true;
     if let Some(previous) = previous {
         // No category for a write that moved the value: it came from an
         // imported file, not from a rule recommendation, and a later
@@ -1531,9 +1550,13 @@ pub fn apply_import(param: &str, value: &str, current: Option<&str>) -> Result<(
             std::iter::once((param.to_string(), previous, outcome.effective, category))
                 .chain(sibling.map(|twin| (twin.entry.0, twin.entry.1, twin.entry.2, None))),
         )?;
-        persist_from_rollback(&guard)?;
+        // Persistence renders the record just written, so its verdict is this
+        // write's verdict. A refused `systemctl enable` leaves the value live
+        // and the record in place — `rollback` still undoes it — but the boot
+        // replay is not armed, and the caller is the only one who can say so.
+        boot_unit_enabled = persist_from_rollback(&guard)?;
     }
-    Ok(())
+    Ok(boot_unit_enabled)
 }
 
 const NONSYSCTL_SCRIPT_PATH: &str = "/etc/ktuner/apply-nonsysctl.sh";
