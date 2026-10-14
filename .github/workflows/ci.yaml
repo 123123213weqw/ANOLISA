@@ -1366,25 +1366,27 @@ jobs:
   # =========================================================================
   # Step 11: Test cosh-ng (Rust workspace)
   # =========================================================================
-  # Split into three parallel jobs so the critical path stays within the
-  # five-minute budget: integration (the longest gate, keeps the historical
-  # "Test cosh-ng" check name), fast checks (fmt/clippy/audits/fast gate,
-  # which repeats the audits run-test-gates.sh already performs), and the
-  # release build (no dependency on the test gates).
-  test-cosh-ng:
-    name: Test cosh-ng
+  # Integration uses three complete target shards and the historical
+  # "Test cosh-ng" aggregate check. Fast checks and release build remain
+  # separate jobs.
+  test-cosh-ng-integration:
+    name: Test cosh-ng integration (${{ matrix.gate }})
     needs: detect-changes
     if: needs.detect-changes.outputs.cosh_ng == 'true'
     runs-on: anolisa-k8s-general-ci-x64
     environment: ${{ needs.detect-changes.outputs.cache_environment }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        gate: [integration-process, integration-raw-cli, integration-shell-host]
     env:
       # This override takes precedence over the workspace's `stable` channel.
-      RUSTUP_TOOLCHAIN: '1.88.0'
+      RUSTUP_TOOLCHAIN: '1.97.1'
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.97.1
 
       - name: Configure trusted compiler cache writes
         if: needs.detect-changes.outputs.cache_environment == 'ci-sccache-writer'
@@ -1416,7 +1418,19 @@ jobs:
           zsh --version
           locale
           test "$(locale charmap)" = UTF-8
-          scripts/run-test-gates.sh integration
+          scripts/run-test-gates.sh "${{ matrix.gate }}"
+
+  test-cosh-ng:
+    name: Test cosh-ng
+    needs: [detect-changes, test-cosh-ng-integration]
+    if: ${{ always() && needs.detect-changes.outputs.cosh_ng == 'true' }}
+    runs-on: anolisa-k8s-general-ci-x64
+    timeout-minutes: 15
+    steps:
+      - name: Require every integration shard
+        env:
+          INTEGRATION_RESULT: ${{ needs.test-cosh-ng-integration.result }}
+        run: test "$INTEGRATION_RESULT" = success
 
   test-cosh-ng-fast:
     name: Test cosh-ng fast checks
