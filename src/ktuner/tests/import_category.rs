@@ -71,7 +71,7 @@ fn body() {
         "a rule-tuned knob is not unclassified: {:?}",
         category.unclassified
     );
-    assert_eq!(category.outcome.restored, 1);
+    assert_eq!(category.outcome.restored(), 1);
     assert_eq!(
         fs::read_to_string(LIVE).unwrap(),
         "60",

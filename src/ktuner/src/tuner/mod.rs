@@ -2276,7 +2276,7 @@ fn restore_units_with(
     systemctl: &str,
 ) -> Result<RollbackOutcome> {
     let mut outcome = RollbackOutcome {
-        restored: 0,
+        restored_params: Vec::new(),
         failures: Vec::new(),
         missing: Vec::new(),
         leftovers: Vec::new(),
@@ -2302,7 +2302,7 @@ fn restore_units_with(
             }
             retired = true;
         }
-        outcome.restored += unit_outcome.restored;
+        outcome.restored_params.extend(unit_outcome.restored_params);
         outcome.failures.extend(unit_outcome.failures);
         outcome.missing.extend(unit_outcome.missing);
         outcome.leftovers.extend(unit_outcome.leftovers);
@@ -2728,17 +2728,24 @@ fn paired_ledger_key(entries: &BTreeMap<String, RollbackEntry>, param: &str) -> 
         .cloned()
 }
 
-/// Outcome of a rollback attempt: how many params were restored, and which
-/// ones the attempt left behind.
+/// Outcome of a rollback attempt: which params were restored, and which ones
+/// the attempt left behind.
 ///
 /// The entries are carried, not just counted: a run that exits 1 has to be
 /// able to name what it did not restore, the way `tune` names the parameters
-/// it failed to write. `failed`/`skipped` are therefore the lengths of the
-/// lists below, and cannot drift from the names a caller reports.
+/// it failed to write — and a run that exits 0 has to be able to name what it
+/// did restore, because the selection is expanded inside the engine (a
+/// mutually exclusive twin comes along with the entry that names it), so the
+/// caller never sees the set it actually retired. `restored`, `failed` and
+/// `skipped` are therefore the lengths of the lists below, and cannot drift
+/// from the names a caller reports.
 pub struct RollbackOutcome {
-    /// How many ledger entries landed: the writes whose read-back still held
-    /// the recorded original after every write in the batch ran.
-    pub restored: usize,
+    /// The ledger keys that landed: the accepted writes, then the refused
+    /// writes whose recorded original turned out to be live because their
+    /// twin's restore landed. Both are ledger keys — the spelling
+    /// `rollback --list` publishes — so a restored twin is named here by its
+    /// own key, not by the parameter whose restore brought it back.
+    pub restored_params: Vec<String>,
     /// The entries whose restore did not land, with the reason.
     pub failures: Vec<ApplyFailure>,
     /// The ledger keys whose recorded path does not exist, so there was
@@ -2759,6 +2766,12 @@ pub struct RollbackOutcome {
 }
 
 impl RollbackOutcome {
+    /// How many ledger entries landed: the length of [`Self::restored_params`],
+    /// so the count cannot drift from the names a caller reports.
+    pub fn restored(&self) -> usize {
+        self.restored_params.len()
+    }
+
     /// How many units of the attempt did not land: the failed parameters plus
     /// whatever the cleanup left behind.
     pub fn failed(&self) -> usize {
@@ -2792,7 +2805,7 @@ pub enum RollbackStatus {
 }
 
 pub fn classify_rollback(outcome: &RollbackOutcome) -> RollbackStatus {
-    if outcome.restored == 0 {
+    if outcome.restored() == 0 {
         RollbackStatus::Nothing
     } else if outcome.failed() == 0 && outcome.skipped() == 0 {
         RollbackStatus::Full
@@ -2978,7 +2991,11 @@ fn restore_entries_with(
     // reports Full (and deletes the ledger) while a recorded original is not
     // the live value. Write-only tunables (read fails) stay verified: their
     // read-back never held anything to diverge from.
-    let mut restored = verified.len();
+    // The entries that landed, in the order the batch landed them: the
+    // accepted writes, then the refused writes the twin's restore brought
+    // back. A write whose final read-back diverged is dropped from the list,
+    // so the names and the count are one value.
+    let mut restored_params: Vec<String> = verified.iter().map(|param| (*param).clone()).collect();
     for param in &verified {
         let entry = &data.entries[*param];
         if let ReadbackVerdict::Clamped { effective } =
@@ -2992,7 +3009,7 @@ fn restore_entries_with(
                     entry.previous
                 );
             }
-            restored -= 1;
+            restored_params.retain(|landed| landed != *param);
             failures.push(ApplyFailure {
                 param: (*param).clone(),
                 error: format!(
@@ -3029,7 +3046,7 @@ fn restore_entries_with(
                     entry.previous
                 );
             }
-            restored += 1;
+            restored_params.push(param.clone());
         } else {
             failures.push(ApplyFailure {
                 param: param.clone(),
@@ -3039,7 +3056,7 @@ fn restore_entries_with(
     }
 
     RollbackOutcome {
-        restored,
+        restored_params,
         failures,
         missing,
         leftovers: Vec::new(),
@@ -3148,7 +3165,7 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
     let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
     let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
     let RollbackOutcome {
-        restored,
+        restored_params,
         failures,
         missing,
         mut leftovers,
@@ -3193,10 +3210,10 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
             );
         }
         progress!();
-        progress!("  共恢复 {restored} 项配置。");
+        progress!("  共恢复 {} 项配置。", restored_params.len());
     }
     Ok(RollbackOutcome {
-        restored,
+        restored_params,
         failures,
         missing,
         leftovers,
@@ -3878,7 +3895,7 @@ mod tests {
             },
             true,
         );
-        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.restored(), 2);
         assert_eq!(fs::read_to_string(&bytes).unwrap(), "0");
         assert_eq!(
             fs::read_to_string(&ratio).unwrap(),
@@ -3906,6 +3923,12 @@ mod tests {
     }
 
     /// An outcome's missing list of length `n`, the path-absent entries.
+    /// An outcome's restored list of length `n`: the ledger keys a batch
+    /// landed, in the order it landed them.
+    fn test_restored(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("vm.ktuner_restored_{i}")).collect()
+    }
+
     fn test_missing(n: usize) -> Vec<String> {
         (0..n).map(|i| format!("vm.ktuner_missing_{i}")).collect()
     }
@@ -4586,7 +4609,7 @@ mod tests {
             )
             .unwrap();
 
-            assert_eq!(outcome.restored, 1);
+            assert_eq!(outcome.restored(), 1);
             assert!(outcome.is_complete());
             assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
             assert!(
@@ -5209,7 +5232,7 @@ mod tests {
     fn test_classify_rollback() {
         assert_eq!(
             classify_rollback(&RollbackOutcome {
-                restored: 3,
+                restored_params: test_restored(3),
                 failures: test_failures(0),
                 missing: test_missing(0),
                 leftovers: Vec::new(),
@@ -5219,7 +5242,7 @@ mod tests {
         );
         assert_eq!(
             classify_rollback(&RollbackOutcome {
-                restored: 2,
+                restored_params: test_restored(2),
                 failures: test_failures(1),
                 missing: test_missing(0),
                 leftovers: Vec::new(),
@@ -5232,7 +5255,7 @@ mod tests {
         // cosmetic contradiction the skipped field fixes.
         assert_eq!(
             classify_rollback(&RollbackOutcome {
-                restored: 2,
+                restored_params: test_restored(2),
                 failures: test_failures(0),
                 missing: test_missing(1),
                 leftovers: Vec::new(),
@@ -5242,7 +5265,7 @@ mod tests {
         );
         assert_eq!(
             classify_rollback(&RollbackOutcome {
-                restored: 0,
+                restored_params: test_restored(0),
                 failures: test_failures(2),
                 missing: test_missing(0),
                 leftovers: Vec::new(),
@@ -5254,7 +5277,7 @@ mod tests {
         // failures — this is the exact false-success the fix removes.
         assert_eq!(
             classify_rollback(&RollbackOutcome {
-                restored: 0,
+                restored_params: test_restored(0),
                 failures: test_failures(0),
                 missing: test_missing(0),
                 leftovers: Vec::new(),
@@ -5277,7 +5300,7 @@ mod tests {
         ] {
             assert_eq!(
                 RollbackOutcome {
-                    restored,
+                    restored_params: test_restored(restored),
                     failures: test_failures(failed),
                     missing: test_missing(skipped),
                     leftovers: Vec::new(),
@@ -5351,7 +5374,7 @@ mod tests {
         // incomplete restoration, like a failed or skipped restore, so the
         // ledger survives and `rollback` exits 1 rather than 0.
         let outcome = RollbackOutcome {
-            restored: 3,
+            restored_params: test_restored(3),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: cleanup_leftovers,
@@ -5504,7 +5527,7 @@ mod tests {
         // What the name means for the caller: the rollback is incomplete, so
         // `rollback` exits 1 instead of reporting a finished cleanup.
         let outcome = RollbackOutcome {
-            restored: 3,
+            restored_params: test_restored(3),
             failures: test_failures(0),
             missing: test_missing(0),
             leftovers: cleanup_leftovers,
@@ -6075,7 +6098,7 @@ mod tests {
         }
         let outcome = restore_entries(&data, true);
         assert_eq!(fs::read_to_string(&path).unwrap(), "10");
-        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.restored(), 1);
         assert_eq!(outcome.failed(), 0);
         assert_eq!(outcome.skipped(), 0);
     }
@@ -6106,7 +6129,7 @@ mod tests {
             "60",
             "rollback must restore the pristine pre-ktuner value, not the intermediate"
         );
-        assert_eq!(outcome.restored, 1, "one knob, one restore write");
+        assert_eq!(outcome.restored(), 1, "one knob, one restore write");
         assert_eq!(outcome.failed(), 0);
         assert_eq!(outcome.skipped(), 0);
     }
@@ -6214,7 +6237,7 @@ mod tests {
             "100",
             "the healed restore must change no outcome: the key-order double write leaves 100"
         );
-        assert_eq!(outcome.restored, 1, "one knob, one restore write");
+        assert_eq!(outcome.restored(), 1, "one knob, one restore write");
         assert_eq!(outcome.failed(), 0);
         assert_eq!(outcome.skipped(), 0);
     }
@@ -6273,7 +6296,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(allowed).unwrap(), "10");
         assert_eq!(fs::read_to_string(forbidden).unwrap(), "unchanged");
-        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.restored(), 1);
         assert_eq!(outcome.failed(), 2);
         assert_eq!(outcome.skipped(), 1);
     }
@@ -6311,7 +6334,7 @@ mod tests {
             "a deny-listed target must never receive a write: {attempted:?}"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 1, 0),
             "the entry must be counted as refused, not skipped or restored"
         );
@@ -6354,7 +6377,7 @@ mod tests {
         // The confirmed restore is restored; the unconfirmed one is a failure
         // so the ledger is kept for a retry.
         assert_eq!(fs::read_to_string(&restored).unwrap(), "10");
-        assert_eq!(outcome.restored, 1);
+        assert_eq!(outcome.restored(), 1);
         assert_eq!(outcome.failed(), 1);
         assert_eq!(outcome.skipped(), 0);
         assert!(!rollback_should_finalize(
@@ -6401,7 +6424,7 @@ mod tests {
             "original",
             "a restore must not write outside the kernel's own trees"
         );
-        assert_eq!(outcome.restored, 0);
+        assert_eq!(outcome.restored(), 0);
         assert_eq!(
             outcome.failed(),
             1,
@@ -6477,7 +6500,7 @@ mod tests {
             "20",
             "the ratio side of the pair is restored"
         );
-        assert_eq!(outcome.restored, 1, "only the ratio write holds");
+        assert_eq!(outcome.restored(), 1, "only the ratio write holds");
         assert_eq!(
             outcome.failed(),
             1,
@@ -6561,9 +6584,23 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&ratio).unwrap(), "20");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "both halves of the pair are restored"
+        );
+        // The refused write landed through the twin, so it is one of the
+        // restored entries and must be named like any other: a caller cannot
+        // learn from the count which key the pair's second write brought back.
+        // The order is the one the batch decided in: the accepted write first,
+        // then the refused write the deferred read proved live.
+        assert_eq!(
+            outcome
+                .restored_params
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["vm.dirty_ratio", "vm.dirty_bytes"],
+            "the refused write the twin restored is named too"
         );
         assert!(
             rollback_should_finalize(outcome.failed(), outcome.skipped()),
@@ -6606,7 +6643,7 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(&bytes).unwrap(), "268435456");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 1, 0),
             "a refusal nothing else repaired stays a failure"
         );
@@ -6683,7 +6720,7 @@ mod tests {
             "0",
             "the ratio the kernel disabled is left at its recorded original"
         );
-        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.restored(), 2);
         assert_eq!(outcome.failed(), 0);
         assert!(rollback_should_finalize(
             outcome.failed(),
@@ -6720,7 +6757,7 @@ mod tests {
             },
             true,
         );
-        assert_eq!(outcome.restored, 2);
+        assert_eq!(outcome.restored(), 2);
         assert_eq!(outcome.failed(), 0);
         assert_eq!(outcome.skipped(), 0);
         assert!(rollback_should_finalize(
@@ -8690,7 +8727,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -8819,7 +8856,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -8874,9 +8911,22 @@ mod tests {
 
             assert_eq!(key, target, "the resolved key is the recorded spelling");
             assert_eq!(
-                (outcome.restored, outcome.failed(), outcome.skipped()),
+                (outcome.restored(), outcome.failed(), outcome.skipped()),
                 (2, 0, 0),
                 "{target}: the recorded twin is restored and counted"
+            );
+            // The selection is expanded inside the engine, so the entry the
+            // caller named is not the whole set it retired: the twin's own
+            // ledger key has to be named, in the order the batch landed the
+            // two writes (a clearer before the twin its write clears).
+            assert_eq!(
+                outcome
+                    .restored_params
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+                vec!["vm.dirty_bytes", "vm.dirty_ratio"],
+                "{target}: the restored twin is named, not only counted"
             );
             assert_eq!(fs::read_to_string(&bytes).unwrap(), "0", "{target}");
             assert_eq!(
@@ -8945,7 +8995,7 @@ mod tests {
 
         assert_eq!(key, "vm.overcommit_ratio");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert_eq!(fs::read_to_string(&ratio).unwrap(), "50");
@@ -8979,7 +9029,7 @@ mod tests {
 
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 0, 1)
         );
         assert!(
@@ -9034,7 +9084,7 @@ mod tests {
 
         assert_eq!(keys, ["vm.swappiness", "net.core.somaxconn"]);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 1, 1)
         );
         assert_eq!(
@@ -9088,7 +9138,7 @@ mod tests {
 
         assert_eq!(key, "vm.dirty_bytes");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 0, 1)
         );
         assert_eq!(
@@ -9279,7 +9329,7 @@ mod tests {
         let (key, outcome) = worker.join().unwrap().unwrap();
         assert_eq!(key, "vm.swappiness");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -9376,7 +9426,7 @@ mod tests {
             "each positional reports the ledger key it resolved to, in the order given"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (3, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9444,7 +9494,7 @@ mod tests {
 
         assert_eq!(keys, params, "each named half reports its ledger key");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "both halves of the pair are restored once, not four times"
         );
@@ -9516,7 +9566,7 @@ mod tests {
             "one ledger key per entry, in the order the spellings first appear"
         );
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "an aliased spelling must not restore the entry twice"
         );
@@ -9680,7 +9730,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 1, 1)
         );
         assert!(
@@ -9745,7 +9795,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 0, 2)
         );
         assert_eq!(fs::read_to_string(&ledger).unwrap(), ledger_before);
@@ -9786,7 +9836,7 @@ mod tests {
 
         assert_eq!(keys, params);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -9892,7 +9942,7 @@ mod tests {
         let (keys, outcome) = worker.join().unwrap().unwrap();
         assert_eq!(keys.len(), 3);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (3, 0, 0)
         );
         assert_eq!(fs::read_to_string(&swappiness).unwrap(), "60");
@@ -9944,7 +9994,7 @@ mod tests {
         let (_, outcome) = rollback_params_at(&params, &ledger, &conf, &service, &script).unwrap();
 
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (1, 1, 1)
         );
         assert_eq!(
@@ -9989,7 +10039,7 @@ mod tests {
         let (_, outcome) = rollback_params_at(&params, &ledger, &conf, &service, &script).unwrap();
 
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert_eq!(batch_writes("ledger", &ledger), 1);
@@ -10012,7 +10062,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (0, 0, 1)
         );
         assert_eq!(batch_writes("ledger", &ledger), 0);
@@ -10069,7 +10119,7 @@ mod tests {
 
         assert!(unmatched.is_empty(), "{unmatched:?}");
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -10134,7 +10184,7 @@ mod tests {
 
             assert!(unmatched.is_empty(), "{unmatched:?}");
             assert_eq!(
-                (outcome.restored, outcome.failed(), outcome.skipped()),
+                (outcome.restored(), outcome.failed(), outcome.skipped()),
                 (1, 0, 0),
                 "only the entry outside the pair is restored ({excluded} excluded)"
             );
@@ -10205,7 +10255,7 @@ mod tests {
 
         assert_eq!(unmatched, ["vm.typo", "net.core.typo2", "vm.typo"]);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0)
         );
         assert!(outcome.is_complete());
@@ -10253,7 +10303,7 @@ mod tests {
 
             assert!(unmatched.is_empty(), "{excluded:?} names recorded entries");
             assert_eq!(
-                (outcome.restored, outcome.failed(), outcome.skipped()),
+                (outcome.restored(), outcome.failed(), outcome.skipped()),
                 (0, 0, 0),
                 "{excluded:?}: nothing is attempted"
             );
@@ -10836,7 +10886,7 @@ mod tests {
         assert!(report.unmatched.is_empty(), "{:?}", report.unmatched);
         assert_eq!(
             (
-                report.outcome.restored,
+                report.outcome.restored(),
                 report.outcome.failed(),
                 report.outcome.skipped()
             ),
@@ -10909,7 +10959,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             (
-                report.outcome.restored,
+                report.outcome.restored(),
                 report.outcome.failed(),
                 report.outcome.skipped()
             ),
@@ -10934,7 +10984,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             (
-                report.outcome.restored,
+                report.outcome.restored(),
                 report.outcome.failed(),
                 report.outcome.skipped()
             ),
@@ -11064,7 +11114,7 @@ mod tests {
         let report =
             rollback_categories_at(&["net".to_string()], &[], &ledger, &conf, &service, &script)
                 .unwrap();
-        assert_eq!(report.outcome.restored, 1);
+        assert_eq!(report.outcome.restored(), 1);
         let data = load_rollback_from(&ledger).unwrap();
         assert!(!data.entries.contains_key("net.core.somaxconn"));
         assert!(data.entries.contains_key("vm.swappiness"));
@@ -11275,7 +11325,7 @@ mod tests {
         };
         let outcome = restore_entries(&data, false);
         assert_eq!(
-            (outcome.restored, outcome.failed(), outcome.skipped()),
+            (outcome.restored(), outcome.failed(), outcome.skipped()),
             (2, 0, 0),
             "every recorded entry must be restored despite the failed writes"
         );
