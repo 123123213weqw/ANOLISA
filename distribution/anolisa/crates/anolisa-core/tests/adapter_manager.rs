@@ -267,6 +267,10 @@ const OWNED_ENV: &[&str] = &[
     "FAKE_OC_VERSION_PREAMBLE",
     "FAKE_OC_CONFIG_FAIL_KEY",
     "FAKE_OC_CONFIG_FAIL_AFTER_KEY",
+    "FAKE_OC_CONFIG_INVALID",
+    "FAKE_OC_CONFIG_INVALID_STATE_DIR",
+    "FAKE_OC_RECEIPT_SNAPSHOT",
+    "FAKE_OC_RECEIPT_SNAPSHOT_SOURCE",
     "HERMES_BIN",
     "HERMES_HOME",
 ];
@@ -452,6 +456,13 @@ if [ "$1" = "--version" ]; then
 fi
 
 sub="$1"; action="$2"; arg3="$3"
+config_invalid=0
+if [ "${FAKE_OC_CONFIG_INVALID:-0}" = "1" ]; then
+  config_invalid=1
+elif [ -n "${FAKE_OC_CONFIG_INVALID_STATE_DIR:-}" ] \
+  && [ "$OPENCLAW_STATE_DIR" = "$FAKE_OC_CONFIG_INVALID_STATE_DIR" ]; then
+  config_invalid=1
+fi
 
 if [ "$sub" = "config" ] && [ "$action" = "set" ]; then
   if [ -n "${FAKE_OC_CONFIG_FAIL_KEY:-}" ] && [ "$arg3" = "$FAKE_OC_CONFIG_FAIL_KEY" ]; then
@@ -465,6 +476,10 @@ if [ "$sub" = "config" ] && [ "$action" = "set" ]; then
     exit 14
   fi
   echo "config set $arg3 $4"
+  exit 0
+fi
+if [ "$sub" = "config" ] && [ "$action" = "file" ] && [ "$arg3" = "--json" ]; then
+  printf '{"path":"%s/openclaw.json"}\n' "$OPENCLAW_STATE_DIR"
   exit 0
 fi
 if [ "$sub" != "plugins" ]; then echo "unknown subcommand: $sub" >&2; exit 2; fi
@@ -485,6 +500,13 @@ case "$action" in
       fi
       [ "${FAKE_OC_PROBE_FAIL:-}" = "install_help" ] && exit 4
       exit 0
+    fi
+    if [ "$config_invalid" = "1" ]; then
+      printf 'OpenClaw config is invalid\nFile: %s/openclaw.json\nProblem:\n- commands.ownerDisplay: Unrecognized key\n' "$OPENCLAW_STATE_DIR" >&2
+      exit 1
+    fi
+    if [ -n "${FAKE_OC_RECEIPT_SNAPSHOT:-}" ]; then
+      cp "$FAKE_OC_RECEIPT_SNAPSHOT_SOURCE" "$FAKE_OC_RECEIPT_SNAPSHOT"
     fi
     reg="$OPENCLAW_STATE_DIR/registry"; mkdir -p "$reg" 2>/dev/null
     if [ "${FAKE_OPENCLAW_FAIL:-}" = "install" ]; then echo "boom-install" >&2; exit 7; fi
@@ -550,6 +572,10 @@ case "$action" in
     ;;
   uninstall)
     reg="$OPENCLAW_STATE_DIR/registry"; mkdir -p "$reg" 2>/dev/null
+    if [ "$config_invalid" = "1" ]; then
+      printf 'OpenClaw config is invalid\nFile: %s/openclaw.json\nProblem:\n- commands.ownerDisplay: Unrecognized key\n' "$OPENCLAW_STATE_DIR" >&2
+      exit 1
+    fi
     if [ "${FAKE_OPENCLAW_FAIL:-}" = "uninstall" ]; then echo "boom-uninstall" >&2; exit 8; fi
     if [ "${FAKE_OPENCLAW_FAIL:-}" = "untracked" ]; then
       echo "Plugin \"$arg3\" is not associated with a tracked package install. Refresh the plugin registry, then reinstall the package or run openclaw doctor before retrying." >&2
@@ -563,6 +589,10 @@ case "$action" in
     ;;
   list)
     reg="$OPENCLAW_STATE_DIR/registry"
+    if [ "$config_invalid" = "1" ]; then
+      printf 'OpenClaw config is invalid\nFile: %s/openclaw.json\nProblem:\n- commands.ownerDisplay: Unrecognized key\n' "$OPENCLAW_STATE_DIR" >&2
+      exit 1
+    fi
     if [ "${FAKE_OC_PROBE_FAIL:-}" = "list" ]; then echo "boom-list" >&2; exit 6; fi
     if [ "$arg3" = "--json" ]; then
       if [ "${FAKE_OC_LIST_JSON+x}" = x ]; then printf '%s\n' "$FAKE_OC_LIST_JSON"; exit 0; fi
@@ -1148,6 +1178,101 @@ fn reenable_migrates_pre_fix_receipt_to_configured_state_dir() {
             .exists()
     );
     assert!(!world.has_claim());
+}
+
+#[test]
+fn migrated_receipt_releases_old_cleanup_ownership_after_new_preflight_rejection() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    let config_key = "migration.key";
+    let manifest = format!(
+        r#"[[adapters]]
+framework = "openclaw"
+source = "adapters/{COMPONENT}/openclaw"
+dest = "{{datadir}}/adapters/{{component}}/openclaw/"
+
+[[adapters.openclaw.config]]
+key = "{config_key}"
+value = true
+"#
+    );
+    write_openclaw_manifest(&world.layout, &manifest);
+    world.apply_env(&guard, None);
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let manager = world.manager();
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("install the plugin in the legacy state directory");
+    assert!(world.registry_marker_exists());
+    assert_eq!(
+        std::fs::read(world.openclaw_home.join("config").join(config_key))
+            .expect("old instance config marker"),
+        b"true"
+    );
+
+    let configured_state = world._root.path().join("configured-openclaw-state");
+    guard.set("OPENCLAW_STATE_DIR", &configured_state);
+    guard.set("FAKE_OC_CONFIG_INVALID_STATE_DIR", &configured_state);
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("new state directory rejects install before mutation");
+
+    assert!(
+        !world.registry_marker_exists(),
+        "migration must clean the prior plugin before replacing its receipt"
+    );
+    assert!(
+        !configured_state.join("registry").join(COMPONENT).exists(),
+        "preflight rejection must not register the plugin in the new directory"
+    );
+    let claim = world
+        .load_state()
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .cloned()
+        .expect("failed new install keeps a receipt for safe recovery");
+    let DriverPayload::OpenClaw(payload) = &claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    assert!(payload.install_rejected_before_mutation);
+    assert!(!payload.plugin_cleanup_required);
+    assert!(payload.config_resources.is_empty());
+    assert!(
+        claim
+            .resources
+            .iter()
+            .all(|resource| !matches!(resource.kind, ClaimResourceKind::FrameworkConfig { .. }))
+    );
+    assert_eq!(
+        std::fs::read(world.openclaw_home.join("config").join(config_key))
+            .expect("migration leaves the old instance config in place"),
+        b"true"
+    );
+    assert!(
+        !configured_state.join("config").join(config_key).exists(),
+        "preflight rejection must not write config in the new instance"
+    );
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("preflight rejection after migration is recoverable");
+    assert!(
+        disabled.report.cleanup_complete,
+        "the migrated receipt must not retain cleanup ownership for the old directory"
+    );
+    assert!(disabled.claim_removed);
+    assert!(!world.has_claim());
+    assert!(!world.registry_marker_exists());
+    assert!(!configured_state.join("registry").join(COMPONENT).exists());
+    let calls = argv_lines(&world.argv_log());
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|line| line.as_str() == "plugins uninstall tokenless --force")
+            .count(),
+        1,
+        "only migration cleanup should invoke uninstall: {calls:?}"
+    );
 }
 
 #[test]
@@ -3313,9 +3438,271 @@ fn nonzero_probe_exit_blocks_enable_before_mutation() {
     }
 }
 
-/// Each probe runs exactly once in a real enable (`--version`,
-/// install/enable/inspect `--help`) happen in prepare, and apply re-probes
-/// nothing (it reuses the prepared capabilities).
+/// A recognized install preflight rejection is durable proof that this attempt
+/// never mutated the plugin registry, so disable can release its failed receipt.
+#[test]
+fn invalid_openclaw_config_recovers_unregistered_failed_install_receipt() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    std::fs::write(
+        world.openclaw_home.join("openclaw.json"),
+        r#"{
+            // The unsupported legacy key makes OpenClaw lifecycle commands fail schema validation.
+            commands: { ownerDisplay: "legacy" },
+            plugins: { entries: {}, installs: {}, },
+        }"#,
+    )
+    .expect("write raw OpenClaw config");
+    guard.set("FAKE_OC_CONFIG_INVALID", "1");
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let manager = world.manager();
+
+    let error = manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("invalid config must reject plugin install");
+    assert!(error.to_string().contains("plugins install"), "{error}");
+    assert!(
+        error.to_string().contains("commands.ownerDisplay"),
+        "{error}"
+    );
+    assert!(
+        world.has_claim(),
+        "failed install should leave a cleanup receipt"
+    );
+    std::fs::create_dir_all(world.openclaw_home.join("registry")).expect("create registry");
+    std::fs::write(
+        world.openclaw_home.join("registry").join(COMPONENT),
+        "pre-existing install",
+    )
+    .expect("write pre-existing registry entry");
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("pre-mutation evidence releases the failed receipt");
+    assert!(
+        disabled.report.cleanup_complete,
+        "{:?}",
+        (disabled.report.messages, argv_lines(&world.argv_log()))
+    );
+    assert!(
+        !world.has_claim(),
+        "pre-mutation failed-install receipt is removed"
+    );
+    assert!(
+        world.registry_marker_exists(),
+        "pre-existing install is untouched"
+    );
+    let calls = argv_lines(&world.argv_log());
+    assert!(
+        calls
+            .iter()
+            .any(|line| line.starts_with("plugins install "))
+    );
+    assert!(
+        !calls
+            .iter()
+            .any(|line| line == "plugins uninstall tokenless --force")
+    );
+    assert!(!calls.iter().any(|line| line == "plugins list --json"));
+    assert!(!calls.iter().any(|line| line == "config file --json"));
+}
+
+#[test]
+fn invalid_config_reenable_failure_preserves_prior_plugin_cleanup_ownership() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let manager = world.manager();
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("initial enable installs the plugin");
+    assert!(world.registry_marker_exists());
+
+    std::fs::write(
+        world.openclaw_home.join("openclaw.json"),
+        r#"{ commands: { ownerDisplay: "legacy" } }"#,
+    )
+    .expect("make OpenClaw config invalid before re-enable");
+    guard.set("FAKE_OC_CONFIG_INVALID", "1");
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("invalid config rejects re-enable before plugin mutation");
+
+    let state = world.load_state();
+    let claim = state
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("failed re-enable retains a receipt");
+    let DriverPayload::OpenClaw(payload) = &claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    assert!(payload.install_rejected_before_mutation);
+    assert!(payload.plugin_cleanup_required);
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("failed cleanup is reported in the disable outcome");
+    assert!(!disabled.report.cleanup_complete);
+    assert!(
+        world.registry_marker_exists(),
+        "prior install remains registered"
+    );
+    assert!(
+        world.has_claim(),
+        "prior cleanup ownership must remain durable"
+    );
+}
+
+#[test]
+fn reenable_persists_cleanup_ownership_before_install_mutation() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    let manager = world.manager();
+
+    // The first attempt is rejected before mutation and leaves no prior
+    // plugin cleanup obligation in the receipt.
+    guard.set("FAKE_OC_CONFIG_INVALID", "1");
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("invalid config rejects initial install");
+    let initial = world.load_state();
+    let initial_claim = initial
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("rejected first attempt keeps its receipt");
+    let DriverPayload::OpenClaw(initial_payload) = &initial_claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    assert!(!initial_payload.plugin_cleanup_required);
+
+    // Capture the durable receipt from inside the fake install command, before
+    // it registers the plugin and fails. This models recovery from a process
+    // interruption at the mutation boundary rather than the later error save.
+    guard.unset("FAKE_OC_CONFIG_INVALID");
+    guard.set("FAKE_OPENCLAW_FAIL", "install_after_register");
+    let snapshot = world
+        .openclaw_home
+        .parent()
+        .unwrap()
+        .join("receipt-at-install.toml");
+    guard.set("FAKE_OC_RECEIPT_SNAPSHOT", &snapshot);
+    guard.set(
+        "FAKE_OC_RECEIPT_SNAPSHOT_SOURCE",
+        world.layout.state_dir.join("installed.toml"),
+    );
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("retry fails after registering the plugin");
+
+    let at_mutation = load_state_at(&snapshot);
+    let persisted_claim = at_mutation
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("cleanup receipt is durable before install starts");
+    let DriverPayload::OpenClaw(persisted_payload) = &persisted_claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    assert!(persisted_payload.plugin_cleanup_required);
+    assert!(!persisted_payload.install_rejected_before_mutation);
+    assert!(world.registry_marker_exists());
+}
+
+#[test]
+fn invalid_config_first_install_does_not_remove_declared_but_unmaterialized_skill() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    configure_plugin_with_skill(&world, "sec-audit");
+    world.apply_env(&guard, None);
+    guard.set("FAKE_OC_CONFIG_INVALID", "1");
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let skill_dir = world.openclaw_home.join("skills/sec-audit");
+    std::fs::create_dir_all(&skill_dir).expect("create unrelated pre-existing skill directory");
+    let user_file = skill_dir.join("user-owned.txt");
+    std::fs::write(&user_file, b"leave this file alone").expect("write existing user file");
+    let manager = world.manager();
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect_err("config preflight rejects install before skill materialization");
+    let state = world.load_state();
+    let claim = state
+        .find_adapter_claim(COMPONENT, FRAMEWORK)
+        .expect("failed first enable leaves a receipt for recovery");
+    let DriverPayload::OpenClaw(payload) = &claim.driver_payload else {
+        panic!("expected OpenClaw receipt");
+    };
+    assert!(
+        !payload.skill_resources.is_empty(),
+        "receipt records the plan"
+    );
+    assert!(
+        !claim.materialized_files.is_empty(),
+        "receipt records planned files"
+    );
+    assert!(
+        !skill_dir.join("SKILL.md").exists(),
+        "skill was not materialized"
+    );
+
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("pre-mutation evidence safely releases the first-attempt receipt");
+    assert!(disabled.report.cleanup_complete);
+    assert!(!world.has_claim());
+    assert!(
+        user_file.exists(),
+        "declared-but-unmaterialized path is not deleted"
+    );
+    let calls = argv_lines(&world.argv_log());
+    assert!(
+        !calls
+            .iter()
+            .any(|line| line == "plugins uninstall tokenless --force")
+    );
+}
+
+#[test]
+fn invalid_config_cannot_hide_successfully_installed_plugin_from_cleanup() {
+    let guard = OpenClawEnvGuard::acquire();
+    let world = stage();
+    world.apply_env(&guard, None);
+    guard.set("FAKE_OC_ARGV_LOG", world.argv_log());
+    let manager = world.manager();
+
+    manager
+        .enable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("install plugin successfully");
+    std::fs::write(
+        world.openclaw_home.join("openclaw.json"),
+        r#"{ commands: { ownerDisplay: "legacy" }, plugins: { entries: {}, installs: {} } }"#,
+    )
+    .expect("remove visible config entry and invalidate core config");
+    guard.set("FAKE_OC_CONFIG_INVALID", "1");
+    let disabled = manager
+        .disable(COMPONENT, Some(FRAMEWORK), false)
+        .expect("uninstall/list failure is reported without losing ownership");
+    assert!(!disabled.report.cleanup_complete);
+    assert!(
+        world.registry_marker_exists(),
+        "installed plugin remains registered"
+    );
+    assert!(
+        world.has_claim(),
+        "registry uncertainty must keep its cleanup receipt"
+    );
+    let calls = argv_lines(&world.argv_log());
+    assert!(
+        calls
+            .iter()
+            .any(|line| line == "plugins uninstall tokenless --force")
+    );
+    assert!(calls.iter().any(|line| line == "plugins list --json"));
+}
+
+/// Each read-only probe runs exactly once in a real enable (`--version`,
+/// install/enable/inspect `--help`) happens in prepare,
+/// and apply re-probes nothing (it reuses the prepared capabilities).
 #[test]
 fn each_probe_runs_exactly_once_per_enable() {
     let guard = OpenClawEnvGuard::acquire();

@@ -641,6 +641,18 @@ pub struct OpenClawClaim {
     /// Resource ids of applied config key/value pairs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_resources: Vec<String>,
+    /// Whether an install preflight rejected an attempt before mutation.
+    /// Re-enable carries this fact forward until a later install succeeds.
+    #[serde(default)]
+    pub install_rejected_before_mutation: bool,
+    /// Whether this receipt still owns or may own a plugin installation.
+    /// Missing legacy values default to true so re-enable remains conservative.
+    #[serde(default = "default_plugin_cleanup_required")]
+    pub plugin_cleanup_required: bool,
+}
+
+fn default_plugin_cleanup_required() -> bool {
+    true
 }
 
 /// Hermes driver payload. Holds only [`ClaimResource::id`] references.
@@ -1414,6 +1426,8 @@ mod tests {
                 plugin_resource: "openclaw_plugin".to_string(),
                 skill_resources: Vec::new(),
                 config_resources: Vec::new(),
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         }
     }
@@ -1444,6 +1458,24 @@ mod tests {
         let json = serde_json::to_string(&claim).expect("serialize JSON");
         let parsed: AdapterClaim = serde_json::from_str(&json).expect("parse JSON");
         assert_eq!(claim, parsed);
+    }
+
+    #[test]
+    fn legacy_openclaw_receipt_requires_plugin_cleanup_by_default() {
+        let mut value = serde_json::to_value(sample_claim()).expect("serialize claim");
+        let payload = value["driver_payload"]["openclaw"]
+            .as_object_mut()
+            .expect("OpenClaw payload");
+        payload.remove("install_rejected_before_mutation");
+        payload.remove("plugin_cleanup_required");
+
+        let loaded: AdapterClaim =
+            serde_json::from_value(value).expect("deserialize legacy receipt");
+        let DriverPayload::OpenClaw(payload) = loaded.driver_payload else {
+            panic!("expected OpenClaw payload");
+        };
+        assert!(!payload.install_rejected_before_mutation);
+        assert!(payload.plugin_cleanup_required);
     }
 
     #[test]
@@ -1847,6 +1879,8 @@ mod tests {
                 plugin_resource: "plugin".to_string(),
                 skill_resources: vec!["skill_sec_audit".to_string()],
                 config_resources: vec!["config_enabled".to_string()],
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         };
         let json = serde_json::to_string(&claim).expect("serialize");

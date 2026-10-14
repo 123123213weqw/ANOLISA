@@ -343,6 +343,8 @@ impl FrameworkDriver for OpenClawDriver {
                 // Pending/applied config resources are journaled during apply;
                 // this list references confirmed entries only.
                 config_resources: Vec::new(),
+                install_rejected_before_mutation: false,
+                plugin_cleanup_required: false,
             }),
         };
         Ok((claim, prepared))
@@ -353,7 +355,30 @@ impl FrameworkDriver for OpenClawDriver {
         prior: &AdapterClaim,
         next: &mut AdapterClaim,
     ) -> Result<(), AdapterError> {
-        preserve_openclaw_config_facts(prior, next)
+        let same_state_dir = claim_state_dir(prior)? == claim_state_dir(next)?;
+        if same_state_dir {
+            preserve_openclaw_config_facts(prior, next)?;
+        }
+        let DriverPayload::OpenClaw(prior_payload) = &prior.driver_payload else {
+            return Err(invalid_config_claim(
+                prior,
+                "receipt payload is not OpenClaw",
+            ));
+        };
+        let DriverPayload::OpenClaw(next_payload) = &mut next.driver_payload else {
+            return Err(invalid_config_claim(
+                next,
+                "receipt payload is not OpenClaw",
+            ));
+        };
+        // The manager cleans the prior instance before replacing its receipt,
+        // and keeps the prior receipt if cleanup fails. Facts from a different
+        // state directory do not describe the new, still-uninstalled instance.
+        next_payload.plugin_cleanup_required =
+            same_state_dir && prior_payload.plugin_cleanup_required;
+        next_payload.install_rejected_before_mutation =
+            same_state_dir && prior_payload.install_rejected_before_mutation;
+        Ok(())
     }
 
     fn materialized_mappings(
@@ -535,8 +560,37 @@ impl FrameworkDriver for OpenClawDriver {
                 user_home,
             );
             let program = cmd.program.clone();
+            let prior_cleanup_required = match &mut claim.driver_payload {
+                DriverPayload::OpenClaw(payload) => {
+                    let prior = payload.plugin_cleanup_required;
+                    // A failed command can be interrupted after creating an
+                    // installation, so persist conservative ownership on error.
+                    payload.plugin_cleanup_required = true;
+                    payload.install_rejected_before_mutation = false;
+                    prior
+                }
+                _ => {
+                    return Err(prepared_state_mismatch(
+                        "openclaw plugin install received a non-OpenClaw claim",
+                    ));
+                }
+            };
+            // The manager may have replaced a rejected-install receipt with
+            // this claim. Persist cleanup ownership before install can mutate
+            // the registry, so a process interruption cannot restore the old
+            // `cleanup_required = false` snapshot.
+            progress.persist_claim(claim)?;
             let output = ctx.ops.run_framework_cli(cmd)?;
             if !output.success() {
+                if install_rejected_before_mutation(&output) {
+                    let DriverPayload::OpenClaw(payload) = &mut claim.driver_payload else {
+                        return Err(prepared_state_mismatch(
+                            "openclaw plugin install received a non-OpenClaw claim",
+                        ));
+                    };
+                    payload.install_rejected_before_mutation = true;
+                    payload.plugin_cleanup_required = prior_cleanup_required;
+                }
                 let mut reason = full_failure_reason("plugins install", &output);
                 // Point the operator at the explicit, auditable retry only when
                 // it could actually help: the host exposes the unsafe flag, the
@@ -555,6 +609,10 @@ impl FrameworkDriver for OpenClawDriver {
                     );
                 }
                 return Err(AdapterError::FrameworkCli { program, reason });
+            }
+            if let DriverPayload::OpenClaw(payload) = &mut claim.driver_payload {
+                payload.install_rejected_before_mutation = false;
+                payload.plugin_cleanup_required = true;
             }
             Some(plugin_id)
         };
@@ -707,7 +765,20 @@ impl FrameworkDriver for OpenClawDriver {
         let mut messages = Vec::new();
         let mut cleanup_complete = true;
 
-        if let Some(plugin_id) = claim_plugin_id(claim) {
+        let install_rejected_before_mutation = matches!(
+            &claim.driver_payload,
+            DriverPayload::OpenClaw(payload)
+                if payload.install_rejected_before_mutation
+                    && !payload.plugin_cleanup_required
+                    && payload.config_resources.is_empty()
+                    && claim_config_counts(claim) == (0, 0)
+        );
+        if install_rejected_before_mutation {
+            messages.push(
+                "OpenClaw rejected plugin install during config preflight before mutation"
+                    .to_string(),
+            );
+        } else if let Some(plugin_id) = claim_plugin_id(claim) {
             validate_plugin_id(&plugin_id)?;
             if find_binary_in_path(&openclaw_bin()).is_none() {
                 return Ok(DisableReport {
@@ -727,46 +798,80 @@ impl FrameworkDriver for OpenClawDriver {
                 messages.push(format!(
                     "openclaw plugin '{plugin_id}' was already unregistered"
                 ));
-            } else if uninstall_reports_untracked_plugin(&output, &plugin_id) {
-                // Missing package ownership does not prove that the plugin is
-                // gone. Verify against the same instance as the uninstall.
+            } else {
+                // A failed install can leave a receipt even though the
+                // framework never registered the plugin. A failed uninstall
+                // alone cannot prove either outcome; only explicit
+                // pre-mutation evidence from install may bypass registry checks.
+                let uninstall_reason = if uninstall_reports_untracked_plugin(&output, &plugin_id) {
+                    format!(
+                        "plugin '{plugin_id}' has no tracked package install; `plugins uninstall` failed"
+                    )
+                } else {
+                    format!(
+                        "openclaw plugin uninstall failed: {}",
+                        cli_failure_reason("plugins uninstall", &output)
+                    )
+                };
                 let mut cmd = build_list_cmd(&home, ctx.user_home.as_deref());
                 cmd.args.push("--json".to_string());
                 let verification = ctx.ops.run_framework_cli_json(cmd);
-                if !verification
-                    .as_ref()
-                    .is_ok_and(|output| json_list_confirms_plugin_absent(output, &plugin_id))
-                {
-                    let reason = match verification {
-                        Ok(output) => inspect_diagnostics(&output),
-                        Err(err) => err.to_string(),
-                    };
-                    return Ok(DisableReport {
-                        cleanup_complete: false,
-                        messages: vec![format!(
-                            "openclaw plugin '{plugin_id}' has no tracked package install; \
-                             `plugins list --json` could not confirm absence: {reason}; \
-                             repair the OpenClaw plugin registry and retry disable"
-                        )],
-                    });
+                match verification {
+                    Ok(list) if json_list_confirms_plugin_absent(&list, &plugin_id) => {
+                        messages.push(format!(
+                            "{uninstall_reason}; `plugins list --json` confirmed the plugin is absent"
+                        ));
+                    }
+                    Ok(list) if !list.success() => {
+                        let diagnostics = inspect_diagnostics(&list);
+                        let detail = if diagnostics.is_empty() {
+                            "the list did not complete successfully".to_string()
+                        } else {
+                            diagnostics
+                        };
+                        return Ok(DisableReport {
+                            cleanup_complete: false,
+                            messages: vec![format!(
+                                "{uninstall_reason}; `plugins list --json` could not confirm absence: {detail}; repair the OpenClaw plugin registry and retry disable"
+                            )],
+                        });
+                    }
+                    Ok(list) => {
+                        let diagnostics = inspect_diagnostics(&list);
+                        let detail = if diagnostics.is_empty() {
+                            "the list still contains the plugin or lacks clean diagnostics"
+                                .to_string()
+                        } else {
+                            diagnostics
+                        };
+                        return Ok(DisableReport {
+                            cleanup_complete: false,
+                            messages: vec![format!(
+                                "{uninstall_reason}; `plugins list --json` could not confirm absence: {detail}; repair the OpenClaw plugin registry and retry disable"
+                            )],
+                        });
+                    }
+                    Err(err) => {
+                        return Ok(DisableReport {
+                            cleanup_complete: false,
+                            messages: vec![format!(
+                                "{uninstall_reason}; `plugins list --json` could not confirm absence: {err}; repair the OpenClaw plugin registry and retry disable"
+                            )],
+                        });
+                    }
                 }
-                messages.push(format!(
-                    "openclaw plugin '{plugin_id}' is absent from `plugins list --json`"
-                ));
-            } else {
-                return Ok(DisableReport {
-                    cleanup_complete: false,
-                    messages: vec![format!(
-                        "openclaw plugin uninstall failed: {}",
-                        cli_failure_reason("plugins uninstall", &output)
-                    )],
-                });
             }
         } else {
             messages.push("receipt records no plugin to unregister".to_string());
         }
 
-        let skill_resources = claim_skill_resources(claim);
+        let skill_resources = if install_rejected_before_mutation {
+            // These paths are declarations in a pre-apply receipt. The
+            // install preflight runs before OpenClaw skill materialization.
+            Vec::new()
+        } else {
+            claim_skill_resources(claim)
+        };
         for skill_name in &skill_resources {
             let skill_dir = home.join("skills").join(skill_name);
             match ctx.ops.remove_tree(&skill_dir) {
@@ -3014,6 +3119,22 @@ fn json_list_confirms_plugin_absent(output: &CliOutput, plugin_id: &str) -> bool
     })
 }
 
+/// Recognize OpenClaw's config-schema rejection, which happens before install
+/// mutates the plugin index or payload. Other failures remain ambiguous.
+fn install_rejected_before_mutation(output: &CliOutput) -> bool {
+    if output.success() || output.timed_out || !output.stdout.trim().is_empty() {
+        return false;
+    }
+    let stderr = strip_ansi(&output.stderr);
+    let mut lines = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty());
+    matches!(lines.next(), Some("OpenClaw config is invalid"))
+        && lines.clone().any(|line| line.starts_with("File:"))
+        && lines.any(|line| line.starts_with("Problem:"))
+}
+
 /// Extract skill names from a claim's `skill_resources` by parsing the
 /// resource ids. Each id has the form `openclaw_skill_<name>`, and we
 /// extract `<name>` as the directory name under `<home>/skills/`.
@@ -3059,8 +3180,10 @@ fn now_iso8601() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::adapter::driver::AdapterOps;
     use std::ffi::OsString;
     use std::sync::{Mutex, MutexGuard};
+    use std::{cell::RefCell, collections::VecDeque};
 
     static OPENCLAW_BIN_ENV_LOCK: Mutex<()> = Mutex::new(());
 
@@ -3109,6 +3232,128 @@ mod tests {
                     std::env::remove_var("OPENCLAW_BIN");
                 }
             }
+        }
+    }
+
+    struct ScriptedOps {
+        outputs: RefCell<VecDeque<CliOutput>>,
+    }
+
+    impl AdapterOps for ScriptedOps {
+        fn run_framework_cli(&self, cmd: FrameworkCommand) -> Result<CliOutput, AdapterError> {
+            self.outputs
+                .borrow_mut()
+                .pop_front()
+                .ok_or_else(|| AdapterError::FrameworkCli {
+                    program: cmd.program,
+                    reason: "no scripted OpenClaw output".to_string(),
+                })
+        }
+
+        fn copy_tree(&self, _: &Path, _: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+
+        fn copy_file(&self, _: &Path, _: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+
+        fn remove_tree(&self, _: &Path) -> Result<bool, AdapterError> {
+            Ok(false)
+        }
+
+        fn write_file(&self, _: &Path, _: &[u8]) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+
+        fn create_symlink(&self, _: &Path, _: &Path) -> Result<(), AdapterError> {
+            unimplemented!()
+        }
+
+        fn read_file(&self, _: &Path) -> Result<Option<Vec<u8>>, AdapterError> {
+            unimplemented!()
+        }
+    }
+
+    fn cleanup_failed_plugin_claim(state_dir: PathBuf) -> AdapterClaim {
+        AdapterClaim {
+            claim_schema: CLAIM_SCHEMA_VERSION,
+            component: "tokenless".to_string(),
+            framework: "openclaw".to_string(),
+            plugin_id: Some("tokenless".to_string()),
+            adapter_type: Some("plugin".to_string()),
+            enabled_at: "2026-10-13T00:00:00Z".to_string(),
+            resource_root: PathBuf::from("/missing/adapter/source"),
+            bundle_digest: None,
+            source_revision: None,
+            materialized_files: Vec::new(),
+            driver_schema: DRIVER_SCHEMA_VERSION,
+            status: ClaimStatus::CleanupFailed,
+            notices: Vec::new(),
+            resources: vec![
+                ClaimResource {
+                    id: "state".to_string(),
+                    purpose: "openclaw_state_dir".to_string(),
+                    kind: ClaimResourceKind::ExternalPath { path: state_dir },
+                },
+                ClaimResource {
+                    id: "plugin".to_string(),
+                    purpose: "openclaw_plugin".to_string(),
+                    kind: ClaimResourceKind::FrameworkPlugin {
+                        framework: "openclaw".to_string(),
+                        plugin_id: "tokenless".to_string(),
+                    },
+                },
+            ],
+            driver_payload: DriverPayload::OpenClaw(OpenClawClaim {
+                state_dir_resource: "state".to_string(),
+                plugin_resource: "plugin".to_string(),
+                skill_resources: Vec::new(),
+                config_resources: Vec::new(),
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
+            }),
+        }
+    }
+
+    fn run_disable_with_outputs(outputs: Vec<CliOutput>) -> DisableReport {
+        let _env = OpenClawBinEnvGuard::set("/bin/sh");
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let layout = anolisa_platform::fs_layout::FsLayout::user(home.clone());
+        let claim = cleanup_failed_plugin_claim(home.join(".openclaw"));
+        let ops = ScriptedOps {
+            outputs: RefCell::new(outputs.into()),
+        };
+        let ctx = DriverCtx {
+            component: "tokenless".to_string(),
+            framework: "openclaw".to_string(),
+            layout: &layout,
+            resource_root: claim.resource_root.clone(),
+            user_home: Some(home),
+            declared_plugin_id: None,
+            requested_profiles: Vec::new(),
+            adapter_type: claim.adapter_type.clone(),
+            declared_skills: Vec::new(),
+            declared_config: Vec::new(),
+            declared_bundle_entry: None,
+            framework_version_req: None,
+            allow_unsafe_plugin_install: false,
+            no_accept_capabilities: false,
+            dry_run: false,
+            ops: &ops,
+        };
+        OpenClawDriver::new()
+            .disable(&claim, &ctx)
+            .expect("disable should return a cleanup report")
+    }
+
+    fn cli_output(status: i32, stdout: &str, stderr: &str) -> CliOutput {
+        CliOutput {
+            status: Some(status),
+            timed_out: false,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
         }
     }
 
@@ -3247,6 +3492,52 @@ mod tests {
             },
             "tokenless"
         ));
+    }
+
+    #[test]
+    fn failed_uninstall_clears_receipt_only_after_json_confirms_plugin_absence() {
+        let report = run_disable_with_outputs(vec![
+            cli_output(1, "", "OpenClaw config is invalid"),
+            cli_output(0, r#"{"plugins":[],"diagnostics":[]}"#, ""),
+        ]);
+
+        assert!(report.cleanup_complete);
+        assert!(report.messages.iter().any(|message| {
+            message.contains("plugins list --json` confirmed the plugin is absent")
+        }));
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_receipt_when_json_still_lists_plugin() {
+        let report = run_disable_with_outputs(vec![
+            cli_output(1, "", "OpenClaw config is invalid"),
+            cli_output(
+                0,
+                r#"{"plugins":[{"id":"tokenless"}],"diagnostics":[]}"#,
+                "",
+            ),
+        ]);
+
+        assert!(!report.cleanup_complete);
+        assert!(
+            report.messages.iter().any(|message| {
+                message.contains("plugins list --json` could not confirm absence")
+            })
+        );
+    }
+
+    #[test]
+    fn failed_uninstall_keeps_receipt_when_json_inventory_is_unavailable() {
+        let report = run_disable_with_outputs(vec![
+            cli_output(1, "", "OpenClaw config is invalid"),
+            cli_output(1, "", "OpenClaw config is invalid"),
+        ]);
+
+        assert!(!report.cleanup_complete);
+        assert!(report.messages.iter().any(|message| {
+            message.contains("plugins list --json` could not confirm absence")
+                && message.contains("OpenClaw config is invalid")
+        }));
     }
 
     #[test]
@@ -3746,6 +4037,36 @@ mod tests {
     }
 
     #[test]
+    fn install_rejection_requires_unambiguous_config_preflight_diagnostic() {
+        let output = |stderr: &str, stdout: &str, timed_out: bool| CliOutput {
+            status: Some(1),
+            timed_out,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
+        };
+        assert!(install_rejected_before_mutation(&output(
+            "OpenClaw config is invalid\nFile: /home/test/openclaw.json\nProblem:\n- commands.ownerDisplay: Unrecognized key",
+            "",
+            false,
+        )));
+        assert!(!install_rejected_before_mutation(&output(
+            "Config is invalid: Unrecognized key at commands.ownerDisplay",
+            "",
+            false,
+        )));
+        assert!(!install_rejected_before_mutation(&output(
+            "OpenClaw config is invalid\nFile: /home/test/openclaw.json",
+            "partial output",
+            false,
+        )));
+        assert!(!install_rejected_before_mutation(&output(
+            "OpenClaw config is invalid\nFile: /home/test/openclaw.json\nProblem: invalid",
+            "",
+            true,
+        )));
+    }
+
+    #[test]
     fn uninstall_cmd_uses_force() {
         let _env = OpenClawBinEnvGuard::unset();
         let cmd = build_uninstall_cmd(
@@ -3904,6 +4225,8 @@ mod tests {
                     "openclaw_skill_cred-scan".to_string(),
                 ],
                 config_resources: vec!["openclaw_config_0".to_string()],
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         };
         let skills = claim_skill_resources(&claim);
@@ -4085,6 +4408,8 @@ mod tests {
                 plugin_resource: RES_PLUGIN.to_string(),
                 skill_resources: Vec::new(),
                 config_resources: Vec::new(),
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         };
         let mut skill_claim = plugin_claim.clone();

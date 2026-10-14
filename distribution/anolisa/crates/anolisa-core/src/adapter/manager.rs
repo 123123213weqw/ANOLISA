@@ -6008,6 +6008,8 @@ source = "adapters/openclaw"
                 plugin_resource: "openclaw_plugin".to_string(),
                 skill_resources: Vec::new(),
                 config_resources: Vec::new(),
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         }
     }
@@ -9385,6 +9387,8 @@ dest = "{datadir}/skills"
                 plugin_resource: "plugin".to_string(),
                 skill_resources: payload_skill_ids,
                 config_resources: payload_config_ids,
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         }
     }

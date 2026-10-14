@@ -1465,6 +1465,8 @@ mod tests {
                 plugin_resource: "plugin".to_string(),
                 skill_resources: Vec::new(),
                 config_resources: Vec::new(),
+                plugin_cleanup_required: true,
+                install_rejected_before_mutation: false,
             }),
         }
     }
