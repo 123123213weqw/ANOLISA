@@ -448,7 +448,7 @@ fn recorded_previous_value(data: &RollbackData, param: &str) -> Option<String> {
 
 /// The classification an imported write of `param` records, looked up in the
 /// ledger by the same kernel-file rule [`matching_record`] keys the reported
-/// original on.
+/// original on, in the healed view that answer reads.
 ///
 /// A write that MOVES the value records none: the live value is then the
 /// imported file's, not a rule's, and the ledger's classification is the rule
@@ -462,7 +462,10 @@ fn recorded_previous_value(data: &RollbackData, param: &str) -> Option<String> {
 /// is the same "a no-op write records nothing the kernel did not do" rule the
 /// twin recorder follows ([`ClearedSibling::cleared_by`]). A lookup keyed on
 /// the recorded path alone found no record for one whose path an older
-/// translation left behind, and cleared the classification anyway.
+/// translation left behind, and cleared the classification anyway. Reading the
+/// raw ledger read the DISCARDED alias of a legacy pair, and the merge then
+/// wrote that category onto the survivor — a rule's classification replaced by
+/// an unrelated alias's, on a write that changed nothing.
 ///
 /// `previous` and `effective` are the canonical forms [`read_previous`] and
 /// the read-back produce, so an exact match is the no-op test; a value the
@@ -478,7 +481,11 @@ fn imported_category(
         return None;
     }
     let identity = canonicalize_path(&param_to_path(param));
-    matching_record(&data.entries, &identity)
+    // Healed on a copy, like the reported original: the classification to keep
+    // is the survivor's, the one the following merge keeps the record of.
+    let mut healed = data.clone();
+    heal_alias_duplicates(&mut healed);
+    matching_record(&healed.entries, &identity)
         .and_then(|(_key, entry, _same_path)| entry.category.clone())
 }
 
@@ -6019,6 +6026,56 @@ mod tests {
             merged.entries[param].category,
             Some(Category::Performance),
             "the classification survives the no-op import"
+        );
+    }
+
+    /// The same heal, on the classification a no-op import keeps. The answer
+    /// decides what the merge writes onto the record it keeps, so reading the
+    /// raw ledger does not only report the discarded alias's category — it
+    /// REPLACES the survivor's with it: a rule's classification swapped for an
+    /// unrelated alias's by a write that changed nothing, after which no
+    /// `--category` selects the entry the rule wrote.
+    #[test]
+    fn a_duplicated_alias_keeps_the_category_the_heal_keeps() {
+        let data: RollbackData = serde_json::from_str(
+            r#"{"version":1,"entries":{
+                "vm.swappiness":{"previous":"10","applied":"30",
+                    "path":"/proc/sys/vm/swappiness","category":"performance"},
+                "vm/swappiness":{"previous":"20","applied":"40",
+                    "path":"/proc/sys/vm/swappiness","category":"security"}
+            }}"#,
+        )
+        .unwrap();
+        // No chain relation, so the heal keeps the greatest key verbatim —
+        // the record a restore writes last.
+        let mut healed = data.clone();
+        heal_alias_duplicates(&mut healed);
+        assert_eq!(
+            healed.entries["vm/swappiness"].category,
+            Some(Category::Security)
+        );
+        assert_eq!(
+            imported_category(&data, "vm.swappiness", "40", "40"),
+            Some(Category::Security),
+            "the kept classification must be the survivor's"
+        );
+        // And the merge that follows the import keeps that answer: the
+        // survivor is what the ledger holds after the no-op write.
+        let category = imported_category(&data, "vm.swappiness", "40", "40");
+        let merged = merge_entries(
+            data,
+            [(
+                "vm.swappiness".to_string(),
+                "40".to_string(),
+                "40".to_string(),
+                category,
+            )],
+        );
+        assert_eq!(merged.entries.len(), 1);
+        assert_eq!(
+            merged.entries["vm/swappiness"].category,
+            Some(Category::Security),
+            "a no-op import must not reclassify the record it keeps"
         );
     }
 
