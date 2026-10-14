@@ -703,6 +703,11 @@ fn dry_run_preview<'a>(
 /// 1 on the same host, and the filtered entries are exactly the difference
 /// between the two — without them in the body, a caller cannot reconcile a
 /// real `tune` with `check` or with its own dry-run preview.
+///
+/// `cleared` names the mutually exclusive twins the writes zeroed as a kernel
+/// side effect — the twins the ledger recorded, so `rollback` brings them
+/// back. The key is absent when no write cleared anything, like the
+/// preview's `would_clear`.
 fn tune_output<'a>(
     in_scope: &[Recommendation],
     outcome: &tuner::ApplyOutcome,
@@ -736,6 +741,9 @@ fn tune_output<'a>(
         // persist.
         "boot_unit_enabled": outcome.boot_unit_enabled,
     });
+    if !outcome.cleared.is_empty() {
+        body["cleared"] = json!(outcome.cleared);
+    }
     if let Some((key, unmatched)) = selection.unmatched_report(in_scope) {
         body[key] = unmatched;
     }
@@ -948,6 +956,9 @@ fn fix_with(param: &str, dry_run: bool, is_root: bool, eval: &rules::EvalResult)
 /// assertable without a live write: every field comes from the recorded
 /// original, the write outcome and the re-gathered diagnosis, never from the
 /// plan.
+///
+/// `cleared` names the twin the write zeroed, in `fix --dry-run`'s
+/// `would_clear` shape; it is absent when the write cleared nothing.
 fn fix_output(
     param: &str,
     fix: &tuner::AppliedFix,
@@ -972,6 +983,9 @@ fn fix_output(
         // whose unit is not enabled is not replayed after a reboot.
         "boot_unit_enabled": fix.boot_unit_enabled,
     });
+    if let Some(twin) = &fix.cleared {
+        output["cleared"] = json!([twin]);
+    }
     if fix.outcome.clamped {
         output["requested"] = json!(rec.recommended_value);
         output["note"] = json!("内核实际生效值与推荐值不同（已按实际生效值记录并持久化，可回滚）");
@@ -2185,6 +2199,32 @@ mod tests {
     }
 
     #[test]
+    fn tune_output_names_the_twins_its_writes_cleared() {
+        // Writing one knob of a mutually exclusive pair zeroes the other, and
+        // the ledger records it so `rollback` can bring it back. The real
+        // run's body names those twins, the way the preview's `would_clear`
+        // does, or a caller sees a second parameter change that nothing in
+        // the output accounts for.
+        let in_scope = vec![rec("vm.dirty_bytes", true), rec("vm.swappiness", true)];
+        let outcome = tuner::ApplyOutcome {
+            applied: 2,
+            failed: vec![],
+            clamped: vec![],
+            boot_unit_enabled: true,
+            cleared: vec!["vm.dirty_ratio".to_string()],
+        };
+        let output = tune_output(&in_scope, &outcome, 30, 35, &[]);
+        assert_eq!(output["cleared"], json!(["vm.dirty_ratio"]));
+        // Nothing cleared: the key is absent and the body is the one it was.
+        let quiet = tuner::ApplyOutcome {
+            cleared: Vec::new(),
+            ..outcome
+        };
+        let output = tune_output(&in_scope, &quiet, 30, 35, &[]);
+        assert!(output.get("cleared").is_none(), "{output}");
+    }
+
+    #[test]
     fn dry_run_output_reports_planned_and_blocked_count() {
         // Two applicable recommendations out of three gathered: the preview
         // must carry the short-circuit status vocabulary ("planned", never
@@ -3375,6 +3415,10 @@ mod tests {
             "an unarmed boot replay must be visible here too: {output}"
         );
         assert!(output.get("note").is_none(), "no clamp, no note: {output}");
+        assert!(
+            output.get("cleared").is_none(),
+            "a write without a twin names none: {output}"
+        );
 
         let clamped = tuner::AppliedFix {
             outcome: tuner::WriteOutcome {
@@ -3393,6 +3437,31 @@ mod tests {
                 .as_str()
                 .is_some_and(|note| note.contains("持久化")),
             "a clamped write keeps its note: {output}"
+        );
+    }
+
+    #[test]
+    fn fix_output_names_the_twin_its_write_cleared() {
+        // `fix --dry-run` previews the twin in `would_clear`; the real fix
+        // names the one the ledger recorded, in the same shape, so one parser
+        // reads both.
+        let rec = rec("vm.dirty_bytes", true);
+        let fix = tuner::AppliedFix {
+            recorded_previous: Some("0".to_string()),
+            outcome: tuner::WriteOutcome {
+                effective: "1073741824".to_string(),
+                clamped: false,
+            },
+            boot_unit_enabled: true,
+            cleared: Some("vm.dirty_ratio".to_string()),
+        };
+        let after = evaluation(vec![]);
+        let output = fix_output("vm.dirty_bytes", &fix, &after, &rec);
+        assert_eq!(output["cleared"], json!(["vm.dirty_ratio"]));
+        assert_eq!(
+            output["cleared"],
+            fix_dry_run_output(&rec)["would_clear"],
+            "the run names what the preview announced"
         );
     }
 
