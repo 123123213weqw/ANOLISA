@@ -113,6 +113,12 @@ pub struct ApplyOutcome {
     /// failure (`applied` and the exit code stay per-write), but a run that
     /// cannot report it promises a replay it never armed.
     pub boot_unit_enabled: bool,
+    /// The mutually exclusive twins this batch's writes zeroed as a kernel
+    /// side effect, in write order, dotted: exactly the twin records the
+    /// batch put in the ledger, so a caller can name what changed besides the
+    /// parameters it asked for. A twin that already read 0, or one a write
+    /// left alone because the value did not change, is not listed.
+    pub cleared: Vec<String>,
 }
 
 pub fn apply(recommendations: &[Recommendation]) -> Result<ApplyOutcome> {
@@ -140,6 +146,7 @@ fn apply_locked(
     let mut applied = 0usize;
     let mut failed: Vec<ApplyFailure> = Vec::new();
     let mut clamped: Vec<ClampNote> = Vec::new();
+    let mut cleared: Vec<String> = Vec::new();
     // Nothing outside /proc/sys was applied, so nothing needs a boot replay.
     let mut boot_unit_enabled = true;
     for (i, rec) in recommendations.iter().enumerate() {
@@ -203,6 +210,7 @@ fn apply_locked(
                 // live change of the pair even when the knob itself was
                 // unrecordable, so it lands outside the branch.
                 if let Some(twin) = twin {
+                    cleared.push(twin.entry.0.clone());
                     applied_recs.push(sibling_rec(twin.entry, rec.category.clone()));
                 }
             }
@@ -251,6 +259,7 @@ fn apply_locked(
         failed,
         clamped,
         boot_unit_enabled,
+        cleared,
     })
 }
 
@@ -273,6 +282,11 @@ pub struct AppliedFix {
     /// refused `systemctl enable` means a non-sysctl fix will not survive the
     /// next boot, and `fix` persists through the same choke point as `tune`.
     pub boot_unit_enabled: bool,
+    /// The mutually exclusive twin this write zeroed as a kernel side effect,
+    /// with [`ApplyOutcome::cleared`]'s meaning: `Some` exactly when the
+    /// ledger recorded the twin. `None` for a knob without a twin, a twin that
+    /// already read 0, and a write that left the value where it was.
+    pub cleared: Option<String>,
 }
 
 /// Apply a single recommendation with rollback recording and persistence, but
@@ -309,11 +323,9 @@ pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
     // write leaves the dirty foreground twin alone, and the record would
     // otherwise claim a kernel state that never existed. It records the
     // knob's own category: the pair is one unit for every later selection.
-    batch.extend(
-        sibling
-            .filter(|twin| twin.cleared_by(previous.as_deref(), &outcome))
-            .map(|twin| sibling_rec(twin.entry, rec.category.clone())),
-    );
+    let twin = sibling.filter(|twin| twin.cleared_by(previous.as_deref(), &outcome));
+    let cleared = twin.as_ref().map(|twin| twin.entry.0.clone());
+    batch.extend(twin.map(|twin| sibling_rec(twin.entry, rec.category.clone())));
     let mut boot_unit_enabled = true;
     if !batch.is_empty() {
         save_rollback(&guard, &batch)?;
@@ -323,6 +335,7 @@ pub fn apply_one(rec: &Recommendation) -> Result<AppliedFix> {
         recorded_previous: pristine.or(previous),
         outcome,
         boot_unit_enabled,
+        cleared,
     })
 }
 

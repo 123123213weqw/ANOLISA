@@ -2159,6 +2159,7 @@ mod tests {
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
+            cleared: Vec::new(),
         };
         let output = tune_output(&in_scope, &outcome, 30, 35, &[]);
         assert_eq!(output["applied"], json!(1));
@@ -2476,6 +2477,7 @@ mod tests {
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: false,
+            cleared: Vec::new(),
         };
         let output = tune_output(&in_scope, &unarmed, 30, 34, &[]);
         assert_eq!(
@@ -2486,6 +2488,7 @@ mod tests {
 
         let armed = tuner::ApplyOutcome {
             boot_unit_enabled: true,
+            cleared: Vec::new(),
             ..unarmed
         };
         let output = tune_output(&in_scope, &armed, 30, 34, &[]);
@@ -2503,6 +2506,7 @@ mod tests {
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
+            cleared: Vec::new(),
         };
         let output = tune_output(&in_scope, &outcome, 30, 35, &["fs/file-max".to_string()]);
         assert_eq!(output["applied"], json!(1));
@@ -2850,6 +2854,7 @@ mod tests {
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
+            cleared: Vec::new(),
         };
         let output = tune_output(
             &in_scope,
@@ -2985,6 +2990,7 @@ mod tests {
             failed: vec![],
             clamped: vec![],
             boot_unit_enabled: true,
+            cleared: Vec::new(),
         };
         let real = tune_output(&in_scope, &outcome, 30, 35, &[]);
         assert_eq!(real["would_skip"], skip);
@@ -3350,6 +3356,7 @@ mod tests {
                 clamped: false,
             },
             boot_unit_enabled: false,
+            cleared: None,
         };
         let after = evaluation(vec![rec.clone()]);
         let output = fix_output("vm.swappiness", &unarmed, &after, &rec);

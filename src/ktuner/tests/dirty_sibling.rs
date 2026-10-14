@@ -43,7 +43,12 @@ fn body() {
         fs::write(sysctl_path(ratio_param), ratio_value).unwrap();
         let _ = fs::remove_file(LEDGER);
 
-        tuner::apply_one(&rec(bytes_param, "1073741824")).unwrap();
+        let fix = tuner::apply_one(&rec(bytes_param, "1073741824")).unwrap();
+        assert_eq!(
+            fix.cleared.as_deref(),
+            Some(ratio_param),
+            "the write names the twin it zeroed"
+        );
 
         // The knob itself is recorded as before.
         let data = ledger();
@@ -83,13 +88,42 @@ fn body() {
     fs::write("/proc/sys/vm/dirty_bytes", "0").unwrap();
     fs::write("/proc/sys/vm/dirty_ratio", "0").unwrap();
     let _ = fs::remove_file(LEDGER);
-    tuner::apply_one(&rec("vm.dirty_bytes", "1073741824")).unwrap();
+    let fix = tuner::apply_one(&rec("vm.dirty_bytes", "1073741824")).unwrap();
     let data = ledger();
     assert!(
         data["entries"].get("vm.dirty_ratio").is_none(),
         "a zeroed sibling records nothing: {data}"
     );
+    assert_eq!(fix.cleared, None, "and the write names no cleared twin");
     tuner::rollback_quiet().unwrap();
+
+    // A batch names every twin its writes zeroed, in write order — the same
+    // twins the ledger records.
+    fs::write("/proc/sys/vm/dirty_bytes", "0").unwrap();
+    fs::write("/proc/sys/vm/dirty_ratio", "20").unwrap();
+    fs::write("/proc/sys/vm/dirty_background_bytes", "0").unwrap();
+    fs::write("/proc/sys/vm/dirty_background_ratio", "10").unwrap();
+    let _ = fs::remove_file(LEDGER);
+    let outcome = tuner::apply_quiet(&[
+        rec("vm.dirty_bytes", "1073741824"),
+        rec("vm.dirty_background_bytes", "268435456"),
+    ])
+    .unwrap();
+    assert_eq!(outcome.applied, 2);
+    assert_eq!(
+        outcome.cleared,
+        ["vm.dirty_ratio", "vm.dirty_background_ratio"],
+        "the batch names the twins it zeroed"
+    );
+    let data = ledger();
+    for twin in &outcome.cleared {
+        assert_eq!(
+            data["entries"][twin.as_str()]["applied"],
+            "0",
+            "every named twin is a ledger record: {data}"
+        );
+    }
+    assert!(tuner::rollback_quiet().unwrap().is_complete());
 }
 
 /// A write that leaves a dirty knob where it was does not clear its twin: the
@@ -114,6 +148,15 @@ fn no_op_body() {
     assert!(
         data["entries"].get("vm.dirty_ratio").is_none(),
         "a write that changes nothing must not record a cleared twin: {data}"
+    );
+    // The same no-op through `tune`'s path names no twin either: the list
+    // follows the ledger, not the twin table.
+    let outcome = tuner::apply_quiet(&[rec("vm.dirty_bytes", "0")]).unwrap();
+    assert_eq!(outcome.applied, 1);
+    assert!(
+        outcome.cleared.is_empty(),
+        "a no-op write names no cleared twin: {:?}",
+        outcome.cleared
     );
 
     // Control: the same knob with a value that does change records the twin.
