@@ -754,10 +754,24 @@ fn tune_output<'a>(
     // They ARE applied (with the kernel's value) and are recorded in the
     // rollback ledger / sysctl.d; the note makes the delta visible (#4160).
     let clamped = serde_json::to_value(&outcome.clamped).unwrap_or_else(|_| json!([]));
+    // What this run wrote, in `fix`'s vocabulary: the original the ledger
+    // recorded (`previous`, the value `rollback` restores) and the value the
+    // kernel took (`applied`, the clamped one when the kernel adjusted the
+    // request). Always present like `failed` — a batch that wrote nothing
+    // answers an empty list, not a missing key — so a caller diffing the run
+    // against `rollback --list` reads the same pair without a second root read
+    // of the ledger. A write-only tunable reports a null `previous`: the write
+    // landed and nothing is restorable, exactly as `fix` reports it.
+    let written: Vec<serde_json::Value> = outcome
+        .written
+        .iter()
+        .map(|w| json!({ "param": w.param, "previous": w.previous, "applied": w.applied }))
+        .collect();
     let mut body = json!({
         "applied": outcome.applied(),
         "failed": failed,
         "clamped": clamped,
+        "written": written,
         "score_before": score_before,
         "score_after": score_after,
         "would_skip": would_skip_json(in_scope, selection),
@@ -2301,6 +2315,108 @@ mod tests {
         };
         let output = tune_output(&in_scope, &quiet, 30, 35, &[]);
         assert!(output.get("cleared").is_none(), "{output}");
+    }
+
+    #[test]
+    fn tune_output_names_what_it_wrote() {
+        // The batch must answer "which parameters changed, and from what" from
+        // the run itself: `applied` is a count, so a caller wanting the names
+        // and the originals had to read the ledger again as root. The pair
+        // reported here is the ledger's own — `previous` is what `rollback`
+        // restores and `applied` is what the kernel took — so a script can
+        // diff the run against `rollback --list`.
+        let in_scope = vec![rec("vm.dirty_bytes", true), rec("vm.swappiness", true)];
+        let outcome = tuner::ApplyOutcome {
+            written: vec![
+                written_entry("vm.dirty_bytes", "2097152", "1073741824"),
+                written_entry("vm.swappiness", "60", "10"),
+            ],
+            failed: vec![],
+            clamped: vec![],
+            boot_unit_enabled: true,
+            cleared: vec!["vm.dirty_ratio".to_string()],
+        };
+        let output = tune_output(&in_scope, &outcome, 30, 32, &[]);
+        assert_eq!(
+            output["written"],
+            json!([
+                { "param": "vm.dirty_bytes", "previous": "2097152", "applied": "1073741824" },
+                { "param": "vm.swappiness", "previous": "60", "applied": "10" },
+            ]),
+            "the run must name every write with its recorded original: {output}"
+        );
+        // The count and the list are one value: one entry per write, and the
+        // twin the write cleared stays in `cleared` — it is a ledger record of
+        // a kernel side effect, not a write this run asked for.
+        assert_eq!(output["applied"], json!(2));
+        assert_eq!(output["written"].as_array().unwrap().len(), 2);
+        assert_eq!(output["cleared"], json!(["vm.dirty_ratio"]));
+    }
+
+    #[test]
+    fn tune_output_keeps_a_write_it_cannot_record() {
+        // A write-only tunable has no original to record, and `fix` answers a
+        // null `previous` for it; the batch reports the entry the same way
+        // instead of dropping a write that did land. A run that wrote nothing
+        // keeps the key as an empty list, like `failed`, so a reader never has
+        // to branch on key presence.
+        let in_scope = vec![rec("vm.swappiness", true), rec("vm.ktuner_probe", true)];
+        let outcome = tuner::ApplyOutcome {
+            written: vec![tuner::WrittenEntry {
+                param: "vm.ktuner_probe".to_string(),
+                previous: None,
+                applied: "10".to_string(),
+            }],
+            failed: vec![],
+            clamped: vec![],
+            boot_unit_enabled: true,
+            cleared: Vec::new(),
+        };
+        let output = tune_output(&in_scope, &outcome, 40, 39, &[]);
+        assert_eq!(
+            output["written"],
+            json!([{ "param": "vm.ktuner_probe", "previous": null, "applied": "10" }])
+        );
+        assert_eq!(output["applied"], json!(1));
+
+        let empty = tuner::ApplyOutcome {
+            written: vec![],
+            failed: vec![],
+            clamped: vec![],
+            boot_unit_enabled: true,
+            cleared: Vec::new(),
+        };
+        let output = tune_output(&in_scope, &empty, 40, 40, &[]);
+        assert_eq!(output["written"], json!([]), "present and empty: {output}");
+        assert_eq!(output["applied"], json!(0));
+    }
+
+    #[test]
+    fn tune_output_reports_the_clamped_value_it_recorded() {
+        // A clamped write is applied with the kernel's value and recorded as
+        // such, so the entry must carry that value and not the request: the
+        // request would contradict both the ledger and `rollback --list` on
+        // the knob this run just wrote.
+        let in_scope = vec![rec("vm.swappiness", true)];
+        let outcome = tuner::ApplyOutcome {
+            written: vec![written_entry("vm.swappiness", "60", "50")],
+            failed: vec![],
+            clamped: vec![tuner::ClampNote {
+                param: "vm.swappiness".to_string(),
+                requested: "10".to_string(),
+                effective: "50".to_string(),
+            }],
+            boot_unit_enabled: true,
+            cleared: Vec::new(),
+        };
+        let output = tune_output(&in_scope, &outcome, 30, 31, &[]);
+        assert_eq!(
+            output["written"],
+            json!([{ "param": "vm.swappiness", "previous": "60", "applied": "50" }]),
+            "a clamped write reports the recorded value, not the request: {output}"
+        );
+        assert_eq!(output["clamped"][0]["requested"], json!("10"));
+        assert_eq!(output["clamped"][0]["effective"], json!("50"));
     }
 
     #[test]
