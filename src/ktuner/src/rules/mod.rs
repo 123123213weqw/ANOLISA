@@ -3114,6 +3114,14 @@ const FORWARDING_DAEMONS: &[&str] = &[
     // default bridge is `incusbr0`, which the interface scan does not name, so
     // a host whose containers route out through it showed neither sign.
     "incusd",
+    // VPN servers that, like `pptpd`, create the interface a client routes
+    // through only once the client connects: an idle server is all the
+    // predicate sees. OpenConnect's `ocserv`, the accel-ppp BRAS daemon
+    // `accel-pppd` (PPPoE/PPTP/L2TP/SSTP termination) and SoftEther's
+    // `vpnserver`.
+    "ocserv",
+    "accel-pppd",
+    "vpnserver",
 ];
 
 /// Whether one of the daemons that forward traffic for others is running.
@@ -13296,6 +13304,11 @@ mod tests {
             // Incus, the LXD fork: its daemon and its `incusbr0` bridge are
             // the only signs, and the bridge name is not one the scan knows.
             "incusd",
+            // VPN servers whose per-client interface appears only once a
+            // client connects, like pptpd: OpenConnect, accel-ppp, SoftEther.
+            "ocserv",
+            "accel-pppd",
+            "vpnserver",
         ] {
             let mut info = make_test_info();
             info.processes = vec![crate::detect::ProcessInfo {
