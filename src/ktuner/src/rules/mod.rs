@@ -4809,17 +4809,13 @@ fn eval_rp_filter_all_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_i64(path);
-    if current == 0 {
-        recs.push(Recommendation {
-            param: "net.ipv4.conf.all.rp_filter".to_string(),
-            current_value: "0".to_string(),
-            recommended_value: "1".to_string(),
-            reason: "未在所有接口启用反向路径过滤，攻击者可伪造源 IP 欺骗（注意：非对称/多路径路由场景需保持 0）".to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Security,
-            writable: true,
-        });
+    if let Some(rec) = rp_filter_recommendation(
+        "net.ipv4.conf.all.rp_filter",
+        read_sysctl_i64(path),
+        host_needs_ip_forward(info),
+        "未在所有接口启用反向路径过滤，攻击者可伪造源 IP 欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
+    ) {
+        recs.push(rec);
     }
     1
 }
@@ -14551,7 +14547,12 @@ mod tests {
             .iter()
             .find(|r| r.param == "net.ipv4.conf.all.rp_filter")
         {
-            assert_eq!(rec.recommended_value, "1");
+            let expected = if host_needs_ip_forward(&info) {
+                "2"
+            } else {
+                "1"
+            };
+            assert_eq!(rec.recommended_value, expected);
             assert_eq!(rec.category, Category::Security);
         }
     }
@@ -19216,7 +19217,10 @@ mod tests {
 
     /// The `rp_filter` rules routed through [`rp_filter_recommendation`].
     fn rp_filter_rules() -> Vec<(&'static str, EvalAt)> {
-        vec![("net.ipv4.conf.default.rp_filter", eval_rp_filter_at)]
+        vec![
+            ("net.ipv4.conf.default.rp_filter", eval_rp_filter_at),
+            ("net.ipv4.conf.all.rp_filter", eval_rp_filter_all_at),
+        ]
     }
 
     #[test]
