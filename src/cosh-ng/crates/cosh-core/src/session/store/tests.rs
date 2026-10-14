@@ -3057,3 +3057,5 @@ fn budget_activity_probes_do_not_rescan_temporary_files_per_candidate() {
         }
     }
 }
+
+mod redaction_boundaries;

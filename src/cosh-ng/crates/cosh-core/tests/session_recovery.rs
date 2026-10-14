@@ -1411,3 +1411,6 @@ fn session_control_bytes_output(home: &Path, request: &[u8]) -> Output {
 
 #[path = "session_recovery/resume_absence.rs"]
 mod resume_absence;
+
+#[path = "session_recovery/redaction_boundaries.rs"]
+mod redaction_boundaries;
