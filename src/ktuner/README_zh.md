@@ -414,16 +414,21 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 ### rollback 输出
 
 ```json
-{"failed": 0, "restored": 5, "skipped": 0, "status": "Full"}
+{"failed": 0, "restored": 5, "restored_params": [ ... ], "skipped": 0, "status": "Full"}
 ```
 
-回滚留下了什么就点名什么：读到 `failed` 或 `skipped` 的调用方不必再用 root 跑一次
+回滚两个方向都点名：`restored_params` 列出本次实际恢复的账本 key，按整批落地的顺序排列。
+集合并不等于调用方点名的参数——互斥孪生会随清零它的条目一起恢复，`--exclude` /
+`--category` 的选择也在引擎内部展开——所以只有这次运行自己说得清；被内核拒绝、却由孪生的
+恢复带回来的写入同样在这里被点名。
+
+回滚留下了什么也点名：读到 `failed` 或 `skipped` 的调用方不必再用 root 跑一次
 `rollback --list` 才知道哪些参数还留着调优。`failures` 为每个没能落地的条目给出一条
 `{"param", "error"}`（内核拒绝写入、回读仍被调整、被后续写入覆盖），`missing` 点出记录
-路径已不存在的条目。两个键只在有话可说时出现，所以什么都没留下的回滚逐字节返回上面的
-本体。计数含义不变：`failed` 仍计入所有没落地的项，包含收尾没能删掉的持久化文件与账本，
-`skipped` 仍是被跳过的缺失路径。四种调用形态都会报告它们——全量回滚、单个位置参数、
-一批参数，以及 `--exclude`、`--category` 包装的本体。
+路径已不存在的条目。三个键都只在有话可说时出现，所以既没有恢复、也没有留下任何东西的回滚
+逐字节返回上面四个计数器。计数含义不变：`failed` 仍计入所有没落地的项，包含收尾没能删掉的
+持久化文件与账本，`skipped` 仍是被跳过的缺失路径。四种调用形态都会报告它们——全量回滚、
+单个位置参数、一批参数，以及 `--exclude`、`--category` 包装的本体。
 
 ```json
 {"failed": 1, "failures": [{"error": "Is a directory (os error 21)", "param": "vm.dirty_ratio"}], "missing": ["net.core.somaxconn"], "restored": 1, "skipped": 1, "status": "Partial"}
@@ -435,14 +440,15 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 `fix`、`why` 相同（点/斜杠别名、含字面点的网卡名）：
 
 ```json
-{"failed": 0, "param": "vm.dirty_bytes", "restored": 2, "skipped": 0, "status": "Full"}
+{"failed": 0, "param": "vm.dirty_bytes", "restored": 2, "restored_params": ["vm.dirty_bytes", "vm.dirty_ratio"], "skipped": 0, "status": "Full"}
 ```
 
 `param` 是被恢复的账本条目，拼写与 `rollback --list` 一致。持久化文件按剩余账本重新
 生成；账本清空时走与全量 rollback 相同的收尾（先删持久化文件，再删账本）。内核互斥的
 参数对（`vm.dirty_bytes` / `vm.dirty_ratio`、`vm.overcommit_kbytes` /
 `vm.overcommit_ratio`、`dirty_background_` 对）连同账本记录的孪生一起恢复：写任一半都会
-把另一半清零，只恢复一半无法让账本描述内核的真实状态，因此 `restored` 把两条都计入。
+把另一半清零，只恢复一半无法让账本描述内核的真实状态，因此 `restored` 把两条都计入，
+`restored_params` 也把两条都点名（孪生用自己的账本 key）。
 写入失败或路径缺失的条目连同其孪生一起保留，退出码 `1`，可重试；账本里没有的参数是命令
 错误（`2`，stderr JSON），绝不静默成功。`status` 描述本次尝试（`Full` / `Partial` /
 `Nothing`），不表示账本已清空。普通 `ktuner rollback` 与 `ktuner rollback --list` 行为不变。
@@ -453,11 +459,11 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 `VM.SWAPPINESS` 都报 `vm.swappiness`）：
 
 ```json
-{"failed": 0, "params": ["vm.swappiness", "net.core.somaxconn"], "restored": 2, "skipped": 0, "status": "Full"}
+{"failed": 0, "params": ["vm.swappiness", "net.core.somaxconn"], "restored": 2, "restored_params": ["vm.swappiness", "net.core.somaxconn"], "skipped": 0, "status": "Full"}
 ```
 
-连同条目一起恢复的孪生计入 `restored` 但不出现在 `params` 里（与单参数版本不列出孪生一致），
-同时点名一对互斥孪生也只恢复一次。写入失败或路径缺失的参数照样出现在 `params` 里，并且由
+随条目一起恢复的孪生由 `restored_params` 点名，不出现在 `params` 里：数组回答这一批点名了
+什么，报告回答它实际撤掉了什么；同时点名一对互斥孪生也只恢复一次。写入失败或路径缺失的参数照样出现在 `params` 里，并且由
 `failures` / `missing` 点名，能不能恢复由计数器和 `status` 表达。部分成功的批只退役落地的条目，未落地的连同其孪生保留记录，退出码
 `1`、`status` 为 `Partial`；一条都没落地时账本与持久化文件都不改动。任一名字不在账本里就在
 动任何东西之前拒绝整条命令（`2`，stderr JSON）——与单参数版本同一条命令错误：静默跳过会让拼错

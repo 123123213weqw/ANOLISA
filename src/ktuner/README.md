@@ -462,21 +462,29 @@ value; persistence reproduces the cleared state.
 ### rollback output
 
 ```json
-{"failed": 0, "restored": 5, "skipped": 0, "status": "Full"}
+{"failed": 0, "restored": 5, "restored_params": [ ... ], "skipped": 0, "status": "Full"}
 ```
 
-A rollback that left something behind names it, so a caller reading `failed` or
-`skipped` does not have to run `rollback --list` as root to find out which
-parameters are still tuned: `failures` carries one `{"param", "error"}` per
-entry whose restore did not land (a write the kernel refused, a read-back that
-stayed clamped, a value a later write clobbered), and `missing` names the
-entries whose recorded path is gone. Both keys appear only when they have
-something to say, so a rollback that left nothing answers with the body above,
-byte for byte. The counters keep their meaning: `failed` still counts
-everything that did not land, including the persisted files and the ledger a
-cleanup could not remove, and `skipped` still counts the absent paths. Every
-invocation shape reports them — the plain rollback, a single positional, a
-batch, and the bodies `--exclude` and `--category` wrap.
+A rollback names what it did, in both directions. `restored_params` lists the
+ledger keys the attempt put back, in the order the batch landed them. The set
+is not the one the caller asked for: a mutually exclusive twin is restored with
+the entry that clears it, and the selection of `--exclude` / `--category` is
+expanded inside the engine, so the run has to answer it — a write the kernel
+refused but the twin's restore brought back is named here like any other.
+
+A rollback that left something behind names that too, so a caller reading
+`failed` or `skipped` does not have to run `rollback --list` as root to find
+out which parameters are still tuned: `failures` carries one
+`{"param", "error"}` per entry whose restore did not land (a write the kernel
+refused, a read-back that stayed clamped, a value a later write clobbered), and
+`missing` names the entries whose recorded path is gone. All three keys appear
+only when they have something to say, so a rollback that restored and left
+nothing answers with the four counters alone, byte for byte. The counters keep
+their meaning: `failed` still counts everything that did not land, including
+the persisted files and the ledger a cleanup could not remove, and `skipped`
+still counts the absent paths. Every invocation shape reports them — the plain
+rollback, a single positional, a batch, and the bodies `--exclude` and
+`--category` wrap.
 
 ```json
 {"failed": 1, "failures": [{"error": "Is a directory (os error 21)", "param": "vm.dirty_ratio"}], "missing": ["net.core.somaxconn"], "restored": 1, "skipped": 1, "status": "Partial"}
@@ -489,7 +497,7 @@ names and leaves the rest of the ledger in place. It accepts the same spellings
 `fix` and `why` do (slash/dot aliases, and the literal-dot interface names):
 
 ```json
-{"failed": 0, "param": "vm.dirty_bytes", "restored": 2, "skipped": 0, "status": "Full"}
+{"failed": 0, "param": "vm.dirty_bytes", "restored": 2, "restored_params": ["vm.dirty_bytes", "vm.dirty_ratio"], "skipped": 0, "status": "Full"}
 ```
 
 `param` is the ledger entry that was restored, spelled the way `rollback --list`
@@ -500,7 +508,8 @@ exclusive with a twin (`vm.dirty_bytes` / `vm.dirty_ratio`,
 `vm.overcommit_kbytes` / `vm.overcommit_ratio`, and the `dirty_background_`
 pair) is restored together with the twin the ledger recorded: writing either
 knob zeroes the other, so a half restore could not leave the ledger describing
-the live kernel, and `restored` counts both entries. An entry whose write failed
+the live kernel, and `restored` counts both entries — `restored_params` names
+both, the twin by its own ledger key. An entry whose write failed
 or whose path is gone keeps its record (and its twin's), exits `1`, and can be
 retried; a parameter the ledger does not record is a command error (`2`, stderr
 JSON), never a silent success. `status` classifies this attempt
@@ -515,12 +524,12 @@ key each positional resolved to, in the order given and deduplicated, so
 `vm/swappiness` and `VM.SWAPPINESS` both report `vm.swappiness`:
 
 ```json
-{"failed": 0, "params": ["vm.swappiness", "net.core.somaxconn"], "restored": 2, "skipped": 0, "status": "Full"}
+{"failed": 0, "params": ["vm.swappiness", "net.core.somaxconn"], "restored": 2, "restored_params": ["vm.swappiness", "net.core.somaxconn"], "skipped": 0, "status": "Full"}
 ```
 
-The twin restored with an entry is counted in `restored` but not named, exactly
-as the single-parameter body does not name it, and naming both halves of a pair
-restores it once. A parameter whose write failed or whose path is gone is still
+A twin an entry brought along is named by `restored_params`, not by `params`:
+the array answers what the batch asked for, the report answers what it retired,
+and naming both halves of a pair restores it once. A parameter whose write failed or whose path is gone is still
 named in `failures` / `missing` — the counters and `status` say whether the
 batch restored. A batch that
 restores only part of what it named retires the entries that landed, keeps the

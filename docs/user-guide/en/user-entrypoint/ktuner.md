@@ -111,10 +111,13 @@ All output is JSON on stdout; errors are JSON on stderr. Exit codes: `0` success
 `1` check found recommendations or rollback left values unrestored, `2` command error.
 Rollback returns `1` for failed writes or missing paths, including partial restoration;
 its JSON counts remain on stdout and the ledger is kept for retry. The body also names
-what it left: `failures` carries one `{"param", "error"}` per entry whose restore did
-not land, and `missing` lists the entries whose recorded path is gone. Both keys appear
-only when they have something to say, so a complete rollback's body is unchanged, and
-every invocation shape reports them the same way. An empty ledger
+what it restored — `restored_params` lists the ledger keys that landed, which is not
+the set the caller named: a mutually exclusive twin comes with the entry that clears
+it, and `--exclude`/`--category` expand their selection inside the engine — and what it
+left: `failures` carries one `{"param", "error"}` per entry whose restore did not land,
+and `missing` lists the entries whose recorded path is gone. All three keys appear only
+when they have something to say, so a rollback that restored and left nothing keeps the
+four counters it always had, and every invocation shape reports them the same way. An empty ledger
 is a successful no-op (`0`); an unreadable or missing ledger is a command error (`2`).
 `sudo ktuner rollback <param>` follows the same contract for the entry it names —
 plus the mutually exclusive twin recorded with it, restored together because writing
