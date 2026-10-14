@@ -11,7 +11,7 @@
 |---|---|
 | 权限 | `trace` 需要 root（或 `CAP_BPF` + `CAP_PERFMON`）。查询类命令需要读取 `/var/log/sysak/.agentsight`，该目录归服务所有，请加 `sudo`。 |
 | 配置文件 | 需要读取规则的命令支持 `--config`，默认 `/etc/agentsight/config.json`。`discover` 读取与 `trace` 相同的文件，因此会反映你的自定义规则。 |
-| 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics` 支持用 `--db` 指定其他数据库文件。 |
+| 数据位置 | 固定为 `/var/log/sysak/.agentsight`。`serve`、`dashboard`、`skill-metrics`、`audit`、`metrics`、`summary`、`interruption` 支持用 `--db` 指定其他数据库文件。 |
 | 机器可读输出 | `discover`、`token`、`audit`、`summary`、`interruption *`、`skill-metrics *` 都支持 `--json`。 |
 | 输出语言 | `summary`、`metrics`、`interruption` 输出英文；`discover`、`token` 无论 locale 都输出中文。需要稳定文本时请用 `--json`。 |
 | 平台 | macOS 上只有 `trace`（轨迹采集）和 `serve`。 |
@@ -150,6 +150,7 @@ AgentSight 仪表盘状态
 FLAGS:
         --json           Output as JSON
 OPTIONS:
+        --db <db>        Override the sessions database path
         --last <last>    Query the last N hours (default: 24) [default: 24]
 ```
 
@@ -167,6 +168,13 @@ Interruptions 1
   low         0
 
 Tokenless     10% saved (110.0K -> 99.0K, 20 ops)
+```
+
+`--db` 改为读取数据库副本（例如从别的机器拷来的），不再读默认目录，因此无需 `sudo`，也不会混入在跑
+主机的数据。中断库从同一目录解析（`interruption_events.db`），与默认布局一致。
+
+```bash
+agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
 
 ## agentsight token
@@ -216,6 +224,7 @@ OPTIONS:
                                   substrings. Repeatable. The hidden count is reported
         --last <last>             Query last N hours (e.g. 24)
         --pid <pid>               Filter by PID
+        --db <db>                 Override the database path
 ```
 
 ```bash
@@ -247,6 +256,12 @@ sudo agentsight audit --last 24 --type llm --json \
 
 ```bash
 sudo agentsight audit --last 1 --exclude agent-sec-cli --exclude observability_hook.py
+```
+
+`--db` 改为读取 `agentsight.db` 的副本（例如从别的机器拷来的），不再读默认目录：
+
+```bash
+agentsight audit --last 24 --db /backup/agentsight/agentsight.db
 ```
 
 ## agentsight discover
@@ -307,9 +322,20 @@ agentsight_token_output_total{agent="CoshNG"} 10000
 运行中的服务在 `GET /metrics`（仅本机）暴露同样的内容，抓取时通常用它更方便，见
 [数据与存储](data-and-storage.md#prometheus-指标)。
 
+`--db` 改为读取 `genai_events.db` 的副本，不再读默认目录：
+
+```bash
+agentsight metrics --db /backup/agentsight/genai_events.db
+```
+
 ## agentsight interruption
 
-查询与关闭中断事件。数据库：`/var/log/sysak/.agentsight/interruption_events.db`。
+查询与关闭中断事件。数据库：`/var/log/sysak/.agentsight/interruption_events.db`。`--db`（放在子命令
+之前）改为读取该库的副本（例如从别的机器拷来的）：
+
+```bash
+agentsight interruption --db /backup/agentsight/interruption_events.db stats --last 168
+```
 
 ```
 SUBCOMMANDS:

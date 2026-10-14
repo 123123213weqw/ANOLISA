@@ -25,8 +25,9 @@ read them.
 | `optimization_config.json` | LLM settings entered on the Dashboard Settings page (API key stored here) |
 | `*.db-wal`, `*.db-shm` | SQLite write-ahead log and shared memory; normal, and checkpointed on clean shutdown |
 
-`--db` on `serve`, `dashboard`, and `skill-metrics` points at a different database file, which is
-how you browse a copy or an archive. The tracer itself always writes to the default directory.
+`--db` on `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption`
+points at a different database file, which is how you browse a copy or an archive. The tracer
+itself always writes to the default directory.
 
 > `serve --db <path>` resolves every sibling store from the `--db` directory — GenAI events, the
 > interruption store, the trajectory store, and the health checker all follow it. The private

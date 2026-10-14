@@ -24,8 +24,8 @@ AgentSight 采集到的一切都以 SQLite 数据库形式留在本机。Dashboa
 | `optimization_config.json` | 在 Dashboard 设置页填写的 LLM 配置（API Key 存于此） |
 | `*.db-wal`、`*.db-shm` | SQLite 预写日志与共享内存；属正常文件，干净退出时会做 checkpoint |
 
-`serve`、`dashboard`、`skill-metrics` 支持用 `--db` 指向别的数据库文件，这也是浏览副本或归档的方式。
-tracer 自身始终写入默认目录。
+`serve`、`dashboard`、`skill-metrics`、`audit`、`metrics`、`summary`、`interruption` 支持用 `--db`
+指向别的数据库文件，这也是浏览副本或归档的方式。tracer 自身始终写入默认目录。
 
 > `serve --db <path>` 会让所有兄弟库都从 `--db` 所在目录解析——GenAI 事件、中断库、轨迹库以及
 > health checker 都跟着它走。私有的安全、拦截、复用与因果库从其 `.agentsight-private/` 子目录解析。
