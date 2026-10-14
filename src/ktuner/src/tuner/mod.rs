@@ -430,9 +430,19 @@ fn matching_record<'a>(
 /// missed the record a merge adopts through its key (a path an older
 /// translation left behind) and reported the fresh re-read instead,
 /// contradicting the ledger and `rollback` on the very knob just written.
+///
+/// The lookup runs on the healed view every other consumer reads: a legacy
+/// ledger can hold two spellings of one kernel path, and the merge, a restore
+/// and the listing all call [`heal_alias_duplicates`] before they act, so the
+/// record whose `previous` a rollback writes is the survivor the heal keeps.
+/// Reading the raw ledger answered with the discarded record instead.
 fn recorded_previous_value(data: &RollbackData, param: &str) -> Option<String> {
     let identity = canonicalize_path(&param_to_path(param));
-    matching_record(&data.entries, &identity)
+    // Healed on a copy, so the caller keeps the ledger it loaded: the original
+    // to report is the one the survivor of a legacy alias pair holds.
+    let mut healed = data.clone();
+    heal_alias_duplicates(&mut healed);
+    matching_record(&healed.entries, &identity)
         .map(|(_key, entry, _same_path)| entry.previous.clone())
 }
 
@@ -7050,6 +7060,43 @@ mod tests {
         assert_eq!(
             recorded_previous_value(&merged, "net/ipv4/conf/Br0.100/forwarding").as_deref(),
             Some("0")
+        );
+    }
+
+    /// A legacy ledger can hold two spellings of one kernel path (the alias
+    /// dedup predates the heal). Every consumer heals before it acts — the
+    /// merge, a restore and the listing — and the heal keeps ONE of the pair
+    /// when the values cannot order it, so the record whose `previous` a
+    /// rollback writes is that survivor. A lookup that reads the raw ledger
+    /// answers with the other record, and `fix` reports an original no
+    /// rollback restores — contradicting the ledger on the very knob it just
+    /// fixed.
+    #[test]
+    fn a_duplicated_alias_reports_the_original_the_heal_keeps() {
+        let data: RollbackData = serde_json::from_str(
+            r#"{"version":1,"entries":{
+                "vm.swappiness":{"previous":"10","applied":"30",
+                    "path":"/proc/sys/vm/swappiness"},
+                "vm/swappiness":{"previous":"20","applied":"40",
+                    "path":"/proc/sys/vm/swappiness"}
+            }}"#,
+        )
+        .unwrap();
+        // The heal every other consumer runs first. Neither `applied` equals
+        // the other's `previous` — the knob was changed outside ktuner between
+        // the two records — so the pair cannot be ordered and the greatest key
+        // survives verbatim, which is the record today's key-order restore
+        // writes last.
+        let mut healed = data.clone();
+        heal_alias_duplicates(&mut healed);
+        assert_eq!(healed.entries.len(), 1, "one kernel file is one record");
+        assert_eq!(healed.entries["vm/swappiness"].previous, "20");
+        // The reported original is that survivor's: the value a rollback
+        // writes.
+        assert_eq!(
+            recorded_previous_value(&data, "vm.swappiness").as_deref(),
+            Some("20"),
+            "the answer must be the record the merge and a restore act on"
         );
     }
 
