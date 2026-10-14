@@ -254,11 +254,12 @@ fn rollback_category_restores_only_the_recorded_categories() {
         serde_json::json!({
             "failed": 0,
             "restored": 1,
+            "restored_params": ["net.core.somaxconn"],
             "skipped": 0,
             "status": "Full",
             "unclassified": ["net.core.legacy_knob"],
         }),
-        "the full-rollback keys, the unclassified report, and nothing besides them"
+        "the counters, the entries it restored, the unclassified report, and nothing besides them"
     );
     assert_eq!(
         fs::read_to_string(scratch.0.join("somaxconn")).unwrap(),
@@ -404,6 +405,7 @@ fn rollback_category_selects_the_union_the_plan_would() {
         serde_json::json!({
             "failed": 0,
             "restored": 4,
+            "restored_params": ["net.core.somaxconn", "vm.dirty_bytes", "vm.dirty_ratio", "vm.swappiness"],
             "skipped": 0,
             "status": "Full",
             "unclassified": ["net.core.legacy_knob"],
@@ -434,6 +436,7 @@ fn rollback_category_stacks_exclusions_and_reports_what_it_left() {
         serde_json::json!({
             "failed": 0,
             "restored": 1,
+            "restored_params": ["net.core.somaxconn"],
             "skipped": 0,
             "status": "Full",
             "unclassified": ["net.core.legacy_knob"],
@@ -462,6 +465,7 @@ fn rollback_category_stacks_exclusions_and_reports_what_it_left() {
         serde_json::json!({
             "failed": 0,
             "restored": 1,
+            "restored_params": ["vm.swappiness"],
             "skipped": 0,
             "status": "Full",
             "unclassified": ["net.core.legacy_knob"],

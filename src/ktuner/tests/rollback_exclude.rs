@@ -209,8 +209,9 @@ fn rollback_exclude_restores_everything_but_the_named_entries() {
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert_eq!(
         body,
-        serde_json::json!({"failed": 0, "restored": 3, "skipped": 0, "status": "Full"}),
-        "the full-rollback keys, and nothing besides them: {body}"
+        serde_json::json!({"failed": 0, "restored": 3, "skipped": 0, "status": "Full",
+            "restored_params": ["net.core.somaxconn", "vm.dirty_bytes", "vm.dirty_ratio"]}),
+        "the counters, the entries it restored, and nothing besides them: {body}"
     );
     assert_eq!(
         fs::read_to_string(scratch.0.join("swappiness")).unwrap(),
@@ -258,7 +259,8 @@ fn rollback_exclude_keeps_the_whole_recorded_pair() {
     let body: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
     assert_eq!(
         body,
-        serde_json::json!({"failed": 0, "restored": 2, "skipped": 0, "status": "Full"}),
+        serde_json::json!({"failed": 0, "restored": 2, "skipped": 0, "status": "Full",
+            "restored_params": ["net.core.somaxconn", "vm.swappiness"]}),
         "{body}"
     );
     assert_eq!(
@@ -313,6 +315,7 @@ fn rollback_exclude_reports_an_unmatched_name_and_restores_all() {
         serde_json::json!({
             "failed": 0,
             "restored": 4,
+            "restored_params": ["net.core.somaxconn", "vm.dirty_bytes", "vm.dirty_ratio", "vm.swappiness"],
             "skipped": 0,
             "status": "Full",
             "unmatched_exclude": ["vm.typo"],
