@@ -1969,7 +1969,7 @@ fn read_pending_at(path: &str) -> Result<Option<RollbackData>> {
     #[cfg(test)]
     tests::finalize_race_probe(path);
     let json = fs::read_to_string(path).context("读取 rollback 文件失败")?;
-    Ok(Some(parse_rollback_ledger(&json)?))
+    Ok(Some(parse_rollback_ledger_at(path, &json)?))
 }
 
 /// The pending entries a rollback of `params` would restore, for
@@ -2098,17 +2098,24 @@ fn rollback_preview_categories_at(
     })
 }
 
-/// Parse rollback-ledger JSON into the healed entry map the preview walks.
-/// A corrupt ledger is an error, never an empty list —
-/// silently treating a corrupt ledger as empty is how the original values
-/// get lost (cf. #3578).
+/// Parse the ledger body read from `path` into the healed entry map every
+/// reader walks. A corrupt ledger is an error, never an empty list — silently
+/// treating a corrupt ledger as empty is how the original values get lost
+/// (cf. #3578) — and the error names the recovery it needs: the file holds the
+/// only record of the originals, so it must be repaired, or moved aside with
+/// its copy kept, and the command rerun. [`load_rollback_from`] already
+/// answers with that remedy; the readers of the same file answered a bare
+/// parser error instead, on the one message an operator is most likely to act
+/// on by deleting the file.
 ///
-/// Legacy duplicate spellings are healed first, so the preview describes the
-/// restore `rollback` will actually perform: `restore_entries` heals before
-/// restoring, and an unhealed preview would promise a second restore that
-/// never runs and report a `previous` the kernel will never receive.
-fn parse_rollback_ledger(json: &str) -> Result<RollbackData> {
-    let mut data: RollbackData = serde_json::from_str(json).context("解析 rollback 文件失败")?;
+/// Legacy duplicate spellings are healed first, so the restore, the selection
+/// and the preview describe what `rollback` will actually perform:
+/// `restore_entries` heals before restoring, and an unhealed listing would
+/// promise a second restore that never runs and report a `previous` the kernel
+/// will never receive.
+fn parse_rollback_ledger_at(path: &str, json: &str) -> Result<RollbackData> {
+    let mut data: RollbackData = serde_json::from_str(json)
+        .with_context(|| format!("parse rollback ledger {path}; {}", ledger_remedy(path)))?;
     heal_alias_duplicates(&mut data);
     Ok(data)
 }
@@ -2207,11 +2214,8 @@ fn rollback_params_at(
         anyhow::bail!("没有找到 rollback 文件 ({ledger})，可能尚未执行过 tune");
     }
     let json = fs::read_to_string(ledger).context("读取 rollback 文件失败")?;
-    let mut data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
-    // Heal first for the same reason restore_entries does: a legacy ledger can
-    // hold two spellings of one kernel path, and the lookup should see the
-    // single record the restore will act on.
-    heal_alias_duplicates(&mut data);
+    // Healed, so the lookup sees the single record the restore will act on.
+    let mut data = parse_rollback_ledger_at(ledger, &json)?;
 
     // Resolve every name before anything is written.
     let keys = resolve_ledger_keys(&data.entries, params)?;
@@ -2382,11 +2386,8 @@ fn rollback_excluding_at(
         anyhow::bail!("没有找到 rollback 文件 ({ledger})，可能尚未执行过 tune");
     }
     let json = fs::read_to_string(ledger).context("读取 rollback 文件失败")?;
-    let mut data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
-    // Heal first for the same reason rollback_params_at does: a legacy ledger
-    // can hold two spellings of one kernel path, and the selection should act
-    // on the single record the restore will act on.
-    heal_alias_duplicates(&mut data);
+    // Healed, so the selection acts on the single record the restore will.
+    let mut data = parse_rollback_ledger_at(ledger, &json)?;
 
     let (unmatched, units) = excluded_units(&data.entries, excluded);
     let outcome = restore_units_at(
@@ -2451,11 +2452,8 @@ fn rollback_categories_at(
         anyhow::bail!("没有找到 rollback 文件 ({ledger})，可能尚未执行过 tune");
     }
     let json = fs::read_to_string(ledger).context("读取 rollback 文件失败")?;
-    let mut data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
-    // Heal first for the same reason rollback_params_at does: a legacy ledger
-    // can hold two spellings of one kernel path, and the selection should act
-    // on the single record the restore will act on.
-    heal_alias_duplicates(&mut data);
+    // Healed, so the selection acts on the single record the restore will.
+    let mut data = parse_rollback_ledger_at(ledger, &json)?;
 
     let selection = category_selection(&data.entries, cats, excluded);
     let outcome = restore_units_at(
@@ -3163,7 +3161,7 @@ fn rollback_inner(quiet: bool) -> Result<RollbackOutcome> {
 
     // The existence check, restore and cleanup share the apply transaction lock.
     let json = fs::read_to_string(ROLLBACK_PATH).context("读取 rollback 文件失败")?;
-    let data: RollbackData = serde_json::from_str(&json).context("解析 rollback 文件失败")?;
+    let data = parse_rollback_ledger_at(ROLLBACK_PATH, &json)?;
     let RollbackOutcome {
         restored_params,
         failures,
@@ -4685,7 +4683,7 @@ mod tests {
             .collect(),
         };
         let json = serde_json::to_string(&data).unwrap();
-        let entries = triples(&parse_rollback_ledger(&json).unwrap());
+        let entries = triples(&parse_rollback_ledger_at(ROLLBACK_PATH, &json).unwrap());
         assert_eq!(
             entries,
             vec![
@@ -4715,7 +4713,8 @@ mod tests {
     #[test]
     fn test_parse_rollback_entries_empty_ledger() {
         // Fresh install / post-rollback state: empty, not an error.
-        let data = parse_rollback_ledger(r#"{"version":1,"entries":{}}"#).unwrap();
+        let data =
+            parse_rollback_ledger_at(ROLLBACK_PATH, r#"{"version":1,"entries":{}}"#).unwrap();
         assert!(data.entries.is_empty());
     }
 
@@ -4727,7 +4726,8 @@ mod tests {
         // returning the pristine 60 — not promise a second restore (10) that
         // rollback never performs.
         let entries = triples(
-            &parse_rollback_ledger(
+            &parse_rollback_ledger_at(
+                ROLLBACK_PATH,
                 r#"{"version":1,"entries":{
                 "vm.swappiness":{"previous":"60","applied":"10","path":"/proc/sys/vm/swappiness"},
                 "vm/swappiness":{"previous":"10","applied":"5","path":"/proc/sys/vm/swappiness"}
@@ -4752,7 +4752,8 @@ mod tests {
         // record restore_entries writes today, so preview and restore agree
         // on both the row count and the previous value that lands.
         let entries = triples(
-            &parse_rollback_ledger(
+            &parse_rollback_ledger_at(
+                ROLLBACK_PATH,
                 r#"{"version":1,"entries":{
                 "vm.swappiness":{"previous":"60","applied":"10","path":"/proc/sys/vm/swappiness"},
                 "vm/swappiness":{"previous":"20","applied":"30","path":"/proc/sys/vm/swappiness"}
@@ -4773,20 +4774,24 @@ mod tests {
 
     #[test]
     fn test_parse_rollback_entries_rejects_corrupt_json() {
-        // The #3578 "corrupt is not empty" contract.
-        let err = match parse_rollback_ledger("not json") {
+        // The #3578 "corrupt is not empty" contract, with the remedy the
+        // operator needs to keep the originals: the error names the file and
+        // the recovery, exactly as [`load_rollback_from`] answers.
+        let err = match parse_rollback_ledger_at(ROLLBACK_PATH, "not json") {
             Ok(_) => panic!("a corrupt ledger must not parse"),
             Err(err) => err,
         };
-        assert!(err.to_string().contains("解析"), "got: {err}");
+        let message = err.to_string();
+        assert!(message.contains("inspect and repair"), "got: {message}");
+        assert!(message.contains(ROLLBACK_PATH), "got: {message}");
     }
 
     #[test]
     fn test_parse_rollback_entries_rejects_wrong_shape() {
         // Wrong top-level type and wrong entries type: Err, no panic, no
         // silent default.
-        assert!(parse_rollback_ledger("[1,2,3]").is_err());
-        assert!(parse_rollback_ledger(r#"{"entries":"x"}"#).is_err());
+        assert!(parse_rollback_ledger_at(ROLLBACK_PATH, "[1,2,3]").is_err());
+        assert!(parse_rollback_ledger_at(ROLLBACK_PATH, r#"{"entries":"x"}"#).is_err());
     }
 
     #[test]
@@ -4811,7 +4816,7 @@ mod tests {
                 .collect(),
         };
         let json = serde_json::to_string(&data).unwrap();
-        let params: Vec<String> = parse_rollback_ledger(&json)
+        let params: Vec<String> = parse_rollback_ledger_at(ROLLBACK_PATH, &json)
             .unwrap()
             .entries
             .keys()
@@ -7762,7 +7767,8 @@ mod tests {
 
         // The units the restore walks for the same names hold exactly those
         // entries.
-        let data = parse_rollback_ledger(&fs::read_to_string(&ledger).unwrap()).unwrap();
+        let data =
+            parse_rollback_ledger_at(ROLLBACK_PATH, &fs::read_to_string(&ledger).unwrap()).unwrap();
         let keys = resolve_ledger_keys(&data.entries, &params).unwrap();
         let restored: Vec<String> = rollback_units(&data.entries, &keys)
             .into_iter()
@@ -8654,6 +8660,50 @@ mod tests {
             let message = error.to_string();
             assert!(message.contains("inspect and repair"), "{message}");
             assert!(message.contains("rerun the command"), "{message}");
+        }
+    }
+
+    /// The same remedy, from every reader of the file. The ledger holds the
+    /// only record of the originals, so the message an operator gets for a
+    /// damaged one is the recovery they must not skip: repair it, or move it
+    /// aside with its copy kept, then rerun. [`load_rollback_from`] answers
+    /// that already; the rollback forms and the previews reported the parser's
+    /// own text under `解析 rollback 文件失败` instead, naming neither the file
+    /// nor the stakes — the answer most likely to be met with `rm`.
+    #[test]
+    fn a_corrupt_ledger_names_the_remedy_from_every_reader() {
+        let dir = AtomicTestDir::new("ledger-remedy-readers");
+        let ledger = dir.0.join("rollback.json");
+        let path = ledger.to_str().unwrap();
+        fs::write(&ledger, b"{").unwrap();
+        let (conf, service, script) = fixture_paths(&dir);
+        let params = ["vm.swappiness".to_string()];
+        let errors = [
+            rollback_params_at(&params, path, &conf, &service, &script)
+                .err()
+                .unwrap_or_else(|| panic!("restore of a corrupt ledger must not parse")),
+            rollback_excluding_at(&[], path, &conf, &service, &script)
+                .err()
+                .unwrap_or_else(|| panic!("an exclusion over a corrupt ledger must not parse")),
+            rollback_categories_at(&["mem".to_string()], &[], path, &conf, &service, &script)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("a category selection over a corrupt ledger must not parse")
+                }),
+            rollback_preview_at(path)
+                .err()
+                .unwrap_or_else(|| panic!("the preview must not read a corrupt ledger")),
+            rollback_preview_params_at(&params, path)
+                .err()
+                .unwrap_or_else(|| panic!("the narrowed preview must not read a corrupt ledger")),
+        ];
+        for error in errors {
+            let message = error.to_string();
+            assert!(message.contains("inspect and repair"), "{message}");
+            assert!(
+                message.contains(path),
+                "the error must name the file it is about: {message}"
+            );
         }
     }
 
