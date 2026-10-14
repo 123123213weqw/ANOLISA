@@ -1937,10 +1937,10 @@ mod tests {
         // A root peer is always trusted in production, regardless of the
         // configured owner. Run the listener under a different kernel UID so
         // this remains a real negative test when the suite itself runs as root.
-        let helper_exe = directory.path().join("untrusted-peer-helper");
-        fs::copy(std::env::current_exe().unwrap(), &helper_exe).unwrap();
-        fs::set_permissions(&helper_exe, fs::Permissions::from_mode(0o755)).unwrap();
-        let mut command = Command::new(&helper_exe);
+        use std::os::fd::AsRawFd;
+
+        let helper_exe = fs::File::open(std::env::current_exe().unwrap()).unwrap();
+        let mut command = Command::new(format!("/proc/self/fd/{}", helper_exe.as_raw_fd()));
         command
             .arg("--exact")
             .arg("checkpoint::tests::untrusted_peer_daemon_helper")
