@@ -455,6 +455,13 @@ twin in `would_clear`, taken from the same table the write path records from
 A real `fix` names the twin its write zeroed in `cleared`, in the same shape
 as `would_clear`; the key is absent when the write cleared nothing.
 
+A real `fix` answers with `fixed`, the parameter exactly as it was typed, and
+`param`, the ledger key the write was recorded under: the recommendation's own
+spelling, which `rollback --list` lists, `rollback <param>` answers with and
+`tune`'s `written` entries carry. They differ when the parameter was named by an
+alias (`VM/SWAPPINESS`, `vm/swappiness`), and `param` is the one to reconcile
+against the ledger.
+
 A real `fix` records the cleared twin's original in the ledger — so
 `rollback` restores it — only when the twin holds a configured (non-zero)
 value; persistence reproduces the cleared state.

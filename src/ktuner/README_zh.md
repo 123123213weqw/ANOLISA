@@ -408,6 +408,11 @@ THP 参数、但 `systemctl enable ktuner-nonsysctl.service` 未成功，该键�
 真实 `fix` 用 `cleared` 列出这次写入清零的孪生，形状与 `would_clear` 相同；
 写入没有清零任何孪生时不出现该键。
 
+真实 `fix` 返回 `fixed`（按输入原样回显的参数名）与 `param`（这次写入在账本中记录的键：
+建议自身的写法，即 `rollback --list` 列出、`rollback <param>` 回答、`tune` 的 `written`
+条目携带的那个键）。用别名（`VM/SWAPPINESS`、`vm/swappiness`）指定参数时两者不同，
+与账本对账应使用 `param`。
+
 真实 `fix` 运行时，只有孪生持有已配置的（非零）原值，才会把被清零的原值
 记入账本（`rollback` 因此能恢复）；持久化重现清零后的状态。
 

@@ -92,6 +92,10 @@ sudo ktuner rollback --list --category net   # 预览同一集合
 与 `sudo ktuner fix <param>` 给出完全相同的 stderr JSON 与退出码，因此预检不会
 与被预览的命令不一致。
 
+真实 `fix` 返回 `fixed`（按输入原样回显的名字）与 `param`（这次写入在账本中记录的键，
+即 `rollback --list` 列出、`rollback <param>` 回答的那个键）。用 `vm/swappiness`
+这类别名指定参数时，两者不同。
+
 真实 `tune` 或 `fix` 用 `cleared` 列出写入清零的互斥孪生，形状与 `would_clear`
 相同：恰好是账本为 `rollback` 记录的孪生。没有清零任何孪生时不出现该键。
 

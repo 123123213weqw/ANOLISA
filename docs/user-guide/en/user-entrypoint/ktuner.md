@@ -96,6 +96,11 @@ exactly like `sudo ktuner fix <param>` — same stderr JSON, same exit code —
 when the parameter is outside the plan, unwritable, or runtime-dangerous, so
 the preview cannot disagree with the command it previews.
 
+A real `fix` answers with `fixed`, the name as typed, and `param`, the ledger
+key the write was recorded under — the key `rollback --list` lists and
+`rollback <param>` answers with. The two differ when the parameter was named by
+an alias such as `vm/swappiness`.
+
 A real `tune` or `fix` names the mutually exclusive twins its writes zeroed in
 `cleared`, in the shape of `would_clear`: exactly the twins the ledger recorded
 for `rollback` to restore. The key is absent when nothing was cleared.
