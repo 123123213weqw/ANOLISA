@@ -468,10 +468,8 @@ fn imported_category(
         return None;
     }
     let identity = canonicalize_path(&param_to_path(param));
-    data.entries
-        .values()
-        .find(|entry| canonicalize_path(&entry.path) == identity)
-        .and_then(|entry| entry.category.clone())
+    matching_record(&data.entries, &identity)
+        .and_then(|(_key, entry, _same_path)| entry.category.clone())
 }
 
 /// Render an option-list reading, with whitespace-separated fields collapsed.
@@ -5771,6 +5769,55 @@ mod tests {
             serde_json::json!({
                 "previous": "128", "applied": "4096", "path": somaxconn.to_str().unwrap(),
             })
+        );
+    }
+
+    /// The same kept classification, for a record whose recorded `path` is no
+    /// longer what the knob resolves to: the merge adopts that record through
+    /// its key (the stale-path repair), so a lookup that only compares the
+    /// recorded path finds no record at all and a no-op import refreshes the
+    /// entry with `category: null` — erasing the classification a rule stamped
+    /// on a knob the import did not change, and dropping it from what
+    /// `rollback --category` selects.
+    #[test]
+    fn a_no_op_import_keeps_a_stale_records_category() {
+        let param = "net.ipv4.conf.Br0.100.forwarding";
+        let data = RollbackData {
+            version: 1,
+            entries: BTreeMap::from([(
+                param.to_string(),
+                RollbackEntry {
+                    previous: "1".to_string(),
+                    applied: "1".to_string(),
+                    path: "/proc/sys/net/ipv4/conf/Br0/100/forwarding".to_string(),
+                    category: Some(Category::Performance),
+                },
+            )]),
+        };
+        for spelling in [param, "net/ipv4/conf/Br0.100/forwarding"] {
+            assert_eq!(
+                imported_category(&data, spelling, "1", "1"),
+                Some(Category::Performance),
+                "{spelling}: a write that changes nothing keeps the rule's category"
+            );
+        }
+        // And the merge that follows the import keeps it too: the adopted
+        // record survives with the classification the rules wrote. This is the
+        // category `apply_import` hands the merge for this write.
+        let category = imported_category(&data, param, "1", "1");
+        let merged = merge_entries(
+            data,
+            [(
+                "net/ipv4/conf/Br0.100/forwarding".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                category,
+            )],
+        );
+        assert_eq!(
+            merged.entries[param].category,
+            Some(Category::Performance),
+            "the classification survives the no-op import"
         );
     }
 
