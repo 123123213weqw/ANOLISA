@@ -8437,14 +8437,28 @@ fn eval_protected_fifos_at(
 }
 
 fn eval_tcp_fack(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_fack";
+    eval_tcp_fack_at(info, recs, "/proc/sys/net/ipv4/tcp_fack")
+}
+
+/// Path-injectable form of [`eval_tcp_fack`] (the `eval_*_at` idiom) so the read is
+/// assertable against synthetic files.
+///
+/// The rule fires on 0 (FACK off, on a pre-4.15 kernel), and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to the same 0. Only a value the reader could produce is
+/// evidence, so a masked or garbled proc entry (a container's, typically)
+/// neither reports a `current_value` the host does not have nor asks for a
+/// write it may not need.
+fn eval_tcp_fack_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if !info.has_listen_sockets() {
         return 1;
     }
-    if let Some(rec) = tcp_fack_recommendation(read_sysctl_u64(path), &info.kernel_version) {
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if let Some(rec) = tcp_fack_recommendation(current, &info.kernel_version) {
         recs.push(rec);
     }
     1
@@ -20342,6 +20356,37 @@ mod tests {
             }
         }
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn tcp_fack_advice_needs_a_readable_value() {
+        // The rule fires on 0, and the reader mapped an unreadable or
+        // unparseable file to the same 0: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("tcp_fack_read", b"1\n");
+        // FACK only has readers before Linux 4.15.
+        let mut info = make_test_info();
+        info.kernel_version = "3.10.0-1160.el7".to_string();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_fack_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves FACK off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 does not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
