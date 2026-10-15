@@ -6002,7 +6002,12 @@ fn eval_rps_sock_flow_entries_at(
     if !rfs_flow_table_configured(net_root) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // The rule fires below a floor, and read_sysctl_u64 maps an unreadable or
+    // unparseable file to 0, which is below it: only a value the reader could
+    // produce is evidence that the table is small.
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 32768 {
         recs.push(Recommendation {
             param: "net.core.rps_sock_flow_entries".to_string(),
@@ -17655,6 +17660,44 @@ mod tests {
             .find(|r| r.param == "net.core.rps_sock_flow_entries")
         {
             assert_eq!(rec.recommended_value, "32768");
+        }
+    }
+
+    #[test]
+    fn rps_sock_flow_entries_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("rps_sock_flow_entries_read", b"32768\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"4096\n").unwrap();
+        // One rx queue with a nonzero rps_flow_cnt: the RFS gate lets it run.
+        let net_root = high.with_file_name("net");
+        let queue = net_root.join("eth0").join("queues").join("rx-0");
+        std::fs::create_dir_all(&queue).unwrap();
+        std::fs::write(queue.join("rps_flow_cnt"), b"4096\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_rps_sock_flow_entries_at(&info, &mut recs, path.to_str().unwrap(), &net_root);
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 4096 is below the floor");
+        assert_eq!(recs[0].current_value, "4096");
+        assert!(advice(&high).is_empty(), "a readable 32768 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
         }
     }
 
