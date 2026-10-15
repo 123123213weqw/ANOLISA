@@ -2970,6 +2970,12 @@ fn eval_perf_event_paranoid(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
 /// -1 permits unprivileged perf events. An unsigned parse turns -1 into the
 /// fallback 0, misreporting the current value and losing the original on
 /// rollback. Read signed, mirroring eval_sched_rt_runtime.
+///
+/// The rule fires below 2, and an unreadable or unparseable file used to fall
+/// back to 0, which is below it. Only a value the reader could produce is
+/// evidence of a permissive setting, so a masked or garbled proc entry (a
+/// container's, typically) neither reports a `current_value` the host does
+/// not have nor asks for a write it may not need.
 fn eval_perf_event_paranoid_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
@@ -2978,11 +2984,9 @@ fn eval_perf_event_paranoid_at(
     if !info.param_exists(path) {
         return 1;
     }
-    let current = std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .parse::<i64>()
-        .unwrap_or(0);
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
     if current < 2 {
         recs.push(Recommendation {
             param: "kernel.perf_event_paranoid".to_string(),
@@ -21076,6 +21080,33 @@ mod tests {
         assert_eq!(recs[0].param, "kernel.perf_event_paranoid");
         assert_eq!(recs[0].current_value, "-1", "current must be faithful");
         assert_eq!(recs[0].recommended_value, "2");
+    }
+
+    #[test]
+    fn perf_event_paranoid_advice_needs_a_readable_value() {
+        // The rule fires below 2, and an unreadable or unparseable file fell
+        // back to 0, which is below it: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write of 2 on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("perf_event_paranoid_read", b"2\n");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_perf_event_paranoid_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 is below 2");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 2 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
