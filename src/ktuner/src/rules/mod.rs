@@ -6989,18 +6989,41 @@ fn dirty_background_bytes_recommendation(
 }
 
 fn eval_hardlockup_panic(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/hardlockup_panic";
+    eval_hardlockup_panic_at(
+        info,
+        recs,
+        "/proc/sys/kernel/hardlockup_panic",
+        "/proc/sys/kernel/nmi_watchdog",
+    )
+}
+
+/// Path-injectable form of [`eval_hardlockup_panic`] (the `eval_*_at` idiom)
+/// so the switch read is assertable against synthetic files.
+///
+/// The rule fires on 0, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to that same 0. Only a zero the reader could produce is
+/// evidence that a hard lockup does not panic, so a masked or garbled proc
+/// entry (a container's, typically) neither reports a `current_value` the
+/// host does not have nor asks for a write it may not need.
+fn eval_hardlockup_panic_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    nmi: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     let _ = info;
     // `None` when the kernel exposes no nmi_watchdog at all (aarch64): then
     // there is no detector for the perf rule to disarm.
-    let nmi = "/proc/sys/kernel/nmi_watchdog";
     let nmi_watchdog = std::path::Path::new(nmi)
         .exists()
         .then(|| read_sysctl_u64(nmi));
-    if let Some(rec) = hardlockup_panic_recommendation(read_sysctl_u64(path), nmi_watchdog) {
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if let Some(rec) = hardlockup_panic_recommendation(current, nmi_watchdog) {
         recs.push(rec);
     }
     1
@@ -16546,6 +16569,45 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hardlockup_panic_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — a hard lockup does not panic — and
+        // read_sysctl_u64 maps an unreadable or unparseable file to that same
+        // 0: a masked or garbled proc entry (a container's, typically) was
+        // reported as `current_value: "0"` and answered with a write of 1 on a
+        // host whose switch was never read.
+        let (off, on, others) = zero_switch_paths("hardlockup_panic_read", b"1\n");
+        // No nmi_watchdog file: the rule's own gate, not the watchdog's.
+        let nmi = off.with_file_name("no_nmi_watchdog");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_hardlockup_panic_at(
+                &info,
+                &mut recs,
+                path.to_str().unwrap(),
+                nmi.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(
+            recs.len(),
+            1,
+            "a readable 0 does not panic on a hard lockup"
+        );
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 does");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
