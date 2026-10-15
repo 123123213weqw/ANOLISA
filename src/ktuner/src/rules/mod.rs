@@ -6966,18 +6966,31 @@ fn laptop_mode_recommendation(
 }
 
 fn eval_tcp_adv_win_scale(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_adv_win_scale";
+    eval_tcp_adv_win_scale_at(info, recs, "/proc/sys/net/ipv4/tcp_adv_win_scale")
+}
+
+/// Path-injectable form of [`eval_tcp_adv_win_scale`] (the `eval_*_at` idiom)
+/// so the signed read is assertable against synthetic files.
+///
+/// The rule fires on 1 and on negative values, and an unreadable or
+/// unparseable file used to fall back to 1. Only a value the reader could
+/// produce is evidence of the low overhead factor, so a masked or garbled proc
+/// entry (a container's, typically) neither reports a `current_value` the
+/// host does not have nor asks for a write it may not need.
+fn eval_tcp_adv_win_scale_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if !info.has_listen_sockets() {
         return 1;
     }
-    let current = std::fs::read_to_string(path)
-        .unwrap_or_default()
-        .trim()
-        .parse::<i64>()
-        .unwrap_or(1);
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
     if let Some(rec) = tcp_adv_win_scale_recommendation(current, &info.kernel_version) {
         recs.push(rec);
     }
@@ -20183,6 +20196,37 @@ mod tests {
             "tcp_fack advice must not be issued for kernel {}: FACK was removed in Linux 4.15",
             info.kernel_version
         );
+    }
+
+    #[test]
+    fn tcp_adv_win_scale_advice_needs_a_readable_value() {
+        // The rule fires on 1 below Linux 6.6, and an unreadable or
+        // unparseable file fell back to that same 1: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "1"`
+        // and answered with a write of 2 on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("tcp_adv_win_scale_read", b"2\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"1\n").unwrap();
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_adv_win_scale_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 1 is below 2 on 5.4");
+        assert_eq!(recs[0].current_value, "1");
+        assert!(advice(&high).is_empty(), "a readable 2 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 1",
+                path.display()
+            );
+        }
     }
 
     #[test]
