@@ -8793,11 +8793,28 @@ fn eval_tcp_comp_sack_delay(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
 }
 
 fn eval_skb_frag_coalesce(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/skb_defer_max";
+    eval_skb_frag_coalesce_at(info, recs, "/proc/sys/net/core/skb_defer_max")
+}
+
+/// Path-injectable form of [`eval_skb_frag_coalesce`] (the `eval_*_at` idiom) so the read is
+/// assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_skb_frag_coalesce_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if let Some(rec) = skb_defer_max_recommendation(current, &info.kernel_version) {
         recs.push(rec);
     }
@@ -20360,6 +20377,35 @@ mod tests {
         // Values that really sit below the target still fire.
         assert!(tcp_adv_win_scale_recommendation(1, "5.10.0").is_some());
         assert!(tcp_adv_win_scale_recommendation(-1, "5.10.0").is_some());
+    }
+
+    #[test]
+    fn skb_defer_max_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("skb_defer_max_read", b"64\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"32\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_skb_frag_coalesce_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 32 is below the floor");
+        assert_eq!(recs[0].current_value, "32");
+        assert!(advice(&high).is_empty(), "a readable 64 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
