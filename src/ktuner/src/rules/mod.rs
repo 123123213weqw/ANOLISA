@@ -5942,11 +5942,29 @@ fn eval_tcp_dsack_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
 }
 
 fn eval_unix_max_dgram_qlen(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/unix/max_dgram_qlen";
+    eval_unix_max_dgram_qlen_at(info, recs, "/proc/sys/net/unix/max_dgram_qlen")
+}
+
+/// Path-injectable form of [`eval_unix_max_dgram_qlen`] (the `eval_*_at`
+/// idiom) so the read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_unix_max_dgram_qlen_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    if let Some(rec) = max_dgram_qlen_recommendation(read_sysctl_u64(path)) {
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if let Some(rec) = max_dgram_qlen_recommendation(current) {
         recs.push(rec);
     }
     1
@@ -17002,6 +17020,35 @@ mod tests {
         assert!(challenge_ack_limit_recommendation(999999999).is_some());
         assert!(challenge_ack_limit_recommendation(2147483646).is_some());
         assert!(challenge_ack_limit_recommendation(0).is_some());
+    }
+
+    #[test]
+    fn unix_max_dgram_qlen_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("max_dgram_qlen_read", b"1024\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"512\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_unix_max_dgram_qlen_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 512 is below the floor");
+        assert_eq!(recs[0].current_value, "512");
+        assert!(advice(&high).is_empty(), "a readable 1024 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
