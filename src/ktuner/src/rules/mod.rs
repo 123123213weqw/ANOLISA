@@ -5211,7 +5211,12 @@ fn eval_busy_read_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
     if !runs_busy_polling_service(info) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // The rule fires on 0, and read_sysctl_u64 maps an unreadable or
+    // unparseable file to that same 0: only a zero the reader could produce
+    // is evidence that busy reads are off.
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current == 0 {
         recs.push(Recommendation {
             param: "net.core.busy_read".to_string(),
@@ -15462,6 +15467,41 @@ mod tests {
             .find(|r| r.param == "net.ipv4.conf.all.arp_announce")
         {
             assert_eq!(rec.recommended_value, "2");
+        }
+    }
+
+    #[test]
+    fn busy_read_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — busy reads off — and read_sysctl_u64 maps an
+        // unreadable or unparseable file to that same 0: a masked or garbled
+        // proc entry (a container's, typically) was reported as
+        // `current_value: "0"` and answered with a write of 50 on a host whose
+        // switch was never read.
+        let (off, on, others) = zero_switch_paths("busy_read_read", b"50\n");
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        info.processes = vec![ProcessInfo {
+            name: "redis-server".to_string(),
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_busy_read_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves busy reads off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 50 enables them");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
+            );
         }
     }
 
