@@ -2832,8 +2832,12 @@ fn eval_tcp_syncookies_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, pat
     if !info.has_listen_sockets() {
         return 1;
     }
-    // Any nonzero value arms the cookie path, so -1 must not read as 0.
-    let current = read_sysctl_i64(path);
+    // Any nonzero value arms the cookie path, so -1 must not read as 0. Only a
+    // zero the reader could produce is evidence that cookies are off:
+    // read_sysctl_i64 maps an unreadable or unparseable file to that same 0.
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
     if current == 0 {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_syncookies".to_string(),
@@ -14170,6 +14174,36 @@ mod tests {
                 assert_eq!(recs[0].current_value, "0");
                 assert_eq!(recs[0].recommended_value, "1");
             }
+        }
+    }
+
+    #[test]
+    fn syncookies_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — SYN cookies off — and read_sysctl_i64 maps an
+        // unreadable or unparseable file to that same 0: a masked or garbled
+        // proc entry (a container's, typically) was reported as
+        // `current_value: "0"` and answered with a write of 1 on a host whose
+        // switch was never read.
+        let (off, on, others) = zero_switch_paths("syncookies_read", b"1\n");
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_syncookies_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves SYN cookies off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 arms them");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
+            );
         }
     }
 
