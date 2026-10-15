@@ -7917,18 +7917,40 @@ fn eval_tcp_comp_sack_nr(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
 }
 
 fn eval_tcp_thin_dupack(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_thin_dupack";
+    eval_tcp_thin_dupack_at(
+        recs,
+        "/proc/sys/net/ipv4/tcp_thin_dupack",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_thin_dupack`] (the `eval_*_at` idiom)
+/// so the switch read is assertable against synthetic files; the listener
+/// probe is passed in, as [`eval_tcp_frto_at`] does.
+///
+/// The rule fires on a zero — thin-stream fast retransmit is off — and
+/// [`read_sysctl_u64`] maps an unreadable or unparseable file to that same 0.
+/// Only a zero the reader could produce is evidence of the disabled switch, so
+/// a masked or garbled proc entry (a container's, typically) neither reports a
+/// `current_value` the host does not have nor asks for a write it may not
+/// need.
+fn eval_tcp_thin_dupack_at(
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    has_listen_sockets: bool,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_thin_dupack".to_string(),
-            current_value: current.to_string(),
+            current_value: "0".to_string(),
             recommended_value: "1".to_string(),
             reason: "启用 thin stream 快速重传优化，对低并发长连接场景减少重传等待时间".to_string(),
             confidence: Confidence::Medium,
@@ -17516,6 +17538,31 @@ mod tests {
         };
         let recs = advice(&off);
         assert_eq!(recs.len(), 1, "a readable 0 disables early retransmit");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 enables it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_thin_dupack_advice_needs_a_readable_switch() {
+        // read_sysctl_u64 maps an unreadable or unparseable file to 0, the
+        // value this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read.
+        let (off, on, others) = switch_fixture("tcp_thin_dupack");
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_thin_dupack_at(&mut recs, path.to_str().unwrap(), true);
+            recs
+        };
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 disables thin-stream dupack");
         assert_eq!(recs[0].current_value, "0");
         assert!(advice(&on).is_empty(), "a readable 1 enables it");
         for path in &others {
