@@ -1357,7 +1357,19 @@ fn eval_wmem_max_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &st
 }
 
 fn eval_tcp_rmem(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_rmem";
+    eval_tcp_rmem_at(info, recs, "/proc/sys/net/ipv4/tcp_rmem")
+}
+
+/// Path-injectable form of [`eval_tcp_rmem`] (the `eval_*_at` idiom) so the
+/// read is assertable against synthetic files.
+///
+/// The rule fires when the tuple's max field is below a floor, and an
+/// unreadable file or a max field that does not parse used to count as 0,
+/// which is below it. Only a max the parse could produce is evidence that the
+/// limit is low, so a masked or garbled proc entry (a container's, typically)
+/// neither reports a `current_value` the host does not have nor asks for a
+/// write it may not need.
+fn eval_tcp_rmem_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -1365,11 +1377,13 @@ fn eval_tcp_rmem(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
         return 1;
     }
     let content = read_sysctl_string(path);
-    let max_val = content
+    let Some(max_val) = content
         .split_whitespace()
         .nth(2)
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
+    else {
+        return 1;
+    };
     if max_val < 16777216 {
         // Raise-only per field: keep a default the administrator raised
         // above the fixed tuple's middle value instead of lowering it.
@@ -14875,6 +14889,49 @@ mod tests {
             .find(|r| r.param == "net.ipv4.tcp_synack_retries")
         {
             assert_eq!(rec.recommended_value, "3");
+        }
+    }
+
+    #[test]
+    fn tcp_rmem_advice_needs_a_readable_max() {
+        // The rule fires when the tuple's max is below 16777216, and an
+        // unreadable file or an unparseable max counted as 0, which is below
+        // it: a masked or garbled proc entry (a container's, typically) was
+        // reported with a `current_value` the host does not have and answered
+        // with a write of the whole tuple on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("tcp_rmem_read", b"4096\t131072\t16777216\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"4096\t131072\t6291456\n").unwrap();
+        let short = high.with_file_name("short");
+        std::fs::write(&short, b"4096 131072\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_rmem_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(
+            recs.len(),
+            1,
+            "a readable max of 6291456 is below the floor"
+        );
+        assert_eq!(recs[0].current_value, "4096 131072 6291456");
+        assert!(
+            advice(&high).is_empty(),
+            "a readable max of 16777216 is not"
+        );
+        for path in others.iter().chain([&short]) {
+            assert!(
+                advice(path).is_empty(),
+                "{}: a max that cannot be read is not 0",
+                path.display()
+            );
         }
     }
 
