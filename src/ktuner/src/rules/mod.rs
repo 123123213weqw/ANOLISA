@@ -4010,11 +4010,24 @@ fn eval_tcp_window_scaling_at(
 }
 
 fn eval_tcp_ecn(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_ecn";
+    eval_tcp_ecn_at(info, recs, "/proc/sys/net/ipv4/tcp_ecn")
+}
+
+/// Path-injectable form of [`eval_tcp_ecn`] (the `eval_*_at` idiom) so the
+/// switch read is assertable against synthetic files.
+///
+/// The rule fires on 0, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to that same 0. Only a zero the reader could produce is
+/// evidence that ECN is off, so a masked or garbled proc entry (a container's,
+/// typically) neither reports a `current_value` the host does not have nor
+/// asks for a write it may not need.
+fn eval_tcp_ecn_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current == 0 && info.has_listen_sockets() {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_ecn".to_string(),
@@ -14020,6 +14033,36 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_timestamps") {
             assert_eq!(rec.recommended_value, "1");
             assert_eq!(rec.confidence, Confidence::High);
+        }
+    }
+
+    #[test]
+    fn tcp_ecn_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — ECN off — and read_sysctl_u64 maps an
+        // unreadable or unparseable file to that same 0: a masked or garbled
+        // proc entry (a container's, typically) was reported as
+        // `current_value: "0"` and answered with a write of 2 on a host whose
+        // switch was never read.
+        let (off, on, others) = zero_switch_paths("tcp_ecn_read", b"2\n");
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_ecn_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves ECN off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 2 enables it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
+            );
         }
     }
 
