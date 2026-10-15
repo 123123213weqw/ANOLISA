@@ -5420,6 +5420,12 @@ fn eval_wmem_default(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize
 /// (`Documentation/networking/ip-sysctl.rst`, v6.6:1006-1007, 7.3.0-rc6:1228-1229).
 /// The reason therefore names the non-TCP sockets instead of promising a faster
 /// first send for new connections.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
 fn eval_wmem_default_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
@@ -5428,7 +5434,9 @@ fn eval_wmem_default_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path:
     if max_speed < 10000 {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 262144 {
         recs.push(Recommendation {
             param: "net.core.wmem_default".to_string(),
@@ -15686,6 +15694,39 @@ mod tests {
             rec.is_none(),
             "Should not recommend rmem_default for 1G network"
         );
+    }
+
+    #[test]
+    fn wmem_default_advice_needs_a_readable_value() {
+        // The rule fires below 262144, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("wmem_default", b"262144\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"212992\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_wmem_default_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 212992 is below the floor");
+        assert_eq!(recs[0].current_value, "212992");
+        assert!(advice(&high).is_empty(), "a readable 262144 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
