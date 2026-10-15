@@ -6281,16 +6281,32 @@ fn eval_tcp_retries1(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
 }
 
 fn eval_tcp_limit_output_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_limit_output_bytes";
+    eval_tcp_limit_output_bytes_at(info, recs, "/proc/sys/net/ipv4/tcp_limit_output_bytes")
+}
+
+/// Path-injectable form of [`eval_tcp_limit_output_bytes`] (the `eval_*_at`
+/// idiom) so the read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_tcp_limit_output_bytes_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     let max_speed = info.network.iter().map(|n| n.speed_mbps).max().unwrap_or(0);
-    if let Some(rec) = tcp_limit_output_bytes_recommendation(
-        read_sysctl_u64(path),
-        max_speed,
-        &info.kernel_version,
-    ) {
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if let Some(rec) =
+        tcp_limit_output_bytes_recommendation(current, max_speed, &info.kernel_version)
+    {
         recs.push(rec);
     }
     1
@@ -18603,6 +18619,39 @@ mod tests {
             rec.is_none(),
             "Should not recommend tcp_limit_output_bytes for 1G network"
         );
+    }
+
+    #[test]
+    fn tcp_limit_output_bytes_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("tcp_limit_output_bytes_read", b"1048576\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"262144\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_limit_output_bytes_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 262144 is below the floor");
+        assert_eq!(recs[0].current_value, "262144");
+        assert!(advice(&high).is_empty(), "a readable 1048576 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
