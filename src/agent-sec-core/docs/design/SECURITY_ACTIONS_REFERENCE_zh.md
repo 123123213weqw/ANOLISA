@@ -740,7 +740,17 @@ audit 根据 valid 退出；analyze 完整风险结果退出 0、覆盖不足 1�
 status/version/exitCode 和错误类别；不复制源码、findings、路径、人工理由、导入证据或密钥。
 
 [批准替代] key/status 使用系统密钥身份，不包含用户公钥路径、口令或历史 keyring；init-keys 和
---passphrase 不保留。init --no-baseline 只建密钥，force-keys 与 rotate-keys 为 root-only。
+--passphrase 不保留。init --no-baseline 只建密钥且保持幂等；force-keys 与 rotate-keys 不支持，
+CLI 在目录发现前非零退出，RPC 在解析 Skill 根目录及业务副作用前返回 NotImplementedError、
+exitCode 1。不再维护换钥事务；managed-skills.json 和 key-rotation.json 不读写、不检测、
+不迁移，也不删除。正常初始化、密钥权限及完整性校验、单 Skill 回滚恢复及其校验顺序保留。
+
+[批准替代] 成功 scan/certify/noop 将 canonical 精确路径记入 daemon 实际使用的系统配置
+managedSkillDirs。普通目录已被模式覆盖时不重复添加；SkillFS 映射目录保存精确项，以供重启后
+直接解析而不遍历 FUSE。该项同时授予普通目录访问权限；移除挂载或关闭默认目录发现后，
+仍须移除该配置项并重启 daemon 才撤销。
+保存失败追加 warnings，不丢弃扫描 findings 或激活结果。启动、status 和聚合操作共用配置发现，
+不再通过私有登记表补充无法发现目录的全局恢复覆盖。show 对映射 Skill 的已有账本仍验证并报告风险。
 完整输出仍通过 Rust CLI 提供，CLI 不执行任何本地能力回退。每次最多两个 SkillSec 执行，
 满载返回 Busy 并经过相同 finalizer；同 Skill 的写操作继续由 Service 锁串行化。
 

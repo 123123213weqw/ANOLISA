@@ -312,7 +312,7 @@ mod tests {
             .unwrap();
         let directory = Directory::open(&root.io_dir).unwrap();
         let ledger = Ledger::open(&directory, false).unwrap().unwrap();
-        let key = KeyStore::open(&service.config.state_dir)
+        let key = KeyStore::open(&service.config().unwrap().state_dir)
             .unwrap()
             .load()
             .unwrap();

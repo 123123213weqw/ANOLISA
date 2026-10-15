@@ -494,7 +494,12 @@ jobs:
         run: |
           cd src/agent-sec-core
           make test-rust-v2
-          cd v2 && cargo doc --workspace --no-deps --locked
+          cd v2
+          skillsec_tests=$(cargo test --locked -p asc-capability-skill-sec --lib --no-run --message-format=json |
+            jq -r 'select(.reason == "compiler-artifact" and .profile.test and .executable != null) | .executable')
+          test -n "$skillsec_tests"
+          sudo "$skillsec_tests" service::tests::configuration_writeback_ --nocapture
+          cargo doc --workspace --no-deps --locked
 
       - name: Run Rust tests with coverage
         run: |

@@ -167,19 +167,26 @@ daemon 读取 root 所有的 `/etc/agent-sec/skillsec.json`；`--skillsec-config
 关闭范围不会删除既有 Skill 元数据或重置信任。不支持其他 glob 语法或 `~`；发现跳过隐藏后代，
 不跟随符号链接。所有本地用户仍可操作全部受管 Skill，本次不引入用户 ACL。
 
-`init`、`scan --all`、`check --all`、`status` 统一由 daemon 发现，合并默认目录、显式模式和
-仍受授权的登记历史。调用端显式路径在 Skill I/O 前校验；一个越界路径即以 `PermissionDenied`
-拒绝整个请求。成功登记仅保存历史，不扩大授权。`init --no-baseline` 和单路径请求不发现目录。
+`init`、`scan --all`、`check --all`、`status` 统一由 daemon 发现，合并默认目录与
+`managedSkillDirs`。调用端显式路径在 Skill I/O 前校验；一个越界路径即以 `PermissionDenied`
+拒绝整个请求。`init --no-baseline` 和单路径请求不发现目录。
 
 启动扫描在现有 worker 中异步执行，与已到期的 SkillFS 通知交替处理，socket 无需等待扫描。
-挂载内 Skill 来自认证通知和已登记身份，不遍历 FUSE。已有标准范围内新增 Skill 立即获得授权，
+挂载内 Skill 来自认证通知和配置中的精确身份，直接经已认证 resolver 解析，不遍历 FUSE。
+已有标准范围内新增 Skill 立即获得授权，
 在下次聚合命令或 daemon 重启时发现；不增加目录 watcher，也不在普通 Skill 调用时自动扫描。
 宿主 Hook 继续按原策略控制调用；安装本身不保证拦截所有直接文件读取。
 
-单次默认发现最多读取 10,000 个目录项、加入 1,024 个新 Skill 身份；这些限制不截断显式配置、
-已登记历史或换钥及恢复集合。单目录失败或预算耗尽时保留已完成的发现，返回含 `root`、`error`
-的 `discoveryErrors`，退出码为 1，状态不能显示健康。启动时记录发现不完整并继续扫描成功的部分。
-带有发现错误的强制密钥初始化不会更换密钥。发现超时或全局登记损坏仍直接失败。
+单次默认发现最多读取 10,000 个目录项、加入 1,024 个新 Skill 身份；这些限制不截断显式配置。
+单目录失败或预算耗尽时保留已完成的发现，返回含 `root`、`error` 的 `discoveryErrors`，退出码为 1，
+状态不能显示健康。启动时记录发现不完整并继续扫描成功的部分。发现超时仍直接失败。
+
+`scan` 和 `certify` 成功后，包括内容未变化的 noop，将 canonical 精确 Skill 路径记入 daemon
+实际使用的配置文件。普通目录已被 `managedSkillDirs` 模式覆盖时不重复添加；SkillFS 路径始终
+保存精确项，使重启后
+无需遍历 FUSE 就能解析该目录。这些项同时授予普通目录访问权限：移除 SkillFS 挂载或关闭
+默认目录发现，都不会撤销已保存路径；还须移除对应的 `managedSkillDirs` 项并重启 daemon。
+保存失败在 `warnings` 中提示，不丢弃扫描结果、findings 或激活结果。修复配置错误后重试扫描即可补存发现信息。
 
 启动扫描、`scan --all` 和 `init` baseline 对 `/usr/share/anolisa/skills` 或
 `/usr/local/share/anolisa/skills` 的直接宿主 Skill 子目录复用只读跳过规则：daemon 无法写入
@@ -189,7 +196,7 @@ root 仍可写的 `0555` 目录正常扫描。显式扫描、用户目录写入�
 仍报错；跳过的 Skill 需放入可写的受管副本后才能建立信任。
 
 状态目录归 root 所有，模式为 0700；`signing-key.pk8` 为 0600。第一阶段允许所有本地用户操作所有
-受管 Skill，文件归属不作为用户访问 ACL。仅内核 UID 0 可以换钥。系统密钥签名的是 daemon 计算的记录，
+受管 Skill，文件归属不作为用户访问 ACL。所有用户均不支持换钥。系统密钥签名的是 daemon 计算的记录，
 不是调用者提交的任意字节。
 
 不导入 V1 历史、加密密钥或 keyring。新 manifest 绑定 Skill 的规范绝对路径身份。
@@ -263,9 +270,8 @@ agent-sec-cli skill-ledger activate /path/to/skill
 检查 `show`，修复所报告的原因后用 `activate` 重试。daemon 重启会恢复支持的中断发布和回滚状态，
 不承诺持久化通知队列。
 
-启动恢复覆盖已登记 Skill。首次扫描若在版本写入后报告登记失败，应修复失败原因并对该 Skill
-重试 `scan`；内容未变化时复用已验证版本，完成登记后再发布激活。首次请求失败时，不保证重启后
-自动发现该目录。
+普通操作保留逐 Skill 的回滚恢复和校验。启动采用配置发现，无法再被发现的 Skill 不保证自动恢复；
+恢复路径后可对其重试显式的已授权操作。不再用独立私有登记表补充全局恢复覆盖。
 
 ## SkillFS 绑定
 
@@ -308,7 +314,7 @@ control socket 仍归 UID 1000 所有，父目录 0700、socket 0600；control �
 
 通知按 Skill 合并，然后依次触发扫描与激活。notify 确认仅表示已接受入队。
 启用 SkillFS 时，`status` 包含 `skillfs` 的 queue/running/processed/failed 计数。
-通过计数、公共审计和真实 FUSE 读取，分别确认受理、处理完成和可见发布；启动时会重新调度已注册的挂载 Skill。
+通过计数、公共审计和真实 FUSE 读取，分别确认受理、处理完成和可见发布；启动时会重新调度配置中保存的精确挂载 Skill。
 
 ## 输出、审计与限制
 
@@ -326,16 +332,14 @@ analyze 覆盖不足返回 1，输入无效返回 2。传输失败写入 stderr 
 CLI 响应保留完整业务数据。内置扫描限制为 2,000 个文件、总计 50 MiB、深度 32；
 findings 导入限制为 2 MiB。覆盖失败会明确呈现，不会为部分内容签发完整扫描结论。
 
-## 换钥与部署回退
+## 系统密钥与部署回退
 
-```sh
-sudo agent-sec-cli skill-ledger rotate-keys
-agent-sec-cli skill-ledger scan --all
-```
+V2 初始化一把系统签名密钥并持续复用。不支持密钥轮转：`rotate-keys` 和 `init --force-keys`
+在目录发现、扫描或密钥修改前失败，直接 RPC 请求也会被拒绝。普通 `init --no-baseline` 保持
+幂等，已有密钥不安全或损坏时不会自动替换。
 
-换钥先撤回已注册 Skill 的暴露，再替换密钥。此前签名随之失去信任，包括此前的 V2 签名。
-重新扫描并激活以建立信任，不提供旧公钥验签回退。撤回失败时保留旧密钥，普通账本写入被阻止，
-直到 root 重试或启动恢复完成。
+不再维护私有 `managed-skills.json` 登记表或 `key-rotation.json` 事务。未发布实现留下的文件
+不读取、不迁移、也不删除。不要通过手动删除签名密钥模拟轮转；已有签名历史依赖该密钥。
 
 替换已有部署前，停止旧 daemon 和 SkillFS 写入者，保留匹配的二进制、配置，并备份私有密钥和状态，
 以及每个 Skill 的内容和 `.skill-meta`。使用副本开展迁移评估。

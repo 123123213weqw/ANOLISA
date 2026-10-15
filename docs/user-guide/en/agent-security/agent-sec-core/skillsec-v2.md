@@ -185,26 +185,33 @@ enabled defaults. Disabling scope does not remove existing Skill metadata or res
 General glob syntax and `~` are unsupported. Discovery skips hidden descendants and never follows
 symlinks. All local users retain access to all managed Skills; this does not introduce a user ACL.
 
-`init`, `scan --all`, `check --all` and `status` discover through the daemon, combining defaults,
-explicit patterns and still-authorized registration. Explicit caller roots are checked before
-Skill I/O; one out-of-range root rejects the entire request with `PermissionDenied`. Successful
-registration records history without expanding scope. `init --no-baseline` and single-path
-requests do not discover directories.
+`init`, `scan --all`, `check --all` and `status` discover through the daemon, combining defaults
+and `managedSkillDirs`. Explicit caller roots are checked before Skill I/O; one out-of-range root
+rejects the entire request with `PermissionDenied`. `init --no-baseline` and single-path requests do
+not discover directories.
 
 Startup scans run asynchronously in the existing worker, alternating with ready SkillFS
 notifications; the socket does not wait for scans. Mounted Skills come from authenticated
-notifications and registered identities, never a FUSE walk. New Skills under existing standard
-roots are authorized immediately and discovered on the next aggregate command or daemon restart.
+notifications and exact configured identities, which go directly through the authenticated resolver,
+never a FUSE walk. New Skills under existing standard roots are authorized immediately and discovered
+on the next aggregate command or daemon restart.
 There is no directory watcher or scan triggered by ordinary Skill invocation. Host Hook policies
 continue to control invocation; installation alone does not make all direct filesystem reads block.
 
 One default-discovery pass visits at most 10,000 directory entries and adds at most 1,024 new
-Skill identities. These limits do not truncate explicit configuration, registered history or key
-rotation/recovery sets. A directory failure or exhausted budget retains completed discoveries and
-returns `discoveryErrors` entries with `root` and `error`, exit code 1 and non-healthy status.
-Startup logs incomplete discovery and scans the successful selection. A forced key initialization
-with incomplete discovery leaves the key unchanged. Discovery deadlines and corrupt global
-registration remain fatal errors.
+Skill identities. These limits do not truncate explicit configuration. A directory failure or
+exhausted budget retains completed discoveries and returns `discoveryErrors` entries with `root`
+and `error`, exit code 1 and non-healthy status. Startup logs incomplete discovery and scans the
+successful selection. Discovery deadlines remain fatal errors.
+
+Successful `scan` and `certify`, including an unchanged-content no-op, remember the canonical exact
+Skill path in the daemon's active configuration file. Ordinary directories already covered by a
+`managedSkillDirs` pattern need no duplicate entry. SkillFS paths always receive an exact entry so
+startup can resolve them without traversing FUSE. These entries also grant ordinary-directory access: removing a SkillFS
+mount or disabling default-directory discovery does not revoke a saved path. Remove its
+`managedSkillDirs` entry and restart the daemon to revoke that authorization. A save failure appears
+in `warnings` and does not discard the scan result, findings or activation outcome. Correct the
+configuration error and retry the scan to persist discovery.
 
 Startup scans, `scan --all` and the `init` baseline skip authorized host Skills directly under
 `/usr/share/anolisa/skills` or `/usr/local/share/anolisa/skills` when the daemon cannot write their
@@ -215,8 +222,8 @@ Explicit scans, user-directory write failures, SkillFS failures and other storag
 errors. Skipped Skills need a writable managed copy to establish trust.
 
 The state directory is root-owned 0700; `signing-key.pk8` is 0600. All local users may operate all
-managed Skills in phase one. Ownership is not an authorization ACL. Only kernel UID 0 may rotate
-the key. The key signs daemon-computed records, not arbitrary caller-provided bytes.
+managed Skills in phase one. Ownership is not an authorization ACL. Key rotation is unsupported
+for all users. The key signs daemon-computed records, not arbitrary caller-provided bytes.
 
 V1 history, encrypted keys and keyrings are not imported. New manifests bind the canonical
 absolute Skill identity. Moving a Skill to another identity requires establishing trust there.
@@ -299,10 +306,10 @@ retain an eligible previous version or a pending view. Manual decisions affect t
 Inspect `show` and retry `activate` after repairing the reported cause. Daemon restart reconciles
 supported interrupted publication and rollback states. No durable notification queue is promised.
 
-Startup recovery covers registered Skills. If the first scan reports a registration failure after
-writing its version, resolve that failure and retry `scan` for the same Skill. Unchanged content
-reuses the verified version and completes registration before activation; a failed first request
-is not guaranteed to be discovered automatically after restart.
+Per-Skill rollback recovery and validation remain part of normal operations. Startup uses configured
+discovery, so a Skill that is no longer discoverable is not guaranteed automatic recovery; retry an
+explicit authorized operation after restoring its path. There is no separate private registry for
+global recovery coverage.
 
 ## SkillFS binding
 
@@ -349,7 +356,7 @@ FUSE view. A mismatched directory inode is rejected instead of certifying replac
 Notifications coalesce per Skill, then trigger scan followed by activation. A notify acknowledgment
 confirms queue admission only. `status` includes `skillfs` queue/running/processed/failed counters
 when configured. Check those counters, public audit and actual FUSE reads to distinguish admission,
-completed processing and visible publication. Startup reschedules registered mount Skills.
+completed processing and visible publication. Startup reschedules exact mount Skills saved in configuration.
 
 ## Output, audit and limits
 
@@ -369,17 +376,16 @@ raw findings, local paths, manual reasons and keys. Full business data remains i
 Built-in scans are bounded to 2,000 files, 50 MiB and depth 32; findings import is limited to 2 MiB.
 Coverage failures remain visible instead of certifying partial content.
 
-## Key rotation and deployment rollback
+## System key and deployment rollback
 
-```sh
-sudo agent-sec-cli skill-ledger rotate-keys
-agent-sec-cli skill-ledger scan --all
-```
+V2 initializes one system signing key and reuses it. Key rotation is unsupported: `rotate-keys` and
+`init --force-keys` fail before directory discovery, scanning or key changes; direct RPC requests are
+also rejected. Ordinary `init --no-baseline` remains idempotent and does not replace an unsafe or
+corrupt existing key.
 
-Rotation withdraws registered exposure before replacing the key. Earlier signatures then lose
-trust, including earlier V2 signatures. Rescan and activate to rebuild trust; no previous-key
-verification fallback exists. If withdrawal fails, the old key remains and ordinary Ledger writes
-are fenced until root retries or startup recovery completes.
+There is no private `managed-skills.json` registry or `key-rotation.json` transaction. Files left by
+unreleased implementations are not read, migrated or deleted. Do not manually delete the signing key
+to simulate rotation: existing signed history depends on it.
 
 Before changing an existing deployment, stop its daemon and SkillFS writers, retain its matching
 binary/configuration, and back up private key/state plus each Skill's content and `.skill-meta`.

@@ -50,13 +50,18 @@ not preload Prompt Scanner models or serve scan RPCs.
 The Rust V2 core adds **SkillSec** behind the existing `skill-ledger` command: local scanners,
 system-key signing, version history, decisions, rollback and SkillFS activation share one root
 daemon. All local users may manage all Skills within the enabled defaults, administrator-configured
-directories or authenticated SkillFS mounts; only root may rotate the signing key.
-Default system directories and standard Skill directories for all local account homes are authorized
-and scanned in the background after daemon startup. No directory configuration is needed for these
-locations. Set `enableDefaultSkillDirs: false` to disable this scope; `managedSkillDirs` remains
-available for additional absolute paths, direct children (`/*`) and recursive trees (`/**`).
-Homes come from `/etc/passwd`, not caller environment variables. Account/configuration changes
-require a daemon restart. Read-only packaged system Skills remain visibly skipped, not certified.
+directories or authenticated SkillFS mounts. Default system directories and standard Skill directories
+for all local account homes are authorized and scanned in the background after daemon startup.
+No directory configuration is needed for these locations. Set `enableDefaultSkillDirs: false` to disable
+this scope; `managedSkillDirs` remains available for additional absolute paths, direct children (`/*`)
+and recursive trees (`/**`). Homes come from `/etc/passwd`, not caller environment variables.
+Account/configuration changes require a daemon restart. Read-only packaged system Skills remain
+visibly skipped, not certified.
+Successful scan/certify operations remember canonical Skill paths in that same configuration;
+ordinary paths already covered by `managedSkillDirs` need no extra entry. SkillFS paths receive exact
+entries. Saved entries remain ordinary authorization after mount removal or default-discovery
+disablement; revoke them by removing the entries and restarting the daemon.
+`rotate-keys` and `init --force-keys` are unsupported and return an error without changing trust.
 
 The V2 systemd system unit is `agent-sec-core.service`; `agent-sec-daemon` is the executable name.
 Check the service with `sudo systemctl status agent-sec-core.service`.

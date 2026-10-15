@@ -174,9 +174,7 @@ async fn run(
         executor = executor.with_environment(bridge.environment());
     }
     let actions = asc_daemon::skill_application(finalizer, pii_rules, executor.clone());
-    if let Err(error) =
-        recover_and_start_skills(&skill_sec, &actions, &skill_worker, executor, telemetry)
-    {
+    if let Err(error) = start_skills(&actions, &skill_worker, executor) {
         report_error(telemetry, &error);
         return (
             ExitCode::FAILURE,
@@ -437,20 +435,11 @@ fn prepare_skillfs(
         .map(|bridge| bridge.map(Arc::new))
 }
 
-fn recover_and_start_skills(
-    service: &Arc<asc_capability_skill_sec::SkillSecService>,
+fn start_skills(
     actions: &Arc<asc_daemon_core::ActionService>,
     worker: &asc_daemon::SkillWorker,
     executor: asc_capability_skill_sec::executor::SkillSecExecutor,
-    telemetry: &asc_observability::TelemetryRuntime,
 ) -> Result<(), asc_daemon::skillfs::SkillFsError> {
-    let recovery = skill_sec::recover(service, actions);
-    if let Err(error) = recovery {
-        report_error(telemetry, &error);
-        telemetry.report(
-            "agent-sec-daemon: SkillSec recovery is degraded; status and administrator retry remain available",
-        );
-    }
     worker.start(actions.clone(), move || {
         executor.discover(std::time::Instant::now() + Duration::from_secs(30))
     })

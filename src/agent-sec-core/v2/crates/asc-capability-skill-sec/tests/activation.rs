@@ -1,6 +1,7 @@
 use asc_capability_skill_sec::scanner::ScannerRegistry;
 use asc_capability_skill_sec::{
-    DecisionAction, Manifest, SkillRoot, SkillSecConfig, SkillSecError, SkillSecService,
+    DecisionAction, ManagedSkillDir, Manifest, SkillRoot, SkillSecConfig, SkillSecError,
+    SkillSecService,
 };
 use serde_json::{Value, json};
 use std::fs;
@@ -18,7 +19,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new() -> Self {
+    fn new(managed: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let base = temp.path().canonicalize().unwrap();
         let state = base.join("state");
@@ -33,7 +34,11 @@ impl Fixture {
                 SkillSecConfig {
                     default_skill_dirs: Vec::new(),
                     state_dir: state.clone(),
-                    managed_skill_dirs: vec![],
+                    managed_skill_dirs: if managed {
+                        vec![ManagedSkillDir::new(&skill).unwrap()]
+                    } else {
+                        Vec::new()
+                    },
                 },
                 ScannerRegistry::default(),
             )
@@ -98,7 +103,7 @@ fn frozen_v1_activation_workflows_match() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/activation.json")).unwrap();
     let mut failures = Vec::new();
     for case in fixture["cases"].as_array().unwrap() {
-        let f = Fixture::new();
+        let f = Fixture::new(case["name"] != "fresh-pending");
         for (index, step) in case["steps"].as_array().unwrap().iter().enumerate() {
             let result = match step["op"].as_str().unwrap() {
                 "write" => {
@@ -156,7 +161,7 @@ fn frozen_v1_activation_workflows_match() {
 
 #[test]
 fn publication_matches_real_xattr_and_hides_blocked_skills() {
-    let f = Fixture::new();
+    let f = Fixture::new(true);
     let first = f.certify(
         "fixture",
         &json!([{"rule":"risk","level":"deny","message":"review"}]),
@@ -193,7 +198,7 @@ fn publication_matches_real_xattr_and_hides_blocked_skills() {
 
 #[test]
 fn rollback_retains_backup_and_restores_selected_snapshot() {
-    let f = Fixture::new();
+    let f = Fixture::new(true);
     f.certify("fixture", &json!([]));
     fs::write(f.root.io_dir.join("main.sh"), "echo changed\n").unwrap();
     f.certify("fixture", &json!([]));
@@ -228,7 +233,7 @@ fn rollback_retains_backup_and_restores_selected_snapshot() {
 
 #[test]
 fn failed_rollback_commit_restores_original_content() {
-    let f = Fixture::new();
+    let f = Fixture::new(true);
     f.certify("fixture", &json!([]));
     fs::write(f.root.io_dir.join("main.sh"), "echo preserve\n").unwrap();
     f.certify("fixture", &json!([]));
@@ -254,7 +259,7 @@ fn failed_rollback_commit_restores_original_content() {
 
 #[test]
 fn reconcile_repairs_complete_split_but_never_trusts_damaged_snapshot() {
-    let f = Fixture::new();
+    let f = Fixture::new(true);
     f.certify("fixture", &json!([]));
     fs::remove_file(f.meta("latest.json")).unwrap();
     let result = f.service.reconcile(&f.root, deadline()).unwrap();

@@ -148,12 +148,9 @@ fn assert_public_audit(events: &Events) {
         "decide",
         "list-scanners",
     ];
-    if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["rotate-keys", "check", "scan"]);
-    }
     expected.push("activate");
     if rustix::process::geteuid().as_raw() == 0 {
-        expected.extend(["check", "rotate-keys", "export", "scan", "decide"]);
+        expected.extend(["check", "export", "scan", "decide"]);
     }
     expected.push("status");
     // Each accepted RPC finalizes once; local CLI validation emits no daemon event.
@@ -289,13 +286,13 @@ async fn assert_decision_and_export_contract(socket: &Path, path: &str, director
 }
 
 async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Path) {
-    if rustix::process::geteuid().as_raw() == 0 {
-        assert_eq!(invoke(socket, &["rotate-keys"]).await.0, 0);
-        assert_eq!(
-            invoke(socket, &["check", path]).await.1["status"],
-            "tampered"
-        );
-        assert_eq!(invoke(socket, &["scan", path]).await.0, 0);
+    for arguments in [
+        vec!["rotate-keys"],
+        vec!["init", "--force-keys", "--no-baseline"],
+    ] {
+        let (code, _, error) = invoke(socket, &arguments).await;
+        assert_eq!(code, 1);
+        assert!(error.contains("not supported"), "{error}");
     }
     assert_eq!(invoke(socket, &["activate", path]).await.0, 0);
     if rustix::process::geteuid().as_raw() == 0 {
@@ -312,7 +309,7 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             vec!["rotate-keys"],
             vec!["export", path, "--output", export_parent.to_str().unwrap()],
         ] {
-            let expected = i32::from(arguments[0] == "rotate-keys");
+            let expected = i32::from(arguments[0] != "export");
             let output = std::process::Command::new(env!("CARGO_BIN_EXE_agent-sec-cli"))
                 .arg("--socket")
                 .arg(socket)
@@ -327,12 +324,22 @@ async fn assert_root_identity_contract(socket: &Path, path: &str, directory: &Pa
             assert_eq!(
                 output.status.code(),
                 Some(expected),
-                "{:?}: {}",
+                "{:?}: stdout={} stderr={}",
                 arguments,
+                String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            if arguments[0] == "check" {
+                let checked: Value = serde_json::from_slice(&output.stdout).unwrap();
+                assert_eq!(checked["status"], "deny");
+                assert!(
+                    checked["findings"]
+                        .to_string()
+                        .contains("PRIVATE_FINDING_MARKER")
+                );
+            }
             if arguments[0] == "rotate-keys" {
-                assert!(String::from_utf8_lossy(&output.stderr).contains("root administrator"));
+                assert!(String::from_utf8_lossy(&output.stderr).contains("not supported"));
             }
         }
         assert_user_can_edit_after_rollback(socket, directory).await;
