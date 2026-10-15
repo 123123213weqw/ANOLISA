@@ -6935,7 +6935,12 @@ fn eval_flow_limit_table_len_at(
     if std::fs::read_to_string(bitmap_path).is_ok_and(|mask| cpumask_is_empty(&mask)) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // The rule fires below a floor, and read_sysctl_u64 maps an unreadable or
+    // unparseable file to 0, which is below it: only a value the reader could
+    // produce is evidence that the table is small.
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 8192 {
         recs.push(Recommendation {
             param: "net.core.flow_limit_table_len".to_string(),
@@ -15818,6 +15823,46 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn flow_limit_table_len_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("flow_limit_table_len_read", b"8192\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"4096\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        // No flow_limit_cpu_bitmap: the bitmap gate does not skip.
+        let bitmap = high.with_file_name("no_bitmap");
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_flow_limit_table_len_at(
+                &info,
+                &mut recs,
+                path.to_str().unwrap(),
+                bitmap.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 4096 is below the floor");
+        assert_eq!(recs[0].current_value, "4096");
+        assert!(advice(&high).is_empty(), "a readable 8192 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
