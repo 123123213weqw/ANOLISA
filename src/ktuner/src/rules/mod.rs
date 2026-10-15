@@ -7918,14 +7918,32 @@ fn eval_tcp_tw_recycle(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> us
 }
 
 fn eval_tcp_orphan_retries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_orphan_retries";
+    eval_tcp_orphan_retries_at(info, recs, "/proc/sys/net/ipv4/tcp_orphan_retries")
+}
+
+/// Path-injectable form of [`eval_tcp_orphan_retries`] (the `eval_*_at` idiom) so the read is
+/// assertable against synthetic files.
+///
+/// The rule fires on 0 (which the kernel treats as 8), and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to the same 0. Only a value the reader could produce is
+/// evidence, so a masked or garbled proc entry (a container's, typically)
+/// neither reports a `current_value` the host does not have nor asks for a
+/// write it may not need.
+fn eval_tcp_orphan_retries_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if !info.has_listen_sockets() {
         return 1;
     }
-    orphan_retries_recommendation(read_sysctl_u64(path), recs);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    orphan_retries_recommendation(current, recs);
     1
 }
 
@@ -20298,6 +20316,35 @@ mod tests {
         let mut small = make_test_info();
         small.memory_total_gb = 16;
         assert!(advice(&small, &off).is_empty());
+    }
+
+    #[test]
+    fn tcp_orphan_retries_advice_needs_a_readable_value() {
+        // The rule fires on 0, and the reader mapped an unreadable or
+        // unparseable file to the same 0: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("orphan_retries_read", b"2\n");
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_orphan_retries_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 is the kernel default of 8");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 2 does not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
