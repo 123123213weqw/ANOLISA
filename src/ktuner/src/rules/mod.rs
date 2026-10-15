@@ -7367,14 +7367,31 @@ fn eval_arp_notify_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
 }
 
 fn eval_default_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/conf/default/arp_announce";
+    eval_default_arp_announce_at(info, recs, "/proc/sys/net/ipv4/conf/default/arp_announce")
+}
+
+/// Path-injectable form of [`eval_default_arp_announce`] (the `eval_*_at`
+/// idiom) so the switch read is assertable against synthetic files.
+///
+/// The rule fires below 2, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below it. Only a value the reader could
+/// produce is evidence of the loose announce policy, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_default_arp_announce_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 2 {
         recs.push(Recommendation {
             param: "net.ipv4.conf.default.arp_announce".to_string(),
@@ -16155,6 +16172,46 @@ mod tests {
             "a readable 0 announces any local address"
         );
         assert!(advice(&on).is_empty(), "a readable 1 restricts it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn default_arp_announce_advice_needs_a_readable_switch() {
+        // read_sysctl_u64 maps an unreadable or unparseable file to 0, below
+        // the 2 this gate raises to, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read. The
+        // multi-NIC gate needs two interfaces and no bond, so the 0 case is
+        // asserted only when that gate lets the rule run.
+        let (off, on, others) = zero_switch_paths("default_arp_announce_read", b"2\n");
+        let mut info = make_test_info();
+        info.network = vec![
+            NetInfo {
+                name: "eth0".to_string(),
+                speed_mbps: 10000,
+            },
+            NetInfo {
+                name: "eth1".to_string(),
+                speed_mbps: 10000,
+            },
+        ];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_arp_announce_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+        assert_eq!(
+            advice(&off).len(),
+            usize::from(!has_bond()),
+            "a readable 0 announces any local address"
+        );
+        assert!(advice(&on).is_empty(), "a readable 2 restricts it");
         for path in &others {
             assert!(
                 advice(path).is_empty(),
