@@ -8880,15 +8880,37 @@ fn eval_min_slab_ratio_at(
 }
 
 fn eval_tcp_autocorking(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_autocorking";
+    eval_tcp_autocorking_at(
+        recs,
+        "/proc/sys/net/ipv4/tcp_autocorking",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_autocorking`] (the `eval_*_at` idiom)
+/// so the switch read is assertable against synthetic files; the listener
+/// probe is passed in, as [`eval_tcp_frto_at`] does.
+///
+/// The rule fires on a zero — autocorking is off — and [`read_sysctl_u64`]
+/// maps an unreadable or unparseable file to that same 0. Only a zero the
+/// reader could produce is evidence of the disabled switch, so a masked or
+/// garbled proc entry (a container's, typically) neither reports a
+/// `current_value` the host does not have nor asks for a write it may not
+/// need.
+fn eval_tcp_autocorking_at(
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    has_listen_sockets: bool,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_autocorking".to_string(),
             current_value: "0".to_string(),
@@ -17207,6 +17229,31 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_autocorking") {
             assert_eq!(rec.recommended_value, "1");
             assert_eq!(rec.category, Category::Performance);
+        }
+    }
+
+    #[test]
+    fn tcp_autocorking_advice_needs_a_readable_switch() {
+        // read_sysctl_u64 maps an unreadable or unparseable file to 0, the
+        // value this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read.
+        let (off, on, others) = switch_fixture("tcp_autocorking");
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_autocorking_at(&mut recs, path.to_str().unwrap(), true);
+            recs
+        };
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 disables autocorking");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 enables it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
         }
     }
 
