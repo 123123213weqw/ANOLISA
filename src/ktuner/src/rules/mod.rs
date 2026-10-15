@@ -762,7 +762,13 @@ fn eval_tcp_fastopen_at(
     if !has_listen_sockets {
         return 1;
     }
-    if let Some(rec) = tcp_fastopen_recommendation(read_sysctl_i64(path)) {
+    // The rule fires on 0 (no flag set), and read_sysctl_i64 maps an
+    // unreadable or unparseable file to that same 0: only a value the reader
+    // could produce is evidence of the missing flags.
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
+    if let Some(rec) = tcp_fastopen_recommendation(current) {
         recs.push(rec);
     }
     1
@@ -10625,6 +10631,34 @@ mod tests {
             "a host without listeners is not recommended TFO"
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn tcp_fastopen_advice_needs_a_readable_value() {
+        // The rule fires on 0 — no Fast Open flag set — and read_sysctl_i64
+        // maps an unreadable or unparseable file to that same 0: a masked or
+        // garbled proc entry (a container's, typically) was reported as
+        // `current_value: "0"` and answered with a write of 1027 on a host
+        // whose value was never read.
+        let (off, on, others) = zero_switch_paths("tcp_fastopen_read", b"1027\n");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_fastopen_at(&info, &mut recs, path.to_str().unwrap(), true);
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 sets no flag");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1027 sets every flag");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
