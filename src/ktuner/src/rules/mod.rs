@@ -8189,8 +8189,9 @@ fn eval_tcp_frto_at(
     if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_frto".to_string(),
             current_value: "0".to_string(),
@@ -17348,6 +17349,32 @@ mod tests {
                 assert_eq!(recs[0].current_value, "0");
                 assert_eq!(recs[0].recommended_value, "2");
             }
+        }
+    }
+
+    #[test]
+    fn tcp_frto_advice_needs_a_readable_switch() {
+        // read_sysctl_i64 maps an unreadable or unparseable file to 0, the value
+        // this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read.
+        let (off, on, others) = switch_fixture("tcp_frto");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_frto_at(&info, &mut recs, path.to_str().unwrap(), true);
+            recs
+        };
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 disables F-RTO");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 enables it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
         }
     }
 
