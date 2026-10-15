@@ -3527,9 +3527,10 @@ fn eval_log_martians_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path:
     if !info.param_exists(path) {
         return 1;
     }
-    // Any nonzero value is enabled, so -1 must not read as the value 0.
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // Any nonzero value is enabled, so -1 must not read as the value 0 —
+    // and neither may a file the reader could not interpret, which the
+    // signed sysctl reader maps to 0 as well.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.log_martians".to_string(),
             current_value: "0".to_string(),
@@ -19143,6 +19144,32 @@ mod tests {
                 assert_eq!(recs[0].current_value, "0");
                 assert_eq!(recs[0].recommended_value, "1");
             }
+        }
+    }
+
+    #[test]
+    fn log_martians_advice_needs_a_readable_switch() {
+        // read_sysctl_i64 maps an unreadable or unparseable file to 0, the value
+        // this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read.
+        let (off, on, others) = switch_fixture("log_martians");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_log_martians_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 drops martians silently");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 logs them");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
         }
     }
 
