@@ -9436,11 +9436,32 @@ fn eval_promote_secondaries_at(
 }
 
 fn eval_unres_qlen_bytes(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/neigh/default/unres_qlen_bytes";
+    eval_unres_qlen_bytes_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/neigh/default/unres_qlen_bytes",
+    )
+}
+
+/// Path-injectable form of [`eval_unres_qlen_bytes`] (the `eval_*_at` idiom) so
+/// the read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_unres_qlen_bytes_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 131072 && info.max_net_speed() >= 10000 {
         recs.push(Recommendation {
             param: "net.ipv4.neigh.default.unres_qlen_bytes".to_string(),
@@ -19020,6 +19041,39 @@ mod tests {
             if val == 0 {
                 assert!(triggered, "Should trigger when promote_secondaries=0");
             }
+        }
+    }
+
+    #[test]
+    fn unres_qlen_bytes_advice_needs_a_readable_value() {
+        // The rule fires below 131072, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("unres_qlen_bytes", b"131072\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"65536\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_unres_qlen_bytes_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 65536 is below the floor");
+        assert_eq!(recs[0].current_value, "65536");
+        assert!(advice(&high).is_empty(), "a readable 131072 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
         }
     }
 
