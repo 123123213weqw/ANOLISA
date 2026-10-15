@@ -6972,9 +6972,10 @@ fn eval_arp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
     if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
-    // Any nonzero value is enabled, so -1 must not read as the value 0.
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // Any nonzero value is enabled, so -1 must not read as the value 0 —
+    // and neither may a file the reader could not interpret, which the
+    // signed sysctl reader maps to 0 as well.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.arp_filter".to_string(),
             current_value: "0".to_string(),
@@ -19796,6 +19797,46 @@ mod tests {
                 assert_eq!(recs[0].current_value, "0");
                 assert_eq!(recs[0].recommended_value, "1");
             }
+        }
+    }
+
+    #[test]
+    fn arp_filter_advice_needs_a_readable_switch() {
+        // read_sysctl_i64 maps an unreadable or unparseable file to 0, the value
+        // this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read. The
+        // multi-NIC gate needs two interfaces and no bond, so the 0 case is
+        // asserted only when that gate lets the rule run.
+        let (off, on, others) = switch_fixture("arp_filter");
+        let mut info = make_test_info();
+        info.network = vec![
+            NetInfo {
+                name: "eth0".to_string(),
+                speed_mbps: 10000,
+            },
+            NetInfo {
+                name: "eth1".to_string(),
+                speed_mbps: 10000,
+            },
+        ];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_arp_filter_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+        assert_eq!(
+            advice(&off).len(),
+            usize::from(!has_bond()),
+            "a readable 0 leaves multi-NIC ARP unfiltered"
+        );
+        assert!(advice(&on).is_empty(), "a readable 1 filters it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
         }
     }
 
