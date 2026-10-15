@@ -2,6 +2,29 @@
 
 ## 1.0.0
 
+**Breaking Changes**
+
+- Security operations require a running root daemon; the CLI does not start it or execute locally.
+  Manage `agent-sec-core.service` with system `systemctl`; the default socket is
+  `/run/agent-sec-core/daemon.sock`. (#3217)
+- `AGENT_SEC_DATA_DIR` and `AGENT_SEC_MODEL_SERVICE_*` are now daemon-wide settings; CLI/hook
+  exports no longer apply. Configure the daemon environment and restart. Storage defaults to
+  `/var/log/agent-sec`, without per-user fallbacks; test isolation requires a separate test daemon,
+  data directory, and socket. (#7283)
+- Shared-store queries isolate by trusted OS UID, not account lifetime; root sees all UIDs.
+  Reusing a UID exposes its retained records to the new account. Keep UIDs stable and have
+  administrators handle old data and permissions before reassignment. (#7277)
+- PII custom rules now use `/etc/agent-sec/pii-checker/rules.yaml` instead of the per-user default.
+  Move custom rules there and restart the daemon to apply changes. (#3286)
+- Skill Ledger uses a shared system signing key; V1 keys, keyrings and history are not imported.
+  Rescan Skills to establish V2 trust; key rotation requires root. (#3295)
+- Skill operations require administrator-configured `managedSkillDirs` or authenticated SkillFS
+  mounts. All local users can operate managed Skills; no per-user Skill ACLs are provided. (#3295)
+- V1 per-user Security Events and Observability history is not automatically imported into the
+  V2 system store. No supported cross-store import tool is shipped; preserve V1 data. (#6605)
+- Legacy `harden`, `verify` and `log-sandbox` commands are unavailable in the V2 CLI.
+  Update dependent scripts before switching to V2.
+
 **V2 Security Operations**
 
 - Added native V2 PII scanning with V1-compatible CLI and Hook contracts. (#3286)
