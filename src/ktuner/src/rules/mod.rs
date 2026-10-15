@@ -5740,12 +5740,29 @@ fn eval_neigh_gc_thresh3(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> u
     1
 }
 
-fn eval_neigh_gc_thresh1(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/neigh/default/gc_thresh1";
+fn eval_neigh_gc_thresh1(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_neigh_gc_thresh1_at(info, recs, "/proc/sys/net/ipv4/neigh/default/gc_thresh1")
+}
+
+/// Path-injectable form of [`eval_neigh_gc_thresh1`] (the `eval_*_at` idiom) so
+/// the read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_neigh_gc_thresh1_at(
+    _info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 2048 {
         recs.push(Recommendation {
             param: "net.ipv4.neigh.default.gc_thresh1".to_string(),
@@ -16379,6 +16396,35 @@ mod tests {
             "the forwarding interface is invisible only to the lossy path: {recs:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn neigh_gc_thresh1_advice_needs_a_readable_value() {
+        // The rule fires below 2048, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("neigh_gc_thresh1", b"2048\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"128\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_neigh_gc_thresh1_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 128 is below the floor");
+        assert_eq!(recs[0].current_value, "128");
+        assert!(advice(&high).is_empty(), "a readable 2048 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
