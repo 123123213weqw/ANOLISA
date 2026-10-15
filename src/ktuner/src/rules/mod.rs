@@ -3616,14 +3616,38 @@ fn eval_log_martians_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path:
 }
 
 fn eval_tcp_max_orphans(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_max_orphans";
+    eval_tcp_max_orphans_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/tcp_max_orphans",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_max_orphans`] (the `eval_*_at` idiom) so
+/// the read is assertable against synthetic files; the listener probe is passed
+/// in, as [`eval_tcp_frto_at`] does.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_tcp_max_orphans_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    has_listen_sockets: bool,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     let recommended = if info.memory_total_gb >= 128 {
         262144
     } else if info.memory_total_gb >= 32 {
@@ -12706,6 +12730,35 @@ mod tests {
         assert_eq!(recs.len(), 1, "a readable 16384 is below the floor");
         assert_eq!(recs[0].current_value, "16384");
         assert!(advice(&high).is_empty(), "a readable 200000 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_max_orphans_advice_needs_a_readable_value() {
+        // The rule fires below 131072, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("tcp_max_orphans", b"131072\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"16384\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_max_orphans_at(&info, &mut recs, path.to_str().unwrap(), true);
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 16384 is below the floor");
+        assert_eq!(recs[0].current_value, "16384");
+        assert!(advice(&high).is_empty(), "a readable 131072 is not");
         for path in &others {
             assert!(
                 advice(path).is_empty(),
