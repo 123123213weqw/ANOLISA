@@ -5720,11 +5720,28 @@ fn rfs_flow_table_configured(net_root: &std::path::Path) -> bool {
 }
 
 fn eval_neigh_gc_thresh3(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/neigh/default/gc_thresh3";
+    eval_neigh_gc_thresh3_at(info, recs, "/proc/sys/net/ipv4/neigh/default/gc_thresh3")
+}
+
+/// Path-injectable form of [`eval_neigh_gc_thresh3`] (the `eval_*_at` idiom) so
+/// the read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_neigh_gc_thresh3_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 4096 {
         recs.push(Recommendation {
             param: "net.ipv4.neigh.default.gc_thresh3".to_string(),
@@ -14307,6 +14324,35 @@ mod tests {
         // The value gate still applies below the version gate.
         assert!(neigh_gc_interval_recommendation(30, "2.4.0").is_none());
         assert!(neigh_gc_interval_recommendation(120, "2.4.0").is_none());
+    }
+
+    #[test]
+    fn neigh_gc_thresh3_advice_needs_a_readable_value() {
+        // The rule fires below 4096, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("neigh_gc_thresh3", b"4096\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"1024\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_neigh_gc_thresh3_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 1024 is below the floor");
+        assert_eq!(recs[0].current_value, "1024");
+        assert!(advice(&high).is_empty(), "a readable 4096 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
