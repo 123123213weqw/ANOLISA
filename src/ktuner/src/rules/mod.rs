@@ -9025,12 +9025,29 @@ fn eval_tcp_thin_dupack_at(
     1
 }
 
-fn eval_tcp_invalid_ratelimit(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_invalid_ratelimit";
+fn eval_tcp_invalid_ratelimit(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_tcp_invalid_ratelimit_at(info, recs, "/proc/sys/net/ipv4/tcp_invalid_ratelimit")
+}
+
+/// Path-injectable form of [`eval_tcp_invalid_ratelimit`] (the `eval_*_at` idiom) so the read is
+/// assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_tcp_invalid_ratelimit_at(
+    _info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 500 {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_invalid_ratelimit".to_string(),
@@ -21693,6 +21710,35 @@ mod tests {
             assert!(
                 advice(path).is_empty(),
                 "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn tcp_invalid_ratelimit_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("invalid_ratelimit_read", b"500\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"100\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_invalid_ratelimit_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 100 is below the floor");
+        assert_eq!(recs[0].current_value, "100");
+        assert!(advice(&high).is_empty(), "a readable 500 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
                 path.display()
             );
         }
