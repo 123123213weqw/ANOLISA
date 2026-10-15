@@ -3481,11 +3481,29 @@ fn ip_forward_recommendation(current: i64, host_needs_forwarding: bool) -> Optio
 }
 
 fn eval_unprivileged_bpf(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/unprivileged_bpf_disabled";
+    eval_unprivileged_bpf_at(info, recs, "/proc/sys/kernel/unprivileged_bpf_disabled")
+}
+
+/// Path-injectable form of [`eval_unprivileged_bpf`] (the `eval_*_at` idiom)
+/// so the switch read is assertable against synthetic files.
+///
+/// The rule fires on 0, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to that same 0. Only a zero the reader could produce is
+/// evidence that unprivileged `bpf()` is allowed, so a masked or garbled proc
+/// entry (a container's, typically) neither reports a `current_value` the
+/// host does not have nor asks for a write it may not need.
+fn eval_unprivileged_bpf_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
-    recommend_unprivileged_bpf(read_sysctl_u64(path), &info.kernel_version, recs);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    recommend_unprivileged_bpf(current, &info.kernel_version, recs);
     1
 }
 
@@ -20165,6 +20183,35 @@ mod tests {
                 recs.is_empty(),
                 "unprivileged bpf is already denied by {current}, so there is \
                  nothing to change"
+            );
+        }
+    }
+
+    #[test]
+    fn unprivileged_bpf_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — unprivileged bpf() allowed — and
+        // read_sysctl_u64 maps an unreadable or unparseable file to that same
+        // 0: a masked or garbled proc entry (a container's, typically) was
+        // reported as `current_value: "0"` and answered with a write of 2 on a
+        // host whose switch was never read.
+        let (off, on, others) = zero_switch_paths("unprivileged_bpf_read", b"2\n");
+        let mut info = make_test_info();
+        info.kernel_version = "6.6.0".to_string();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_unprivileged_bpf_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 allows unprivileged bpf()");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 2 denies it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
             );
         }
     }
