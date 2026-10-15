@@ -1646,8 +1646,10 @@ fn eval_default_qdisc_at(
     if !bbr_will_be_in_force(info, cc_path, avail_path, module_tree) {
         return 1;
     }
+    // read_sysctl_string answers "" for a file it cannot read, and no qdisc
+    // is named "": an empty read is no evidence of the discipline in force.
     let qdisc = read_sysctl_string(qdisc_path);
-    if qdisc == "fq" || qdisc == "fq_codel" {
+    if qdisc.is_empty() || qdisc == "fq" || qdisc == "fq_codel" {
         return 1;
     }
 
@@ -12356,6 +12358,60 @@ mod tests {
                 plan(cc).is_empty(),
                 "{}: an unreadable algorithm is not a plan onto BBR",
                 cc.display()
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_qdisc_advice_needs_a_readable_value() {
+        // read_sysctl_string answers "" for a file it cannot read, and "" is
+        // neither fq nor fq_codel: a masked proc entry (a container's,
+        // typically) was reported as `current_value: ""` and answered with a
+        // write of fq on a host whose qdisc was never read.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_qdisc_read_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let cc = dir.join("tcp_congestion_control");
+        let available = dir.join("tcp_available_congestion_control");
+        std::fs::write(&cc, "bbr\n").unwrap();
+        std::fs::write(&available, "reno cubic bbr\n").unwrap();
+        let tree = dir.join("modules");
+        std::fs::create_dir_all(tree.join("kernel/net/sched")).unwrap();
+        std::fs::write(tree.join("kernel/net/sched/sch_fq.ko"), b"").unwrap();
+        let readable = dir.join("pfifo_fast");
+        std::fs::write(&readable, "pfifo_fast\n").unwrap();
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let io_error = dir.join("io_error");
+        std::fs::create_dir_all(&io_error).unwrap();
+        let advice = |qdisc: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_qdisc_at(
+                &info,
+                &mut recs,
+                cc.to_str().unwrap(),
+                qdisc.to_str().unwrap(),
+                available.to_str().unwrap(),
+                Some(&tree),
+            );
+            recs
+        };
+
+        let recs = advice(&readable);
+        assert_eq!(recs.len(), 1, "a readable pfifo_fast under BBR is advised");
+        assert_eq!(recs[0].current_value, "pfifo_fast");
+        for qdisc in [&empty, &io_error] {
+            assert!(
+                advice(qdisc).is_empty(),
+                "{}: an unreadable qdisc is not a non-fq one",
+                qdisc.display()
             );
         }
 
