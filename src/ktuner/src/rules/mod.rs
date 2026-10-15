@@ -3136,9 +3136,14 @@ fn eval_rp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
     if !info.param_exists(path) {
         return 1;
     }
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled filter.
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
     if let Some(rec) = rp_filter_recommendation(
         "net.ipv4.conf.default.rp_filter",
-        read_sysctl_i64(path),
+        current,
         host_needs_ip_forward(info),
         "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
     ) {
@@ -17945,6 +17950,33 @@ mod tests {
         );
         assert!(max_dgram_qlen_recommendation(1024).is_none());
         assert!(max_dgram_qlen_recommendation(1023).is_some());
+    }
+
+    #[test]
+    fn rp_filter_default_advice_needs_a_readable_value() {
+        // The rule fires on 0, and the reader mapped an unreadable or
+        // unparseable file to the same 0: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("rp_filter_default_read", b"1\n");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_rp_filter_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves the filter off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 does not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
