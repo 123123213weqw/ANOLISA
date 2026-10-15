@@ -5850,7 +5850,18 @@ fn tcp_limit_output_bytes_recommendation(
 }
 
 fn eval_dev_weight(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/dev_weight";
+    eval_dev_weight_at(info, recs, "/proc/sys/net/core/dev_weight")
+}
+
+/// Path-injectable form of [`eval_dev_weight`] (the `eval_*_at` idiom) so the
+/// read is assertable against synthetic files.
+///
+/// The rule fires below a floor, and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to 0, which is below every floor. Only a value the reader
+/// could produce is evidence that the limit is low, so a masked or garbled
+/// proc entry (a container's, typically) neither reports a `current_value`
+/// the host does not have nor asks for a write it may not need.
+fn eval_dev_weight_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -5858,7 +5869,9 @@ fn eval_dev_weight(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
     if max_speed < 10000 {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current < 128 {
         recs.push(Recommendation {
             param: "net.core.dev_weight".to_string(),
@@ -16427,6 +16440,39 @@ mod tests {
                 legacy.reason.contains("1048576"),
                 "kernel {version}: the target stays visible in the reason: {}",
                 legacy.reason
+            );
+        }
+    }
+
+    #[test]
+    fn dev_weight_advice_needs_a_readable_value() {
+        // The rule fires below 128, and read_sysctl_u64 maps an unreadable or
+        // unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("dev_weight", b"128\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"64\n").unwrap();
+        let mut info = make_test_info();
+        info.network = vec![NetInfo {
+            name: "eth0".to_string(),
+            speed_mbps: 10000,
+        }];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_dev_weight_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 64 is below the floor");
+        assert_eq!(recs[0].current_value, "64");
+        assert!(advice(&high).is_empty(), "a readable 128 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
             );
         }
     }
