@@ -1193,9 +1193,13 @@ fn eval_tcp_max_syn_backlog_at(
     if syncookies == 0 && info.param_exists(syncookies_path) && info.has_listen_sockets() {
         return 1;
     }
-    if let Some(rec) =
-        syn_backlog_recommendation(read_sysctl_u64(path), syncookies, info.has_listen_sockets())
-    {
+    // The rule fires below a floor, and read_sysctl_u64 maps an unreadable or
+    // unparseable file to 0, which is below it: only a value the reader could
+    // produce is evidence that the queue is small.
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if let Some(rec) = syn_backlog_recommendation(current, syncookies, info.has_listen_sockets()) {
         recs.push(rec);
     }
     1
@@ -15001,6 +15005,45 @@ mod tests {
         assert_eq!(recs[0].current_value, "1024");
         assert_eq!(recs[0].recommended_value, "65536");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn syn_backlog_advice_needs_a_readable_value() {
+        // The rule fires below a floor, and read_sysctl_u64 maps an unreadable
+        // or unparseable file to 0, which is below it: a masked or garbled proc
+        // entry (a container's, typically) was reported as `current_value: "0"`
+        // and answered with a raise on a host whose value was never read.
+        let (_, high, others) = zero_switch_paths("syn_backlog_read", b"8192\n");
+        let low = high.with_file_name("low");
+        std::fs::write(&low, b"1024\n").unwrap();
+        // No tcp_syncookies file (a kernel without CONFIG_SYN_COOKIES): the
+        // backlog is the only defence, so the rule runs.
+        let syncookies = high.with_file_name("no_syncookies");
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_max_syn_backlog_at(
+                &info,
+                &mut recs,
+                path.to_str().unwrap(),
+                syncookies.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 1024 is below the floor");
+        assert_eq!(recs[0].current_value, "1024");
+        assert!(advice(&high).is_empty(), "a readable 8192 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
