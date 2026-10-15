@@ -1752,7 +1752,12 @@ fn eval_tcp_tw_reuse_at(
     if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    // The rule fires on 0, and read_sysctl_u64 maps an unreadable or
+    // unparseable file to that same 0: only a zero the reader could produce
+    // is evidence that reuse is off.
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     // In v6.6, tcp_twsk_unique() only considers reuse when a TIME_WAIT entry
     // has a nonzero tw_ts_recent_stamp, which new connections get when the
     // timestamp option is negotiated. Disabling timestamps stops that steady-
@@ -14015,6 +14020,40 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_timestamps") {
             assert_eq!(rec.recommended_value, "1");
             assert_eq!(rec.confidence, Confidence::High);
+        }
+    }
+
+    #[test]
+    fn tcp_tw_reuse_advice_needs_a_readable_switch() {
+        // The rule fires on 0 — TIME_WAIT reuse off — and read_sysctl_u64
+        // maps an unreadable or unparseable file to that same 0: a masked or
+        // garbled proc entry (a container's, typically) was reported as
+        // `current_value: "0"` and answered with a write of 1 on a host whose
+        // switch was never read.
+        let (off, on, others) = zero_switch_paths("tcp_tw_reuse_read", b"2\n");
+        // No timestamps file: inconclusive, which keeps the advice.
+        let timestamps = off.with_file_name("no_timestamps");
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_tw_reuse_at(
+                &mut recs,
+                path.to_str().unwrap(),
+                timestamps.to_str().unwrap(),
+                true,
+            );
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 leaves reuse off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 2 enables it");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not 0",
+                path.display()
+            );
         }
     }
 
