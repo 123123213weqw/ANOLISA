@@ -1890,7 +1890,14 @@ fn eval_tcp_congestion_control_at(
     if !info.param_exists(path) {
         return 1;
     }
+    // read_sysctl_string answers "" for a file it cannot read, and no
+    // algorithm is named "": an empty read is no evidence of the algorithm in
+    // force, so it neither reports a `current_value` the host does not have
+    // nor asks for a write it may not need.
     let current = read_sysctl_string(path);
+    if current.is_empty() {
+        return 1;
+    }
     if current != "bbr" && bbr_will_be_in_force(info, path, avail_path, module_tree) {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_congestion_control".to_string(),
@@ -1921,10 +1928,13 @@ fn bbr_will_be_in_force(
     avail_path: &str,
     module_tree: Option<&std::path::Path>,
 ) -> bool {
-    if read_sysctl_string(cc_path) == "bbr" {
+    let current = read_sysctl_string(cc_path);
+    if current == "bbr" {
         return true;
     }
-    if !info.param_exists(avail_path) {
+    // The congestion-control rule writes nothing over a value it could not
+    // read, so such a plan does not switch BBR on.
+    if current.is_empty() || !info.param_exists(avail_path) {
         return false;
     }
     let available = read_sysctl_string(avail_path);
@@ -12283,6 +12293,71 @@ mod tests {
 
         // Inside a container the tree is not the host kernel's.
         assert!(eval(None).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn congestion_control_advice_needs_a_readable_value() {
+        // read_sysctl_string answers "" for a file it cannot read, and "" is
+        // not "bbr": a masked proc entry (a container's, typically) was
+        // reported as `current_value: ""` and answered with a write of bbr,
+        // and the qdisc rule then judged a plan that switches BBR on.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_cc_read_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let available = dir.join("tcp_available_congestion_control");
+        let qdisc = dir.join("default_qdisc");
+        std::fs::write(&available, "reno cubic bbr\n").unwrap();
+        std::fs::write(&qdisc, "pfifo_fast\n").unwrap();
+        let tree = dir.join("modules");
+        std::fs::create_dir_all(tree.join("kernel/net/sched")).unwrap();
+        std::fs::write(tree.join("kernel/net/sched/sch_fq.ko"), b"").unwrap();
+        let readable = dir.join("cubic");
+        std::fs::write(&readable, "cubic\n").unwrap();
+        let empty = dir.join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        let io_error = dir.join("io_error");
+        std::fs::create_dir_all(&io_error).unwrap();
+        let plan = |cc: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_congestion_control_at(
+                &info,
+                &mut recs,
+                cc.to_str().unwrap(),
+                available.to_str().unwrap(),
+                Some(&tree),
+            );
+            eval_default_qdisc_at(
+                &info,
+                &mut recs,
+                cc.to_str().unwrap(),
+                qdisc.to_str().unwrap(),
+                available.to_str().unwrap(),
+                Some(&tree),
+            );
+            recs
+        };
+
+        let recs = plan(&readable);
+        assert_eq!(
+            recs.len(),
+            2,
+            "a readable cubic is switched to BBR, with its qdisc"
+        );
+        assert_eq!(recs[0].current_value, "cubic");
+        for cc in [&empty, &io_error] {
+            assert!(
+                plan(cc).is_empty(),
+                "{}: an unreadable algorithm is not a plan onto BBR",
+                cc.display()
+            );
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }
