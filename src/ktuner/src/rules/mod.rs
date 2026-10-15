@@ -6896,8 +6896,9 @@ fn eval_icmp_ignore_bogus_at(
     if !info.param_exists(path) {
         return 1;
     }
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.icmp_ignore_bogus_error_responses".to_string(),
             current_value: "0".to_string(),
@@ -18251,6 +18252,32 @@ mod tests {
             }
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn icmp_ignore_bogus_advice_needs_a_readable_switch() {
+        // read_sysctl_i64 maps an unreadable or unparseable file to 0, the value
+        // this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read.
+        let (off, on, others) = switch_fixture("icmp_bogus");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_icmp_ignore_bogus_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 logs bogus ICMP errors");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 ignores them");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
