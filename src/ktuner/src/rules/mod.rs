@@ -10468,8 +10468,9 @@ fn eval_promote_secondaries_at(
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.default.promote_secondaries".to_string(),
             current_value: "0".to_string(),
@@ -22657,16 +22658,44 @@ mod tests {
     }
 
     #[test]
+    fn promote_secondaries_advice_needs_a_readable_value() {
+        // The rule fires on 0, and the reader mapped an unreadable or
+        // unparseable file to the same 0: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("promote_secondaries_read", b"-1\n");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 drops the secondaries");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable -1 does not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn test_promote_secondaries() {
         let info = make_test_info();
         let mut recs = Vec::new();
         let checked = eval_promote_secondaries(&info, &mut recs);
         if std::path::Path::new("/proc/sys/net/ipv4/conf/default/promote_secondaries").exists() {
             assert_eq!(checked, 1);
-            let val = read_sysctl_u64("/proc/sys/net/ipv4/conf/default/promote_secondaries");
+            let val = read_switch_i64("/proc/sys/net/ipv4/conf/default/promote_secondaries");
             let triggered = recs.iter().any(|r| r.param.contains("promote_secondaries"));
-            if val == 0 {
-                assert!(triggered, "Should trigger when promote_secondaries=0");
+            match val {
+                Some(0) => assert!(triggered, "Should trigger when promote_secondaries=0"),
+                Some(_) | None => assert!(!triggered, "Only a readable 0 triggers"),
             }
         }
     }
