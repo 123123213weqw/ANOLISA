@@ -6728,8 +6728,9 @@ fn eval_arp_notify_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
     if arp_tuning_skipped(info.network.len(), has_bond()) {
         return 1;
     }
-    let current = read_sysctl_i64(path);
-    if current == 0 {
+    // The reader maps a file it cannot interpret to 0 as well; only a
+    // successfully read 0 is the disabled switch.
+    if read_switch_i64(path) == Some(0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.arp_notify".to_string(),
             current_value: "0".to_string(),
@@ -20495,6 +20496,46 @@ mod tests {
             );
         }
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn arp_notify_advice_needs_a_readable_switch() {
+        // read_sysctl_i64 maps an unreadable or unparseable file to 0, the value
+        // this gate fires on, so a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose switch was never read. The
+        // multi-NIC gate needs two interfaces and no bond, so the 0 case is
+        // asserted only when that gate lets the rule run.
+        let (off, on, others) = switch_fixture("arp_notify");
+        let mut info = make_test_info();
+        info.network = vec![
+            NetInfo {
+                name: "eth0".to_string(),
+                speed_mbps: 10000,
+            },
+            NetInfo {
+                name: "eth1".to_string(),
+                speed_mbps: 10000,
+            },
+        ];
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_arp_notify_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+        assert_eq!(
+            advice(&off).len(),
+            usize::from(!has_bond()),
+            "a readable 0 leaves gratuitous ARP off"
+        );
+        assert!(advice(&on).is_empty(), "a readable 1 notifies");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
