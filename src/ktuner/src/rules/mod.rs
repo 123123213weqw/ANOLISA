@@ -8678,9 +8678,46 @@ fn eval_tcp_reordering_at(
     1
 }
 
-fn eval_sched_energy_aware(_info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/sched_energy_aware";
+fn eval_sched_energy_aware(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_sched_energy_aware_at(
+        info,
+        recs,
+        "/proc/sys/kernel/sched_energy_aware",
+        "/sys/devices/system/cpu/smt/active",
+        "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor",
+    )
+}
+
+/// Path-injectable form of [`eval_sched_energy_aware`] (the `eval_*_at` idiom)
+/// so the EAS preconditions are assertable against synthetic files.
+///
+/// The knob only lets the scheduler build energy-aware perf domains, and the
+/// kernel refuses to build them on most servers whatever it says: v6.6
+/// `build_perf_domains()` (kernel/sched/topology.c), the knob's only reader
+/// (:383), gives up while SMT is active (`sched_smt_active()`, :396-399) and
+/// when a CPU has no cpufreq policy or a governor other than schedutil
+/// (:416-425); 6.12 `sched_is_eas_possible()` applies the same tests. There a
+/// write of 0 changes nothing, so the promised performance gain cannot happen
+/// (the "never recommend a no-op" rule of the page-cluster and
+/// hardlockup_panic gates).
+///
+/// `smt/active` prints `sched_smt_active()` itself (v6.6 kernel/cpu.c:3005).
+/// cpu0's governor stands for the set: one CPU without schedutil is enough to
+/// rule EAS out, and a missing or unreadable file means no policy to check.
+fn eval_sched_energy_aware_at(
+    _info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    smt_active_path: &str,
+    governor_path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
+        return 1;
+    }
+    if read_switch(smt_active_path) == Some(1) {
+        return 1;
+    }
+    if read_sysctl_string(governor_path) != "schedutil" {
         return 1;
     }
     let current = read_sysctl_u64(path);
@@ -21091,6 +21128,62 @@ mod tests {
             assert_eq!(rec.recommended_value, "0");
             assert_eq!(rec.category, Category::Performance);
         }
+    }
+
+    /// The knob only matters where the kernel can build energy-aware perf
+    /// domains: `build_perf_domains()` gives up while SMT is active and when a
+    /// CPU's governor is not schedutil, so on such a host the write of 0
+    /// changed nothing although the rule promised a performance gain.
+    #[test]
+    fn sched_energy_aware_advice_needs_eas_to_be_possible() {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_energy_aware_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = |name: &str, body: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            path.to_str().unwrap().to_string()
+        };
+        let knob = file("sched_energy_aware", b"1\n");
+        let knob_off = file("sched_energy_aware_off", b"0\n");
+        let smt_on = file("smt_on", b"1\n");
+        let smt_off = file("smt_off", b"0\n");
+        let schedutil = file("schedutil", b"schedutil\n");
+        let performance = file("performance", b"performance\n");
+        let missing = dir.join("missing").to_str().unwrap().to_string();
+        let info = make_test_info();
+        let advice = |knob: &str, smt: &str, governor: &str| {
+            let mut recs = Vec::new();
+            eval_sched_energy_aware_at(&info, &mut recs, knob, smt, governor);
+            recs
+        };
+
+        let recs = advice(&knob, &smt_off, &schedutil);
+        assert_eq!(recs.len(), 1, "EAS can run: the knob decides");
+        assert_eq!(recs[0].recommended_value, "0");
+        assert!(
+            advice(&knob, &missing, &schedutil).len() == 1,
+            "no SMT control"
+        );
+        assert!(
+            advice(&knob, &smt_on, &schedutil).is_empty(),
+            "SMT is active"
+        );
+        assert!(
+            advice(&knob, &smt_off, &performance).is_empty(),
+            "not schedutil"
+        );
+        assert!(
+            advice(&knob, &smt_off, &missing).is_empty(),
+            "no cpufreq policy"
+        );
+        assert!(
+            advice(&knob_off, &smt_off, &schedutil).is_empty(),
+            "already 0"
+        );
     }
 
     #[test]
