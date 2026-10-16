@@ -295,11 +295,7 @@ pub fn evaluate_with_workload(info: &SystemInfo, workload: &WorkloadType) -> Res
     checked += eval_max_queued_signals(info, &mut recs);
     checked += eval_keys_maxbytes(info, &mut recs);
     checked += eval_pipe_max_size(info, &mut recs);
-    checked += eval_shmall(info, &mut recs, current_page_size, |path| {
-        std::path::Path::new(path)
-            .exists()
-            .then(|| read_sysctl_u64(path))
-    });
+    checked += eval_shmall(info, &mut recs, current_page_size, read_shmall);
     checked += eval_tcp_app_win(info, &mut recs);
     checked += eval_ip_default_ttl(info, &mut recs);
     checked += eval_tcp_frto(info, &mut recs);
@@ -10315,6 +10311,19 @@ fn shmall_target_pages(memory_total_gb: u64, page_size: u64) -> u64 {
         return 0;
     }
     (memory_total_gb * 1024 * 1024 * 1024 / page_size) / 2
+}
+
+/// The value [`eval_shmall`] reads in production: `None` for a missing file
+/// and for one that could not be read or parsed.
+///
+/// The rule fires below half of RAM, and [`read_sysctl_u64`] maps an
+/// unreadable or unparseable file to 0, which is below every target. Only a
+/// value the reader could produce is evidence that the limit is low, so a
+/// masked or garbled proc entry (a container's, typically) neither reports a
+/// `current_value` the host does not have nor asks for a write it may not
+/// need.
+fn read_shmall(path: &str) -> Option<u64> {
+    read_switch(path)
 }
 
 fn eval_shmall(
@@ -22384,6 +22393,40 @@ mod tests {
         );
         assert_eq!(checked, 1);
         assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn shmall_advice_needs_a_readable_value() {
+        // The production reader mapped an unreadable or unparseable file to
+        // Some(0), which is below every target: a masked or garbled proc entry
+        // (a container's, typically) was reported as `current_value: "0"` and
+        // answered with a raise on a host whose limit was never read.
+        let (low, high, others) = zero_switch_paths("shmall_read", b"18446744073692774399\n");
+        std::fs::write(&low, b"1024\n").unwrap();
+        let mut info = make_test_info();
+        info.memory_total_gb = 256;
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_shmall(
+                &info,
+                &mut recs,
+                || 4096,
+                |_| read_shmall(path.to_str().unwrap()),
+            );
+            recs
+        };
+
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 1024 is below the target");
+        assert_eq!(recs[0].current_value, "1024");
+        assert!(advice(&high).is_empty(), "the kernel default is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
     }
 
     #[test]
