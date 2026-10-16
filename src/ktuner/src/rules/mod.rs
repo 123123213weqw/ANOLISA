@@ -11031,15 +11031,35 @@ fn eval_compact_unevictable_at(
 }
 
 fn eval_perf_cpu_time_max_percent(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/kernel/perf_cpu_time_max_percent";
+    eval_perf_cpu_time_max_percent_at(info, recs, "/proc/sys/kernel/perf_cpu_time_max_percent")
+}
+
+/// Path-injectable form of [`eval_perf_cpu_time_max_percent`] (the `eval_*_at`
+/// idiom) so the read is assertable against synthetic files.
+///
+/// 0 is not a tighter limit than 5 but no limit at all: v6.6
+/// `perf_cpu_time_max_percent_handler()` (kernel/events/core.c:484-488)
+/// treats 0 exactly like 100 and sets `perf_sample_allowed_ns` to 0, which
+/// makes `perf_sample_event_took()` return before any throttling (:521-527),
+/// and `sysctl/kernel.rst` documents 0 as "Disable the mechanism". The rule
+/// already fires on 100, so it fires on 0 too. The value is read with
+/// [`read_switch`], so a file that cannot be read or parsed is not taken for
+/// that 0.
+fn eval_perf_cpu_time_max_percent_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if info.cpu_cores <= 16 {
         return 1;
     }
-    let current = read_sysctl_u64(path);
-    if current > 5 {
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
+    if current == 0 || current > 5 {
         recs.push(Recommendation {
             param: "kernel.perf_cpu_time_max_percent".to_string(),
             current_value: current.to_string(),
@@ -24121,6 +24141,50 @@ mod tests {
         let checked = eval_perf_cpu_time_max_percent(&info, &mut recs);
         if std::path::Path::new("/proc/sys/kernel/perf_cpu_time_max_percent").exists() {
             assert_eq!(checked, 1);
+        }
+    }
+
+    #[test]
+    fn perf_cpu_time_max_percent_zero_is_no_limit() {
+        // The kernel treats 0 exactly like 100: both disable the throttling
+        // (perf_sample_allowed_ns = 0). The rule fired on 100 and stayed quiet
+        // on 0, the setting with no CPU limit at all.
+        let (off, _, others) = zero_switch_paths("perf_cpu_time_zero", b"5\n");
+        let dir = off.parent().unwrap().to_path_buf();
+        let value = |name: &str, body: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            path
+        };
+        let mut info = make_test_info();
+        info.cpu_cores = 64;
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_perf_cpu_time_max_percent_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        for (name, body) in [
+            ("zero", &b"0\n"[..]),
+            ("full", b"100\n"),
+            ("default", b"25\n"),
+        ] {
+            let recs = advice(&value(name, body));
+            assert_eq!(recs.len(), 1, "{name}");
+            assert_eq!(recs[0].recommended_value, "5", "{name}");
+        }
+        assert_eq!(advice(&value("zero", b"0\n"))[0].current_value, "0");
+        assert!(
+            advice(&value("tight", b"5\n")).is_empty(),
+            "5 is the target"
+        );
+        assert!(advice(&value("tighter", b"1\n")).is_empty(), "1 is tighter");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
         }
     }
 
