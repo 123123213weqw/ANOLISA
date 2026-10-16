@@ -741,10 +741,16 @@ fn eval_somaxconn(
         4096
     };
 
-    if info.sysctl.somaxconn < threshold as u64 {
+    // A value that could not be read says nothing about the backlog: the 0
+    // it used to fall back to sits below both floors, so the rule reported a
+    // limit the host never showed and asked to raise it.
+    let Some(somaxconn) = info.sysctl.somaxconn else {
+        return 1;
+    };
+    if somaxconn < threshold as u64 {
         recs.push(Recommendation {
             param: "net.core.somaxconn".to_string(),
-            current_value: info.sysctl.somaxconn.to_string(),
+            current_value: somaxconn.to_string(),
             recommended_value: "65535".to_string(),
             reason: "检测到监听端口，增大 listen backlog 避免高并发时连接被拒绝".to_string(),
             confidence: Confidence::Medium,
@@ -13315,7 +13321,7 @@ mod tests {
                 swappiness: 60,
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
-                somaxconn: 128,
+                somaxconn: Some(128),
                 thp_enabled: "always".to_string(),
             },
             processes: vec![ProcessInfo {
@@ -13716,7 +13722,7 @@ mod tests {
         info.sysctl.thp_enabled = "madvise".to_string();
         info.sysctl.dirty_ratio = 10;
         info.sysctl.dirty_background_ratio = 5;
-        info.sysctl.somaxconn = 65535;
+        info.sysctl.somaxconn = Some(65535);
         info.processes = vec![];
         info.network = vec![];
 
@@ -14772,13 +14778,44 @@ mod tests {
     #[test]
     fn test_somaxconn_not_triggered_without_listen() {
         let mut info = make_test_info();
-        info.sysctl.somaxconn = 128;
+        info.sysctl.somaxconn = Some(128);
         info.processes = vec![];
         // has_listen_sockets() reads live /proc, so on this machine it may or may not trigger
         // We just verify the rule exists and has the right recommended value when triggered
         let recs = evaluate(&info).unwrap().recommendations;
         if let Some(rec) = recs.iter().find(|r| r.param == "net.core.somaxconn") {
             assert_eq!(rec.recommended_value, "65535");
+        }
+    }
+
+    #[test]
+    fn somaxconn_advice_needs_a_readable_value() {
+        // somaxconn fell back to 0 when it could not be read or parsed, and 0
+        // sits below both backlog floors: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a raise on a host whose limit was never read.
+        let (low, high, others) = zero_switch_paths("somaxconn_read", b"65535\n");
+        let mut info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut advice = |path: &std::path::Path| {
+            info.sysctl.somaxconn = read_somaxconn_from(path);
+            let mut recs = Vec::new();
+            eval_somaxconn(&info, &WorkloadType::Mixed, &mut recs);
+            recs
+        };
+
+        std::fs::write(&low, b"128\n").unwrap();
+        let recs = advice(&low);
+        assert_eq!(recs.len(), 1, "a readable 128 is below the floor");
+        assert_eq!(recs[0].current_value, "128");
+        assert!(advice(&high).is_empty(), "a readable 65535 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
         }
     }
 

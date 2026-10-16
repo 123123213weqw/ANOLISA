@@ -142,7 +142,7 @@ mod java_application_argument_regressions {
                 swappiness: 60,
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
-                somaxconn: 128,
+                somaxconn: Some(128),
                 thp_enabled: "always".into(),
             },
             processes,
@@ -234,7 +234,10 @@ pub struct SysctlValues {
     pub swappiness: u64,
     pub dirty_ratio: u64,
     pub dirty_background_ratio: u64,
-    pub somaxconn: u64,
+    /// `None` when `net.core.somaxconn` could not be read or parsed, so the
+    /// rules never size the listen backlog from a value the host did not
+    /// report.
+    pub somaxconn: Option<u64>,
     pub thp_enabled: String,
 }
 
@@ -1756,9 +1759,16 @@ fn read_sysctl_values() -> Result<SysctlValues> {
         swappiness: read_sysctl_u64("/proc/sys/vm/swappiness"),
         dirty_ratio: read_sysctl_u64("/proc/sys/vm/dirty_ratio"),
         dirty_background_ratio: read_sysctl_u64("/proc/sys/vm/dirty_background_ratio"),
-        somaxconn: read_sysctl_u64("/proc/sys/net/core/somaxconn"),
+        somaxconn: read_somaxconn_from(Path::new("/proc/sys/net/core/somaxconn")),
         thp_enabled: read_thp_enabled(),
     })
+}
+
+/// `net.core.somaxconn`, `None` when the file could not be read or parsed:
+/// the 0 the shared reader falls back to sits below every backlog floor, so
+/// it would be reported as the host's value and answered with a raise.
+pub(crate) fn read_somaxconn_from(path: &Path) -> Option<u64> {
+    read_sysfs_u64(path)
 }
 
 /// Normalize a raw link-speed reading. The kernel prints SPEED_UNKNOWN (-1
@@ -2565,7 +2575,7 @@ mod tests {
                 swappiness: 60,
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
-                somaxconn: 128,
+                somaxconn: Some(128),
                 thp_enabled: "always".to_string(),
             },
             processes: names
@@ -4306,7 +4316,7 @@ mod tests {
                 swappiness: 60,
                 dirty_ratio: 20,
                 dirty_background_ratio: 10,
-                somaxconn: 128,
+                somaxconn: Some(128),
                 thp_enabled: "always".to_string(),
             },
             processes: vec![
