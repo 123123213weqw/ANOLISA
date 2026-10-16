@@ -264,7 +264,13 @@ fn shell_handoff_timeout_notice_is_deferred_until_foreground_is_idle() {
     .expect("timeout notice");
     let idle_text = String::from_utf8_lossy(&idle_output);
 
-    assert_eq!(action, None);
+    assert_eq!(
+        action,
+        Some(RawObserverAction::RestorePrompt {
+            ghost_text: None,
+            ghost_route: Default::default(),
+        })
+    );
     assert!(
         idle_text.contains("Command exceeded configured shell handoff timeout (1s)."),
         "{idle_text}"
@@ -461,4 +467,41 @@ fn assert_gate_wrapping_preserves_only_physical_write_source() {
         !crate::shell_host::physical_error(&storage),
         "an untagged writer with the same OS code is strict"
     );
+}
+
+#[test]
+fn deferred_handoff_timeout_notice_restores_native_prompt_without_input() {
+    let mut state = InlineState {
+        pending_shell_handoff_timeout_notice: Some(Duration::from_secs(2)),
+        ..InlineState::default()
+    };
+    let mut output = Vec::new();
+    let action = shell_handoff_timeout_recovery_action_with_timeout(
+        &mut state,
+        false,
+        &mut output,
+        Some(Duration::from_secs(2)),
+    )
+    .expect("idle timeout notice");
+    assert_eq!(
+        action,
+        Some(RawObserverAction::RestorePrompt {
+            ghost_text: None,
+            ghost_route: Default::default(),
+        })
+    );
+    assert!(String::from_utf8_lossy(&output).contains("handoff timeout (2s)."));
+    assert!(state.pending_shell_handoff_timeout_notice.is_none());
+    output.clear();
+    assert_eq!(
+        shell_handoff_timeout_recovery_action_with_timeout(
+            &mut state,
+            false,
+            &mut output,
+            Some(Duration::from_secs(2)),
+        )
+        .expect("settled timeout notice"),
+        None
+    );
+    assert!(output.is_empty());
 }

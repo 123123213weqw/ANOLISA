@@ -115,7 +115,7 @@ pub(super) fn recover<W: Write>(
     }
     let mut physical = PhysicalDisplayWriter(output);
     let result = (|| {
-        physical.write_all(b"\x18\x1b[0m\x1b[?7h\r\n")?;
+        physical.write_all(b"\x18\x1b[0m\x1b[?7h\x1b[?25h\r\n")?;
         for _ in 0..rows.max(1) {
             physical.write_all(b"\r\n")?;
         }

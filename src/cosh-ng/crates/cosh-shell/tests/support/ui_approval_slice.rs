@@ -597,6 +597,10 @@ impl RealCoreApprovalHarness {
             .rows(0, self.terminal.cols)
             .nth(usize::from(row))
             .unwrap_or_default();
+        assert!(
+            !screen.hide_cursor(),
+            "native editable cursor must be visible before input"
+        );
         assert_eq!(cursor_line.trim_end(), NATIVE_PROMPT_MARKER);
         assert_eq!(usize::from(col), NATIVE_PROMPT_MARKER.len() + 1);
         assert_eq!(screen.cell(row, 0).unwrap().fgcolor(), vt100::Color::Idx(2));

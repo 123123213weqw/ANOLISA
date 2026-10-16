@@ -31,6 +31,10 @@ pub(crate) fn physical_failures_require_an_emitted_token_and_never_mask_other_er
     assert!(recover(&reset, &mut healthy, 24).expect("actual fresh flush"));
     assert!(!reset.display_is_failed());
     assert!(healthy.starts_with(b"\x18"));
+    assert!(
+        healthy.windows(6).any(|bytes| bytes == b"\x1b[?25h"),
+        "physical recovery must restore the caret hidden by the worker"
+    );
     assert_eq!(healthy.iter().filter(|byte| **byte == b'\n').count(), 25);
     assert_eq!(
         *mode.lock().unwrap(),

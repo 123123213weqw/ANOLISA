@@ -269,6 +269,10 @@ fn shell_handoff_timeout_recovery_action_with_timeout<W: Write>(
     if !shell_busy && !shell_handoff_pending {
         if let Some(timeout) = state.pending_shell_handoff_timeout_notice.take() {
             render_shell_handoff_timeout_notice(state, output, timeout)?;
+            return Ok(Some(RawObserverAction::RestorePrompt {
+                ghost_text: None,
+                ghost_route: Default::default(),
+            }));
         }
         return Ok(None);
     }
