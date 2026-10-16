@@ -460,6 +460,38 @@ fn eval_swappiness(
     workload: &WorkloadType,
     recs: &mut Vec<Recommendation>,
 ) -> usize {
+    eval_swappiness_at(
+        info,
+        workload,
+        recs,
+        "/proc/swaps",
+        "/sys/kernel/mm/numa/demotion_enabled",
+    )
+}
+
+/// Path-injectable form of [`eval_swappiness`] (the `eval_*_at` idiom) so the
+/// swap gate is assertable against a synthetic /proc/swaps.
+///
+/// `vm.swappiness` only weighs anonymous against file pages when reclaim can
+/// take anonymous pages at all: v6.6 `get_scan_count()` (mm/vmscan.c:3038-3042)
+/// scans file pages alone when `can_reclaim_anon_pages()` is false — no swap
+/// space and no demotion target (:605-627) — and the multi-gen LRU's
+/// `get_swappiness()` (:3300-3313) returns 0 under the same two conditions.
+/// On a host with no swap area and demotion off, the write changes nothing,
+/// so the promised reduction in swapping cannot happen there — the same
+/// "never recommend a no-op" gate the page-cluster rule applies to the same
+/// table. Demotion that is on keeps the advice, since it can make anonymous
+/// pages reclaimable without swap.
+fn eval_swappiness_at(
+    info: &SystemInfo,
+    workload: &WorkloadType,
+    recs: &mut Vec<Recommendation>,
+    swaps_path: &str,
+    demotion_path: &str,
+) -> usize {
+    if !swap_configured(swaps_path) && read_sysctl_string(demotion_path) != "true" {
+        return 1;
+    }
     let is_db = info.has_process("postgres")
         || info.has_process("mysqld")
         // MariaDB 10.4+ runs as mariadbd — the same OLTP database as mysqld.
@@ -11674,7 +11706,7 @@ mod tests {
         info.disks[0].read_ahead_kb = Some(512);
 
         let mut recs = Vec::new();
-        eval_swappiness(&info, &WorkloadType::Mixed, &mut recs);
+        swappiness_on_a_swap_host(&info, &WorkloadType::Mixed, &mut recs);
         assert!(
             recs.iter().any(|r| r.param == "vm.swappiness"),
             "mariadbd must gate the swappiness rule in"
@@ -11704,6 +11736,91 @@ mod tests {
         );
     }
 
+    /// [`eval_swappiness`] on a host with one swap area, so the database and
+    /// memory gates are asserted whatever the test machine's own swap is.
+    fn swappiness_on_a_swap_host(
+        info: &SystemInfo,
+        workload: &WorkloadType,
+        recs: &mut Vec<Recommendation>,
+    ) -> usize {
+        let (swaps, _) = swappiness_swap_tables();
+        eval_swappiness_at(info, workload, recs, &swaps, "/nonexistent")
+    }
+
+    /// A /proc/swaps with one area and one with the header alone.
+    fn swappiness_swap_tables() -> (String, String) {
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_swappiness_swaps_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let header = "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n";
+        let on = dir.join("swaps_on");
+        std::fs::write(
+            &on,
+            format!("{header}/dev/sdb2 partition\t8388604\t0\t-2\n"),
+        )
+        .unwrap();
+        let off = dir.join("swaps_off");
+        std::fs::write(&off, header).unwrap();
+        (
+            on.to_str().unwrap().to_string(),
+            off.to_str().unwrap().to_string(),
+        )
+    }
+
+    /// With no swap area and demotion off, reclaim never takes anonymous pages
+    /// (`get_scan_count()` scans file pages alone), so vm.swappiness weighs
+    /// nothing and the write the rule asked for changed nothing. Demotion that
+    /// is on keeps the advice: it makes anonymous pages reclaimable.
+    #[test]
+    fn swappiness_advice_needs_swap_or_demotion() {
+        let (swap_on, swap_off) = swappiness_swap_tables();
+        let dir = std::path::Path::new(&swap_on)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let demotion_on = dir.join("demotion_on");
+        std::fs::write(&demotion_on, "true\n").unwrap();
+        let demotion_off = dir.join("demotion_off");
+        std::fs::write(&demotion_off, "false\n").unwrap();
+        let mut info = info_with_processes(&["postgres"]);
+        info.sysctl.swappiness = 60;
+        let advice = |swaps: &str, demotion: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_swappiness_at(
+                &info,
+                &WorkloadType::Mixed,
+                &mut recs,
+                swaps,
+                demotion.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let recs = advice(&swap_on, &demotion_off);
+        assert_eq!(recs.len(), 1, "a swap area makes the knob matter");
+        assert_eq!(recs[0].recommended_value, "1");
+        assert_eq!(
+            advice(&swap_off, &demotion_on).len(),
+            1,
+            "demotion does too"
+        );
+        assert!(
+            advice(&swap_off, &demotion_off).is_empty(),
+            "no swap, no demotion"
+        );
+        assert!(
+            advice(&swap_off, &dir.join("missing")).is_empty(),
+            "no demotion control"
+        );
+        assert!(
+            advice(dir.join("no_swaps").to_str().unwrap(), &demotion_off).is_empty(),
+            "an unreadable swap table counts as no swap"
+        );
+    }
+
     #[test]
     fn oracle_gates_the_database_tuning_rules() {
         // oracle is the one OLTP database is_database_present already counts
@@ -11724,7 +11841,7 @@ mod tests {
         info.disks[0].read_ahead_kb = Some(512);
 
         let mut recs = Vec::new();
-        eval_swappiness(&info, &WorkloadType::Mixed, &mut recs);
+        swappiness_on_a_swap_host(&info, &WorkloadType::Mixed, &mut recs);
         let swap = recs
             .iter()
             .find(|r| r.param == "vm.swappiness")
@@ -11752,7 +11869,7 @@ mod tests {
         let mut big = info_with_processes(&["oracle"]);
         big.memory_total_gb = 64;
         let mut recs = Vec::new();
-        eval_swappiness(&big, &WorkloadType::Mixed, &mut recs);
+        swappiness_on_a_swap_host(&big, &WorkloadType::Mixed, &mut recs);
         let swap = recs
             .iter()
             .find(|r| r.param == "vm.swappiness")
@@ -13009,6 +13126,10 @@ mod tests {
         let info = make_test_info();
         let recs = evaluate(&info).unwrap().recommendations;
         let swap_rec = recs.iter().find(|r| r.param == "vm.swappiness");
+        // The rule reads the live swap table; a swapless runner gets no advice.
+        if !swap_configured("/proc/swaps") {
+            return;
+        }
         assert!(swap_rec.is_some());
         assert_eq!(swap_rec.unwrap().recommended_value, "1");
     }
@@ -14570,6 +14691,10 @@ mod tests {
             .unwrap()
             .recommendations;
         let rec = recs.iter().find(|r| r.param == "vm.swappiness");
+        // The rule reads the live swap table; a swapless runner gets no advice.
+        if !swap_configured("/proc/swaps") {
+            return;
+        }
         assert!(
             rec.is_some(),
             "IoLatency workload should recommend swappiness=1 even when current is 10"
