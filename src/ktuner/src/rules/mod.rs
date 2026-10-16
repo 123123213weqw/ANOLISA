@@ -10621,14 +10621,27 @@ fn eval_protected_regular_at(
 }
 
 fn eval_bpf_jit_enable(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/core/bpf_jit_enable";
+    eval_bpf_jit_enable_at(info, recs, "/proc/sys/net/core/bpf_jit_enable")
+}
+
+/// Path-injectable form of [`eval_bpf_jit_enable`] (the `eval_*_at` idiom) so the read is
+/// assertable against synthetic files.
+///
+/// The rule fires on 0 (the JIT off), and [`read_sysctl_u64`] maps an unreadable or
+/// unparseable file to the same 0. Only a value the reader could produce is
+/// evidence, so a masked or garbled proc entry (a container's, typically)
+/// neither reports a `current_value` the host does not have nor asks for a
+/// write it may not need.
+fn eval_bpf_jit_enable_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if !info.has_listen_sockets() {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current == 0 {
         recs.push(Recommendation {
             param: "net.core.bpf_jit_enable".to_string(),
@@ -22251,6 +22264,35 @@ mod tests {
         eval_keys_maxkeys(&info, &mut recs);
         if let Some(rec) = recs.iter().find(|r| r.param == "kernel.keys.maxkeys") {
             assert_eq!(rec.recommended_value, "2000");
+        }
+    }
+
+    #[test]
+    fn bpf_jit_enable_advice_needs_a_readable_value() {
+        // The rule fires on 0, and read_sysctl_u64 mapped an unreadable or
+        // unparseable file to the same 0: a masked or garbled proc entry (a
+        // container's, typically) was reported as `current_value: "0"` and
+        // answered with a write on a host whose value was never read.
+        let (off, on, others) = zero_switch_paths("bpf_jit_enable_read", b"1\n");
+        let info = make_test_info();
+        // The rule only speaks on a host that listens on TCP.
+        let _listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_bpf_jit_enable_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&off);
+        assert_eq!(recs.len(), 1, "a readable 0 is the JIT off");
+        assert_eq!(recs[0].current_value, "0");
+        assert!(advice(&on).is_empty(), "a readable 1 is not");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
         }
     }
 
