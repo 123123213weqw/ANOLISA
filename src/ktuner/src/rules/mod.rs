@@ -8074,7 +8074,12 @@ fn eval_arp_notify_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
 }
 
 fn eval_default_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_default_arp_announce_at(info, recs, "/proc/sys/net/ipv4/conf/default/arp_announce")
+    eval_default_arp_announce_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/arp_announce",
+        "/proc/sys/net/ipv4/conf/all/arp_announce",
+    )
 }
 
 /// Path-injectable form of [`eval_default_arp_announce`] (the `eval_*_at`
@@ -8085,15 +8090,28 @@ fn eval_default_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) 
 /// produce is evidence of the loose announce policy, so a masked or garbled
 /// proc entry (a container's, typically) neither reports a `current_value`
 /// the host does not have nor asks for a write it may not need.
+///
+/// `IN_DEV_ARP_ANNOUNCE` is an `IN_DEV_MAXCONF` (v6.6
+/// include/linux/inetdevice.h:94-96, 135): `arp_solicit()`
+/// (net/ipv4/arp.c:349) picks the source address by the larger of `conf/all`
+/// and the device slot.
+/// With `all` already at 2, every interface, existing or created later,
+/// announces as strictly as the 2 asked for here, so the write changes
+/// nothing. `all` is read signed (-1 is legal and loses the max), and an
+/// `all` that cannot be read keeps the advice.
 fn eval_default_arp_announce_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    all_path: &str,
 ) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if arp_tuning_skipped(info.network.len(), has_bond()) {
+        return 1;
+    }
+    if read_switch_i64(all_path).is_some_and(|all| all >= 2) {
         return 1;
     }
     let Some(current) = read_switch(path) else {
@@ -18373,7 +18391,7 @@ mod tests {
         ];
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_default_arp_announce_at(&info, &mut recs, path.to_str().unwrap());
+            eval_default_arp_announce_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             recs
         };
         assert_eq!(
@@ -18389,6 +18407,50 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn default_arp_announce_skips_a_template_all_already_covers() {
+        // IN_DEV_ARP_ANNOUNCE takes the larger of `conf/all` and the device
+        // slot, so with `all` at 2 the template's lower value never picks a
+        // source address; `all` below 2 or at -1 leaves it in force, and an
+        // unreadable `all` proves nothing.
+        let (template, all_on, others) = zero_switch_paths("default_arp_announce_all", b"2\n");
+        let all_loose = all_on.with_file_name("all_loose");
+        std::fs::write(&all_loose, b"1\n").unwrap();
+        let all_negative = all_on.with_file_name("all_negative");
+        std::fs::write(&all_negative, b"-1\n").unwrap();
+        let mut info = make_test_info();
+        info.network = ["eth0", "eth1"]
+            .map(|name| NetInfo {
+                name: name.to_string(),
+                speed_mbps: 10000,
+            })
+            .to_vec();
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_arp_announce_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs.len()
+        };
+        let speaks = usize::from(!has_bond());
+
+        assert_eq!(
+            advice(&all_on),
+            0,
+            "`all` already announces strictly everywhere"
+        );
+        assert_eq!(advice(&all_loose), speaks, "`all` at 1 leaves the template");
+        assert_eq!(
+            advice(&all_negative),
+            speaks,
+            "-1 loses the max to the template"
+        );
+        assert_eq!(advice(&others[0]), speaks, "an unreadable `all` is not on");
     }
 
     #[test]
