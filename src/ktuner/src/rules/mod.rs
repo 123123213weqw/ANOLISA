@@ -10189,11 +10189,17 @@ fn eval_tcp_frto_at(
 }
 
 fn eval_icmp_ratelimit(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_icmp_ratelimit_at(info, recs, "/proc/sys/net/ipv4/icmp_ratelimit")
+    eval_icmp_ratelimit_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/icmp_ratelimit",
+        "/proc/sys/net/ipv4/icmp_ratemask",
+    )
 }
 
 /// Path-injectable form of [`eval_icmp_ratelimit`] (the `eval_*_at`
-/// idiom) so the switch read is assertable against synthetic files.
+/// idiom) so the two switches the limiter depends on are assertable against
+/// synthetic files.
 ///
 /// The rule fires on a zero — ICMP replies are not rate limited — and
 /// [`read_sysctl_u64`] maps an unreadable or unparseable file to that same 0.
@@ -10201,8 +10207,41 @@ fn eval_icmp_ratelimit(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usi
 /// so a masked or garbled proc entry (a container's, typically) neither
 /// reports a `current_value` the host does not have nor asks for a write it
 /// may not need.
-fn eval_icmp_ratelimit_at(_info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+///
+/// The value this rule raises is read at exactly one place, the per-peer
+/// token bucket in `icmpv4_xrlim_allow()` (v6.6 net/ipv4/icmp.c:324-325), and
+/// that call is preceded in the same function by `icmpv4_mask_allow()`
+/// (called `:315`, defined `:275`), which returns "allowed, do not limit" for
+/// every message whose type is not in `net.ipv4.icmp_ratemask`:
+///
+/// ```text
+///    if (!((1 << type) & READ_ONCE(net->ipv4.sysctl_icmp_ratemask)))
+///        return true;
+/// ```
+///
+/// (`:285`). The documentation states the same dependency — "Limit the
+/// maximal rates for sending ICMP packets whose type matches icmp_ratemask
+/// (see below)" — and calls 0 the value that disables limiting, so a host that
+/// runs `icmp_ratemask = 0` re-enables every type in that test and never
+/// reaches the bucket: the write this rule recommends changes no reply's fate.
+///
+/// The mask is read signed because it is registered as a plain
+/// `proc_dointvec` int with no min/max (`net/ipv4/sysctl_net_ipv4.c:646-651`,
+/// v6.6) where -1 means "every bit set", i.e. limiting on all types. No rule
+/// of this engine writes `icmp_ratemask`, so the on-disk value is the one the
+/// plan leaves behind — unlike the SACK gates, no sibling here could turn a
+/// readable 0 into a nonzero. An unreadable mask is not evidence that limiting
+/// is off and keeps the advice.
+fn eval_icmp_ratelimit_at(
+    _info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    ratemask_path: &str,
+) -> usize {
     if !std::path::Path::new(path).exists() {
+        return 1;
+    }
+    if read_switch_i64(ratemask_path) == Some(0) {
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
@@ -23489,9 +23528,15 @@ mod tests {
         // answered with a write on a host whose limit was never read.
         let (off, on, others) = switch_fixture("icmp_ratelimit");
         let info = make_test_info();
+        let (_, mask_on, _) = switch_fixture("icmp_ratelimit_mask");
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_icmp_ratelimit_at(&info, &mut recs, path.to_str().unwrap());
+            eval_icmp_ratelimit_at(
+                &info,
+                &mut recs,
+                path.to_str().unwrap(),
+                mask_on.to_str().unwrap(),
+            );
             recs
         };
         let recs = advice(&off);
@@ -23502,6 +23547,61 @@ mod tests {
             assert!(
                 advice(path).is_empty(),
                 "{}: an unreadable switch is not the value 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn icmp_ratelimit_advice_needs_a_ratemask() {
+        // icmpv4_xrlim_allow() consults the peer bucket only after
+        // icmpv4_mask_allow() (called at v6.6 net/ipv4/icmp.c:315) has decided
+        // the type is limited, and that test is
+        // `(1 << type) & icmp_ratemask` (:285).
+        // With a readable 0 in the mask no type is limited, so the limit this
+        // rule raises is never read.
+        let (off, on, others) = switch_fixture("icmp_ratelimit_needs_mask");
+        let (_, mask_on, mask_others) = switch_fixture("icmp_ratemask");
+        let mask_off = mask_on.with_file_name("ratemask.off");
+        std::fs::write(&mask_off, b"0\n").unwrap();
+        let info = make_test_info();
+        let advice = |limit: &std::path::Path, mask: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_icmp_ratelimit_at(
+                &info,
+                &mut recs,
+                limit.to_str().unwrap(),
+                mask.to_str().unwrap(),
+            );
+            recs
+        };
+
+        assert_eq!(
+            advice(&off, &mask_on).len(),
+            1,
+            "a mask with types set: the limit decides"
+        );
+        assert!(
+            advice(&on, &mask_on).is_empty(),
+            "a readable limit needs no write"
+        );
+        assert!(
+            advice(&off, &mask_off).is_empty(),
+            "an empty mask: no message ever reaches the limit"
+        );
+        for path in &others {
+            assert!(
+                advice(path, &mask_on).is_empty(),
+                "{}: an unreadable limit is not the value 0",
+                path.display()
+            );
+        }
+        // A mask that cannot be read is not evidence that nothing is limited.
+        for path in &mask_others {
+            assert_eq!(
+                advice(&off, path).len(),
+                1,
+                "{}: an unreadable mask keeps the advice",
                 path.display()
             );
         }
