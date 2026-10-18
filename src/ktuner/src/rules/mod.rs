@@ -7192,7 +7192,12 @@ fn eval_arp_ignore_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
 }
 
 fn eval_default_log_martians(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_default_log_martians_at(info, recs, "/proc/sys/net/ipv4/conf/default/log_martians")
+    eval_default_log_martians_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/log_martians",
+        "/proc/sys/net/ipv4/conf/all/log_martians",
+    )
 }
 
 /// Path-injectable form of [`eval_default_log_martians`] (the `eval_*_at`
@@ -7202,12 +7207,23 @@ fn eval_default_log_martians(info: &SystemInfo, recs: &mut Vec<Recommendation>) 
 /// (include/linux/inetdevice.h) is an `IN_DEV_ORCONF` truthiness test — -1
 /// is legal and enabled. The unsigned reader's fallback 0 made the `== 0`
 /// gate report new interfaces as blind to martians.
+///
+/// The ORCONF also reads `conf/all` (v6.6 include/linux/inetdevice.h:91-92,
+/// 108): with `all` nonzero every interface, existing or created later, logs
+/// martians whatever the template says (the `IN_DEV_LOG_MARTIANS` tests in
+/// net/ipv4/route.c and ip_input.c), so a 0 here hides nothing and the write
+/// changes nothing. An `all` that cannot be read is not evidence that it is
+/// on, and keeps the advice.
 fn eval_default_log_martians_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    all_path: &str,
 ) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    if read_switch_i64(all_path).is_some_and(|all| all != 0) {
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0 —
@@ -26281,7 +26297,8 @@ mod tests {
             ));
             std::fs::write(&path, format!("{value}\n")).unwrap();
             let mut recs = Vec::new();
-            let checked = eval_default_log_martians_at(&info, &mut recs, path.to_str().unwrap());
+            let checked =
+                eval_default_log_martians_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             std::fs::remove_file(&path).ok();
             assert_eq!(checked, 1);
             assert_eq!(
@@ -26307,7 +26324,7 @@ mod tests {
         let info = make_test_info();
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_default_log_martians_at(&info, &mut recs, path.to_str().unwrap());
+            eval_default_log_martians_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             recs
         };
         let recs = advice(&off);
@@ -26321,6 +26338,32 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn default_log_martians_skips_a_template_all_already_covers() {
+        // IN_DEV_LOG_MARTIANS ORs `conf/all` with the device slot, so with
+        // `all` on every interface logs martians and the template's 0 hides
+        // nothing; only an `all` read as 0 leaves the template in force, and
+        // an unreadable one proves nothing.
+        let (template, all_on, others) = zero_switch_paths("default_log_martians_all", b"-1\n");
+        let all_off = all_on.with_file_name("all_off");
+        std::fs::write(&all_off, b"0\n").unwrap();
+        let info = make_test_info();
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_log_martians_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs.len()
+        };
+
+        assert_eq!(advice(&all_on), 0, "`all` already logs martians everywhere");
+        assert_eq!(advice(&all_off), 1, "`all` off leaves the template");
+        assert_eq!(advice(&others[0]), 1, "an unreadable `all` is not on");
     }
 
     #[test]
