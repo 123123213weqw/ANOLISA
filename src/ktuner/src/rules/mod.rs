@@ -5319,6 +5319,7 @@ fn eval_default_accept_source_route(info: &SystemInfo, recs: &mut Vec<Recommenda
         info,
         recs,
         "/proc/sys/net/ipv4/conf/default/accept_source_route",
+        "/proc/sys/net/ipv4/conf/all/accept_source_route",
     )
 }
 
@@ -5333,12 +5334,26 @@ fn eval_default_accept_source_route(info: &SystemInfo, recs: &mut Vec<Recommenda
 /// unsigned reader parsed "-1" to Err and fell back to 0 — the *disabled*
 /// value — so the finding was missed on the template that arms future
 /// interfaces.
+///
+/// `IN_DEV_SOURCE_ROUTE` is an `IN_DEV_ANDCONF` (v6.6
+/// include/linux/inetdevice.h:83-85, 103-104): `ip_rcv_options()`
+/// (net/ipv4/ip_input.c:290) accepts a source-routed packet only when
+/// `conf/all` AND the device slot are both on. With `all` read as 0 every
+/// interface, existing or created later, drops the packet whatever the
+/// template says — and that is the kernel's own default (`all` 0, `default`
+/// 1, net/ipv4/devinet.c:70-91) — so the write changes nothing and the
+/// finding is not true of the host. An `all` that cannot be read keeps the
+/// advice.
 fn eval_default_accept_source_route_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    all_path: &str,
 ) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    if read_switch_i64(all_path) == Some(0) {
         return 1;
     }
     // Any nonzero value accepts source routing, so -1 must not read as 0.
@@ -18354,6 +18369,11 @@ mod tests {
     /// Synthetic readable-0 / readable-non-zero / malformed / empty / directory
     /// / missing switches for the "a failed read is not the value 0" gates.
     /// The directory is an IO error even for root.
+    /// A `conf/all` path that never exists, for the `conf/default` rules
+    /// whose `all` slot a test does not exercise: an unreadable `all` keeps
+    /// the advice, so those tests see the template alone.
+    const NO_ALL_SLOT: &str = "/nonexistent/ktuner/conf/all";
+
     fn zero_switch_paths(
         prefix: &str,
         on: &[u8],
@@ -19055,6 +19075,37 @@ mod tests {
             assert_eq!(rec.recommended_value, "0");
             assert_eq!(rec.category, Category::Security);
         }
+    }
+
+    #[test]
+    fn default_accept_source_route_skips_a_template_all_already_refuses() {
+        // IN_DEV_SOURCE_ROUTE ANDs `conf/all` with the device slot, so with
+        // `all` at 0 — the kernel's own default — no interface accepts a
+        // source-routed packet and the template's 1 decides nothing; `all`
+        // on (1 or -1) leaves the template in force, and an unreadable `all`
+        // proves nothing.
+        let (all_off, all_on, others) = zero_switch_paths("default_source_route_all", b"-1\n");
+        let template = all_on.with_file_name("template");
+        std::fs::write(&template, b"1\n").unwrap();
+        let info = make_test_info();
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_accept_source_route_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs.len()
+        };
+
+        assert_eq!(
+            advice(&all_off),
+            0,
+            "`all` 0 already refuses on every interface"
+        );
+        assert_eq!(advice(&all_on), 1, "`all` on leaves the template");
+        assert_eq!(advice(&others[0]), 1, "an unreadable `all` is not off");
     }
 
     #[test]
@@ -27290,8 +27341,9 @@ mod tests {
                 ),
                 (
                     "net.ipv4.conf.default.accept_source_route",
-                    eval_default_accept_source_route_at
-                        as fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize,
+                    |info, recs, path| {
+                        eval_default_accept_source_route_at(info, recs, path, NO_ALL_SLOT)
+                    },
                 ),
             ] {
                 let mut recs = Vec::new();
