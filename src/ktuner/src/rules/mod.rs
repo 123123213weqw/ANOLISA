@@ -3262,7 +3262,12 @@ fn eval_perf_event_paranoid_at(
 }
 
 fn eval_rp_filter(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_rp_filter_at(info, recs, "/proc/sys/net/ipv4/conf/default/rp_filter")
+    eval_rp_filter_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/rp_filter",
+        "/proc/sys/net/ipv4/conf/all/rp_filter",
+    )
 }
 
 /// Path-injectable form of [`eval_rp_filter`] (the `eval_*_at` idiom) so the
@@ -3276,7 +3281,20 @@ fn eval_rp_filter(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 /// a nonzero value arms the source validation. The unsigned reader parsed
 /// "-1" to Err and fell back to 0 — the *disabled* value — so the `== 0`
 /// gate invented a finding on a host whose validation is fully armed.
-fn eval_rp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
+///
+/// `IN_DEV_RPFILTER` is an `IN_DEV_MAXCONF` (v6.6
+/// include/linux/inetdevice.h:94-96, 102): `fib_validate_source()`
+/// (net/ipv4/fib_frontend.c:425) validates by the larger of `conf/all` and
+/// the device slot. With `all` already at or above the mode asked for here,
+/// every interface, existing or created later, validates at least that way
+/// whatever the template says, so the write changes nothing and the finding
+/// is not true of the host. An `all` that cannot be read keeps the advice.
+fn eval_rp_filter_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    all_path: &str,
+) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
@@ -3291,7 +3309,14 @@ fn eval_rp_filter_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &s
         host_needs_ip_forward(info),
         "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
     ) {
-        recs.push(rec);
+        let all_covers = read_switch_i64(all_path).is_some_and(|all| {
+            rec.recommended_value
+                .parse::<i64>()
+                .is_ok_and(|want| all >= want)
+        });
+        if !all_covers {
+            recs.push(rec);
+        }
     }
     1
 }
@@ -19315,6 +19340,42 @@ mod tests {
     }
 
     #[test]
+    fn rp_filter_default_skips_a_template_all_already_covers() {
+        // IN_DEV_RPFILTER takes the larger of `conf/all` and the device slot,
+        // so with `all` at or above the mode the rule asks for, the template's
+        // 0 never decides a validation; `all` below it leaves the template in
+        // force, and an unreadable `all` proves nothing.
+        let (template, all_loose, others) = zero_switch_paths("rp_filter_default_all", b"2\n");
+        let all_off = all_loose.with_file_name("all_off");
+        std::fs::write(&all_off, b"0\n").unwrap();
+        let all_strict = all_loose.with_file_name("all_strict");
+        std::fs::write(&all_strict, b"1\n").unwrap();
+        let info = make_test_info();
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_rp_filter_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let wanted = advice(&all_off);
+        assert_eq!(wanted.len(), 1, "`all` off leaves the template");
+        assert!(
+            advice(&all_loose).is_empty(),
+            "`all` at 2 already covers either mode"
+        );
+        // Strict `all` covers the strict advice, not the loose one a
+        // forwarding host is given.
+        let loose_wanted = wanted[0].recommended_value == "2";
+        assert_eq!(advice(&all_strict).len(), usize::from(loose_wanted));
+        assert_eq!(advice(&others[0]).len(), 1, "an unreadable `all` is not on");
+    }
+
+    #[test]
     fn rp_filter_default_advice_needs_a_readable_value() {
         // The rule fires on 0, and the reader mapped an unreadable or
         // unparseable file to the same 0: a masked or garbled proc entry (a
@@ -19324,7 +19385,7 @@ mod tests {
         let info = make_test_info();
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_rp_filter_at(&info, &mut recs, path.to_str().unwrap());
+            eval_rp_filter_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             recs
         };
 
@@ -27452,7 +27513,9 @@ mod tests {
     /// The `rp_filter` rules routed through [`rp_filter_recommendation`].
     fn rp_filter_rules() -> Vec<(&'static str, EvalAt)> {
         vec![
-            ("net.ipv4.conf.default.rp_filter", eval_rp_filter_at),
+            ("net.ipv4.conf.default.rp_filter", |info, recs, path| {
+                eval_rp_filter_at(info, recs, path, NO_ALL_SLOT)
+            }),
             ("net.ipv4.conf.all.rp_filter", eval_rp_filter_all_at),
         ]
     }
@@ -27476,7 +27539,8 @@ mod tests {
             for (param, run) in [
                 (
                     "net.ipv4.conf.default.rp_filter",
-                    eval_rp_filter_at as fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize,
+                    (|info, recs, path| eval_rp_filter_at(info, recs, path, NO_ALL_SLOT))
+                        as fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize,
                 ),
                 (
                     "net.ipv4.conf.all.rp_filter",
