@@ -8115,7 +8115,12 @@ fn eval_default_arp_announce_at(
 }
 
 fn eval_default_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    eval_default_arp_ignore_at(info, recs, "/proc/sys/net/ipv4/conf/default/arp_ignore")
+    eval_default_arp_ignore_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/arp_ignore",
+        "/proc/sys/net/ipv4/conf/all/arp_ignore",
+    )
 }
 
 /// Path-injectable form of [`eval_default_arp_ignore`] (the `eval_*_at`
@@ -8126,15 +8131,27 @@ fn eval_default_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
 /// evidence of the unset switch, so a masked or garbled proc entry (a
 /// container's, typically) neither reports a `current_value` the host does
 /// not have nor asks for a write it may not need.
+///
+/// `IN_DEV_ARP_IGNORE` is an `IN_DEV_MAXCONF` (v6.6
+/// include/linux/inetdevice.h:94-96, 136): each interface answers by the
+/// larger of `conf/all` and its own slot. With `all` already at 1 or above,
+/// every interface, existing or created later, ignores at least as strictly
+/// as the 1 asked for here, so the write changes nothing. `all` is read
+/// signed (a plain `proc_dointvec` slot, -1 is legal and loses the max), and
+/// an `all` that cannot be read keeps the advice.
 fn eval_default_arp_ignore_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    all_path: &str,
 ) -> usize {
     if !std::path::Path::new(path).exists() {
         return 1;
     }
     if arp_tuning_skipped(info.network.len(), has_bond()) {
+        return 1;
+    }
+    if read_switch_i64(all_path).is_some_and(|all| all >= 1) {
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
@@ -18847,7 +18864,7 @@ mod tests {
         ];
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_default_arp_ignore_at(&info, &mut recs, path.to_str().unwrap());
+            eval_default_arp_ignore_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             recs
         };
         assert_eq!(
@@ -18863,6 +18880,50 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn default_arp_ignore_skips_a_template_all_already_covers() {
+        // IN_DEV_ARP_IGNORE takes the larger of `conf/all` and the device
+        // slot, so with `all` at 1 or above the template's 0 never decides a
+        // reply; `all` at 0 or -1 leaves it in force, and an unreadable `all`
+        // proves nothing.
+        let (template, all_on, others) = zero_switch_paths("default_arp_ignore_all", b"2\n");
+        let all_off = all_on.with_file_name("all_off");
+        std::fs::write(&all_off, b"0\n").unwrap();
+        let all_negative = all_on.with_file_name("all_negative");
+        std::fs::write(&all_negative, b"-1\n").unwrap();
+        let mut info = make_test_info();
+        info.network = ["eth0", "eth1"]
+            .map(|name| NetInfo {
+                name: name.to_string(),
+                speed_mbps: 10000,
+            })
+            .to_vec();
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_arp_ignore_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs.len()
+        };
+        let speaks = usize::from(!has_bond());
+
+        assert_eq!(
+            advice(&all_on),
+            0,
+            "`all` already ignores on every interface"
+        );
+        assert_eq!(advice(&all_off), speaks, "`all` off leaves the template");
+        assert_eq!(
+            advice(&all_negative),
+            speaks,
+            "-1 loses the max to the template"
+        );
+        assert_eq!(advice(&others[0]), speaks, "an unreadable `all` is not on");
     }
 
     #[test]
