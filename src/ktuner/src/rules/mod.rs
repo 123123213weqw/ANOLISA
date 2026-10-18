@@ -8011,12 +8011,14 @@ fn eval_arp_notify(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 ///
 /// The value is read SIGNED: `conf/all/arp_notify` sits in the same
 /// `devinet_conf_proc` plain `proc_dointvec` int slot with no min/max as the
-/// other devconf booleans (net/ipv4/devinet.c), so -1 is a legal value, and
-/// `IN_DEV_ARP_NOTIFY` is an `IN_DEV_MAXCONF` truthiness test consumed by
-/// net/ipv4/arp.c — any nonzero value makes the host send gratuitous ARP on
-/// link change. The unsigned reader parsed "-1" to Err and fell back to 0 —
-/// the *disabled* value — so the `== 0` gate invented a finding on a host
-/// that already sends notifications.
+/// other devconf booleans (net/ipv4/devinet.c), so -1 is a legal value.
+///
+/// `IN_DEV_ARP_NOTIFY` is an `IN_DEV_MAXCONF` (v6.6
+/// include/linux/inetdevice.h:94-96, 137), not a truthiness test of `all`:
+/// `inetdev_event()` (net/ipv4/devinet.c:1601) notifies by the larger of
+/// `all` and the device slot. A negative `all` loses that max to every
+/// device slot of 0 or more, so it turns nothing on and leaves the host as
+/// a 0 does; only a positive `all` sends gratuitous ARP on every interface.
 fn eval_arp_notify_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
@@ -8025,11 +8027,11 @@ fn eval_arp_notify_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
-    // successfully read 0 is the disabled switch.
-    if read_switch_i64(path) == Some(0) {
+    // successfully read value at or below 0 is the unset switch.
+    if let Some(current) = read_switch_i64(path).filter(|&value| value <= 0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.arp_notify".to_string(),
-            current_value: "0".to_string(),
+            current_value: current.to_string(),
             recommended_value: "1".to_string(),
             reason: "多网卡环境未启用 ARP 通知，IP 变更或故障切换时对端 ARP 缓存可能不更新"
                 .to_string(),
@@ -27662,12 +27664,13 @@ mod tests {
     }
 
     #[test]
-    fn arp_notify_minus_one_already_notifies() {
-        // IN_DEV_ARP_NOTIFY is a truthiness test consumed by net/ipv4/arp.c;
-        // -1 sends the gratuitous ARP already, so reading it as the fallback
-        // 0 invented a finding on a notifying host. The multi-NIC gate needs
-        // two interfaces and no bond, so the 0 case is asserted only when
-        // that gate lets the rule run.
+    fn arp_notify_minus_one_turns_nothing_on() {
+        // IN_DEV_ARP_NOTIFY takes the larger of `all` and the device slot
+        // (inetdev_event() in net/ipv4/devinet.c), so a -1 `all` loses to
+        // every device slot of 0 or more and notifies no interface: it is as
+        // unset as 0, and the advice reports the value it read. The
+        // multi-NIC gate needs two interfaces and no bond, so the firing
+        // cases are asserted only when that gate lets the rule run.
         let mut info = make_test_info();
         info.network = vec![
             NetInfo {
@@ -27685,7 +27688,7 @@ mod tests {
             std::process::id(),
             std::thread::current().id()
         ));
-        for (value, expects_rec) in [("-1", false), ("1", false), ("0", !bonded)] {
+        for (value, expects_rec) in [("-1", !bonded), ("1", false), ("0", !bonded)] {
             std::fs::write(&path, value).unwrap();
             let mut recs = Vec::new();
             eval_arp_notify_at(&info, &mut recs, path.to_str().unwrap());
@@ -27695,8 +27698,11 @@ mod tests {
             assert_eq!(
                 rec.is_some(),
                 expects_rec,
-                "value={value}: only 0 leaves gratuitous ARP off"
+                "value={value}: only a positive `all` sends gratuitous ARP"
             );
+            if let Some(rec) = rec {
+                assert_eq!(rec.current_value, value);
+            }
         }
         let _ = std::fs::remove_file(&path);
     }
