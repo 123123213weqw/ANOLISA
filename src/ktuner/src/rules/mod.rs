@@ -7192,6 +7192,14 @@ fn eval_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 /// evidence of the unset switch, so a masked or garbled proc entry (a
 /// container's, typically) neither reports a `current_value` the host does
 /// not have nor asks for a write it may not need.
+///
+/// The slot is a plain `proc_dointvec` int (`devinet_conf_proc`,
+/// net/ipv4/devinet.c), so -1 is legal, and it is unset rather than
+/// unreadable: `IN_DEV_ARP_IGNORE` is an `IN_DEV_MAXCONF` (v6.6
+/// include/linux/inetdevice.h:94-96, 136), where a negative `all` loses the
+/// max to every device slot of 0 or more, and `arp_ignore()`
+/// (net/ipv4/arp.c:401) answers a negative value from its `default:` arm —
+/// the same reply-to-everything `return 0` as case 0.
 fn eval_arp_ignore_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
@@ -7201,10 +7209,10 @@ fn eval_arp_ignore_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
     // successfully read 0 is the disabled switch.
-    if read_switch(path) == Some(0) {
+    if let Some(current) = read_switch_i64(path).filter(|&value| value <= 0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.all.arp_ignore".to_string(),
-            current_value: "0".to_string(),
+            current_value: current.to_string(),
             recommended_value: "1".to_string(),
             reason: "多网卡环境下默认回复所有接口的 ARP 请求，可能导致流量走错网卡和路由异常"
                 .to_string(),
@@ -18694,6 +18702,36 @@ mod tests {
                 "{}: an unreadable switch is not the value 0",
                 path.display()
             );
+        }
+    }
+
+    #[test]
+    fn arp_ignore_negative_all_is_unset() {
+        // A negative `all` loses the MAXCONF to every device slot of 0 or
+        // more and lands in the kernel switch's `default:` arm, which
+        // behaves as 0, so it is the unset switch, not an unreadable one:
+        // the advice fires and reports the value read.
+        let (_, _, others) = switch_fixture("arp_ignore_negative");
+        let negative = others[0].with_file_name("switch.negative");
+        std::fs::write(&negative, b"-1\n").unwrap();
+        let mut info = make_test_info();
+        info.network = ["eth0", "eth1"]
+            .map(|name| NetInfo {
+                name: name.to_string(),
+                speed_mbps: 10000,
+            })
+            .to_vec();
+        let mut recs = Vec::new();
+        eval_arp_ignore_at(&info, &mut recs, negative.to_str().unwrap());
+
+        assert_eq!(
+            recs.len(),
+            usize::from(!has_bond()),
+            "-1 answers on every interface"
+        );
+        if let Some(rec) = recs.first() {
+            assert_eq!(rec.current_value, "-1");
+            assert_eq!(rec.recommended_value, "1");
         }
     }
 
