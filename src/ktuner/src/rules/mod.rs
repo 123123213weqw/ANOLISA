@@ -9273,14 +9273,71 @@ fn tcp_recovery_recommendation(current: u64, kernel_version: &str) -> Option<Rec
 }
 
 fn eval_tcp_comp_sack_delay(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
-    let path = "/proc/sys/net/ipv4/tcp_comp_sack_delay_ns";
-    if !std::path::Path::new(path).exists() {
+    eval_tcp_comp_sack_delay_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/tcp_comp_sack_delay_ns",
+        "/proc/sys/net/ipv4/tcp_sack",
+        "/proc/sys/net/ipv4/tcp_comp_sack_nr",
+        info.has_listen_sockets(),
+    )
+}
+
+/// Path-injectable form of [`eval_tcp_comp_sack_delay`] (the `eval_*_at`
+/// idiom) so the two switches that decide whether compressed ACKs run at all
+/// are assertable against synthetic files.
+///
+/// The delay is read at exactly one place: the timer arm at the end of
+/// `__tcp_ack_snd_check()` (v6.6 net/ipv4/tcp_input.c:5602-5607), and that
+/// code is behind two earlier guards in the same function. The first bails
+/// out of the whole compression branch when the connection did not negotiate
+/// SACK or the compress count already reached its own limit:
+///
+/// ```text
+///    if (!tcp_is_sack(tp) ||
+///        tp->compressed_ack >= READ_ONCE(...sysctl_tcp_comp_sack_nr))
+///        goto send_now;
+/// ```
+///
+/// (`:5580-5581`). `tcp_is_sack()` is `tp->rx_opt.sack_ok`
+/// (include/net/tcp.h:1188-1191), set from the SACK-permitted option only
+/// while `net.ipv4.tcp_sack` is on (`tcp_parse_options()`, :4127-4129), and
+/// `Documentation/networking/ip-sysctl.rst` documents the second switch as
+/// "Using 0 disables SACK compression" (`tcp_comp_sack_nr`). So on a host
+/// that reads a SACK switch of 0, or a compress count of 0, no connection
+/// ever arms this timer and the delay cannot change an ACK decision — the
+/// same dependency gate the D-SACK and early-retransmit rules apply.
+///
+/// Both gates fail open: a switch that is missing, masked or unparsable is not
+/// evidence that the feature is off, and the engine's own `tcp_sack` rule
+/// raises a readable 0 to 1 in the same plan, so the advice waits for the
+/// plan's own write rather than for a value nothing read. The SACK switch is
+/// read signed because through v5.10 it was a plain `proc_dointvec` int where
+/// -1 means enabled; the compress count has always been a count and is read
+/// unsigned.
+fn eval_tcp_comp_sack_delay_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    sack_path: &str,
+    comp_sack_nr_path: &str,
+    has_listen_sockets: bool,
+) -> usize {
+    if !info.param_exists(path) {
         return 1;
     }
-    if !info.has_listen_sockets() {
+    if !has_listen_sockets {
         return 1;
     }
-    let current = read_sysctl_u64(path);
+    if read_switch_i64(sack_path) == Some(0) {
+        return 1;
+    }
+    if read_switch(comp_sack_nr_path) == Some(0) {
+        return 1;
+    }
+    let Some(current) = read_switch(path) else {
+        return 1;
+    };
     if current > 1000000 {
         recs.push(Recommendation {
             param: "net.ipv4.tcp_comp_sack_delay_ns".to_string(),
@@ -23658,6 +23715,80 @@ mod tests {
         if let Some(rec) = recs.iter().find(|r| r.param == "net.ipv4.tcp_comp_sack_nr") {
             assert_eq!(rec.recommended_value, "44");
         }
+    }
+
+    #[test]
+    fn tcp_comp_sack_delay_needs_a_compression_reader() {
+        // The delay has one reader, the timer arm at the end of
+        // __tcp_ack_snd_check() (v6.6 net/ipv4/tcp_input.c:5602-5607), and
+        // that code is behind the SACK and compress-count guards at :5580-5581.
+        // A readable 0 in either switch means no connection ever arms the
+        // timer, so the advice was a write that changed nothing.
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_comp_sack_delay_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, value: &[u8]| {
+            let path = dir.join(name);
+            std::fs::write(&path, value).unwrap();
+            path
+        };
+        let long_delay = write("delay.long", b"5000000\n");
+        let exact_delay = write("delay.exact", b"1000000\n");
+        let sack_on = write("sack.on", b"1\n");
+        let sack_off = write("sack.off", b"0\n");
+        let nr_on = write("nr.on", b"44\n");
+        let nr_off = write("nr.off", b"0\n");
+        let info = make_test_info();
+        let advice = |delay: &std::path::Path, sack: &std::path::Path, nr: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_tcp_comp_sack_delay_at(
+                &info,
+                &mut recs,
+                delay.to_str().unwrap(),
+                sack.to_str().unwrap(),
+                nr.to_str().unwrap(),
+                true,
+            );
+            recs
+        };
+
+        assert_eq!(
+            advice(&long_delay, &sack_on, &nr_on).len(),
+            1,
+            "both switches on: the delay decides"
+        );
+        assert!(
+            advice(&exact_delay, &sack_on, &nr_on).is_empty(),
+            "the kernel default needs no write"
+        );
+        assert!(
+            advice(&long_delay, &sack_off, &nr_on).is_empty(),
+            "SACK off: nothing arms the compressed-ACK timer"
+        );
+        assert!(
+            advice(&long_delay, &sack_on, &nr_off).is_empty(),
+            "compression disabled: nothing arms the timer either"
+        );
+        // A gate that cannot be read is not evidence that the feature is off.
+        assert_eq!(
+            advice(&long_delay, &dir.join("sack.missing"), &nr_on).len(),
+            1,
+            "an unreadable SACK switch keeps the advice"
+        );
+        assert_eq!(
+            advice(&long_delay, &sack_on, &dir.join("nr.missing")).len(),
+            1,
+            "an unreadable compress count keeps the advice"
+        );
+        // The target itself is read through read_switch, so a garbled file is
+        // not the 0 below no floor here: it is not a value at all.
+        assert!(
+            advice(&dir.join("delay.missing"), &sack_on, &nr_on).is_empty(),
+            "an unreadable delay is not a value"
+        );
     }
 
     #[test]
