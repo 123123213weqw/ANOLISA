@@ -11374,6 +11374,7 @@ fn eval_promote_secondaries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
         info,
         recs,
         "/proc/sys/net/ipv4/conf/default/promote_secondaries",
+        "/proc/sys/net/ipv4/conf/all/promote_secondaries",
     )
 }
 
@@ -11385,12 +11386,23 @@ fn eval_promote_secondaries(info: &SystemInfo, recs: &mut Vec<Recommendation>) -
 /// `int do_promote = IN_DEV_PROMOTE_SECONDARIES(in_dev)`. -1 is legal and
 /// enabled, so the unsigned reader's fallback 0 made the `== 0` gate claim
 /// secondary addresses are dropped on primary removal.
+///
+/// The ORCONF also reads `conf/all` (v6.6 include/linux/inetdevice.h:91-92,
+/// 117-119): with `all` nonzero every interface promotes, existing and new,
+/// whatever its own slot or the `default` template says, so a 0 here drops
+/// nothing and the write cannot change `__inet_del_ifa()`
+/// (net/ipv4/devinet.c:360). An `all` that cannot be read is not evidence
+/// that it is on, and keeps the advice.
 fn eval_promote_secondaries_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
     path: &str,
+    all_path: &str,
 ) -> usize {
     if !info.param_exists(path) {
+        return 1;
+    }
+    if read_switch_i64(all_path).is_some_and(|all| all != 0) {
         return 1;
     }
     // Any nonzero value is enabled, so -1 must not read as the value 0.
@@ -18534,14 +18546,14 @@ mod tests {
         }
     }
 
-    /// Synthetic readable-0 / readable-non-zero / malformed / empty / directory
-    /// / missing switches for the "a failed read is not the value 0" gates.
-    /// The directory is an IO error even for root.
     /// A `conf/all` path that never exists, for the `conf/default` rules
     /// whose `all` slot a test does not exercise: an unreadable `all` keeps
     /// the advice, so those tests see the template alone.
     const NO_ALL_SLOT: &str = "/nonexistent/ktuner/conf/all";
 
+    /// Synthetic readable-0 / readable-non-zero / malformed / empty / directory
+    /// / missing switches for the "a failed read is not the value 0" gates.
+    /// The directory is an IO error even for root.
     fn zero_switch_paths(
         prefix: &str,
         on: &[u8],
@@ -25126,7 +25138,7 @@ mod tests {
         let info = make_test_info();
         let advice = |path: &std::path::Path| {
             let mut recs = Vec::new();
-            eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap());
+            eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             recs
         };
 
@@ -25144,19 +25156,55 @@ mod tests {
     }
 
     #[test]
-    fn test_promote_secondaries() {
+    fn promote_secondaries_skips_a_default_all_already_covers() {
+        // IN_DEV_PROMOTE_SECONDARIES ORs `conf/all` with the device slot, so
+        // with `all` on every interface promotes and the `default` write
+        // changes nothing; only an `all` read as 0 leaves the template in
+        // force, and an unreadable one proves nothing.
+        let (off, all_on, others) = zero_switch_paths("promote_secondaries_all", b"-1\n");
+        let all_off = all_on.with_file_name("all_off");
+        std::fs::write(&all_off, b"0\n").unwrap();
         let info = make_test_info();
-        let mut recs = Vec::new();
-        let checked = eval_promote_secondaries(&info, &mut recs);
-        if std::path::Path::new("/proc/sys/net/ipv4/conf/default/promote_secondaries").exists() {
+        let advice = |all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_promote_secondaries_at(
+                &info,
+                &mut recs,
+                off.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs.len()
+        };
+
+        assert_eq!(advice(&all_on), 0, "`all` already promotes everywhere");
+        assert_eq!(advice(&all_off), 1, "`all` off leaves the template");
+        assert_eq!(advice(&others[0]), 1, "an unreadable `all` is not on");
+    }
+
+    #[test]
+    fn test_promote_secondaries() {
+        // Synthetic slots only: the live rule now also reads `conf/all`, so a
+        // host with `default=0, all=1` is correctly silent and a live-read
+        // assertion would depend on the host.
+        let (off, on, _) = zero_switch_paths("promote_secondaries_rule", b"1\n");
+        let info = make_test_info();
+        let advice = |path: &std::path::Path, all: &str| {
+            let mut recs = Vec::new();
+            let checked =
+                eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap(), all);
             assert_eq!(checked, 1);
-            let val = read_switch_i64("/proc/sys/net/ipv4/conf/default/promote_secondaries");
-            let triggered = recs.iter().any(|r| r.param.contains("promote_secondaries"));
-            match val {
-                Some(0) => assert!(triggered, "Should trigger when promote_secondaries=0"),
-                Some(_) | None => assert!(!triggered, "Only a readable 0 triggers"),
-            }
-        }
+            recs
+        };
+
+        let recs = advice(&off, NO_ALL_SLOT);
+        assert_eq!(recs.len(), 1, "Should trigger when promote_secondaries=0");
+        assert_eq!(recs[0].param, "net.ipv4.conf.default.promote_secondaries");
+        assert_eq!(recs[0].recommended_value, "1");
+        assert!(advice(&on, NO_ALL_SLOT).is_empty(), "1 is already on");
+        assert!(
+            advice(&off, on.to_str().unwrap()).is_empty(),
+            "`all=1` covers a `default=0` template"
+        );
     }
 
     #[test]
@@ -26711,7 +26759,8 @@ mod tests {
             ));
             std::fs::write(&path, format!("{value}\n")).unwrap();
             let mut recs = Vec::new();
-            let checked = eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap());
+            let checked =
+                eval_promote_secondaries_at(&info, &mut recs, path.to_str().unwrap(), NO_ALL_SLOT);
             std::fs::remove_file(&path).ok();
             assert_eq!(checked, 1);
             assert_eq!(
