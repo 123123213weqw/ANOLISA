@@ -5622,25 +5622,37 @@ fn eval_rp_filter_all(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usiz
 /// Path-injectable form of [`eval_rp_filter_all`] (the `eval_*_at` idiom) so
 /// the signed read is assertable against a temp file.
 ///
-/// The value is read SIGNED: `conf/all/rp_filter` sits in the same
-/// `devinet_conf_proc` plain `proc_dointvec` int slot with no min/max as the
-/// `default` template (net/ipv4/devinet.c), so -1 is a legal value, and
-/// `IN_DEV_RPFILTER` is a truthiness test (`__fib_validate_source`,
-/// net/ipv4/fib_frontend.c): a nonzero value arms the source validation for
-/// every interface. The unsigned reader parsed "-1" to Err and fell back to
-/// 0 — the *disabled* value — so the `== 0` gate invented a finding on a
-/// host whose validation is fully armed.
+/// The value is read SIGNED: `conf/all/rp_filter` sits in the
+/// `devinet_conf_proc` plain `proc_dointvec` int slot with no min/max
+/// (net/ipv4/devinet.c), so -1 is a legal value. `IN_DEV_RPFILTER` is an
+/// `IN_DEV_MAXCONF` of this slot and the device's own (v6.6
+/// include/linux/inetdevice.h:94-96, 101), and `fib_validate_source()` (v6.6
+/// net/ipv4/fib_frontend.c:425) validates by the larger of the two.
+///
+/// A negative `all` therefore arms nothing through this slot: it sits below
+/// every mode the knob has, so an interface's own slot — 0 on the kernel
+/// default, net/ipv4/devinet.c:82-93 — decides, and validation is off exactly
+/// as it is on a 0 `all`. Only a positive value arms a mode, and only exactly
+/// 1 arms strict validation: `__fib_validate_source()` (v6.6
+/// net/ipv4/fib_frontend.c:397) takes its strict branch for `rpf == 1` alone,
+/// while any other nonzero value only drops a source with no route at all
+/// (`:409`), which is loose mode.
+///
+/// Reading -1 as the armed switch skipped this finding on exactly those
+/// hosts, and it reported `current_value: "0"` — the value a later rollback
+/// restores — instead of the -1 the kernel holds. An interface whose own slot
+/// is negative as well keeps the max negative and runs loose validation; the
+/// advice then tightens it rather than restoring a mode that was armed.
 fn eval_rp_filter_all_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path: &str) -> usize {
     if !info.param_exists(path) {
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
-    // successfully read 0 is the disabled filter.
+    // successfully read value at or below 0 is the unset `all` slot.
     let Some(current) = read_switch_i64(path) else {
         return 1;
     };
-    // Only exactly 0 is the disabled filter.
-    if current != 0 {
+    if current > 0 {
         return 1;
     }
     recs.push(rp_filter_recommendation(
@@ -19867,6 +19879,47 @@ mod tests {
     }
 
     #[test]
+    fn rp_filter_all_reads_a_negative_slot_as_unset() {
+        // IN_DEV_RPFILTER takes the larger of `conf/all` and the device slot,
+        // so a -1 `all` arms nothing through that slot: an interface sitting
+        // on its own 0 — the kernel default — wins the max and validates
+        // nothing, exactly as with a 0 `all`. Reading it as armed skipped the
+        // finding, and reported "0" where the kernel holds -1.
+        let (slot, on, others) = zero_switch_paths("rp_filter_all_neg", b"2\n");
+        let negative = slot.with_file_name("all_negative");
+        std::fs::write(&negative, b"-1\n").unwrap();
+        let info = make_test_info();
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_rp_filter_all_at(&info, &mut recs, path.to_str().unwrap());
+            recs
+        };
+
+        let recs = advice(&negative);
+        assert_eq!(recs.len(), 1, "-1 arms nothing on its own");
+        assert_eq!(recs[0].current_value, "-1", "the value the kernel holds");
+        let expected = if host_needs_ip_forward(&info) {
+            "2"
+        } else {
+            "1"
+        };
+        assert_eq!(recs[0].recommended_value, expected);
+        // A readable 0 is still the disarmed switch this rule is for.
+        let zero = advice(&slot);
+        assert_eq!(zero.len(), 1, "a readable 0 is the disabled filter");
+        assert_eq!(zero[0].current_value, "0");
+        // A positive slot arms a mode on its own.
+        assert!(advice(&on).is_empty(), "a readable 2 is loose mode");
+        for path in &others {
+            assert!(
+                advice(path).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn test_rp_filter_all() {
         let info = make_test_info();
         let mut recs = Vec::new();
@@ -28251,7 +28304,7 @@ mod tests {
         let path_str = path.to_str().unwrap();
         let info = make_test_info();
         for (value, default_expects, all_expects) in [
-            ("-1", true, false),
+            ("-1", true, true),
             ("2", false, false),
             ("1", false, false),
             ("0", true, true),
