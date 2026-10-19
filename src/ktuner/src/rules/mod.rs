@@ -8244,11 +8244,15 @@ fn eval_default_arp_ignore(info: &SystemInfo, recs: &mut Vec<Recommendation>) ->
 /// Path-injectable form of [`eval_default_arp_ignore`] (the `eval_*_at`
 /// idiom) so the switch read is assertable against synthetic files.
 ///
-/// The rule fires on a zero and [`read_sysctl_u64`] maps an unreadable or
-/// unparseable file to that same 0. Only a zero the reader could produce is
+/// The rule fires on a zero, and [`read_switch_i64`] answers `None` for a file
+/// it cannot read or parse. Only a value the kernel could have produced is
 /// evidence of the unset switch, so a masked or garbled proc entry (a
 /// container's, typically) neither reports a `current_value` the host does
-/// not have nor asks for a write it may not need.
+/// not have nor asks for a write it may not need. The template is read SIGNED
+/// because it is the same plain `proc_dointvec` int slot (`devinet_conf_proc`,
+/// net/ipv4/devinet.c) as `all`: -1 is legal, every device inherits it at
+/// registration, and a negative device slot loses the MAXCONF to its own 0 —
+/// `arp_ignore()`'s `default:` arm replies to every request, exactly as with 0.
 ///
 /// `IN_DEV_ARP_IGNORE` is an `IN_DEV_MAXCONF` (v6.6
 /// include/linux/inetdevice.h:94-96, 136): each interface answers by the
@@ -8273,11 +8277,14 @@ fn eval_default_arp_ignore_at(
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
-    // successfully read 0 is the disabled switch.
-    if read_switch(path) == Some(0) {
+    // successfully read value at or below 0 is the disabled switch — the
+    // template is a plain `proc_dointvec` int, so -1 is legal and a device
+    // that inherits it loses the MAXCONF to its own 0, replying to every
+    // request exactly as with 0.
+    if let Some(current) = read_switch_i64(path).filter(|&value| value <= 0) {
         recs.push(Recommendation {
             param: "net.ipv4.conf.default.arp_ignore".to_string(),
-            current_value: "0".to_string(),
+            current_value: current.to_string(),
             recommended_value: "1".to_string(),
             reason: "新建网络接口对所有 ARP 请求都回复，多网卡时可能导致 ARP 冲突".to_string(),
             confidence: Confidence::Medium,
@@ -19148,6 +19155,37 @@ mod tests {
             "-1 loses the max to the template"
         );
         assert_eq!(advice(&others[0]), speaks, "an unreadable `all` is not on");
+    }
+
+    #[test]
+    fn default_arp_ignore_reads_a_negative_template_as_unset() {
+        // Same slot and same inheritance as the announce twin: a -1 template
+        // is legal, every device inherits it, and a negative device slot
+        // loses the MAXCONF to its own 0 so arp_ignore() answers from its
+        // `default:` arm — reply to every request, exactly as with 0. The
+        // unsigned read took "-1" for an unreadable file and stayed quiet.
+        let (_, _, others) = switch_fixture("default_arp_ignore_negative");
+        let negative = others[0].with_file_name("template.negative");
+        std::fs::write(&negative, b"-1\n").unwrap();
+        let mut info = make_test_info();
+        info.network = ["eth0", "eth1"]
+            .map(|name| NetInfo {
+                name: name.to_string(),
+                speed_mbps: 10000,
+            })
+            .to_vec();
+        let mut recs = Vec::new();
+        eval_default_arp_ignore_at(&info, &mut recs, negative.to_str().unwrap(), NO_ALL_SLOT);
+
+        assert_eq!(
+            recs.len(),
+            usize::from(!has_bond()),
+            "-1 replies on every interface"
+        );
+        if let Some(rec) = recs.first() {
+            assert_eq!(rec.current_value, "-1");
+            assert_eq!(rec.recommended_value, "1");
+        }
     }
 
     #[test]
