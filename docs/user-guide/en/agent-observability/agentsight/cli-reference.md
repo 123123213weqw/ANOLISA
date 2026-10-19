@@ -386,6 +386,21 @@ OPTIONS:
         --severity <severity>    [possible values: critical, high, medium, low]
 ```
 
+`stats` and `count` take the same `--agent` filter `list` does, so one agent's breakdown can be
+read without post-processing `list --json`:
+
+```
+FLAGS:
+        --json          Output as JSON
+
+OPTIONS:
+        --agent <agent>          Filter by agent name (exact match)
+        --last <last>            Query last N hours (default: 24) [default: 24]
+```
+
+Both keep their existing scopes: `stats` reports the whole window (resolved and unresolved), and
+`count` reports unresolved events only. Without `--agent` they cover every agent on the host.
+
 ```bash
 $ sudo agentsight interruption list --last 24
 INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT              RESOLVED  AGENT    SESSION_ID
@@ -420,8 +435,14 @@ Interruption Event Detail
 # per-type counts for the last week
 sudo agentsight interruption stats --last 168
 
+# the same breakdown for one agent only
+sudo agentsight interruption stats --last 168 --agent CoshNG
+
 # unresolved counts by severity
 sudo agentsight interruption count --last 24
+
+# unresolved counts for one agent only
+sudo agentsight interruption count --last 24 --agent CoshNG
 
 # everything that hit one session, then close one event
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
