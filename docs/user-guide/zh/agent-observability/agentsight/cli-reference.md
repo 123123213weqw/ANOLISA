@@ -494,11 +494,36 @@ sudo agentsight interruption resolve 11111111222222223333333344444444
 
 # 只看该会话里仍未解决的中断
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
+
+# 只看该会话里命中 token_limit 的中断
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
 
 `session` 与 `conversation` 接受和 `list`、`stats` 相同的 `--unresolved` / `--resolved` 这对参数，
-于是按 id 的视图可以只看仍未解决（或已关闭）的事件，不必用眼睛去读 `RESOLVED` 列。两个 flag 互斥；
-都不给时照旧打印该 id 的全部历史。
+于是按 id 的视图可以只看仍未解决（或已关闭）的事件，不必用眼睛去读 `RESOLVED` 列。它们同样接受
+`list` 的 `--type` 与 `--severity` 过滤，取值集合一致，因此单个会话可以直接读到 critical 的
+`agent_crash` 那几行，不用再处理 `--json` 数组：
+
+```
+FLAGS:
+        --json          Output as JSON (one JSON array)
+        --resolved      Show only resolved events
+        --unresolved    Show only unresolved events
+
+OPTIONS:
+        --severity <severity>    [possible values: critical, high, medium, low]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
+```
+
+解决状态那两个 flag 仍然互斥，所有过滤默认关闭：不带任何 flag 时照旧打印该 id 的全部历史。
+这两个视图有意不提供 `--agent`——解析器按 `(agent, pid, prompt)` 推导 session，一个 session 本身
+就只属于一个 Agent；按 Agent 过滤请用 `list`、`stats` 或 `count`。
 
 > `--type` 接受检测器能产出的所有中断类型（取值由 `InterruptionType::ALL` 派生）。
 > `agentsight interruption list --help` 会列出当前取值；带触发条件的完整清单见

@@ -142,6 +142,13 @@ sudo agentsight interruption conversation aaaaaaaabbbbbbbbccccccccdddddddd
 sudo agentsight interruption resolve 11111111222222223333333344444444
 ```
 
+这两个按 id 的视图都接受 `--type`、`--severity` 以及 `--unresolved` / `--resolved`，也就是 `list`
+已有的那些过滤，因此可以只把某个繁忙会话里正在排查的那几行取出来，而不必翻整张表：
+
+```bash
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --severity critical
+```
+
 「解决」只是把事件标记为已处理，不会删除任何数据。
 
 ## 在 Dashboard 里
