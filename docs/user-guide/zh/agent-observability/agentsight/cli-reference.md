@@ -541,6 +541,29 @@ Dashboard 的 Skill 指标页展示的是同一批数字，其热度图也支持
 在那里传该参数是用法错误，与 `GET /api/skill-metrics/downloads` 等接口的拒绝行为一致。不给该参数时
 趋势仍按周分桶，文本与 JSON 输出保持不变。
 
+## 在本地批量导出 ATIF
+
+从源码仓库的 `src/agentsight` 目录运行：
+
+```bash
+python3 scripts/batch-analyze.py --file session.jsonl --export-atif ./atif-export --min-steps 1
+```
+
+`--export-atif DIRECTORY` 保存转换后的文档，不启动分析器，也不发起模型请求。
+它与 `--dim` 互斥，并拒绝 `--binary`。文件选择沿用分析模式：`--file`、可重复的
+`--dir`、`--limit`（默认 10）和 `--min-steps`（默认 3）。目录扫描仍要求文件至少
+1 KiB，并排除 subagent 文件；小文件可通过 `--file` 显式导出。
+
+文件名为源文件规范化绝对路径的完整 SHA-256 加 `.atif.json`。不同目录中的同名源文件
+不会混淆；再次导出同一路径会原子替换其旧产物。移动源文件后产物名会变化。
+源文件和目标目录中的其他文件保持不变，目标目录按需创建。标准输出按文件生成一行
+JSON 记录，包含 `_atif_file`、`_source_file`、`_session_id` 和 `_steps`。
+
+产物使用 UTF-8，沿用转换器已有的过滤和截断规则，不是原始日志的无损备份。
+产物包含会话内容，应放在适合保存这些数据的本地目录。写入失败会记入标准错误的
+汇总，清理临时文件后继续后续文件。与原有批量分析一致，批次处理结束时返回 0，
+即使汇总中有单个文件失败。
+
 ## 相关页面
 
 - [配置](configuration.md)——配置文件控制哪些行为
