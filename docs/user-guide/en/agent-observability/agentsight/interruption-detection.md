@@ -147,6 +147,14 @@ sudo agentsight interruption conversation aaaaaaaabbbbbbbbccccccccdddddddd
 sudo agentsight interruption resolve 11111111222222223333333344444444
 ```
 
+Both per-id views accept `--type`, `--severity`, and `--unresolved` / `--resolved`, the same
+filters `list` has, so the history of one busy session can be narrowed to the rows you are
+triaging instead of scanning the whole table:
+
+```bash
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --severity critical
+```
+
 Resolving only marks the event as handled; it never deletes data.
 
 ## In the Dashboard

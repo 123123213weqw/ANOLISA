@@ -510,12 +510,38 @@ sudo agentsight interruption resolve 11111111222222223333333344444444
 
 # only what is still open in that session
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
+
+# only the token-limit hits in that session
+sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
 
 `session` and `conversation` take the same `--unresolved` / `--resolved` pair `list` and `stats`
 do, so a per-id view can be narrowed to the events still open (or already closed) without reading
-the `RESOLVED` column by eye. The two flags are mutually exclusive; without either the command
-prints the id's whole history, as before.
+the `RESOLVED` column by eye. They also accept `list`'s `--type` and `--severity` filters, with the
+same closed value sets, so one session can be read down to its critical `agent_crash` rows without
+post-processing the `--json` array:
+
+```
+FLAGS:
+        --json          Output as JSON (one JSON array)
+        --resolved      Show only resolved events
+        --unresolved    Show only unresolved events
+
+OPTIONS:
+        --severity <severity>    [possible values: critical, high, medium, low]
+        --type <itype>           [possible values: agent_crash, rate_limit, auth_error,
+                                                   network_timeout, service_unavailable,
+                                                   safety_filter, sse_truncated, context_overflow,
+                                                   token_limit, llm_error, retry_storm, dead_loop,
+                                                   tool_failure, empty_response, resource_exhaustion,
+                                                   slow_response, state_machine_error,
+                                                   unauthorized_action]
+```
+
+The resolution pair stays mutually exclusive, and every filter defaults to off: without flags the
+command prints the id's whole history, as before. `--agent` is deliberately not part of these two
+views — the resolver derives a session from `(agent, pid, prompt)`, so one session already belongs
+to one agent. Scope by agent on `list`, `stats`, or `count` instead.
 
 > `--type` accepts every interruption type the detector can produce (the values are derived from
 > `InterruptionType::ALL`). `agentsight interruption list --help` prints the current list; the full
