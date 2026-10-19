@@ -150,6 +150,7 @@ AgentSight 仪表盘状态
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -179,6 +180,19 @@ Tokenless     10% saved (110.0K -> 99.0K, 20 ops)
 ```bash
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
+
+`--agent` 把 Sessions 与 Interruptions 两节收窄到单个 Agent，两节分别沿用各自存储的匹配口径：
+Sessions 比较会话列表本就解析出的标签——优先记录到的 Agent 名，缺省时回退到进程名；Interruptions
+只比较 `agent_name` 列，也就是 `interruption list --agent` 过滤的那一列。两者都大小写不敏感。
+带上它时标题与 JSON 会多出一个 `agent` 键标明范围；不带时两节覆盖所有 Agent，报告形状与之前
+完全一致。
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless 节省量是按会话记录的、不带 Agent 归属，因此按 Agent 的报告不再输出该节，并明确说明，
+而不是把全主机的数字摆在按 Agent 的汇总旁边。
 
 ## agentsight token
 
