@@ -3288,22 +3288,34 @@ fn eval_rp_filter(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
 /// Path-injectable form of [`eval_rp_filter`] (the `eval_*_at` idiom) so the
 /// signed read is assertable against a temp file.
 ///
-/// The value is read SIGNED: the `default/rp_filter` entry sits in the same
-/// `devinet_conf_proc` plain `proc_dointvec` int slot with no min/max as the
-/// `all` template (net/ipv4/devinet.c), so -1 is a legal value, and
-/// `IN_DEV_RPFILTER` (include/linux/inetdevice.h), read by
-/// `__fib_validate_source` (net/ipv4/fib_frontend.c), is a truthiness test:
-/// a nonzero value arms the source validation. The unsigned reader parsed
-/// "-1" to Err and fell back to 0 — the *disabled* value — so the `== 0`
-/// gate invented a finding on a host whose validation is fully armed.
+/// The value is read SIGNED: the `default/rp_filter` entry sits in the
+/// `devinet_conf_proc` plain `proc_dointvec` int slot with no min/max
+/// (net/ipv4/devinet.c), so -1 is a legal value. `IN_DEV_RPFILTER` is an
+/// `IN_DEV_MAXCONF` of this template and the device slot (v6.6
+/// include/linux/inetdevice.h:94-96, 101), and `fib_validate_source()` (v6.6
+/// net/ipv4/fib_frontend.c:425) validates by the larger of the two.
 ///
-/// `IN_DEV_RPFILTER` is an `IN_DEV_MAXCONF` (v6.6
-/// include/linux/inetdevice.h:94-96, 102): `fib_validate_source()`
-/// (net/ipv4/fib_frontend.c:425) validates by the larger of `conf/all` and
-/// the device slot. With `all` already at or above the mode asked for here,
-/// every interface, existing or created later, validates at least that way
-/// whatever the template says, so the write changes nothing and the finding
-/// is not true of the host. An `all` that cannot be read keeps the advice.
+/// A negative template therefore arms nothing on its own: it sits below every
+/// mode the knob has, so a device slot of 0 — the kernel's default
+/// (net/ipv4/devinet.c:82-93) — wins the max, and validation is off exactly
+/// as it is on a 0. Only a positive value arms a mode, and only exactly 1
+/// arms strict validation: `__fib_validate_source()` (v6.6
+/// net/ipv4/fib_frontend.c:397) takes its strict branch for `rpf == 1` alone,
+/// while any other nonzero value only drops a source with no route at all
+/// (`:409`), which is loose mode.
+///
+/// Reading the negative template as armed skipped the finding on exactly
+/// those hosts, and it recorded `current_value: "0"` — the value a later
+/// rollback restores — instead of the -1 the kernel holds. The exception is
+/// an interface whose own slot is negative as well: the max stays negative,
+/// which the kernel runs as loose validation, and the advice then tightens it
+/// rather than restoring a mode that was already armed.
+///
+/// A larger `conf/all` still covers the advice: with `all` at or above the
+/// mode asked for here, every interface, existing or created later, validates
+/// at least that way whatever the template says, so the write changes nothing
+/// and the finding is not true of the host. An `all` that cannot be read
+/// keeps the advice.
 fn eval_rp_filter_at(
     info: &SystemInfo,
     recs: &mut Vec<Recommendation>,
@@ -3314,24 +3326,26 @@ fn eval_rp_filter_at(
         return 1;
     }
     // The reader maps a file it cannot interpret to 0 as well; only a
-    // successfully read 0 is the disabled filter.
+    // successfully read value at or below 0 is the unset template.
     let Some(current) = read_switch_i64(path) else {
         return 1;
     };
-    if let Some(rec) = rp_filter_recommendation(
-        "net.ipv4.conf.default.rp_filter",
-        current,
-        host_needs_ip_forward(info),
-        "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
-    ) {
-        let all_covers = read_switch_i64(all_path).is_some_and(|all| {
-            rec.recommended_value
-                .parse::<i64>()
-                .is_ok_and(|want| all >= want)
-        });
-        if !all_covers {
-            recs.push(rec);
-        }
+    if current > 0 {
+        return 1;
+    }
+    let host_forwards = host_needs_ip_forward(info);
+    let want = if host_forwards { 2 } else { 1 };
+    // The device slot is the template here, and it is at or below 0, so the
+    // MAXCONF is whichever of the two is larger: an `all` at or above the
+    // mode asked for already settles every interface.
+    let covered = read_switch_i64(all_path).is_some_and(|all| all >= want);
+    if !covered {
+        recs.push(rp_filter_recommendation(
+            "net.ipv4.conf.default.rp_filter",
+            current,
+            host_forwards,
+            "未启用反向路径过滤，攻击者可伪造源 IP 进行欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
+        ));
     }
     1
 }
@@ -3339,8 +3353,11 @@ fn eval_rp_filter_at(
 /// The reason an `rp_filter` rule gives on a host that forwards for others.
 const RP_FILTER_LOOSE_REASON: &str = "本机为容器/虚拟化/VPN/路由主机，转发路径可能非对称，严格模式会丢弃合法流量；按内核文档对非对称或复杂路由的建议启用宽松模式（RFC 3704 Loose），仍可拦截无路由可达的伪造源 IP";
 
-/// Value-driven core of the two `rp_filter` rules: what to recommend for a
-/// disabled (0) validation, and nothing for an armed one.
+/// Value-driven core of the two `rp_filter` rules: the advice a disarmed
+/// validation calls for. Each rule decides whether its slot leaves validation
+/// off — a negative value is below every mode and only the MAXCONF with the
+/// other slot turns it into a real one — and passes the value it read so the
+/// report and a later rollback see what the kernel holds.
 ///
 /// Strict mode (1) drops a packet whose source is not reachable back through
 /// the interface it arrived on, which is exactly what asymmetric routing
@@ -3356,24 +3373,21 @@ fn rp_filter_recommendation(
     current: i64,
     host_forwards: bool,
     strict_reason: &str,
-) -> Option<Recommendation> {
-    if current != 0 {
-        return None;
-    }
+) -> Recommendation {
     let (recommended, reason) = if host_forwards {
         ("2", RP_FILTER_LOOSE_REASON)
     } else {
         ("1", strict_reason)
     };
-    Some(Recommendation {
+    Recommendation {
         param: param.to_string(),
-        current_value: "0".to_string(),
+        current_value: current.to_string(),
         recommended_value: recommended.to_string(),
         reason: reason.to_string(),
         confidence: Confidence::Medium,
         category: Category::Security,
         writable: true,
-    })
+    }
 }
 
 fn eval_panic(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
@@ -5625,14 +5639,16 @@ fn eval_rp_filter_all_at(info: &SystemInfo, recs: &mut Vec<Recommendation>, path
     let Some(current) = read_switch_i64(path) else {
         return 1;
     };
-    if let Some(rec) = rp_filter_recommendation(
+    // Only exactly 0 is the disabled filter.
+    if current != 0 {
+        return 1;
+    }
+    recs.push(rp_filter_recommendation(
         "net.ipv4.conf.all.rp_filter",
         current,
         host_needs_ip_forward(info),
         "未在所有接口启用反向路径过滤，攻击者可伪造源 IP 欺骗（注意：非对称/多路径路由场景应改用宽松模式 2）",
-    ) {
-        recs.push(rec);
-    }
+    ));
     1
 }
 
@@ -19759,6 +19775,71 @@ mod tests {
     }
 
     #[test]
+    fn rp_filter_default_reads_a_negative_template_as_unset() {
+        // IN_DEV_RPFILTER takes the larger of `conf/all` and the device slot,
+        // so a negative template is below every mode and arms nothing on its
+        // own: the devices that inherit it validate by whatever `all` selects,
+        // and the kernel default there is 0. The old `!= 0` core read -1 as
+        // armed and stayed quiet on exactly those hosts, while the value it
+        // reported to a later rollback was "0" rather than the -1 the kernel
+        // holds.
+        let (template, all_loose, others) = zero_switch_paths("rp_filter_default_neg", b"2\n");
+        let all_off = all_loose.with_file_name("all_off");
+        std::fs::write(&all_off, b"0\n").unwrap();
+        let negative = template.with_file_name("template_negative");
+        std::fs::write(&negative, b"-1\n").unwrap();
+        let strict = template.with_file_name("template_strict");
+        std::fs::write(&strict, b"1\n").unwrap();
+        let info = make_test_info();
+        let advice = |template: &std::path::Path, all: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_rp_filter_at(
+                &info,
+                &mut recs,
+                template.to_str().unwrap(),
+                all.to_str().unwrap(),
+            );
+            recs
+        };
+
+        let recs = advice(&negative, &all_off);
+        assert_eq!(recs.len(), 1, "-1 inherits `all`'s 0 and arms nothing");
+        assert_eq!(recs[0].current_value, "-1", "the value the kernel holds");
+        let expected = if host_needs_ip_forward(&info) {
+            "2"
+        } else {
+            "1"
+        };
+        assert_eq!(
+            recs[0].recommended_value, expected,
+            "the advice follows the host, not the template"
+        );
+        // A positive template arms a mode on its own again.
+        assert!(
+            advice(&strict, &all_off).is_empty(),
+            "a readable 1 arms strict validation"
+        );
+        assert!(
+            advice(&template, &all_loose).is_empty(),
+            "a 2 template is loose mode"
+        );
+        // An `all` at or above the asked mode settles every interface whatever
+        // the template says; 2 covers `want` on forwarding and quiet hosts alike.
+        assert!(
+            advice(&negative, &all_loose).is_empty(),
+            "`all` at 2 already covers every interface"
+        );
+        // An unreadable template is not evidence of anything.
+        for path in &others {
+            assert!(
+                advice(path, &all_off).is_empty(),
+                "{}: an unreadable value is not 0",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
     fn rp_filter_all_advice_needs_a_readable_value() {
         // The rule fires on 0, and the reader mapped an unreadable or
         // unparseable file to the same 0: a masked or garbled proc entry (a
@@ -28104,7 +28185,7 @@ mod tests {
             name: "docker".to_string(),
         }];
         assert!(host_needs_ip_forward(&forwarding));
-        for (param, run) in rp_filter_rules() {
+        for (param, run, _) in rp_filter_rules(true, true) {
             let mut recs = Vec::new();
             run(&forwarding, &mut recs, path.to_str().unwrap());
             let rec = recs.iter().find(|r| r.param == param).unwrap();
@@ -28116,35 +28197,52 @@ mod tests {
         }
         let _ = std::fs::remove_file(&path);
 
-        let strict = rp_filter_recommendation("p", 0, false, "strict").unwrap();
+        let strict = rp_filter_recommendation("p", 0, false, "strict");
         assert_eq!(strict.recommended_value, "1");
         assert_eq!(strict.reason, "strict");
-        for armed in [1, 2, -1] {
-            assert!(rp_filter_recommendation("p", armed, true, "strict").is_none());
-            assert!(rp_filter_recommendation("p", armed, false, "strict").is_none());
-        }
+        assert_eq!(strict.current_value, "0");
+        let loose = rp_filter_recommendation("p", 0, true, "strict");
+        assert_eq!(loose.recommended_value, "2");
+        assert_eq!(loose.reason, RP_FILTER_LOOSE_REASON);
+        // The value read reaches the report, so a rollback restores what the
+        // kernel held rather than an assumed 0.
+        assert_eq!(
+            rp_filter_recommendation("p", -1, false, "strict").current_value,
+            "-1"
+        );
     }
 
     /// An `eval_*_at` rule: the system, the recommendation sink, the path.
     type EvalAt = fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize;
 
-    /// The `rp_filter` rules routed through [`rp_filter_recommendation`].
-    fn rp_filter_rules() -> Vec<(&'static str, EvalAt)> {
+    /// The `rp_filter` rules routed through [`rp_filter_recommendation`],
+    /// each paired with whether the caller expects its advice for a slot that
+    /// reads the given value.
+    fn rp_filter_rules(
+        default_expects: bool,
+        all_expects: bool,
+    ) -> Vec<(&'static str, EvalAt, bool)> {
         vec![
-            ("net.ipv4.conf.default.rp_filter", |info, recs, path| {
-                eval_rp_filter_at(info, recs, path, NO_ALL_SLOT)
-            }),
-            ("net.ipv4.conf.all.rp_filter", eval_rp_filter_all_at),
+            (
+                "net.ipv4.conf.default.rp_filter",
+                (|info, recs, path| eval_rp_filter_at(info, recs, path, NO_ALL_SLOT)) as EvalAt,
+                default_expects,
+            ),
+            (
+                "net.ipv4.conf.all.rp_filter",
+                eval_rp_filter_all_at as EvalAt,
+                all_expects,
+            ),
         ]
     }
 
     #[test]
     fn devconf_rp_filter_rules_do_not_invent_findings_on_minus_one() {
-        // IN_DEV_RPFILTER is a truthiness test: a nonzero value arms the
-        // source validation. The unsigned reader collapsed "-1" to the
-        // fallback 0 — the disabled value — so the "is it off" gates
-        // invented a hardening finding on a host whose validation is
-        // already fully armed.
+        // IN_DEV_RPFILTER is an IN_DEV_MAXCONF of `conf/all` and the device
+        // slot, so -1 is not an armed switch: it sits below every mode and
+        // loses the max to a device slot of 0 or more. The rules therefore
+        // still report a negative slot when nothing else selects a mode, and
+        // stay quiet on a positive one.
         let path = std::env::temp_dir().join(format!(
             "ktuner_devconf_rp_filter_{}_{:?}",
             std::process::id(),
@@ -28152,20 +28250,14 @@ mod tests {
         ));
         let path_str = path.to_str().unwrap();
         let info = make_test_info();
-        for (value, expects_rec) in [("-1", false), ("2", false), ("1", false), ("0", true)] {
+        for (value, default_expects, all_expects) in [
+            ("-1", true, false),
+            ("2", false, false),
+            ("1", false, false),
+            ("0", true, true),
+        ] {
             std::fs::write(&path, value).unwrap();
-            for (param, run) in [
-                (
-                    "net.ipv4.conf.default.rp_filter",
-                    (|info, recs, path| eval_rp_filter_at(info, recs, path, NO_ALL_SLOT))
-                        as fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize,
-                ),
-                (
-                    "net.ipv4.conf.all.rp_filter",
-                    eval_rp_filter_all_at
-                        as fn(&SystemInfo, &mut Vec<Recommendation>, &str) -> usize,
-                ),
-            ] {
+            for (param, run, expects_rec) in rp_filter_rules(default_expects, all_expects) {
                 let mut recs = Vec::new();
                 run(&info, &mut recs, path_str);
                 let rec = recs.iter().find(|r| r.param == param);
