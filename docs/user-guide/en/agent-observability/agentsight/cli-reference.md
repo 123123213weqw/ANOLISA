@@ -13,7 +13,7 @@ it is a real capture.
 | Privileges | `trace` needs root (or `CAP_BPF` + `CAP_PERFMON`). Query commands need read access to `/var/log/sysak/.agentsight`, which the packaged service owns — use `sudo`. |
 | Config file | Commands that read rules accept `--config`, default `/etc/agentsight/config.json`. `discover` reads the same file `trace` does, so it reflects your custom rules. |
 | Data location | Fixed at `/var/log/sysak/.agentsight`. `serve`, `dashboard`, `skill-metrics`, `audit`, `metrics`, `summary`, and `interruption` accept `--db` to point at a different database file. |
-| Machine output | `--json` is available on `discover`, `token`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
+| Machine output | `--json` is available on `discover`, `token`, `metrics`, `audit`, `summary`, `interruption *`, and `skill-metrics *`. |
 | Output language | `summary`, `metrics`, and `interruption` print English; `discover` and `token` print Chinese regardless of locale. Use `--json` for stable, language-neutral text. |
 | Platform | On macOS only `trace` (trajectory collector) and `serve` exist. |
 | Sample IDs | Session, conversation, trace, and interruption IDs in the examples are placeholders — substitute the ones from your own output. |
@@ -332,6 +332,23 @@ agentsight_token_input_total{agent="Cosh"} 50000
 # HELP agentsight_token_output_total Total output tokens consumed by agent (all-time)
 # TYPE agentsight_token_output_total counter
 agentsight_token_output_total{agent="CoshNG"} 10000
+```
+
+`--json` prints the same per-agent rows as objects (`agent_name`, `input_tokens`, `output_tokens`,
+`total_tokens`, `request_count`) instead of the exposition format, for scripts that would otherwise
+have to parse it:
+
+```bash
+$ sudo agentsight metrics --json
+[
+  {
+    "agent_name": "CoshNG",
+    "input_tokens": 100000,
+    "output_tokens": 10000,
+    "total_tokens": 110000,
+    "request_count": 42
+  }
+]
 ```
 
 The running server exposes the same content at `GET /metrics` (localhost only), which is usually
