@@ -570,6 +570,25 @@ JSON 记录，包含 `_atif_file`、`_source_file`、`_session_id` 和 `_steps`�
 - [Dashboard 指南](dashboard.md)——这些查询在界面上的等价操作
 - [数据与存储](data-and-storage.md)——HTTP API 与数据库结构
 
+## 并行批量分析
+
+源码仓库的批处理工具可以并行运行相互独立的分析器进程。
+从 `src/agentsight` 先构建分析器，再显式启用最多四个 worker：
+
+```bash
+cargo build -p agentsight-opt --bin analyze
+python3 scripts/batch-analyze.py --dir /path/to/sessions --dim perf --binary target/debug/analyze --jobs 4
+```
+
+`--jobs N` 接受 1 到 8，默认 1；运行中的调用和已提交但未输出的任务均不超过 N。
+即使后面的调用先完成，JSON 文档和逐文件诊断仍按原始发现顺序输出，因此较早的慢文件
+可能延后可见输出。每份文档仍保留源文件和会话元数据。
+
+文件选择、最少步骤过滤、超时、失败计数、退出行为和临时文件清理沿用原有规则。
+预先构建可避免多个 Cargo 调用争用构建锁。完整分析仍需要模型凭据；N 大于 1 时
+可能同时产生付费请求，并触发端点限流。该能力在允许并发的情况下缩短独立会话的
+批次耗时，不会降低单次模型延迟、Token 用量或单价。
+
 ## 基准测试产物
 
 从仓库根目录运行 `bash src/agentsight/scripts/benchmark/single_run/resource_run.sh --help`，

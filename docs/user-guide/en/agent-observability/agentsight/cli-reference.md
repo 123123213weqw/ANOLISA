@@ -593,6 +593,28 @@ a completed batch returns 0 even if its summary includes per-file failures.
 - [Dashboard guide](dashboard.md) — UI equivalents of these queries
 - [Data and storage](data-and-storage.md) — HTTP API and database layout
 
+## Parallel batch analysis
+
+The source-checkout batch tool can run independent analyzer invocations concurrently.
+From `src/agentsight`, build the analyzer once and opt in to up to four workers:
+
+```bash
+cargo build -p agentsight-opt --bin analyze
+python3 scripts/batch-analyze.py --dir /path/to/sessions --dim perf --binary target/debug/analyze --jobs 4
+```
+
+`--jobs N` accepts 1 through 8 and defaults to 1. Both running invocations and outstanding
+work are bounded by N. Documents and per-file diagnostics are emitted in the original
+discovery order, even when later invocations finish first; this may delay visible output
+behind a slow earlier file. Each document retains its source/session metadata.
+
+Existing selection, minimum-step filtering, timeout, failure counters, exit behavior and
+temporary-file cleanup remain in effect. Prebuilding avoids concurrent Cargo build-lock
+contention. Full analysis still requires model credentials; choosing N above 1 may issue
+simultaneous paid requests and encounter endpoint rate limits. This reduces elapsed time
+for independent sessions where concurrency is available; it does not reduce per-request
+model latency, token use or prices.
+
 ## Benchmark artifacts
 
 From the repository root, `bash src/agentsight/scripts/benchmark/single_run/resource_run.sh --help`
