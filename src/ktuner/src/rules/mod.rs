@@ -228,6 +228,7 @@ pub fn evaluate_with_workload(info: &SystemInfo, workload: &WorkloadType) -> Res
     checked += eval_accept_source_route(info, &mut recs);
     checked += eval_tcp_rfc1337(info, &mut recs);
     checked += eval_secure_redirects(info, &mut recs);
+    checked += eval_default_secure_redirects(info, &mut recs);
     checked += eval_mmap_min_addr(info, &mut recs);
     checked += eval_default_accept_redirects(info, &mut recs);
     checked += eval_default_accept_source_route(info, &mut recs);
@@ -5191,6 +5192,69 @@ fn eval_secure_redirects_at(
             writable: true,
         });
     }
+    1
+}
+
+fn eval_default_secure_redirects(info: &SystemInfo, recs: &mut Vec<Recommendation>) -> usize {
+    eval_default_secure_redirects_at(
+        info,
+        recs,
+        "/proc/sys/net/ipv4/conf/default/secure_redirects",
+        std::path::Path::new("/proc/sys/net/ipv4/conf"),
+    )
+}
+
+/// Path-injectable form of [`eval_default_secure_redirects`] (the `eval_*_at`
+/// idiom). The `default` template is what new interfaces inherit, and
+/// `IN_DEV_SEC_REDIRECTS` is an `IN_DEV_ORCONF` of that template with the
+/// device's own slot (v6.6 include/linux/inetdevice.h:91-92, 113-114), so a
+/// device that never overrode the slot keeps accepting redirects to its
+/// default gateways even after `conf/all/secure_redirects` is written to 0.
+/// The `all` rule alone therefore cannot finish its own hardening plan.
+///
+/// The two preconditions are the `all` rule's, from the same consumer:
+/// `__ip_do_redirect()` (net/ipv4/route.c) reads the knob only inside its
+/// `!IN_DEV_SHARED_MEDIA(in_dev)` branch and after its
+/// `!IN_DEV_RX_REDIRECTS(in_dev)` bail-out (v6.6 :768, :773-777), so while
+/// shared media is on for every interface, or no interface accepts redirects
+/// at all, writing this template changes nothing either. See
+/// [`eval_secure_redirects_at`] for both predicates.
+///
+/// The value is read SIGNED: the slot is the same `devinet_conf_proc` plain
+/// `proc_dointvec` int with no min/max, so -1 is legal and enabled.
+fn eval_default_secure_redirects_at(
+    info: &SystemInfo,
+    recs: &mut Vec<Recommendation>,
+    path: &str,
+    conf_root: &std::path::Path,
+) -> usize {
+    if !info.param_exists(path) {
+        return 1;
+    }
+    if !shared_media_disabled_somewhere(conf_root) {
+        return 1;
+    }
+    if no_interface_accepts_redirects(conf_root) {
+        return 1;
+    }
+    // Only a slot the reader could interpret is evidence at all: an
+    // unreadable one would report a current_value the host does not have. A
+    // readable 0 is the disarmed template, and nothing is left to turn off.
+    let Some(current) = read_switch_i64(path) else {
+        return 1;
+    };
+    if current == 0 {
+        return 1;
+    }
+    recs.push(Recommendation {
+        param: "net.ipv4.conf.default.secure_redirects".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "0".to_string(),
+        reason: "新创建的网络接口默认仍接受发往默认网关的 ICMP 重定向；仅关闭 conf/all 的 secure_redirects 改不掉模板继承的值".to_string(),
+        confidence: Confidence::High,
+        category: Category::Security,
+        writable: true,
+    });
     1
 }
 
@@ -27168,6 +27232,117 @@ mod tests {
             1,
             "an unreadable forwarding slot keeps the advice instead of guessing the exemption"
         );
+    }
+
+    #[test]
+    fn default_secure_redirects_covers_the_template_all_leaves_behind() {
+        // IN_DEV_SEC_REDIRECTS is an ORCONF of the `all` slot and the device's
+        // own (v6.6 include/linux/inetdevice.h:91-92, 113-114), so writing
+        // `all` to 0 leaves every interface that still carries the template's
+        // inherited 1 accepting redirects to its default gateways. The `all`
+        // rule's own plan is therefore half a fix, and this rule names the
+        // template slot the devices inherit.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_default_secure_redirects_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let template = write("default/secure_redirects", "1\n");
+        // Both preconditions open: one interface has shared media off, and an
+        // interface accepts redirects through the OR half.
+        for relative in ["all/shared_media", "eth0/shared_media"] {
+            write(relative, "0\n");
+        }
+        let advice = |path: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_secure_redirects_at(&info, &mut recs, path.to_str().unwrap(), &dir);
+            recs
+        };
+
+        let recs = advice(&template);
+        assert_eq!(recs.len(), 1, "the template still arms future interfaces");
+        assert_eq!(recs[0].param, "net.ipv4.conf.default.secure_redirects");
+        assert_eq!(recs[0].current_value, "1");
+        assert_eq!(recs[0].recommended_value, "0");
+        assert_eq!(recs[0].category, Category::Security);
+
+        // A readable 0 template needs nothing; -1 is legal and armed.
+        let zero = write("default/secure_redirects.0", "0\n");
+        assert!(advice(&zero).is_empty(), "a 0 template is already off");
+        let negative = write("default/secure_redirects.neg", "-1\n");
+        let armed = advice(&negative);
+        assert_eq!(armed.len(), 1, "-1 is legal in this plain int slot");
+        assert_eq!(armed[0].current_value, "-1");
+
+        // An unreadable template is not evidence of an armed one.
+        let garbled = write("default/secure_redirects.garbled", "masked\n");
+        assert!(advice(&garbled).is_empty(), "a garbled slot proves nothing");
+        assert!(
+            advice(std::path::Path::new(
+                "/nonexistent/ktuner/default_secure_redirects"
+            ))
+            .is_empty(),
+            "a missing slot proves nothing"
+        );
+    }
+
+    #[test]
+    fn default_secure_redirects_keeps_the_shared_media_and_accept_gates() {
+        // The new template rule reads the same consumer as the `all` rule, so
+        // it must inherit both preconditions: while shared media is on for
+        // every interface, or no interface accepts redirects at all,
+        // __ip_do_redirect() never consults IN_DEV_SEC_REDIRECTS and the
+        // template write changes nothing.
+        let info = make_test_info();
+        let dir = std::env::temp_dir().join(format!(
+            "ktuner_default_secure_redirects_gates_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |relative: &str, content: &str| {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().expect("parent")).unwrap();
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let template = write("default/secure_redirects", "1\n");
+        let advice = |dir: &std::path::Path| {
+            let mut recs = Vec::new();
+            eval_default_secure_redirects_at(&info, &mut recs, template.to_str().unwrap(), dir);
+            recs.len()
+        };
+
+        // Shared media on everywhere: the knob has no reader.
+        for relative in ["all/shared_media", "eth0/shared_media"] {
+            write(relative, "1\n");
+        }
+        assert_eq!(advice(&dir), 0, "shared media on everywhere hides the knob");
+
+        // Shared media off, but every accept_redirects reads 0: the earlier
+        // bail-out wins and the knob is still unreachable.
+        for relative in ["all/shared_media", "eth0/shared_media"] {
+            write(relative, "0\n");
+        }
+        write("all/accept_redirects", "0\n");
+        for interface in ["default", "eth0"] {
+            write(&format!("{interface}/accept_redirects"), "0\n");
+        }
+        assert_eq!(advice(&dir), 0, "no interface accepts a redirect at all");
+
+        // One interface accepting through the OR half opens the consumer.
+        write("eth0/accept_redirects", "1\n");
+        assert_eq!(advice(&dir), 1, "an accepting interface keeps the advice");
     }
 
     #[test]
