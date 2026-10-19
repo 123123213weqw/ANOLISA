@@ -8177,11 +8177,16 @@ fn eval_default_arp_announce(info: &SystemInfo, recs: &mut Vec<Recommendation>) 
 /// Path-injectable form of [`eval_default_arp_announce`] (the `eval_*_at`
 /// idiom) so the switch read is assertable against synthetic files.
 ///
-/// The rule fires below 2, and [`read_sysctl_u64`] maps an unreadable or
-/// unparseable file to 0, which is below it. Only a value the reader could
-/// produce is evidence of the loose announce policy, so a masked or garbled
-/// proc entry (a container's, typically) neither reports a `current_value`
-/// the host does not have nor asks for a write it may not need.
+/// The rule fires below 2, and [`read_switch_i64`] answers `None` for a file it
+/// cannot read or parse, so only a value the kernel could have produced is
+/// evidence of the loose announce policy: a masked or garbled proc entry (a
+/// container's, typically) neither reports a `current_value` the host does not
+/// have nor asks for a write it may not need. The template is read SIGNED
+/// because it is the same plain `proc_dointvec` int slot (`devinet_conf_proc`,
+/// net/ipv4/devinet.c) as `all`: -1 is legal, every device inherits it at
+/// registration, and a negative device slot loses the MAXCONF to its own 0 —
+/// the loose policy this rule raises, so the unsigned read's `None` withheld
+/// the advice on exactly the hosts that carry the worst setting.
 ///
 /// `IN_DEV_ARP_ANNOUNCE` is an `IN_DEV_MAXCONF` (v6.6
 /// include/linux/inetdevice.h:94-96, 135): `arp_solicit()`
@@ -8206,21 +8211,24 @@ fn eval_default_arp_announce_at(
     if read_switch_i64(all_path).is_some_and(|all| all >= 2) {
         return 1;
     }
-    let Some(current) = read_switch(path) else {
+    // The template is the same plain `proc_dointvec` int slot as `all`, so -1
+    // is legal there and the device slot inherits it at registration: a
+    // negative template loses the MAXCONF to every device's 0 and lands in
+    // `arp_solicit()`'s `default:` arm, which announces any local address —
+    // the loose policy the advice is for. Read signed, and fire on the value
+    // read; an unreadable or malformed file still keeps the rule quiet.
+    let Some(current) = read_switch_i64(path).filter(|&value| value < 2) else {
         return 1;
     };
-    if current < 2 {
-        recs.push(Recommendation {
-            param: "net.ipv4.conf.default.arp_announce".to_string(),
-            current_value: current.to_string(),
-            recommended_value: "2".to_string(),
-            reason: "新建网络接口的 ARP 通告策略不佳，可能导致 ARP 回复从错误的源地址发出"
-                .to_string(),
-            confidence: Confidence::Medium,
-            category: Category::Performance,
-            writable: true,
-        });
-    }
+    recs.push(Recommendation {
+        param: "net.ipv4.conf.default.arp_announce".to_string(),
+        current_value: current.to_string(),
+        recommended_value: "2".to_string(),
+        reason: "新建网络接口的 ARP 通告策略不佳，可能导致 ARP 回复从错误的源地址发出".to_string(),
+        confidence: Confidence::Medium,
+        category: Category::Performance,
+        writable: true,
+    });
     1
 }
 
@@ -18573,6 +18581,38 @@ mod tests {
             "-1 loses the max to the template"
         );
         assert_eq!(advice(&others[0]), speaks, "an unreadable `all` is not on");
+    }
+
+    #[test]
+    fn default_arp_announce_reads_a_negative_template_as_loose() {
+        // The `default` template is the same plain proc_dointvec int slot as
+        // `all`, so -1 is legal, and every device inherits it at registration.
+        // A negative device slot loses the MAXCONF to its own 0, and
+        // arp_solicit() answers it from its `default:` arm — announce any
+        // local address, the loose policy this rule raises. The unsigned read
+        // treated "-1" as an unreadable file and withheld the advice.
+        let (_, _, others) = zero_switch_paths("default_arp_announce_negative", b"2\n");
+        let negative = others[0].with_file_name("template.negative");
+        std::fs::write(&negative, b"-1\n").unwrap();
+        let mut info = make_test_info();
+        info.network = ["eth0", "eth1"]
+            .map(|name| NetInfo {
+                name: name.to_string(),
+                speed_mbps: 10000,
+            })
+            .to_vec();
+        let mut recs = Vec::new();
+        eval_default_arp_announce_at(&info, &mut recs, negative.to_str().unwrap(), NO_ALL_SLOT);
+
+        assert_eq!(
+            recs.len(),
+            usize::from(!has_bond()),
+            "-1 announces any local address"
+        );
+        if let Some(rec) = recs.first() {
+            assert_eq!(rec.current_value, "-1");
+            assert_eq!(rec.recommended_value, "2");
+        }
     }
 
     #[test]
