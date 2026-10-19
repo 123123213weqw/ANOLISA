@@ -158,6 +158,7 @@ One-command health picture for a recent window.
 FLAGS:
         --json                          Output as JSON
 OPTIONS:
+        --agent <agent>                 Scope the session and interruption totals to one agent
         --db <db>                       Override the sessions database path
         --last <last>                   Query the last N hours (default: 24) [default: 24]
         --tokenless-db <tokenless-db>   Override the tokenless stats database path
@@ -189,6 +190,20 @@ the reading host's own data.
 ```bash
 agentsight summary --last 24 --db /backup/agentsight/genai_events.db
 ```
+
+`--agent` narrows the Sessions and Interruptions sections to one agent, and the two sections match
+the same way their own stores do. Sessions compare the label the session listing already resolves —
+the recorded agent name, falling back to the process name — while interrupts compare the
+`agent_name` column only, which is what `interruption list --agent` filters on. Both matches are
+case-insensitive. The heading and the JSON gain an `agent` key naming the scope; without the flag
+both sections cover every agent and the report keeps its previous shape.
+
+```bash
+agentsight summary --last 24 --agent CoshNG
+```
+
+Tokenless savings are recorded per session and carry no agent, so an agent-scoped report leaves
+that section out and says so rather than printing host-wide numbers beside agent-scoped totals.
 
 ## agentsight token
 
