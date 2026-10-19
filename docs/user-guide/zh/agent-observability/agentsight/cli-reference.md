@@ -373,6 +373,21 @@ OPTIONS:
         --severity <severity>    [possible values: critical, high, medium, low]
 ```
 
+`stats` 与 `count` 接受和 `list` 相同的 `--agent` 过滤，不用再自己去处理 `list --json` 的输出来
+得到单个 Agent 的分布：
+
+```
+FLAGS:
+        --json          Output as JSON
+
+OPTIONS:
+        --agent <agent>          Filter by agent name (exact match)
+        --last <last>            Query last N hours (default: 24) [default: 24]
+```
+
+两者各自原有的统计口径不变：`stats` 统计整个窗口（含已解决与未解决），`count` 只统计未解决事件。
+不带 `--agent` 时覆盖主机上的所有 Agent。
+
 ```bash
 $ sudo agentsight interruption list --last 24
 INTERRUPTION_ID                    TYPE          SEVERITY  OCCURRED_AT              RESOLVED  AGENT    SESSION_ID
@@ -407,8 +422,14 @@ Interruption Event Detail
 # 最近一周按类型统计
 sudo agentsight interruption stats --last 168
 
+# 只看某个 Agent 的同一份分布
+sudo agentsight interruption stats --last 168 --agent CoshNG
+
 # 未解决事件按严重级别计数
 sudo agentsight interruption count --last 24
+
+# 只看某个 Agent 的未解决计数
+sudo agentsight interruption count --last 24 --agent CoshNG
 
 # 查某个会话命中的全部中断，然后关闭其中一条
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
