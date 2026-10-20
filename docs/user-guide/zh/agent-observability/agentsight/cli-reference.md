@@ -523,12 +523,30 @@ sudo agentsight interruption count --last 24 --agent CoshNG
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
 
+# 同样关闭一条，但要机器可读的输出
+sudo agentsight interruption resolve 11111111222222223333333344444444 --json
+
 # 只看该会话里仍未解决的中断
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
 
 # 只看该会话里命中 token_limit 的中断
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
+
+`resolve` 同样接受 `--json`，于是这个唯一会写库的 `interruption` 子命令与只读命令使用同一套机器可读
+口径。不带该参数时，它保持原来那一行输出不变：
+
+```
+$ sudo agentsight interruption resolve 11111111222222223333333344444444 --json
+{
+  "status": "resolved",
+  "interruption_id": "11111111222222223333333344444444"
+}
+```
+
+`status` 与 HTTP 路由 `POST /api/interruptions/{id}/resolve` 的返回字段一致；CLI 额外带上
+`interruption_id`，而该路由只在路径里带这个 id。
+id 不存在时两种形式仍然以非零码退出并在 stderr 给出提示：`--json` 只改变成功时的返回体，不改变失败路径。
 
 `session` 与 `conversation` 接受和 `list`、`stats` 相同的 `--unresolved` / `--resolved` 这对参数，
 于是按 id 的视图可以只看仍未解决（或已关闭）的事件，不必用眼睛去读 `RESOLVED` 列。它们同样接受
