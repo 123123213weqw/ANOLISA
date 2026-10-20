@@ -260,6 +260,12 @@ whose live subvolume still exists.
 
 ---
 
+## Service startup failures
+
+The systemd service waits 10 seconds before retrying after failure and allows four starts within five minutes (the initial start plus three retries). Once the limit is reached, automatic restarts stop. This counts all starts, without distinguishing recovery failures from configuration or environment errors. Failures that take long enough to span the counting window may continue to restart.
+
+Inspect the cause with `sudo journalctl -u ws-ckpt -n 100 --no-pager`. After fixing the cause, run `sudo systemctl start ws-ckpt`. If startup is still rate-limited, run `sudo systemctl reset-failed ws-ckpt` to clear the start counter, then start the service again.
+
 ## Configuration
 
 ### Daemon Configuration

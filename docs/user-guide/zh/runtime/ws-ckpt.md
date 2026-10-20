@@ -235,6 +235,12 @@ ws-ckpt init -w /path/to/workspace
 
 ---
 
+## 服务启动失败
+
+systemd 服务在失败后等待 10 秒重试，5 分钟内最多启动 4 次（首次启动加 3 次重试）。达到限制后停止自动重启；此限制统计所有启动，不区分恢复失败和配置、环境错误。若每轮失败耗时较长、跨过计数窗口，仍可能继续重试。
+
+先运行 `sudo journalctl -u ws-ckpt -n 100 --no-pager` 查看具体原因。修复原因后，运行 `sudo systemctl start ws-ckpt`。若仍提示启动频率受限，先执行 `sudo systemctl reset-failed ws-ckpt`清除启动计数，再重新启动。
+
 ## 配置
 
 ### Daemon 配置
