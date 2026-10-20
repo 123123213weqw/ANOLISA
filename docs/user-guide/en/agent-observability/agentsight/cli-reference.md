@@ -542,12 +542,31 @@ sudo agentsight interruption count --last 24 --agent CoshNG
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444
 sudo agentsight interruption resolve 11111111222222223333333344444444
 
+# the same close, with a machine-readable answer
+sudo agentsight interruption resolve 11111111222222223333333344444444 --json
+
 # only what is still open in that session
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --unresolved
 
 # only the token-limit hits in that session
 sudo agentsight interruption session 00000000-1111-2222-3333-444444444444 --type token_limit
 ```
+
+`resolve` also accepts `--json`, so the one `interruption` subcommand that writes the database
+answers in the same machine-readable vocabulary as the read commands. Without the flag it keeps the
+single line it has always printed:
+
+```
+$ sudo agentsight interruption resolve 11111111222222223333333344444444 --json
+{
+  "status": "resolved",
+  "interruption_id": "11111111222222223333333344444444"
+}
+```
+
+`status` is the field the HTTP route `POST /api/interruptions/{id}/resolve` answers with; the CLI
+adds `interruption_id`, which the route only carries in its path. An unknown id still exits non-zero with the message on
+stderr in both forms: `--json` changes the success body, not the failure path.
 
 `session` and `conversation` take the same `--unresolved` / `--resolved` pair `list` and `stats`
 do, so a per-id view can be narrowed to the events still open (or already closed) without reading
