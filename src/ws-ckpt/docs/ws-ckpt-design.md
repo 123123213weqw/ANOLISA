@@ -614,17 +614,18 @@ config reload（`notify_waiters()`）会立即打断 sleep，让 loop 重读配�
 
 - tmp 是已验证的 Btrfs subvolume、live 不存在：使用 `RENAME_NOREPLACE` 恢复旧 live。
 - tmp 不存在：幂等 no-op。
-- live 与 tmp 同时存在，或任一路径是 symlink、普通目录、文件或无法验证：保留所有路径并
-  阻止 backend bootstrap。没有 durable rollback commit evidence 时，daemon 不能证明应该
-  保留哪一个 subvolume。
+- live 与 tmp 都是已验证的 Btrfs subvolume：说明 rollback 已从目标快照创建新 live，只差
+  最后的删除旧子卷。启动时保留 live、删除 tmp 以完成 rollback；与 rollback 自身的清理一致，
+  删除失败只告警（non-fatal），下次启动重试。
+- 任一路径是 symlink、普通目录、文件或无法验证：保留所有路径并阻止 backend bootstrap。
 - recovery 只接管在 `snapshots/<workspace-id>/` 中有对应 ownership marker 的
   `.rollback-tmp`。该证据同时覆盖当前 ID 和 migration 保留的 legacy ID；没有 marker 的
   foreign path 只告警并保留。
 
-当前 fail-closed 粒度是整个 daemon：一个 workspace 的 ambiguous rollback 会阻止其他
+当前 fail-closed 粒度是整个 daemon：一个 workspace 的无法验证路径会阻止其他
 workspace 一同启动。这是缺少 per-workspace quarantine 时的安全取舍。该恢复也不能关闭
-“新 live 已创建或旧 tmp 已删除，但 `index.head` 尚未持久化”的逻辑提交窗口；完整自动恢复
-需要 durable rollback journal/commit record。真实 Btrfs crash injection 与断电持久性仍需
+“新 live 已创建或旧 tmp 已删除，但 `index.head` 尚未持久化”的逻辑提交窗口，此时
+`index.head` 仍指向 rollback 前的快照。真实 Btrfs crash injection 与断电持久性仍需
 在隔离的特权环境验证。
 
 ---
