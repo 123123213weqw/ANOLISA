@@ -2570,6 +2570,25 @@ mod tests {
     }
 
     #[test]
+    fn post_tool_preserves_printed_html_and_reports_file_read_statistics() {
+        let content = format!(
+            "<html><body><main>{}</main></body></html>",
+            "source text ".repeat(200)
+        );
+        let request = PostToolRequest {
+            content_origin: ContentOrigin::CommandOutput,
+            command: Some("cat page.html".into()),
+            ..post_tool_request(&content)
+        };
+        let mut opts = options();
+        opts.html_extraction_enabled = true;
+        let outcome = post_tool_with_store(&request, &opts, None).unwrap();
+        assert_eq!(outcome.stats.content_origin.as_deref(), Some("file_read"));
+        assert_eq!(outcome.response.output, content);
+        assert!(outcome.response.applied_operations.is_empty());
+    }
+
+    #[test]
     fn post_tool_routes_statuses_before_the_json_pipeline() {
         for status in [ToolResultStatus::Interrupted, ToolResultStatus::Denied] {
             let request = post_tool_request(r#"{"debug":"remove me","value":1}"#);

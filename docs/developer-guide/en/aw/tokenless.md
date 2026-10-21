@@ -133,9 +133,16 @@ return value cannot replace model-visible content.
 Only a supported single text slot is projected. Media, multiple content blocks,
 intermediate streaming chunks and unsuccessful tool results remain unchanged.
 Replacement preserves native metadata and envelope fields. Qoder requires a
-string replacement, so a structured envelope is serialized into that string. Known file-read tools
-are classified as `file_content`; shell commands are supplied to Tokenless so it
-can also recognize plain file reads. Other tools use `api_response`.
+string replacement, so a structured envelope is serialized into that string.
+AW infers `content_origin` using heuristic rules. An extracted command gives
+`command_output`; without a command, tool names classify known shell tools as
+`command_output`, known file-read tools as `file_content`, and other tools as
+`api_response`.
+
+Tokenless refines plain file prints such as `cat page.html` to `file_read` and uses
+that origin in statistics. `file_read` retains eligible output compression and
+protects HTML source; `file_content` bypasses compression.
+
 For OpenClaw, after-event `tool_name` statistics and AW journal metadata use
 lowercase policy names (for example, `Bash` becomes `exec`); before events retain
 the raw name for sec-core lookup. Join phases by session/tool-call IDs, not names.

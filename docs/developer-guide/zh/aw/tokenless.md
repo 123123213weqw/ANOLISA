@@ -110,9 +110,14 @@ OpenClaw 要求 middleware API 和显式插件启用；AW 生成的原生 profil
 
 仅投影受支持的单个文本槽。Media、多个 Content Block、流式中间块以及未成功的工具
 结果保持原样。替换保留原生 metadata 和 envelope 字段。Qoder 要求字符串替换，因此结构化
-envelope 会序列化到该字符串中。已知文件读取工具标为
-`file_content`；Shell 命令会交给 Tokenless，使其也能识别单纯的文件读取。其他工具
-使用 `api_response`。
+envelope 会序列化到该字符串中。
+AW 通过启发式规则推断 `content_origin`。提取到命令时标为 `command_output`；
+没有命令时，按工具名将已知 Shell 工具标为 `command_output`，
+已知文件读取工具标为 `file_content`，其余标为 `api_response`。
+
+Tokenless 会将 `cat page.html` 这类纯文件打印细化为 `file_read`，并用于统计。
+`file_read` 保留适用的输出压缩并保护 HTML 源码；`file_content` 跳过压缩。
+
 OpenClaw 的 after 事件 `tool_name` 统计和 AW Journal 元数据使用小写策略名
 （例如 `Bash` 变为 `exec`）；before 事件保留原名用于 sec-core 查找。跨阶段关联应使用
 Session/工具调用 ID，而不是工具名。
