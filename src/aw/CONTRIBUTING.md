@@ -169,8 +169,23 @@ python3 -B scripts/native_acceptance.py --agent agentscope \
   --output target/native-evidence/agentscope
 ```
 
+To run only the pinned OpenClaw loader/runner suite from `src/aw`, reuse the
+inventory's isolated npm installation shape:
+
+```bash
+npm install --prefix target/openclaw-native --ignore-scripts --no-audit --no-fund openclaw@2026.9.6
+OPENCLAW_PACKAGE_DIR="$PWD/target/openclaw-native/node_modules/openclaw" \
+  node --test --test-reporter=tap crates/aw-service/tests/openclaw-native.mjs
+```
+
+All eight TAP tests must pass without skips. The suite loads the actual AW
+entrypoint and manifest through OpenClaw's official loader, then exercises its
+registered hooks and middleware. Policy aliases come from the pinned runtime.
+Missing SDK dependencies or loader failures fail the suite. This focused command
+does not replace native evidence aggregation or certify Gateway/model turns.
+
 The binary directory must contain the nightly bundle and checksums. Install the
-inventory's Python version, Node 24.15.0 and uv 0.11.13 first. Qoder and QwenPaw
+inventory's Python version, Node 24.16.0 and uv 0.11.13 first. Qoder and QwenPaw
 also require a working local Docker daemon; Qoder requires its PAT in the
 environment. Select either Agent with `--agent qoder` or `--agent qwenpaw` in the
 same native entrypoint above. Native execution

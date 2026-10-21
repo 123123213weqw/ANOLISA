@@ -137,8 +137,22 @@ python3 -B scripts/native_acceptance.py --agent agentscope \
   --output target/native-evidence/agentscope
 ```
 
+仅运行固定 OpenClaw 的 loader/runner 套件时，从 `src/aw` 复用清单中的隔离 npm
+安装方式：
+
+```bash
+npm install --prefix target/openclaw-native --ignore-scripts --no-audit --no-fund openclaw@2026.9.6
+OPENCLAW_PACKAGE_DIR="$PWD/target/openclaw-native/node_modules/openclaw" \
+  node --test --test-reporter=tap crates/aw-service/tests/openclaw-native.mjs
+```
+
+八项 TAP 测试必须全部通过且不得跳过。套件通过 OpenClaw 官方 loader 加载实际 AW
+入口与 manifest，再执行注册的 Hook 和中间件；策略别名来自固定版本的运行时。
+SDK 依赖缺失或 loader 失败都会使套件失败。该定向命令不能替代原生证据汇总，
+也不代表 Gateway 或模型轮次验收通过。
+
 二进制目录须包含 nightly 的 bundle 和校验文件。先安装清单指定的 Python 版本、
-Node 24.15.0 和 uv 0.11.13。Qoder 和 QwenPaw 还需要可用的本地 Docker daemon，
+Node 24.16.0 和 uv 0.11.13。Qoder 和 QwenPaw 还需要可用的本地 Docker daemon，
 Qoder 需在环境中配置 PAT。在上述统一原生入口使用 `--agent qoder` 或
 `--agent qwenpaw` 选择对应套件。原生执行使用一个所属短临时目录容纳 Linux Unix
 socket，并在退出时删除；保留证据放在 `target/`。原生任务使用独立 Python 和

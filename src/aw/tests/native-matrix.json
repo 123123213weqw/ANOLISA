@@ -303,7 +303,7 @@
       "npm_packages": [
         "openclaw@2026.9.6"
       ],
-      "boundary": "Official Hook and result middleware runners, ordering and effect adoption; no Gateway or model turn.",
+      "boundary": "Official plugin loader/SDK/manifest, runtime-scoped result middleware, native policy aliases, Hook ordering and effect adoption; no Gateway or model turn.",
       "cases": [
         {
           "name": "hooks",
@@ -315,7 +315,7 @@
           ],
           "timeout_seconds": 120,
           "report": "tap",
-          "tests": 5
+          "tests": 8
         }
       ]
     },
