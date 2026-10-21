@@ -476,3 +476,38 @@ fn native_qoder_scheduling_is_an_explicit_adapter_setting() {
     value["spec"]["agents"]["qoder"]["qoder"]["unknown"] = json!(true);
     assert!(parse(&value).is_err());
 }
+
+#[test]
+fn json_documents_parse_equivalently_across_layouts_and_number_spellings() {
+    let yaml = VALIDATOR
+        .parse(include_bytes!("../examples/aw.minimal.yaml"))
+        .unwrap();
+    let fixture = include_str!("../examples/aw.minimal.json");
+    assert_eq!(
+        VALIDATOR.parse(fixture.as_bytes()).unwrap().as_value(),
+        yaml.as_value()
+    );
+    // Compact, pretty and tab-indented spellings are the same document; the
+    // fixture keeps no double spaces inside string values.
+    for layout in [
+        serde_json::to_string(yaml.as_value()).unwrap(),
+        serde_json::to_string_pretty(yaml.as_value()).unwrap(),
+        fixture.replace("  ", "\t"),
+    ] {
+        assert_eq!(
+            VALIDATOR.parse(layout.as_bytes()).unwrap().as_value(),
+            yaml.as_value(),
+            "{layout}"
+        );
+    }
+    // A JSON exponent resolves through YAML scalar rules: the budget arrives
+    // as float-typed 1000.0, which the schema's integer type accepts.
+    let exponent = fixture.replace(
+        "\"default_event_budget_ms\": 5000",
+        "\"default_event_budget_ms\": 1e3",
+    );
+    let parsed = VALIDATOR.parse(exponent.as_bytes()).unwrap();
+    let budget = &parsed.as_value()["spec"]["execution"]["default_event_budget_ms"];
+    assert_eq!(budget.as_f64(), Some(1000.0));
+    assert!(budget.as_i64().is_none());
+}

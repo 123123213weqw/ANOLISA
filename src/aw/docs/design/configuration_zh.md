@@ -12,8 +12,9 @@ Provider JSON 当作 canonical wire 元数据接受。
 期望输入接受。这借鉴声明式对象结构，不引入 Kubernetes API 或依赖。Provider
 实例是命名对象，由有序事件步骤引用，同一个实现可以实例化多份私有配置。
 
-Schema 是字段结构的权威定义。可复用离线校验器将有界 YAML 解析成 JSON，校验
-结构后检查静态关系。`Configuration::as_value` 暴露已校验文档，不另外维护公开
+Schema 是字段结构的权威定义。可复用离线校验器将有界 YAML 或 JSON 解析成 JSON
+数据模型，校验结构后检查静态关系。JSON 作为 YAML 1.2 子集走同一条有界路径。
+`Configuration::as_value` 暴露已校验文档，不另外维护公开
 Rust 字段模型，也不隐式填入默认值。Provider 私有对象保留有限小数和 Unicode
 键，已有 wire 编码保持不变。Host 与服务根据完整原始配置字节计算版本，因此
 格式变化也会选择不同的 revision。

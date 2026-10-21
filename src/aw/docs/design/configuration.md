@@ -16,7 +16,9 @@ Provider instances are named objects referenced by ordered event steps; one
 implementation can have multiple instances with different private configuration.
 
 The schema is the authoritative field shape. A reusable offline validator parses
-bounded YAML into JSON, validates that shape, then checks static relationships.
+bounded YAML or JSON documents into the JSON data model, validates that shape,
+then checks static relationships. JSON travels the same bounded path as a
+YAML 1.2 subset.
 `Configuration::as_value` exposes the validated document; there is no duplicate
 public Rust field model or implicit default insertion. Provider-owned objects
 preserve finite JSON decimals and Unicode keys; existing wire encoding remains

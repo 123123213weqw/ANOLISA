@@ -137,8 +137,11 @@ stdin 未完整交付、非法或超限输出仍为错误，由 `on_error` 处�
 
 解析器接受一份 UTF-8 YAML 或 JSON，输入及展开后 JSON 均不超过 4 MiB，嵌套
 深度不超过 32。重复键、非字符串键、自定义 YAML tag、merge key、非有限数值
-及多文档均拒绝；普通 alias 在限额内展开。诊断包含字段路径或源码位置与约束，
-不回显字段值。
+及多文档均拒绝；普通 alias 在限额内展开。JSON 输入沿用同一套 YAML 标量解析
+规则：`1e3` 这类指数写法会以浮点 `1000.0` 到达，Schema 的 integer 类型接受
+整数值。JSON 入门文档与 YAML 入门文档一一对应：
+[aw.minimal.json](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/examples/aw.minimal.json)。
+诊断包含字段路径或源码位置与约束，不回显字段值。
 
 本 alpha 配置与已有能力 wire 记录、Schema ID/摘要分开演进，不应将 Provider
 配置送入仅支持整数的 wire canonicalizer。校验器不安装或修改任何原生文件；

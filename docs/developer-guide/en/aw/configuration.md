@@ -164,7 +164,12 @@ reported explicitly. Parsing alone does not perform that admission.
 The parser accepts one UTF-8 YAML or JSON document, bounded to 4 MiB before and
 after expansion and nesting depth 32. Duplicate keys, non-string mapping keys,
 custom YAML tags, merge keys, non-finite numbers and multiple documents fail.
-Ordinary aliases are expanded within those limits. Diagnostics include field
+Ordinary aliases are expanded within those limits. JSON input follows the same
+YAML scalar resolution: an exponent spelling such as `1e3` arrives as
+float-typed `1000.0`, which the schema's integer type accepts. A JSON starter
+document mirrors the YAML starter at
+[aw.minimal.json](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/examples/aw.minimal.json).
+Diagnostics include field
 paths or source locations and constraints without echoing field values.
 
 This alpha configuration is separate from existing capability wire records and
