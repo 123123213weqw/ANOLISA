@@ -169,6 +169,11 @@ YAML scalar resolution: an exponent spelling such as `1e3` arrives as
 float-typed `1000.0`, which the schema's integer type accepts. A JSON starter
 document mirrors the YAML starter at
 [aw.minimal.json](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/examples/aw.minimal.json).
+Decimal integer scalars outside both the signed and unsigned 128-bit ranges are
+rejected rather than rounded into floats, including scalars tagged `!!float`.
+Use exponent/decimal notation for floating-point values and quoted strings for
+exact large identifiers. This does not expand the existing integer value range.
+
 Diagnostics include field
 paths or source locations and constraints without echoing field values.
 

@@ -141,6 +141,10 @@ stdin 未完整交付、非法或超限输出仍为错误，由 `on_error` 处�
 规则：`1e3` 这类指数写法会以浮点 `1000.0` 到达，Schema 的 integer 类型接受
 整数值。JSON 入门文档与 YAML 入门文档一一对应：
 [aw.minimal.json](https://github.com/agentic-os-org/ANOLISA/blob/main/src/aw/crates/aw-config/examples/aw.minimal.json)。
+超出有符号和无符号 128 位范围的十进制整数 scalar 会被拒绝，不会舍入成浮点数，
+标记为 `!!float` 的 scalar 也适用。浮点值使用指数或小数写法；需要精确保留的大型
+标识符使用带引号的字符串。这不扩大现有整数值的支持范围。
+
 诊断包含字段路径或源码位置与约束，不回显字段值。
 
 本 alpha 配置与已有能力 wire 记录、Schema ID/摘要分开演进，不应将 Provider
