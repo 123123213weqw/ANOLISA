@@ -30,7 +30,11 @@ runs steps serially. It rechecks provider descriptors and absolute deadlines
 before dispatch, including after journal writes. Every selected provider within
 a step is accounted for before reducing the decision. Denial, preservation or
 cancellation stops later steps. The generated terminal record is validated
-against the plan and actual invocation evidence before it can be returned.
+against the plan and actual invocation evidence before it can be returned. An observed
+non-allow command-inspection verdict retains terminal `deny` when cancellation
+overlaps the call. The step still records `cancelled` and its reason; cancellation
+without such a verdict retains terminal `cancelled`. The validator rejects a
+terminal decision that contradicts this receipt evidence.
 
 The Host authenticates providers, implements their protocols, and enforces
 execution/output limits. Core validates reported evidence and observed call
