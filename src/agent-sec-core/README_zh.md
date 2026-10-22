@@ -70,6 +70,10 @@ Rust V2 客户端在发送请求前校验连接对端的内核 peer UID 为 0。
 
 源码构建的 Rust `agent-sec-cli` 经 `asc-daemon` 提供12 条 Policy、Scope、Binding 管理命令。参阅[命令参考](../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md)
 和 [V2 workspace](v2/README.md)。PAP 状态保存在 SQLite 中，Binding 受理不代表策略已生效。
+默认 Policy 数据目录 `/var/log/agent-sec` 的祖先不安全时，可回退到 `/var/lib/agent-sec/policy`；
+daemon 自己拥有的叶目录权限会先修复为 `0700`。
+两处都有数据库，或选址会绕过已有数据库时拒绝启动；显式 `AGENT_SEC_DATA_DIR` 仍为固定路径。
+详见 [Policy 存储](../../docs/user-guide/zh/agent-security/agent-sec-core/policy-cli.md#policy-数据库位置)。
 PolicyTemplate 是包含通用规则的可复用策略；AgentSight Adapter 当前仅执行文件删除 block 规则。
 Scope 保存不可变策略快照，拥有自动 Binding 创建、下发和清理生命周期。
 可通过 daemon 的 `--policy-admin-uid <UID>` 授权非 root Policy CLI 调用者；默认仍只授权 root。

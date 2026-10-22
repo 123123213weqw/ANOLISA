@@ -20,6 +20,34 @@ Scope 受理不代表保护已生效。CLI 和 daemon 需一起升级：Scope up
 agent-sec-cli --socket "$SOCKET" policy list
 ```
 
+## Policy 数据库位置
+
+未设置非空 `AGENT_SEC_DATA_DIR` 时，daemon 检查两处 Policy 数据库：
+A 为 `/var/log/agent-sec/policy-state.db`，B 为
+`/var/lib/agent-sec/policy/policy-state.db`。A 的目录安全时选择 A，
+仅在 A 的祖先不安全且 B 的目录安全时选择 B。这兼容 Ubuntu `/var/log` 等组可写祖先，
+不修改系统目录权限。仅 Policy 存储可回退，安全事件和可观测存储路径保持原状。
+
+创建任何文件前，daemon 检查两处是否已有数据库：
+
+- 两处都有数据库时拒绝启动，不自动选择或合并。
+- 目录检查的选址会绕过另一处已有数据库时拒绝启动，包括使用 B 后 A 又恢复安全的情况。
+- 其余情况打开所选位置的已有数据库或初始化新库。坏库、未知 schema、锁占用和 I/O 错误
+  不会触发换库。
+
+祖先检查通过后，daemon 会先把自己拥有的已有叶目录权限修复为 `0700`，再完成选址。
+例如 `/var/log/agent-sec` 为 `0755` 时修复并继续使用 A；`/var/log` 为 `0775` 时才允许回退 B。
+不修改祖先目录权限。叶目录属主错误或权限修复失败均报错，不作为回退理由。
+
+目录诊断包含失败路径、实际 UID/GID/mode 和权限要求；冲突诊断列出两处数据库路径，
+要求恢复原目录配置或显式执行离线迁移。不自动移动、删除或重建已有状态。
+路径不可读取或仅剩 SQLite sidecar 均报错，不能当成数据库不存在。
+
+在 daemon 环境中显式设置非空 `AGENT_SEC_DATA_DIR` 时，使用该固定数据目录，
+不参与默认 A/B 发现或回退。数据目录必须由 daemon UID 拥有且为 `0700`，
+数据库及辅助文件为 `0600`。祖先必须归 root 或 daemon UID 所有且不可组写或其他用户写，
+root 所有的 sticky 目录除外。路径中的目录不能是 symlink。
+
 ## 关联本地日志
 
 V2 使用原生 OpenTelemetry 关联本地请求日志。`--trace-context` 保留原有扁平 Agent

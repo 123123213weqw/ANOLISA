@@ -245,6 +245,15 @@ WAL/SHM sidecar 受私有目录保护。绑定 UDS 前必须实际打开 JSONL�
 失败即非零退出；JSONL 失败只输出告警，daemon 仍启动并对该副本保持 best-effort 写入。成功
 启动后单侧瞬时写失败仍保持独立 fail-open，不改变 capability 的业务结果。
 
+Policy 存储独立执行 DPROC-023 路径选择：显式非空 `AGENT_SEC_DATA_DIR` 为固定路径，
+否则候选 A 为 `/var/log/agent-sec/policy-state.db`，B 为
+`/var/lib/agent-sec/policy/policy-state.db`。先检查两处已有状态，再按目录安全性优先选择 A，
+A 的祖先不安全时选择安全的 B。祖先安全且已有叶目录归 daemon 所有时，先将叶目录修复为 `0700`；
+叶目录属主错误或修复失败直接报错。两处都有库，或选址会绕过另一处已有库时拒绝启动并列出路径与原因。
+不能把读取错误视为不存在，也不因数据库损坏、schema、锁或 I/O 错误换库。
+预检查不创建文件、不改变祖先权限、不迁移数据；无冲突时才打开或初始化所选库，最终打开再次验证目录。
+`0700` 私有目录及 `0600` 文件要求保持不变，安全事件和可观测路径不随 Policy fallback 改变。
+
 scan composition root 还注入共享 telemetry sink。`AGENT_SEC_TELEMETRY_LOG_PATH` 沿用 V1，
 默认 uploader-owned JSONL。路径中的 `~` 优先使用 `HOME`，未设置时查询当前 UID 的系统
 用户数据库；`~user` 查询指定用户的 home，保持 V1 `Path.expanduser()` 对已有用户的展开行为。
@@ -493,6 +502,7 @@ DPROC-011 和 DPROC-018 的 focused evidence 为 `asc-cli/tests/commands.rs` 的
 | DPROC-017 | state migrator 完成 V1 per-user 到 system-owned state 的 owner-safe 迁移和回滚 |
 | DPROC-018 | CLI/TUI 不直读 SQLite；query 必须经过 daemon authorization |
 | DPROC-019 | raw/RPM/container/systemd/Helm 生成 checksum、SBOM 和 build metadata |
+| DPROC-023 | Policy 默认目录安全性选择与已有状态冲突拒绝；已有自有叶目录修复为 `0700`，仅祖先不安全触发回退；显式数据根不回退，不修改已有数据库；fixture 为 `v2/crates/asc-policy-repository-sqlite/src/path/tests.rs` 和 `v2/apps/asc-daemon/tests/bootstrap.rs` 的同名测试及叶目录修复回归 |
 
 每个 DPROC ID 必须映射到机器可执行 fixture 或真实部署证据。Rust unit test 不能代替安装后
 service/package、server-side admission 或真实 Kubernetes rollout 验证。

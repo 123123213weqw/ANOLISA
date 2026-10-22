@@ -23,6 +23,41 @@ or grant permissions.
 agent-sec-cli --socket "$SOCKET" policy list
 ```
 
+## Policy database location
+
+With no nonempty `AGENT_SEC_DATA_DIR`, the daemon checks two Policy database paths:
+A is `/var/log/agent-sec/policy-state.db`; B is
+`/var/lib/agent-sec/policy/policy-state.db`. It selects A when A's directory is
+safe, otherwise B when A's ancestors are unsafe and B's directory is safe. This handles group-writable log
+ancestors such as Ubuntu's `/var/log` without changing their permissions.
+Only Policy storage can fall back; security-event and observability paths stay unchanged.
+
+Before creating anything, the daemon checks both locations for existing databases:
+
+- If both contain a database, startup fails rather than choosing or merging them.
+- If the directory selection would bypass a database at the other location, startup
+  fails. This includes A becoming safe again after B has been used.
+- Otherwise, the daemon opens the selected existing database or initializes it.
+  Corruption, incompatible schema, lock contention and I/O errors never select another database.
+
+After validating ancestors, an existing leaf directory owned by the daemon UID
+is restricted to `0700` before selection. For example, `/var/log/agent-sec` at
+`0755` is repaired and stays at A; `/var/log` at `0775` permits fallback to B.
+Ancestors are never chmodded. A foreign-owned leaf or a failed permission repair
+is a startup error, not a reason to select B.
+
+Directory diagnostics identify the failing path, actual UID/GID/mode and required
+permissions. Conflicts identify both database paths and require restoring the
+previous directory configuration or an explicit offline migration. Existing data
+is never automatically moved, deleted or rebuilt. Unreadable paths and orphaned
+SQLite sidecars are errors, not proof that the database is absent.
+
+A nonempty `AGENT_SEC_DATA_DIR` in the daemon's environment selects a fixed data
+directory, without default A/B discovery or fallback. Keep it private (`0700`,
+owned by the daemon UID); database and auxiliary files must be `0600`. Ancestors
+must be owned by root or the daemon UID and must not be group/other writable,
+except for root-owned sticky directories. No path component may be a symlink.
+
 ## Correlate local logs
 
 V2 uses native OpenTelemetry for local request correlation. `--trace-context`

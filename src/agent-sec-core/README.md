@@ -79,6 +79,11 @@ Rust V2 clients verify the connected daemon's kernel peer UID is 0 before sendin
 The source-built Rust `agent-sec-cli` provides 12 Policy, Scope and Binding administration
 commands through `asc-daemon`. See the [command reference](../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md)
 and [V2 workspace](v2/README.md). PAP state persists in SQLite; Binding acceptance does not imply enforcement.
+The default Policy database can fall back to `/var/lib/agent-sec/policy` when its
+`/var/log/agent-sec` ancestors are unsafe; owned leaf permissions are repaired to 0700.
+Conflicting or bypassed existing databases
+refuse startup; explicit `AGENT_SEC_DATA_DIR` remains a fixed path. See
+[Policy storage](../../docs/user-guide/en/agent-security/agent-sec-core/policy-cli.md#policy-database-location).
 PolicyTemplates are reusable policies with general rules; the AgentSight Adapter
 currently executes only file-deletion block rules. Scopes save immutable Policy snapshots and
 own automatic Binding creation, reconciliation and cleanup. To authorize non-root Policy CLI callers, configure

@@ -196,8 +196,14 @@ The current `asc-daemon` executable composes and registers the PAP dispatcher an
 protocol rejection encoder from `asc-daemon-handler`. It composes `PapService`
 with a root-managed Principal policy and the SQLite Repository. Policy state lives
 in `policy-state.db` under `AGENT_SEC_DATA_DIR`
-(default `/var/log/agent-sec`). The data directory must be private (0700), with
-database and lock files restricted to 0600. Unsafe existing permissions, incompatible
+(default `/var/log/agent-sec`). Owned leaf permissions are repaired to 0700 after
+ancestor validation. Without an explicit data root, unsafe default ancestors
+select `/var/lib/agent-sec/policy` for Policy storage only. Startup
+checks both locations before creating anything and rejects two existing databases
+or a directory selection that would bypass the other location's database.
+An explicit `AGENT_SEC_DATA_DIR` stays fixed without default discovery or fallback.
+The data directory must be private (0700), with
+database and lock files restricted to 0600. Unrepairable permissions, incompatible
 schema and corruption fail startup; the daemon never deletes or rebuilds this state.
 An independent database lease prevents two socket namespaces from sharing it.
 See [persistence, upgrade and recovery](../docs/design/POLICY_SQLITE_PERSISTENCE_DESIGN_zh.md).
