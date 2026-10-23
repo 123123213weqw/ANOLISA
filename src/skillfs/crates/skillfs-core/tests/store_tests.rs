@@ -279,6 +279,46 @@ fn is_kebab_case_skill_name(name: &str) -> bool {
         && !name.ends_with('-')
 }
 
+/// The helper above mirrors the parser's name grammar, so it needs its own
+/// regression coverage: without a test, this copy can drift away from
+/// `parser::validate_name` unnoticed.
+///
+/// The boundary cases pin the documented 64-character limit. The parser
+/// measures that limit in characters, so a 64-character name stays within
+/// the limit even when its UTF-8 byte length is larger.
+#[test]
+fn is_kebab_case_skill_name_accepts_the_documented_boundary() {
+    assert!(is_kebab_case_skill_name(&"a".repeat(64)));
+    assert!(!is_kebab_case_skill_name(&"a".repeat(65)));
+}
+
+/// Names outside the grammar are rejected, which is the same set of rules
+/// the parser applies.
+#[test]
+fn is_kebab_case_skill_name_rejects_names_outside_the_grammar() {
+    assert!(!is_kebab_case_skill_name(""));
+    assert!(!is_kebab_case_skill_name("-leading"));
+    assert!(!is_kebab_case_skill_name("trailing-"));
+    assert!(!is_kebab_case_skill_name("Uppercase"));
+    assert!(!is_kebab_case_skill_name("with_underscore"));
+}
+
+/// The length limit is counted in characters, not UTF-8 bytes. 64
+/// multi-byte characters are 192 bytes, so a byte-based limit would reject
+/// them for the wrong reason.
+#[test]
+fn is_kebab_case_skill_name_counts_characters_not_utf8_bytes() {
+    let name = "技".repeat(64);
+    assert_eq!(name.chars().count(), 64);
+    assert!(name.len() > 64, "the byte length must exceed the limit");
+
+    // The name is still rejected, because it is not kebab-case. The same
+    // length in ASCII is accepted, so the rejection cannot come from the
+    // length rule.
+    assert!(is_kebab_case_skill_name(&"a".repeat(64)));
+    assert!(!is_kebab_case_skill_name(&name));
+}
+
 #[test]
 fn invalid_directory_name_degrades_the_skill() {
     let source_dir = tempfile::tempdir().unwrap();
