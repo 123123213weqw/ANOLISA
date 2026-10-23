@@ -332,6 +332,15 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
+两个命令都支持从文件读取输入，而不必使用标准输入：
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` 是 `--file` 的简写形式。不指定时从标准输入读取，这正是上面示例的用法。
+
 `compress-toon` 支持 `--agent-id`、`--session-id`、`--tool-use-id` 和 `--min-toon-chars`。当负载低于最小长度或编码后无收益时会输出原 JSON，且不记录该次统计。这类透传场景退出码仍为 `0`，stderr 上的提示仅供参考：在脚本等自动化场景中，请通过比较 stdout 与输入负载来判断是否发生了编码，不要依赖 stderr。透传和无收益场景会在 stdout 上逐字节原样复现输入（不添加、不去除末尾换行符），任何字节差异都说明负载已被编码；作为兜底，也可以检查 stdout 是否仍为合法 JSON。
 
 ## `retrieve`

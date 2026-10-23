@@ -350,6 +350,16 @@ echo '{"name":"test","value":42}' \
   | tokenless decompress-toon
 ```
 
+Both commands accept the input as a file instead of standard input:
+
+```bash
+tokenless compress-toon --file payload.json
+tokenless decompress-toon --file payload.toon
+```
+
+`-f` is the short form of `--file`. Without it, the input is read from standard
+input, which is what the examples above use.
+
 `compress-toon` supports `--agent-id`, `--session-id`, `--tool-use-id`, and `--min-toon-chars`. When a payload is below the minimum length or encoding provides no savings, it returns the original JSON and does not record that operation. The exit code is still `0` in these passthrough cases, and the note on stderr is informational only: when scripting, detect whether encoding happened by comparing stdout with the input payload instead of relying on stderr. Passthrough and no-savings runs reproduce the input byte-for-byte on stdout (no trailing newline is added or stripped), so any byte difference means the payload was encoded; checking whether stdout is still valid JSON works as a fallback.
 
 ## `retrieve`
