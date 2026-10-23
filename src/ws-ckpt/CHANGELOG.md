@@ -2,7 +2,7 @@
 
 [中文版](CHANGELOG_zh.md)
 
-## 0.5.1
+## 0.6.0
 
 ### Added
 - CI prebuilt packages for ws-ckpt (#7106)
@@ -15,7 +15,7 @@
 
 ### Fixed
 - Fixed startup rollback recovery: restore rollback head, finish interrupted rollbacks, and limit repeated daemon restarts (#8570)
-- Fixed the parent walk stopping on a cycle (#8467)
+- Fixed non-termination when the parent chain contains a cycle (#8467)
 - Cleaned up stranded config temp files (#3764)
 - Raised the openclaw CLI capture limit past 1 MiB (#4040)
 - Fixed btrfs creates under storage pressure (#7888)

@@ -164,12 +164,12 @@ if [ $1 -eq 0 ]; then
 fi
 
 %changelog
-* Fri Oct 23 2026 ziqi02 <ziqi02@alibaba-inc.com> - 0.5.1-1
+* Fri Oct 23 2026 ziqi02 <ziqi02@alibaba-inc.com> - 0.6.0-1
 - Added CI prebuilt packages for ws-ckpt
 - Added pagination to snapshot listings
 - Added reconciliation of interrupted cleanup operations
 - Improved startup rollback recovery: restore rollback head, finish interrupted rollbacks, and limit repeated daemon restarts
-- Fixed the parent walk stopping on a cycle
+- Fixed non-termination when the parent chain contains a cycle
 - Cleaned up stranded config temp files
 - Raised the openclaw CLI capture limit past 1 MiB
 - Blocked btrfs creates under storage pressure
