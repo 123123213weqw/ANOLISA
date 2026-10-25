@@ -109,6 +109,10 @@ Linux x86_64 和 ARM64 包包含主程序、配置、用户服务及已打包的
 渲染，RPM 契约保持独立。两种安装模式均不会启动用户服务。
 通过 `python3 tests/test_raw_packaging.py` 运行打包回归测试。
 
+## Smoke 验证
+
+使用 Python 3.8+ 运行 `make smoke`，在临时命名空间验证 release MCP 服务。`make smoke SMOKE_TIMEOUT=10` 可修改默认 30 秒的协议检查期限；进程清理另有 2 秒上限。详见[测试指南](../../docs/user-guide/zh/getting-started/testing.md)。
+
 ## 许可证
 
 Apache License 2.0 — 详见 [LICENSE](LICENSE)。

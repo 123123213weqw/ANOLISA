@@ -153,6 +153,10 @@ contract from `.anolisa/component.raw.toml.in` and Cargo.toml; the RPM contract
 remains separate. Both installation modes leave the user service stopped.
 Run `python3 tests/test_raw_packaging.py` for packaging regressions.
 
+## Smoke validation
+
+Run `make smoke` with Python 3.8+ to validate the release MCP server in a temporary namespace. `make smoke SMOKE_TIMEOUT=10` overrides the default 30-second protocol deadline; process cleanup is bounded separately to two seconds. See the [testing guide](../../docs/user-guide/en/getting-started/testing.md).
+
 ## License
 
 Apache License 2.0 — see [LICENSE](LICENSE).
