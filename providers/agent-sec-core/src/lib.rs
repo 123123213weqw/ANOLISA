@@ -3,6 +3,7 @@
 mod config;
 pub mod health;
 mod scan;
+mod trace_context;
 
 use std::io::{Read, Write};
 use std::path::Path;
@@ -101,7 +102,15 @@ fn dispatch(
                         .pointer(&mapping.input_pointer)
                         .and_then(Value::as_str)
                         .ok_or("invalid_tool_input")?;
-                    let verdict = scan::call(cli, socket, code, mapping.language, remaining)?;
+                    let trace_context = trace_context::from_event(event);
+                    let verdict = scan::call(
+                        cli,
+                        socket,
+                        code,
+                        mapping.language,
+                        &trace_context,
+                        remaining,
+                    )?;
                     match (config.mode, verdict) {
                         (Mode::Block, scan::Verdict::Risk) => ("block", "code_risk"),
                         (_, scan::Verdict::Risk) => ("observe", "code_risk"),

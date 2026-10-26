@@ -79,13 +79,18 @@ fn code_is_literal_cli_data_and_timeout_is_shared() {
     assert_eq!(reply["effects"][0]["reason_code"], "code_pass");
     let args = directory.argv();
     let args = args.as_array().unwrap();
-    assert_eq!(args[0], "--socket");
-    assert_eq!(args[1], "/unused-sec-core.sock");
-    assert_eq!(args[2], "--timeout-ms");
-    let milliseconds: u64 = args[3].as_str().unwrap().parse().unwrap();
+    assert_eq!(args[0], "--trace-context");
+    assert_eq!(
+        serde_json::from_str::<Value>(args[1].as_str().unwrap()).unwrap(),
+        json!({"agent_name":"qoder"})
+    );
+    assert_eq!(args[2], "--socket");
+    assert_eq!(args[3], "/unused-sec-core.sock");
+    assert_eq!(args[4], "--timeout-ms");
+    let milliseconds: u64 = args[5].as_str().unwrap().parse().unwrap();
     assert!((1..=1000).contains(&milliseconds));
     assert_eq!(
-        &args[4..],
+        &args[6..],
         &json!([
             "scan-code",
             "--code",
@@ -100,6 +105,136 @@ fn code_is_literal_cli_data_and_timeout_is_shared() {
     );
     assert!(!reply.to_string().contains("private evidence"));
     directory.assert_stopped();
+}
+
+#[test]
+fn trace_context_keeps_native_ids_across_adapter_dialects() {
+    for adapter in [
+        "qoder",
+        "qoder-sdk",
+        "claude-sdk",
+        "openclaw",
+        "hermes",
+        "pi",
+        "qwenpaw",
+        "agentscope",
+    ] {
+        let fields = json!({"trace_id":"legacy-trace", "session_id":"session",
+            "run_id":"native-run", "call_id":"native-call"});
+        let mut native = fields.clone();
+        match adapter {
+            "openclaw" => {
+                native = json!({
+                    "event":{"traceId":"legacy-trace", "runId":"native-run",
+                        "callId":"native-call", "toolCallId":"native-tool"},
+                    "context":{"sessionId":"session", "runId":"other-run",
+                        "toolCallId":"other-tool"}
+                });
+            }
+            "hermes" => {
+                native = json!({"session_id":"session", "extra":{
+                    "traceId":"legacy-trace", "runId":"native-run",
+                    "callId":"native-call", "tool_call_id":"native-tool",
+                    "api_request_id":"different-api-request"
+                }});
+            }
+            "pi" | "qwenpaw" | "agentscope" => {
+                native["tool_call_id"] = json!("different-alias-tool");
+                native["tool_call"] = json!({"id":"native-tool"});
+                native["invocation_id"] = json!("aw-invocation");
+            }
+            _ => {
+                native["tool_call_id"] = json!("different-alias-tool");
+                native["tool_use_id"] = json!("native-tool");
+            }
+        }
+        native["agent_name"] = json!("untrusted-native-label");
+        let directory = support::Directory::new(json!({"stdout":{"ok":true,"verdict":"pass"}}));
+        let mut request = invocation();
+        request["event"]["agent"]["adapter"] = json!(adapter);
+        request["event"]["session_id"] = json!("aw-generated-session");
+        request["event"]["tool"]["call_id"] = json!("aw-generated-call");
+        request["event"]["native"] = native;
+        let reply = run(request, &directory.cli());
+        assert_eq!(reply["status"], "ok", "{adapter}");
+        let args = directory.argv();
+        assert_eq!(args[0], "--trace-context", "{adapter}");
+        let context: Value = serde_json::from_str(args[1].as_str().unwrap()).unwrap();
+        let mut expected = fields;
+        expected["agent_name"] = json!(adapter);
+        expected["tool_call_id"] = json!("native-tool");
+        assert_eq!(context, expected, "{adapter}");
+        assert!(reply.get("trace_context").is_none());
+        directory.assert_stopped();
+    }
+}
+
+#[test]
+fn trace_context_bounds_native_fields_before_starting_the_cli() {
+    for (value, expected) in [
+        ("x".repeat(140_000), "x".repeat(242) + "...[truncated]"),
+        ("界".repeat(256), "界".repeat(256)),
+        ("🦀".repeat(257), "🦀".repeat(242) + "...[truncated]"),
+    ] {
+        let directory = support::Directory::new(json!({"stdout":{"ok":true,"verdict":"pass"}}));
+        let mut request = invocation();
+        let padded = format!("\u{1c} \t{value}\n \u{1f}");
+        request["event"]["native"] = json!({
+            "trace_id":padded,"session_id":padded,"run_id":padded,
+            "call_id":padded,"tool_use_id":padded,"tool_call_id":"ignored-alias"
+        });
+        let reply = run(request, &directory.cli());
+        assert_eq!(reply["status"], "ok");
+        assert_eq!(reply["effects"][0]["reason_code"], "code_pass");
+        let args = directory.argv();
+        let context_arg = args[1].as_str().unwrap();
+        assert!(context_arg.len() < 8192);
+        let context: Value = serde_json::from_str(context_arg).unwrap();
+        assert_eq!(
+            context,
+            json!({
+                "agent_name":"qoder","trace_id":expected,"session_id":expected,
+                "run_id":expected,"call_id":expected,"tool_call_id":expected
+            })
+        );
+        directory.assert_stopped();
+    }
+}
+
+#[test]
+fn missing_or_invalid_trace_fields_do_not_become_aw_identifiers() {
+    for adapter in [
+        "qoder",
+        "qoder-sdk",
+        "claude-sdk",
+        "openclaw",
+        "hermes",
+        "pi",
+        "qwenpaw",
+        "agentscope",
+    ] {
+        for native in [
+            json!({}),
+            json!({"trace_id":null, "session_id":42, "run_id":" \t",
+                "call_id":{"id":"invalid"}, "tool_call_id":false,
+                "extra":{"api_request_id":"not-a-call-id"},
+                "tool_input":{"run_id":"argument-run", "tool_call_id":"argument-tool"}}),
+        ] {
+            let directory = support::Directory::new(json!({"stdout":{"ok":true,"verdict":"pass"}}));
+            let mut request = invocation();
+            request["event"]["agent"]["adapter"] = json!(adapter);
+            request["event"]["agent"]["instance_id"] = json!("aw-generated-session");
+            request["event"]["session_id"] = json!("aw-generated-session");
+            request["event"]["tool"]["call_id"] = json!("aw-generated-call");
+            request["event"]["native"] = native;
+            assert_eq!(run(request, &directory.cli())["status"], "ok", "{adapter}");
+            let args = directory.argv();
+            assert_eq!(args[0], "--trace-context");
+            let context: Value = serde_json::from_str(args[1].as_str().unwrap()).unwrap();
+            assert_eq!(context, json!({"agent_name":adapter}), "{adapter}");
+            directory.assert_stopped();
+        }
+    }
 }
 
 #[test]

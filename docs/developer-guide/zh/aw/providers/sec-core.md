@@ -121,6 +121,18 @@ Provider 的私有 `config` 接受以下字段：
 判定为 `pass`。非零或信号退出、非法 JSON、无效判定、超时和输出超限均返回
 Provider 错误，不产生候选效果。
 
+扫描前，桥接通过 `--trace-context` 传入以 Adapter 名称表示的 `agent_name`、
+原生 `trace_id`、`session_id`、`run_id`、`call_id` 和 `tool_call_id`。
+字段从原始回调提取，包括 OpenClaw 的 event/context 和 Hermes 的 extra 字段。
+Pi、QwenPaw 和 AgentScope 的原生工具 ID 从 `tool_call.id` 提取。
+AW 标准化事件中的 session、调用和实例 ID 不用于兜底；原生字段缺失、空白或
+不是字符串时会省略。
+sec-core CLI 将这份兼容输入转换为已有的 OTel Context/Baggage。
+
+启动 CLI 前，桥接会去除各原生关联字段首尾的空白，并将其限制为 256 个 Unicode
+码点；超长时保留 `...[truncated]` 后缀，后缀也计入限长。这与 CLI 的归一化规则
+一致，并在触及操作系统参数长度限制之前约束 context 参数大小。
+
 调用方必须限制整个 Provider 进程的期限，包括 stdin 接收和 stdout 输出。
 `aw-host` 通过 `aw-exec` 提供这一保证。直接调用时也必须在请求发送完毕后关闭 stdin，
 并在 I/O 停滞时终止进程；Provider 自身不保证独立调用的总耗时上限。

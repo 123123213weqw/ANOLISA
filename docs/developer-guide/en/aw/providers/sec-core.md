@@ -142,6 +142,20 @@ never run as a shell command. Exit 0 means the CLI completed a scan, not that it
 verdict was `pass`. Nonzero/signal exits, malformed JSON, invalid verdicts,
 timeouts and stream limits produce Provider errors without candidate effects.
 
+Before scanning, the bridge passes `--trace-context` with the Adapter name as
+`agent_name` and native `trace_id`, `session_id`, `run_id`, `call_id` and
+`tool_call_id` values. It reads the original callback, including OpenClaw's
+event/context and Hermes's extra fields. Pi, QwenPaw and AgentScope supply the
+native tool ID through `tool_call.id`. Normalized AW session, call and instance
+IDs are never used as fallbacks; absent, blank or non-string native fields are
+omitted. The sec-core CLI converts this compatible input to its existing OTel
+Context/Baggage.
+
+Before starting the CLI, the bridge strips each native correlation value and
+limits it to 256 Unicode code points, including a `...[truncated]` suffix when
+truncation is needed. This matches the CLI's normalization and bounds the context
+argument before it reaches the OS argument limit.
+
 The caller must enforce a deadline for the entire Provider process, including
 stdin receipt and stdout delivery. `aw-host` does this through `aw-exec`. A direct
 caller must also close stdin after the request and terminate the process if I/O
